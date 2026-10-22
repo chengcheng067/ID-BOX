@@ -110,6 +110,28 @@ export function paperColor(): string {
   return v.length > 0 ? v : '#ffffff'
 }
 
+/**
+ * 离屏渲染的**背景决策**（纯函数，可单测）——把「格式 → 要不要背景」这条规则
+ * 从 `renderBallBlob` 里抽出来，避免它再被误改成硬编码黑。
+ *
+ * - `'png'` → **恒为 `undefined`**（不是空串！`BallScene` 靠 `undefined` 判定
+ *   `alpha:true` + 清屏色 0 → 透明画布）。球图缩略图只认这条；
+ * - `'jpeg'` → 调用方显式给的色，否则 `paperColor()`（读 `--render-canvas-bg`：
+ *   浅色 `#FFFFFF` / 深色 `#1C1C1E`）。**绝不回落成 `#000000`**——纯黑在浅色主题下
+ *   是一块突兀的黑方块，也不是设计口径（v0.2.1 增补 1）。
+ *
+ * 空白串 / 非字符串同样按"没传"处理（`trim()` 后判空），免得把 `'   '` 交给
+ * `THREE.Color` 解析出黑。
+ */
+export function resolveBallBackground(
+  format: 'jpeg' | 'png',
+  background?: string
+): string | undefined {
+  if (format === 'png') return undefined
+  const explicit = typeof background === 'string' ? background.trim() : ''
+  return explicit.length > 0 ? explicit : paperColor()
+}
+
 /** 槽位 → MeshPhysicalMaterial 贴图属性（显式 switch，类型安全） */
 function assignMap(material: MeshPhysicalMaterial, slot: MaterialSlotKey, tex: Texture): void {
   switch (slot) {
@@ -1486,8 +1508,10 @@ async function renderBallBlob(
   canvas.width = size
   canvas.height = size
 
-  // PNG：background 必须**不传**（不是传空串），BallScene 靠 `undefined` 判定透明画布
-  const background = format === 'png' ? undefined : opts.background ?? paperColor()
+  // PNG：background 必须**不传**（不是传空串），BallScene 靠 `undefined` 判定透明画布。
+  // JPEG：显式色 → 否则 `paperColor()`（主题画布色）。规则集中在 `resolveBallBackground`，
+  // 单测直接锁这条口径（不许回落成纯黑）。
+  const background = resolveBallBackground(format, opts.background)
 
   const ball = new BallScene(canvas, {
     shape: opts.shape ?? 'sphere',

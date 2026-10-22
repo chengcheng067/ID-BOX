@@ -35,7 +35,8 @@ import type {
   TrashRestoreResult,
   TrashSoftDeleteItem,
   TrashSoftDeleteResult,
-  TrashSweepResult
+  TrashSweepResult,
+  UpdateInfo
 } from '../shared/types'
 
 /**
@@ -245,6 +246,18 @@ const api = {
   },
   /** 应用版本号（读 package.json version，主进程 app.getVersion()） */
   getAppVersion: (): Promise<string> => ipcRenderer.invoke(IPC.getAppVersion),
+  /**
+   * 检查 GitHub 最新正式版。
+   *
+   * @param force true = 绕过主进程 10 分钟缓存（「立即检查」按钮传 true；
+   *              启动自动检查传 false，同一会话内重复调用直接拿缓存）
+   * @returns `UpdateInfo`；**永远 resolve**（网络 / HTTP / 解析失败写在 `error` 字段）
+   */
+  checkUpdate: (force?: boolean): Promise<UpdateInfo> =>
+    ipcRenderer.invoke(IPC.checkUpdate, force === true),
+  /** 用系统默认浏览器打开 http(s) 外链；非法协议 / 打开失败返回 false */
+  openExternal: (url: string): Promise<boolean> =>
+    ipcRenderer.invoke(IPC.openExternal, url),
 
   // ── 2026-10-19 AI 辅助分类（docs/15 §7，词表优先 + 模型兜底） ────────
   /**

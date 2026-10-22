@@ -893,17 +893,28 @@ async function patchAssets(ids: string[], patch: MarkPatch): Promise<boolean> {
 }
 
 /**
- * RA3 缩略图重生（**先生成新的，再通配删旧**，06 §12-RA3 / 03 §5.4）：
+ * RA3 缩略图重生（**先生成新的，再删旧**，06 §12-RA3 / 03 §5.4）。
  *
- * ① `ensureThumb(新 coverAbs)` 先生成新缓存文件（salt = 路径 + mtime + 尺寸的内容身份，
- *    2026-10-22 起不再只是路径哈希 —— 原地覆盖同名封面也要换名，否则浏览器缓存不失效）；
- * ② `deleteThumb(id)` 通配删本 id 全部缓存——**preload 的 deleteThumb 无排除参数**，
- *    会把 ① 的新文件一并删掉；
- * ③ 再 `ensureThumb` 一次补回（文件名由 salt 决定，确定可复现）。
+ * 两种资产走**两条不同的删旧策略**（2026-10 回归修复：用户报「材质球渲染完变成有底的方块」）：
  *
- * 净效果：磁盘上只剩新 salt 的缓存；且全程内存状态尚未切换，网格引用的旧文件
- * 在 ② 之前始终存在、新文件在状态切换时必然已在磁盘——网格不闪灰格。
- * ① 失败（无封面/图损坏）→ 保留旧缓存文件不删，退化为 'none'（不彻底丢图）。
+ * **A. 球图适用的资产（材质 / 贴图，见 `ballThumbTarget`）——绝不允许通配删。**
+ *    球图缓存与封面缩略图同处 thumbs 目录、同属一个 id，文件名只差 salt
+ *    （球图 `<id>-<ballHash>.png`，封面 `<id>-<内容salt>.jpg`）。
+ *    旧实现在这里无条件 `deleteThumb(id)`（按 id 通配全删），会把**刚渲好的透明球图
+ *    一起删掉**；紧接着 `commitCover` 又把 `thumbPath` 写成新的封面缩略图（不透明 JPEG）
+ *    → 卡片上出现一块方形的底色（深色主题下就是黑块）。更糟的是球队列的
+ *    `ballAttempted` 让本会话不再重渲 → 只有重启才自愈。
+ *    所以这里改为：① 只**精确删上一张封面缩略图**（`deleteOneThumb`，四道校验见
+ *    `main/thumb.ts:deleteOneThumb`）；② `thumbPath` 当前就是球图时**原样返回球图名**
+ *    ——卡片继续显示透明球，保存封面不会把它顶掉。
+ *
+ * **B. 其它资产（模型 / HDR / 字体…）**：没有任何球图可误删，沿用原策略
+ *    （通配删旧 salt → 再补回），保证缓存目录不残留历史 salt。
+ *
+ * 两条策略共同的时序约束：新文件在状态切换前必然已在磁盘 → 网格不闪灰格；
+ * `ensureThumb` 的 salt 是**内容身份**（路径 + mtime + 尺寸），内容一变就换名
+ * → 原地覆盖同名封面（如 HDR 预览「拍照」）也能立刻刷新，不需要重启。
+ * 生成失败（无封面 / 图损坏）→ 不删任何旧文件，退化为 'none'（不彻底丢图）。
  */
 async function regenThumbSweep(
   id: string,
@@ -911,6 +922,31 @@ async function regenThumbSweep(
 ): Promise<{ thumbPath?: string; thumbStatus: ThumbStatus }> {
   const first = await window.modvault.ensureThumb(id, coverAbs).catch(() => null)
   if (!first) return { thumbStatus: 'none' }
+
+  const asset = useVault.getState().assets.find((a) => a.id === id)
+  const ball = asset ? ballThumbTarget(asset) : null
+
+  // A：球图资产 —— 精确删「上一张封面缩略图」，球图一个字节都不碰。
+  if (asset && ball) {
+    // `asset.thumbPath === ball.name` 时上一张就是球图本身，**不能删**（prev 置 null）。
+    const prev = asset.thumbPath && asset.thumbPath !== ball.name ? asset.thumbPath : null
+    if (prev && prev !== first) {
+      // 老 preload / 测试桩可能没有 deleteOneThumb：缺失时静默跳过（不影响落盘）
+      const del = window.modvault?.deleteOneThumb
+      if (typeof del === 'function') {
+        await del.call(window.modvault, id, prev).catch(() => false)
+      }
+    }
+    // 球图仍是当前缩略图（且上面没删它）→ 继续用它（透明 PNG，卡片透出画布色）
+    if (asset.thumbPath === ball.name) {
+      return { thumbPath: ball.name, thumbStatus: 'ready' }
+    }
+    // 还没渲过球图 / 参数变了：先用封面缩略图兜底，`commitCover` 会紧接着补一次球图
+    return { thumbPath: first, thumbStatus: 'ready' }
+  }
+
+  // B：非球图资产（模型 / HDR / 字体…，本资产没有球图可误删）
+  //    —— 通配删旧 salt → 再补回（与历史行为一致，缓存目录不残留历史 salt）
   await window.modvault.deleteThumb(id).catch(() => 0)
   const finalName = await window.modvault.ensureThumb(id, coverAbs).catch(() => null)
   return finalName
@@ -941,8 +977,9 @@ function isRootCoverRel(rel: string): boolean {
  * **「同 rel 或 根层同族封面」全部剔除**，见 `isRootCoverRel()` 的注释。
  *
  * 顺序不可调换（RA3）：先合并 files + 算体积 → 再 `regenThumbSweep`（先生成新、
- * 再通配删旧）→ **最后**一次性写库。中途任何一步失败都不会留下"cover 指向不存在文件"
- * 的中间态（缩略图失败只退化 `thumbStatus`，cover 仍然成立）。
+ * 再删旧（球图适用时**只精确删上一张封面缩略图**，绝不通配删））→ 一次性写库 →
+ * **最后**补一次球图（`enqueueBallThumb`，fresh 时零成本早退）。中途任何一步失败都不会
+ * 留下"cover 指向不存在文件"的中间态（缩略图失败只退化 `thumbStatus`，cover 仍然成立）。
  */
 async function commitCover(
   id: string,
@@ -993,6 +1030,18 @@ async function commitCover(
   }
   void db.assets.put(updated)
   useVault.setState((s) => ({ assets: s.assets.map((a) => (a.id === id ? updated : a)) }))
+
+  // ── 2026-10 回归修复：保存封面后**补一次球图**（不需要重启） ────────────────
+  // 上面的 `regenThumbSweep` 已经保证「球图适用时绝不通配删、thumbPath 是球图就继续用球图」
+  // （正常路径到这里已是透明球图，下面的入队会命中 fresh 直接早退，零成本）。
+  // 这里兜住另一种状态：资产此前**还没渲过球图**（或参数刚变），thumbPath 只能先落在
+  // 封面缩略图上（不透明 JPEG）→ 主动入队重渲，卡片随即回到透明球。
+  // 清 `ballAttempted` 的理由：它是"同一期望名只试一次"的防抖闸（DEF-09），而保存封面是
+  // **显式用户动作**，值得再试一次；否则早先失败过的那次记录会把该资产永久挡在队列外。
+  if (ballThumbTarget(updated) && !ballThumbIsFresh(updated)) {
+    ballAttempted.delete(updated.id)
+  }
+  enqueueBallThumb(updated)
 }
 
 /**
@@ -3183,6 +3232,26 @@ function ballSlotsOf(asset: Asset): ReturnType<typeof effectiveMaterialSlots> | 
   const slots = effectiveMaterialSlots(asset.files)
   if (!slots.albedo) return null
   return hasMaterialSlots(slots) ? slots : null
+}
+
+/**
+ * 这个资产的「球图**应该**叫什么」——`null` = 它不该有球图（网格走封面 / 类型占位）。
+ *
+ * 三道门必须与**入队侧**（`enqueueBallThumb`）和**渲染侧**（`renderBallThumbFor`）
+ * 完全一致，否则会出现"缩略图指向一张永远不会被渲出来的球图"：
+ * ① 只有 `material` / `texture` 渲球（模型资产即使带贴图也不渲，DEF-08）；
+ * ② `coverSource === 'named'`（包内自带官方渲染图）优先官方图，不渲球；
+ * ③ 没有 albedo 槽位 → 素球无信息量，不渲（`ballSlotsOf` 的两道门）。
+ *
+ * 供 `regenThumbSweep` 判定「能不能保住球图」：球图适用的资产在换封面 / 改名 / 分类
+ * 迁移时都必须**保留**透明球图，不能被封面缩略图顶掉（2026-10 回归修复）。
+ */
+function ballThumbTarget(asset: Asset): { name: string } | null {
+  if (asset.kind !== 'material' && asset.kind !== 'texture') return null
+  if (asset.coverSource === 'named' && asset.cover) return null
+  const slots = ballSlotsOf(asset)
+  if (!slots) return null
+  return { name: ballThumbName(asset.id, slots, resolveRenderParams(asset)) }
 }
 
 /**

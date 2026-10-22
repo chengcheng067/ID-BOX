@@ -18,6 +18,13 @@ import {
   type AliasSuggestion
 } from '../logic/aliasIndex'
 import { RETENTION_OPTIONS } from '../logic/trashView'
+// 自动检查更新（2026-10 用户需求）：状态机单独一个模块 —— `store.ts` 正被并发改动，
+// 更新检查只是「一个只读结论 + 一个进行中标志」，放进全局 store 只会扩大冲突面。
+import {
+  checkForUpdate,
+  useUpdateChecking,
+  useUpdateState
+} from '../logic/updateState'
 import { Modal } from './Modal'
 import { IconCheck, IconRefresh } from '../icons'
 import { UNCLASSIFIED } from '../../shared/taxonomy'
@@ -29,6 +36,9 @@ import { UNCLASSIFIED } from '../../shared/taxonomy'
 import donateQr from '../assets/brand/donate-qr.png'
 import contactQr from '../assets/brand/contact-qr.png'
 import brandMark from '../assets/brand/mark.png'
+
+// 自动检查在渲染进程入口 `main.tsx` 触发（不要依赖本文件的 import 时机：
+// 设置弹窗一旦改成 `lazy()`，放在这里的模块副作用会静默失效）。
 
 /**
  * 设置弹窗 tab（§3.6）：外观/导入/库与分类/别名/数据与备份/高级/关于。
@@ -653,6 +663,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const rescan = useVault((s) => s.rescan)
   const [tab, setTab] = useState<SettingsTab>('appearance')
   const [version, setVersion] = useState('')
+  // 自动检查更新（关于页）：结论 + 进行中标志都来自 logic/updateState.ts 的模块级 store。
+  // 启动自动检查已在文件顶部触发（模块级），这里只负责渲染与手动重试。
+  const updateInfo = useUpdateState()
+  const updateChecking = useUpdateChecking()
   /**
    * 内容区底部「还有内容」渐隐条（2026-10-21 走查 P2⑦）。
    *
@@ -1826,6 +1840,31 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     </div>
   )
 
+  /**
+   * 关于页「检查更新」的状态行文案（唯一来源，避免 JSX 里堆三元）。
+   *
+   * 优先级：检查中 > 有更新 > 失败 > 已是最新 > 尚未检查。
+   * - 失败**不弹窗**，就这一行小字（用户要求"不打扰"；自动检查失败也一样）。
+   * - `latest` 为空时退回"已是最新"（理论上不会发生：成功即有 tag_name）。
+   */
+  const updateStatusText = updateChecking
+    ? '正在检查…'
+    : updateInfo?.hasUpdate && updateInfo.latest
+      ? `发现新版本 v${updateInfo.latest}`
+      : updateInfo?.error
+        ? '检查失败，可稍后重试'
+        : updateInfo
+          ? '已是最新版本'
+          : ''
+
+  /** 「去下载」：优先安装包直链（一键下载），没有就开 Release 页面 */
+  const openUpdateDownload = () => {
+    const target = updateInfo?.assetUrl || updateInfo?.url
+    if (!target) return
+    // 打开失败（系统无默认浏览器等）静默忽略：不下发 notice，用户可再点 Release 链接
+    void window.modvault.openExternal(target).catch(() => undefined)
+  }
+
   const aboutTab = (
     <div className="flex flex-col items-center pb-2">
       {/* §3.6：居中 Logo 56×56 r16 + "ID BOX" 22px + 版本号胶囊。
@@ -1843,8 +1882,47 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       <div className="mt-2 rounded-full bg-accent-tint px-3 py-1 text-[13px] font-semibold text-accent-text">
         v{version || '…'}
       </div>
-      {/* 2026-10-21 走查 P2⑤：这里原有一个禁用态的「检查更新（留位）」按钮——点不动、
-          文案是内部排期口径。本地离线运行没有更新通道，展示它只会让人以为功能坏了，移除。 */}
+
+      {/* ── 检查更新（2026-10 用户需求：「每一次运行都自动检测 GitHub Releases」）──────
+          四态：检查中 / 有更新（→ 去下载）/ 已是最新 / 失败（一行小字，不弹窗）。
+          颜色全部走既有 token（text-secondary / text-accent-text / accent 底），
+          按钮复用 `.btn` / `.btn-primary` / `.btn-ghost`，开关复用下方 `Toggle`。 */}
+      <div className="mt-3 flex min-h-[20px] items-center gap-2">
+        <span
+          className={`text-[11px] ${
+            updateInfo?.hasUpdate && !updateChecking ? 'text-accent-text' : 'text-secondary'
+          }`}
+        >
+          {updateStatusText}
+        </span>
+      </div>
+      <div className="mt-1 flex items-center gap-2">
+        {updateInfo?.hasUpdate && (
+          <button className="btn btn-primary !px-3 !py-1 text-[12px]" onClick={openUpdateDownload}>
+            去下载
+          </button>
+        )}
+        <button
+          className="btn btn-ghost !px-2.5 !py-1 text-[12px] text-secondary disabled:opacity-50"
+          disabled={updateChecking}
+          onClick={() => void checkForUpdate({ force: true })}
+          title="立即检查 GitHub 上是否有新版本"
+        >
+          {updateChecking && <IconRefresh className="animate-spin" />}
+          {updateChecking ? '检查中…' : '立即检查'}
+        </button>
+      </div>
+
+      {/* 自动检查开关：复用设置页既有 Toggle（用户明确要求不用原生 checkbox） */}
+      <div className="mt-4 w-full max-w-[420px] rounded-theme-card border border-line bg-elevated/40 px-3">
+        <Row title="启动时自动检查更新" desc="每次启动时查一次 GitHub Releases；断网或失败不会影响使用">
+          <Toggle
+            checked={settings.autoCheckUpdate !== false}
+            onChange={(v) => void saveSettings({ autoCheckUpdate: v })}
+          />
+        </Row>
+      </div>
+
       <div className="mt-4 text-[11px] text-muted">MIT License · 本地离线运行 · 数据不出设备</div>
 
       {/* ── 赞赏与反馈（2026-10 用户要求：「关于界面去把打赏和反馈给做上」）──────────

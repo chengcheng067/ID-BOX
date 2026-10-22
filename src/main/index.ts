@@ -24,7 +24,8 @@ import {
   type TrashPurgeItem,
   type TrashRestoreItem,
   type TrashSoftDeleteItem,
-  TRASH_RETENTION_DAYS
+  TRASH_RETENTION_DAYS,
+  type UpdateInfo
 } from '../shared/types'
 import { loadSettings, normalizeAiClassify, normalizeSettings, saveSettings } from './settings'
 import {
@@ -47,6 +48,7 @@ import {
   testAiConnection
 } from './aiClassify'
 import { findSevenZip, thumbsDir } from './paths'
+import { fetchLatestRelease } from './updateCheck'
 import { freeBytesOf } from './disk'
 import { deleteThumb, deleteOneThumb, ensureThumb, clearThumbs, pruneThumbs, thumbStats } from './thumb'
 import { MAX_COVER_IMAGE_BYTES, writeCoverImageInto } from './coverImage'
@@ -1221,6 +1223,78 @@ ipcMain.on(IPC.winClose, () => {
 
 /** 设置·关于 tab 的版本胶囊 / tab 栏左下角小字（§3.6） */
 ipcMain.handle(IPC.getAppVersion, () => app.getVersion())
+
+// ── 2026-10 自动检查更新（GitHub Releases，关于页） ────────────────────
+//
+// 为什么缓存放主进程而不是渲染层：
+// ① 渲染层有两个入口（启动自动检查 + 设置页「立即检查」），天然会重复请求；
+// ② 主进程是单例，缓存天然全局；GitHub 未认证限流 60 次/小时/IP，必须省着用；
+// ③ **失败不写缓存** —— 断网时用户点「立即检查」应当真的重试一次，
+//    而不是拿到 10 分钟前的失败结论（否则用户会以为"永远修不好了"）。
+// 同一时刻的并发请求合并到一个 in-flight Promise（启动检查 + 用户立刻点按钮只发一次）。
+const UPDATE_CACHE_TTL_MS = 10 * 60 * 1000
+let updateCache: UpdateInfo | null = null
+let updateInFlight: Promise<UpdateInfo> | null = null
+
+function checkUpdateWithCache(force: boolean): Promise<UpdateInfo> {
+  const now = Date.now()
+  if (!force && updateCache && now - updateCache.checkedAt < UPDATE_CACHE_TTL_MS) {
+    return Promise.resolve(updateCache)
+  }
+  if (updateInFlight) return updateInFlight
+  const current = app.getVersion()
+  updateInFlight = fetchLatestRelease({ current })
+    .then((info) => {
+      // 只缓存成功结论；失败留空 → 下次调用真的重试
+      updateCache = info.error === null ? info : null
+      logDebug('update:checked', {
+        current: info.current,
+        latest: info.latest,
+        hasUpdate: info.hasUpdate,
+        error: info.error
+      })
+      return info
+    })
+    .catch((err: unknown) => {
+      // fetchLatestRelease 契约上**从不抛错**；这里是最后一道保险：
+      // 无论如何都要给渲染层一个结构完整的 UpdateInfo，绝不把异常穿过 IPC。
+      logWarn('update:check 意外异常', err)
+      updateCache = null
+      const fallback: UpdateInfo = {
+        current,
+        latest: null,
+        hasUpdate: false,
+        url: null,
+        assetUrl: null,
+        publishedAt: null,
+        checkedAt: Date.now(),
+        error: 'network'
+      }
+      return fallback
+    })
+    .finally(() => {
+      updateInFlight = null
+    })
+  return updateInFlight
+}
+
+ipcMain.handle(IPC.checkUpdate, (_e, force: unknown) => checkUpdateWithCache(force === true))
+
+/**
+ * 用系统默认浏览器打开外链（「去下载」）。
+ * 与 `openPath` 分开：`shell.openPath` 面向本地路径，喂 URL 在 Windows 上会返回错误串。
+ * **只放行 http(s)**：防止渲染层被注入后借 `file://` / 自定义协议拉起本机程序。
+ */
+ipcMain.handle(IPC.openExternal, async (_e, url: unknown) => {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false
+  try {
+    await shell.openExternal(url)
+    return true
+  } catch (err) {
+    logWarn('openExternal 失败', err)
+    return false
+  }
+})
 
 // ── 2026-10 诊断日志（崩溃取证 + 用户自助导出） ────────────────────────
 //

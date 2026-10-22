@@ -74,6 +74,18 @@ export const IPC = {
   winClose: 'win:close',
   /** package.json 版本号（设置·关于 tab 版本胶囊 / 侧栏小字） */
   getAppVersion: 'app:getVersion',
+  // ── 2026-10 自动检查更新（GitHub Releases） ──────────────────────
+  /**
+   * 检查 GitHub 最新正式版。入参 `force?: boolean`（true = 绕过主进程 10 分钟缓存，
+   * 「立即检查」按钮用）；返回 `UpdateInfo`。**永不 reject**（失败写在 `error` 字段）。
+   */
+  checkUpdate: 'app:checkUpdate',
+  /**
+   * 用系统默认浏览器打开 http(s) 外链（「去下载」按钮）。
+   * 与 `openPath` 分开：`shell.openPath` 是给本地路径用的，喂 URL 在 Windows 上
+   * 会返回错误串（不是"打开浏览器"的语义）。只接受 http/https，其余返回 false。
+   */
+  openExternal: 'shell:openExternal',
   // ── 2026-10-19 AI 辅助分类（docs/15 §7，词表优先 + 模型兜底） ──────────
   /** 请求一批资产名的分类结论（main 侧发 HTTP，渲染层有 CORS/CSP 限制） */
   aiClassify: 'ai:classify',

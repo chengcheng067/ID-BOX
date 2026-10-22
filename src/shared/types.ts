@@ -453,6 +453,14 @@ export interface Settings {
    */
   zhimoCoverReplacePacked: boolean
   /**
+   * 启动时自动检查更新（GitHub Releases，默认 **true**）。
+   *
+   * 关闭后 `startAutoCheck()` 一次请求都不发（手动点「立即检查」仍然可用）。
+   * 检查本身是**纯网络只读**：失败静默、不阻塞启动、不改任何数据。
+   * 归一化方向与 `zhimoCover` 一致：只认严格 `false`，缺键 / 脏值一律按开。
+   */
+  autoCheckUpdate: boolean
+  /**
    * 别名映射表（0.6.0）：用户自定义的「文件名 → 显示名」。只影响显示，不改磁盘。
    * 默认空数组 = 行为与 0.5.x 完全一致（显示名仍走 `displayName()` 的剥 ID 规则）。
    */
@@ -510,6 +518,8 @@ export const DEFAULT_SETTINGS: Settings = {
   zhimoCover: true,
   // 子开关默认开 = 用无水印小图替换包内预览图（只约束自动任务，手动永远替换）
   zhimoCoverReplacePacked: true,
+  // 启动时自动检查更新默认开（装上就有效果）；失败静默，绝不影响启动
+  autoCheckUpdate: true,
   // 0.6.0：别名表 / 智能集合默认空（= 行为与 0.5.x 一致），模板给一个保守默认
   aliases: [],
   savedViews: [],
@@ -1024,4 +1034,36 @@ export type HdrPrepareResult =
 export interface HdrProgressEvent {
   path: string
   ratio: number
+}
+
+// ── 自动检查更新（GitHub Releases） ─────────────────────────────────────
+//
+// 结论类型放在 shared：主进程产出（`main/updateCheck.ts`）、preload 原样转发、
+// 渲染层展示三者共用一份形状。**没有任何字段是"必须成功才有"的** ——
+// 失败时 `error` 有值，其余字段保持 null / false，UI 只管分支渲染，不用 try/catch。
+
+/** 检查更新失败的三类原因（都**不是异常**，只是结论） */
+export type UpdateCheckError = 'network' | 'http' | 'parse'
+
+/** `app:checkUpdate` 的返回结构（主进程 10 分钟内复用同一份结论） */
+export interface UpdateInfo {
+  /** 当前版本（已去掉 `v` 前缀），来自 `app.getVersion()` */
+  current: string
+  /** 最新正式版（已去掉 `v` 前缀）；失败 / 无数据为 null */
+  latest: string | null
+  /** `latest > current` 时为 true；prerelease / draft 一律 false */
+  hasUpdate: boolean
+  /** Release 页面地址（`html_url`），「去下载」的兜底目标 */
+  url: string | null
+  /**
+   * 安装包直链（`IDBOX-Setup-*.exe` 的 `browser_download_url`）。
+   * 「去下载」**优先**用它（一键下安装包），为空时回退 `url`。
+   */
+  assetUrl: string | null
+  /** Release 发布时间（ISO 字符串，原样透传，仅展示用） */
+  publishedAt: string | null
+  /** 本次检查的时间戳（毫秒） */
+  checkedAt: number
+  /** 失败原因；`null` = 检查成功（不代表"有更新"，看 `hasUpdate`） */
+  error: UpdateCheckError | null
 }

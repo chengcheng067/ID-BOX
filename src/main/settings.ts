@@ -117,6 +117,14 @@ export const SettingsSchema = z.object({
    * 同上：单项降级 + 默认开；与总开关**互不牵连**（见 normalizeSettings）。
    */
   zhimoCoverReplacePacked: z.boolean().optional().catch(true),
+  /**
+   * 启动时自动检查更新（默认 **true**）。
+   *
+   * `.catch(true)`：**单项降级** —— 脏值（`'yes'` / `1` / `null`）只让这一项回落默认，
+   * 不拖垮整份 settings.json（否则 libraryDir 一起丢，库会"消失"）。
+   * 方向与 `zhimoCover` 一致：默认开，只有严格 `false` 才关。
+   */
+  autoCheckUpdate: z.boolean().optional().catch(true),
   /** AI 辅助分类（默认关闭；逐字段降级，见 AiClassifySchema 注释） */
   aiClassify: AiClassifySchema,
   /**
@@ -347,6 +355,8 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   //    绝不能因为"总开关关了"就把它强制写成 false —— 用户关一次总开关会丢掉子偏好
   //    （下次打开总开关时用户设置被静默重置，属数据丢失）。
   merged.zhimoCoverReplacePacked = merged.zhimoCoverReplacePacked === false ? false : true
+  // 启动时自动检查更新：只认严格 false（缺键 / 'false' / 0 之类脏值一律按开）
+  merged.autoCheckUpdate = merged.autoCheckUpdate === false ? false : true
   // 并发 stepper（§3.6）：默认 2，夹到 [1, 8]
   const cc = merged.extractConcurrency
   if (!Number.isFinite(cc)) {
