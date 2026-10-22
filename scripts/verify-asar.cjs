@@ -40,15 +40,27 @@ const main = read(mainFiles[0])
 const pre = read(preFiles[0])
 const renderer = read(rFiles[0])
 const css = read(cssFiles[0])
+// 0.7.3 起有跨 chunk 的标记（相机/材质球/救援在独立 chunk 里），
+// 只搜 index-*.js 会漏 → 拼一份全量渲染 chunk 供新增标记使用。
+const rendererAll = find(/^out\/renderer\/assets\/.*\.js$/)
+  .map((f) => read(f))
+  .join('\n')
 
 check('main: update:check ipc', main, 'update:check')
 check('main: github releases/latest', main, 'releases/latest')
 check('main: deleteOneThumb (精确删图)', main, 'deleteOneThumb')
+check('main: thumb:list 只读列目录', main, 'thumb:list')
 check('preload: checkUpdate bridge', pre, 'checkUpdate')
+check('preload: listThumbs bridge', pre, 'listThumbs')
 check('renderer: startAutoCheck', renderer, 'startAutoCheck')
 check('renderer: ballThumbTarget (球图不复用通配删)', renderer, 'ballThumbTarget')
 check('renderer: regenThumbSweep', renderer, 'regenThumbSweep')
 check('renderer: autoCheckUpdate 设置项', renderer, 'autoCheckUpdate')
+check('renderer: rescan-pre 覆盖前快照', rendererAll, 'rescan-pre-')
+check('renderer: rescue- 救援快照', rendererAll, 'rescue-')
+// 判据是正则字面量 `/\.cover\.(png|…)/`，产物里保留反斜杠，所以标记要带转义
+check('renderer: 派生封面判据 (\\.cover\\.)', rendererAll, '\\.cover\\.')
+check('renderer: 球图取景距离 2.935225', rendererAll, '2.935225')
 check('css: --preview-tint token', css, '--preview-tint')
 check('css: folder-stage-leave 260ms', css, 'folder-stage-leave')
 
