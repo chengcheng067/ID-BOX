@@ -216,33 +216,140 @@ export function hasMaterialSlots(slots: MaterialSlots): boolean {
   return slotRelPaths(slots).length > 0
 }
 
+// ── 2026-10 修复：贴图球拿「我们自己的商品预览图」当 albedo ────────────────────
+//
+// 用户原话：「UV 重新渲染居然用的是球面来渲染，**不是用的材质本身**来渲染」。
+//
+// 真机取证（143 条真实记录逐条算过）：20 条 `kind==='texture'` 的资产，
+// `effectiveMaterialSlots()` 返回的 albedo **全部**是 `<资产名>.cover.jpg`，
+// 也就是我们抓来的商品页预览图（常带边框、水印、甚至"一张渲染好的球"本身）——
+// 球上贴的当然不是材质。
+//
+// 确定性成因（不是"看起来像"）：
+// ① 封面文件的**唯一写入路径**是 `src/main/coverImage.ts` 的
+//    `coverFileName(assetFolderName, ext)` → `<资产文件夹名>.cover.<ext>`
+//    （ext 只可能是 `png` / `jpg`，见 `coverImageExt()`；知末抓取
+//    `refreshZhimoCoverInto()` 也复用同一个写入函数，所以命名完全一致），
+//    落在**资产文件夹根层**，并且写新封面时会先删掉同族旧 `*.cover.*`；
+// ② 贴图资产的 files 形如 [`<名>.cover.jpg`, `<名>.jpeg`]（实测 20/20 如此）；
+// ③ 旧的兜底是 `files.find(第一张非数据通道图)`。`c` < `j`、`c` < `p`，
+//    所以 `<名>.cover.jpg` 永远排在真实贴图前面 → 它被当成 albedo。
+//    槽位识别（`materialSlots`）也吃同一份列表，命名里带 `Base_Color` 的
+//    封面（`x_Base_Color.cover.jpg`）同样会抢到 albedo 槽位。
+//
+// 修法：**先剔掉派生图，再做槽位识别与兜底**（不修改 `materialSlots` 的签名，
+// 它的其它调用点仍按原语义工作）。派生图的判据见 `isDerivedCover()`。
+
+/**
+ * 派生图的扩展名白名单。
+ *
+ * `coverImage.ts` 只会写 `png` / `jpg`；这里放宽到常见静态图片格式，
+ * 是为了容忍历史版本 / 手工改名留下的 `.cover.webp` 之类残留——
+ * 判据的**核心是 `.cover.` / `.preview.` 这个中缀**，扩展名只用来排除
+ * `x.cover.json` 这类非图片垃圾。
+ */
+const DERIVED_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tif', 'tiff'])
+
+/**
+ * 派生图中缀：`.cover.<ext>` / `.preview.<ext>`（大小写不敏感）。
+ *
+ * - `.cover.` ← `src/main/coverImage.ts` 的 `coverFileName()`：
+ *   用户拖图设封面、详情面板「拍照」、知末抓取**三条路**都落这个名；
+ * - `.preview.` ← `src/main/skpPreview.ts` 的 `writeSkpPreviewInto()`：
+ *   从 .skp 里抽出来的内嵌缩略图（同样是"预览图"，不是材质数据）。
+ *
+ * ⚠️ 只认**带点的中缀**：用户自己名叫 `cover.jpg` / `我的封面.jpg` 的文件不命中。
+ */
+const DERIVED_IMAGE_INFIX_RE = /\.(?:cover|preview)\.([^./\\]+)$/i
+
+/**
+ * 这个文件是不是**我们（ID BOX 自己）生成的派生图**。
+ *
+ * 派生图 = 商品预览图 / 我们自己截的图 / 从模型里抽出来的缩略图。
+ * **它不能当 albedo**：它是"材质长什么样的照片"，不是材质数据本身。
+ * 把它喂给球，球上显示的就是一张带边框/水印/整体渲染的图片——
+ * 用户看到的现象正是「用球面渲染，不是用材质本身」。
+ *
+ * 判据严格对齐真实写入规则（`coverImage.ts` / `skpPreview.ts`）：
+ * 1. 位于**资产文件夹根层**（`rel` 不含 `/`）——两个写入函数都写在根层；
+ *    嵌套子目录里的 `*.cover.*` 是用户自己的文件，按 `store.ts` 的
+ *    `isRootCoverRel()` 同一口径**不碰**；
+ * 2. 文件名以 `.cover.<图片扩展名>` 或 `.preview.<图片扩展名>` 结尾，大小写不敏感。
+ *
+ * 纯函数、零 IO，可在 node 里单测。
+ */
+export function isDerivedCover(file: Pick<AssetFile, 'rel' | 'name'>): boolean {
+  const rel = (file.rel || file.name || '').replace(/\\/g, '/')
+  if (rel.includes('/')) return false // 只认资产根层（见上第 1 条）
+  const name = file.name || rel
+  const m = DERIVED_IMAGE_INFIX_RE.exec(name)
+  if (!m) return false
+  const ext = (m[1] ?? '').toLowerCase()
+  return DERIVED_IMAGE_EXTS.has(ext)
+}
+
+/** 文件体积（旧索引可能没有 `size` → 当 0，不参与"取最大"的优势） */
+function fileSizeOf(file: AssetFile): number {
+  return typeof file.size === 'number' && Number.isFinite(file.size) && file.size > 0
+    ? file.size
+    : 0
+}
+
+/**
+ * 从候选里挑**体积最大**的那张（并列取输入序在前者，保证确定性）。
+ *
+ * 为什么要"取最大"而不是"取第一张"：贴图资产里常混着缩略图 / 小样图 /
+ * 详情页截图，体积最小的往往正是废图。体积是纯数据里最便宜的分辨率代理
+ * （`w`/`h` 只在 PNG/JPEG 上才有，旧记录还是 undefined）。
+ */
+function largestColorImage(files: readonly AssetFile[]): AssetFile | null {
+  let best: AssetFile | null = null
+  for (const f of files) {
+    if (!IMAGE_FILE_EXTS.has(f.ext.toLowerCase())) continue
+    if (dataChannelOf(f) !== null) continue // 数据通道图（法线/粗糙度/AO/位移）不能当颜色
+    if (best === null || fileSizeOf(f) > fileSizeOf(best)) best = f
+  }
+  return best
+}
+
 /**
  * 实际参与渲球的槽位（反馈 4，docs/15 §4：**单张 JPG/PNG 也要上材质球**）。
  *
  * 规则（纯函数，可单测）：
- * 1. 先走 `materialSlots` 的正常 PBR 识别；
- * 2. 认出了至少一个槽位 → **原样返回**，绝不被兜底覆盖（否则正常材质的 albedo
+ * 0. **先剔掉派生图**（`isDerivedCover`：`<资产名>.cover.<ext>` /
+ *    `<主名>.preview.<ext>`）——它们是商品预览图，不是材质数据（见上方长注释）。
+ *    槽位识别与兜底**都只在这份过滤后的列表上做**；
+ * 1. 再走 `materialSlots` 的正常 PBR 识别；
+ * 2. 认出了 baseColor → 原样返回，绝不被兜底覆盖（否则正常材质的 albedo
  *    会被"第一张图"顶掉，比如第一张恰好是 normal）；
- * 3. 一个槽位都没有 → 取 `files` 里第一张**图片**（按文件名顺序，不看目录），
- *    赋给 `albedo`（基础色）；这样单图导入的贴图也能渲出有颜色的球；
- * 4. 资产里没有任何图片（例如只有 `.skp` / `.json`）→ 返回 `{}`，仍不可渲球。
+ * 3. 没有 baseColor → 从**非数据通道图**里挑**体积最大**的一张补成 albedo
+ *    （单图导入的贴图也能渲出有颜色的球；取最大避免选中缩略图）；
+ * 4. 过滤后一张可当颜色的都没有 → **退化**：如果资产里只有派生封面，
+ *    允许用它当 albedo。选择理由：这类资产（例如只抓了封面、贴图还是 `.psd`
+ *    / 未入库格式的）本来就没有任何可渲染的材质数据，返回 `{}` 等于**不出球**；
+ *    用封面至少能给出"这个材质大致是什么颜色/纹理"的信息，比空着更接近用户
+ *    预期，而且此时**不存在**被封面顶掉的真贴图（真贴图一张都没有）；
+ * 5. 连派生封面也没有（例如只有 `.skp` / `.json`）→ 返回 `{}`，仍不可渲球。
  *
  * 扩展名口径与入库白名单共用 `shared/imageExts.ts` 的 `IMAGE_FILE_EXTS`
  * （见该文件注释：两处各写一遍必然漂移）。
  */
 export function effectiveMaterialSlots(files: AssetFile[]): MaterialSlots {
-  const slots = materialSlots(files)
+  // ⓪ 派生图先出局：`materialSlots()` 的输入与后面的兜底候选都只用这份
+  const usable = files.filter((f) => !isDerivedCover(f))
+  const slots = materialSlots(usable)
   // ① 已经认出 baseColor → 原样用
   if (slots.albedo) return slots
   // ② 认出了别的通道但**没有 baseColor**（典型：只有一张 `xxx_Normal.jpg`）——
   //    以前会直接返回 `{ normal }`，渲染出一个没有颜色贴图的白球。
-  //    2026-10-21 走查：从「非数据通道图」里挑第一张补成 baseColor。
-  // ③ 一张可当颜色的都没有 → 返回空对象（调用方据此不提供球预览）。
-  const firstColor = files.find(
-    (f) => IMAGE_FILE_EXTS.has(f.ext.toLowerCase()) && dataChannelOf(f) === null
-  )
-  if (!firstColor) return {}
-  return { ...slots, albedo: firstColor.rel }
+  //    2026-10-21 走查：从「非数据通道图」里挑体积最大的一张补成 baseColor。
+  const color = largestColorImage(usable)
+  if (color) return { ...slots, albedo: color.rel }
+  // ③ 过滤后没有任何可当颜色的真图 → 允许退化用派生封面（理由见 jsdoc 第 4 条）
+  const cover = largestColorImage(files.filter((f) => isDerivedCover(f)))
+  if (cover) return { ...slots, albedo: cover.rel }
+  // ④ 一张图都没有 → 空对象（调用方据此不提供球预览）
+  return {}
 }
 
 /**
