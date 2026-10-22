@@ -488,6 +488,56 @@ describe('rescan 改库前快照 rescan-pre-*', () => {
     expect(putOrder).toBeLessThan(bulkPutOrder)
   })
 
+  it('本地 2 条记录都被 scanned 覆盖 → 快照里是 2 条**覆盖前**的原记录', async () => {
+    const a = localAsset() // favorite:true / styles / renderParams
+    const b = localAsset()
+    b.id = 'local-uuid-2'
+    b.folder = 'E:\\Lib\\模型\\家具\\沙发\\第二件'
+    b.relFolder = '模型/家具/沙发/第二件'
+    b.favorite = false
+    b.rating = 2
+    b.tags = ['第二件']
+    b.renderParams = { roughness: 2, bump: 0.1, uv: 0.1 }
+
+    const scannedA = scannedAsset()
+    const scannedB = scannedAsset({
+      folder: b.folder,
+      name: '磁盘名2',
+      relFolder: '材质/石材/水磨石/磁盘名2'
+    })
+
+    useVault.setState({ assets: [a, b] })
+    modvault.rescan.mockResolvedValue({ assets: [scannedA, scannedB], ignored: [] })
+    await useVault.getState().rescan()
+
+    const snap = [...backupStore.values()].find((x) => x.id.startsWith('rescan-pre-'))!
+    expect(snap).toBeDefined()
+    const records = JSON.parse(snap.json) as Asset[]
+    expect(records.map((r) => r.id).sort()).toEqual([a.id, b.id].sort())
+
+    // 每一条都是**覆盖前**的值（不是扫描值、也不是合并后的值）
+    const ra = records.find((r) => r.id === a.id)!
+    expect(ra.favorite).toBe(true)
+    expect(ra.rating).toBe(5)
+    expect(ra.styles).toEqual(['现代', '侘寂'])
+    expect(ra.renderParams).toEqual({
+      roughness: 1.4,
+      bump: 0.7,
+      uv: 3.1,
+      light: 1,
+      metal: 0,
+      alpha: 1
+    })
+    expect(ra.updatedAt).toBe(LOCAL_UPDATED_AT)
+
+    const rb = records.find((r) => r.id === b.id)!
+    expect(rb.favorite).toBe(false)
+    expect(rb.rating).toBe(2)
+    expect(rb.tags).toEqual(['第二件'])
+    expect(rb.renderParams).toEqual({ roughness: 2, bump: 0.1, uv: 0.1 })
+    expect(rb.name).toBe('本地名') // 磁盘名尚未覆盖进来
+  })
+
   it('新记录（本地没有对应 folder）不进快照；一条都没有 → 不写空备份', async () => {
     useVault.setState({ assets: [] })
     modvault.rescan.mockResolvedValue({
