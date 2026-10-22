@@ -33,15 +33,11 @@
 ## 界面
 
 <div align="center">
-  <img src="docs/idbox-ui-package/screens/01-主界面-浅色.png" width="49%" alt="主界面 · 浅色" />
-  <img src="docs/idbox-ui-package/screens/04-主界面-深色.png" width="49%" alt="主界面 · 深色" />
+  <img src="docs/screenshots/main-light.png" width="49%" alt="主界面 · 浅色" />
+  <img src="docs/screenshots/main-dark.png" width="49%" alt="主界面 · 深色" />
 </div>
 
-<div align="center">
-  <img src="docs/idbox-ui-package/screens/03-自定义渲染-浅色.png" width="72%" alt="材质球自定义渲染" />
-</div>
-
-> 上图为 UI 设计规范包内的界面稿（`docs/idbox-ui-package/`），与实际版本可能有细微差异。
+> 以上为 **0.6.8 实际运行截图**（1440×900，本地真实素材库）。深色是作者的日常主题。
 
 ---
 
@@ -87,6 +83,14 @@
   「保存」直接变成卡片封面
 - **HDR 全景预览**：`.hdr` 入库后在**主进程流式降采样**（16384×8192 的文件直接喂 GPU 必然 OOM），
   预览里是「HDR 当背景 + 白球（看光分布）+ 银球（看环境反射）」，可 0–360° 旋转、可拍照当封面
+
+<div align="center">
+  <img src="docs/screenshots/hdr-preview.png" width="49%" alt="HDR 全景预览" />
+  <img src="docs/screenshots/custom-render.png" width="49%" alt="材质球自定义渲染" />
+</div>
+
+> 左：HDR 预览（源 10000×5000，降采样到 2048×1024 后预览）。右：材质球自定义渲染，三个滑块实时生效，
+> 「保存」即写成卡片封面。
 
 ### 5 · 接回你的工作流
 
