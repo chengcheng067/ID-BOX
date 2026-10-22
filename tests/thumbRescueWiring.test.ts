@@ -175,7 +175,7 @@ describe('init · 救援接线', () => {
     await useVault.getState().init()
 
     const after = useVault.getState().assets[0]!
-    expect(after.thumbPath).toBe(GOOD) // prefer 指定，而不是更晚的 NEWER
+    expect(after.thumbPath).toBe(NEWER) // 通用规则：同 id 多候选取 mtime 最大（不认 rev）
     expect(after.thumbStatus).toBe('ready')
     // 写库走的是定向 modify（不是整对象 put），且只碰这两个字段
     const rescueWrite = modifyCalls.find((c) => c.changed.includes('thumbPath'))
@@ -190,13 +190,15 @@ describe('init · 救援接线', () => {
     expect(modvault.ensureThumb).not.toHaveBeenCalled()
   })
 
-  it('事故参数：只在 renderParams 为空时补齐成完整六字段', async () => {
-    rows = [asset({ thumbPath: NEWER, thumbStatus: 'ready' })] // 已有（错误的）图 + 无参数
+  it('事故参数：只在 renderParams 为空时补齐成完整六字段；**不写 thumbPath**（manual 封面 → 不 pin 错图）', async () => {
+    // 真实记录就是 manual 封面 + `…-7933daa4.png`（默认 UV，错图）。按裁定：参数救、
+    // 缩略图不救（球图管线永远轮不到它，pin 住 = 把错图永久冻结）。
+    rows = [asset({ coverSource: 'manual', thumbPath: NEWER, thumbStatus: 'ready' })]
 
     await useVault.getState().init()
 
     const after = useVault.getState().assets[0]!
-    expect(after.thumbPath).toBe(GOOD) // prefer 从"最新但错误"换回正确那张
+    expect(after.thumbPath).toBe(NEWER) // 一个字都没动
     expect(after.renderParams).toEqual({
       roughness: 1,
       bump: 1,
@@ -205,6 +207,23 @@ describe('init · 救援接线', () => {
       metal: 0,
       alpha: 1
     })
+  })
+
+  it('`manual` / `named` 不进救援：不写库、不写快照（交回 ensureMissingThumbs 按封面 salt 生成）', async () => {
+    for (const coverSource of ['manual', 'named'] as const) {
+      rows = [asset({ coverSource, thumbStatus: 'none', thumbPath: undefined })]
+      backups.clear()
+      modifyCalls.length = 0
+
+      await useVault.getState().init()
+
+      const after = useVault.getState().assets[0]!
+      expect(after.thumbPath).toBeUndefined() // 救援没碰它
+      expect(backups.size).toBe(0) // 也没写快照
+      // 注意：这里**不断言** ensureThumb —— 那是 ensureMissingThumbs 的实现细节，
+      // 且 `thumbAttempted` 是模块级集合（同一文件内第二次会跳过）。
+      // "跳过救援"的判定已在 `tests/thumbRescue.test.ts` 的纯函数用例里逐一钉住。
+    }
   })
 
   it('用户已经调过参数 → 一个字节都不覆盖（救援只填空）', async () => {

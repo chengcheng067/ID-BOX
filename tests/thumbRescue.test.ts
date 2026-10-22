@@ -12,7 +12,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   RENDER_PARAMS_RESTORE,
-  RESCUE_PREFER,
   THUMB_RESCUE_LIMIT,
   THUMB_RESCUE_SNAPSHOT_PREFIX,
   applyThumbRescue,
@@ -22,7 +21,7 @@ import {
   type ThumbRescueAsset,
   type ThumbRescueDeps
 } from '../src/renderer/logic/thumbRescue'
-import { ballThumbName, fnv1a, paramsKey, RENDER_REV } from '../src/shared/ballParams'
+import { ballThumbName, fnv1a, paramsKey } from '../src/shared/ballParams'
 import type { ThumbFileEntry } from '../src/shared/types'
 
 const ID_A = 'aaaaaaaa-1111-4222-8333-444455556666'
@@ -105,6 +104,36 @@ describe('planThumbRescue · 匹配规则', () => {
     expect(planThumbRescue([needRescue()], [])).toEqual([])
   })
 
+  it('**任意** 8hex 文件名都必须被挂回（救援不认 rev / 不算期望名）', () => {
+    // 故意用一个按任何 rev 都算不出来的 hash：救援的判据只有形状 + id 前缀
+    const plan = planThumbRescue([needRescue()], [file(ID_A, '00ff00ff', 'png')])
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.thumbPath).toBe(`${ID_A}-00ff00ff.png`)
+  })
+
+  it('`manual` 封面 → 一律跳过（哪怕盘上是球图候选）', () => {
+    const plan = planThumbRescue(
+      [needRescue({ coverSource: 'manual' })],
+      [file(ID_A, '00ff00ff', 'png')]
+    )
+    expect(plan).toEqual([])
+  })
+
+  it('`named` 封面 → 一律跳过（哪怕盘上是封面候选）', () => {
+    const plan = planThumbRescue(
+      [needRescue({ coverSource: 'named' })],
+      [file(ID_A, '00ff00ff', 'jpg')]
+    )
+    expect(plan).toEqual([])
+  })
+
+  it('`zhimo` / `root` / `placeholder` 不受影响（它们本来就该有缩略图）', () => {
+    for (const coverSource of ['zhimo', 'root', 'placeholder', 'embedded', 'largest'] as const) {
+      const plan = planThumbRescue([needRescue({ coverSource })], [file(ID_A, '00ff00ff', 'jpg')])
+      expect(plan).toHaveLength(1)
+    }
+  })
+
   it('上限封顶（默认 THUMB_RESCUE_LIMIT，可覆盖）', () => {
     const assets = Array.from({ length: 5 }, (_, i) =>
       needRescue({ id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}` })
@@ -112,69 +141,6 @@ describe('planThumbRescue · 匹配规则', () => {
     const files = assets.map((a) => file(a.id, 'abcdef01'))
     expect(planThumbRescue(assets, files, { limit: 2 })).toHaveLength(2)
     expect(THUMB_RESCUE_LIMIT).toBeGreaterThan(2)
-  })
-})
-
-describe('planThumbRescue · prefer（显式偏好优先于 mtime）', () => {
-  const TARGET = '5e4c3050-e057-4681-a70a-cb277890c309'
-  const PREFERED = `${TARGET}-e94039c0.png`
-  const NEWER = `${TARGET}-7933daa4.png`
-
-  it('偏好文件优先，即便它不是最新的那个（事故现场：7900 比 e940 晚 5 分钟）', () => {
-    const plan = planThumbRescue(
-      [{ id: TARGET, thumbStatus: 'none' }],
-      [
-        file(TARGET, '7933daa4', 'png', 5000), // 更晚
-        file(TARGET, 'e94039c0', 'png', 1000) // 正确
-      ],
-      { prefer: { [TARGET]: PREFERED } }
-    )
-    expect(plan).toHaveLength(1)
-    expect(plan[0]!.thumbPath).toBe(PREFERED)
-    expect(plan[0]!.candidates).toBe(2)
-  })
-
-  it('偏好**允许替换已有 thumbPath**（唯一例外；否则用户永远看到默认 UV 那张）', () => {
-    const plan = planThumbRescue(
-      [{ id: TARGET, thumbPath: NEWER, thumbStatus: 'ready' }],
-      [file(TARGET, '7933daa4', 'png', 5000), file(TARGET, 'e94039c0', 'png', 1000)],
-      { prefer: { [TARGET]: PREFERED } }
-    )
-    expect(plan).toHaveLength(1)
-    expect(plan[0]!.thumbPath).toBe(PREFERED)
-  })
-
-  it('偏好文件不在盘上 → 回落 mtime 规则（绝不凭空造名字）', () => {
-    const plan = planThumbRescue(
-      [{ id: TARGET, thumbStatus: 'none' }],
-      [file(TARGET, '7933daa4', 'png', 5000)],
-      { prefer: { [TARGET]: PREFERED } }
-    )
-    expect(plan).toHaveLength(1)
-    expect(plan[0]!.thumbPath).toBe(NEWER)
-  })
-
-  it('偏好文件不在盘上且记录已有可用图 → 不产出', () => {
-    const plan = planThumbRescue(
-      [{ id: TARGET, thumbPath: NEWER, thumbStatus: 'ready' }],
-      [file(TARGET, '7933daa4', 'png', 5000)],
-      { prefer: { [TARGET]: PREFERED } }
-    )
-    expect(plan).toEqual([])
-  })
-
-  it('软删记录：偏好也不能越过', () => {
-    const plan = planThumbRescue(
-      [{ id: TARGET, thumbStatus: 'none', deletedAt: 1 }],
-      [file(TARGET, 'e94039c0', 'png', 1000)],
-      { prefer: { [TARGET]: PREFERED } }
-    )
-    expect(plan).toEqual([])
-  })
-
-  it('RESCUE_PREFER 与表项同源（写死的那一个文件名）', () => {
-    expect(RESCUE_PREFER[TARGET]).toBe(PREFERED)
-    expect(Object.keys(RESCUE_PREFER)).toEqual([TARGET])
   })
 })
 
@@ -273,7 +239,6 @@ describe('RENDER_PARAMS_RESTORE · 事故参数的字面量证据', () => {
    * 写死成历史事实；本次救援只保证**参数值正确**，不保证永远命中同一张图。
    */
   const TARGET_SLOT = '新中式复古仿古砖_复古砖_墙砖_地砖_深色仿古砖ID_1172815578.cover.jpg'
-  const TARGET_SLOTS_FIXED = { albedo: TARGET_SLOT }
 
   it('uv=3.10 + 其余默认 → rev3 的 hash 输入算出 e94039c0（盘上那张旧球图）', () => {
     const entry = RENDER_PARAMS_RESTORE[0]!
@@ -291,27 +256,6 @@ describe('RENDER_PARAMS_RESTORE · 事故参数的字面量证据', () => {
     expect(fnv1a('rev3\n' + TARGET_SLOT + '\n1.00,1.00,3.10')).not.toBe(
       fnv1a('rev3\n' + TARGET_SLOT)
     )
-  })
-
-  it('当前 RENDER_REV 下同一参数已经是另一个名字（rev4 相机口径 → 旧图必然作废）', () => {
-    // 显式 rev4：把"升级后必然换名"钉死；RENDER_REV 再 +1 时这条记录的是历史，不是约束
-    expect(fnv1a('rev4\n' + TARGET_SLOT + '\n1.00,1.00,3.10')).toBe('2d6997ef')
-    expect(fnv1a('rev4\n' + TARGET_SLOT)).toBe('f84ff4cd')
-    expect(RENDER_REV).toBeGreaterThanOrEqual(4) // 只增不减的纪律
-  })
-
-  it('`ballThumbName` 的输入 = rev 前缀 + 槽位 + 参数串（与上面三条同源，不是另一套算法）', () => {
-    const expectedHash = fnv1a(
-      'rev' +
-        RENDER_REV +
-        '\n' +
-        TARGET_SLOT +
-        '\n' +
-        paramsKey(restoreParamsFor(RENDER_PARAMS_RESTORE[0]!))
-    )
-    expect(
-      ballThumbName(TARGET_ID, TARGET_SLOTS_FIXED, restoreParamsFor(RENDER_PARAMS_RESTORE[0]!), 'sphere')
-    ).toBe(`${TARGET_ID}-${expectedHash}.png`)
   })
 
   it('槽位随 albedo 修复而变 → 名字必定不同（注释里那条提醒的可执行版本）', () => {

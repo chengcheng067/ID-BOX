@@ -12,7 +12,7 @@
  *
  * 任何一次同类损伤都能自愈，不需要迁移标记（谓词在修复完成后自然为假 = 天然幂等）。
  *
- * ## 五条硬纪律（改这里之前先读）
+ * ## 六条硬纪律（改这里之前先读）
  *
  * ① **有图的绝不碰**：只处理 `!thumbPath || thumbStatus !== 'ready'` 的记录。
  *    已经能显示的记录一旦被改写，就是拿"能看"换"可能更好"，毫无必要。
@@ -37,6 +37,13 @@
  *    ⇒ 也不要为了"更严格"而新增 `ballHashAtRev` 之类的历史 rev 入口：那种入口迟早
  *    会被某处误用来**回写文件名**。`shared/ballParams.ts` 永远只有一个真源 `RENDER_REV`。
  *
+ * ⑥ **`manual` / `named` 封面的资产不进救援**（team-lead 2026-10 裁定）：
+ *    `ballThumbTarget()` 已经规定「用户手动指定过封面 / 包内自带官方图 → 该资产
+ *    **不该有球图**，卡片显示封面」。救援把球图挂回去 = 绕过这条产品不变量，
+ *    等于亲手制造 0.7.2 里 `isStaleBallThumb` / `repairStaleBallThumbs` 花一整轮
+ *    修掉的 bug。这类记录交回既有 `ensureMissingThumbs`（它按当前封面 salt 生成，
+ *    结果与 `manual` 语义一致），成本一条 IPC/资产。
+ *
  * ## 为什么"最新那个候选"就够
  *
  * 同一 id 的多个缓存文件只可能来自"同一资产的不同 cover salt / 不同参数"。
@@ -52,7 +59,7 @@ import {
   type BallParamScales,
   type NormalizedBallParams
 } from '../../shared/ballParams'
-import type { ThumbFileEntry, ThumbStatus } from '../../shared/types'
+import type { CoverSource, ThumbFileEntry, ThumbStatus } from '../../shared/types'
 
 /** 单次救援的上限（防病态库一次改几千条把启动拖住；正常事故只会是个位数~几十条） */
 export const THUMB_RESCUE_LIMIT = 200
@@ -67,6 +74,11 @@ export interface ThumbRescueAsset {
   thumbStatus?: ThumbStatus
   /** 软删记录不救援：它们在 `.trash/` 里，恢复后反而会让回收站条目"有图"而误导用户 */
   deletedAt?: number
+  /**
+   * 封面来源。`manual` / `named` 一律**不进救援**（见文件头 ⑥）：
+   * 这类资产的卡片按产品不变量显示封面，球图管线永远轮不到它。
+   */
+  coverSource?: CoverSource
 }
 
 /** 一条救援计划：把 `assetId` 的缩略图指向 `thumbPath` */
@@ -83,21 +95,6 @@ export interface ThumbRescuePlanItem {
 export interface PlanThumbRescueOptions {
   /** 覆盖上限（默认 {@link THUMB_RESCUE_LIMIT}） */
   limit?: number
-  /**
-   * **显式偏好**：`assetId → 期望文件名`，命中时**绕过 mtime 规则**（也绕过"已有图就不碰"）。
-   *
-   * 只服务于"最新 ≠ 正确"的个案：`5e4c3050-…` 的 id 下同时有
-   * `…-e94039c0.png`（UV 3.10，02:00）与 `…-7933daa4.png`（默认 UV，02:05 更晚），
-   * 纯按最新会挑到错的那张。
-   *
-   * 两条边界：
-   * ① 期望文件**必须真的在该 id 的候选列表里**（以 `thumb:list` 的结果为准），
-   *    不在就回落到 mtime 规则——绝不凭空造一个不存在的名字；
-   * ② 命中偏好时**允许替换已有 `thumbPath`**：这是唯一会改写"看起来已有图"的
-   *    记录的口子，因此只能由**静态的一次性表**驱动（`RESCUE_PREFER`），
-   *    不允许从运行时数据自动推导。
-   */
-  prefer?: Readonly<Record<string, string>>
 }
 
 /**
@@ -113,7 +110,8 @@ export interface PlanThumbRescueOptions {
  * - 同一 id 多个候选：`mtimeMs` 最大者胜；`mtimeMs` 相同则 `.png` 优先
  *   （球图/透明图信息量更高），再相同按文件名降序（保证结果确定、可断言）；
  * - `size <= 0` 的文件一律跳过（0 字节通常是写盘被打断的残骸，挂上去就是灰格）；
- * - 记录侧：`deletedAt` 有值 → 跳过；已有可用缩略图 → 跳过。
+ * - 记录侧：`deletedAt` 有值 → 跳过；`coverSource` 为 `manual` / `named` → 跳过
+ *   （产品不变量：这类资产显示封面，见文件头 ⑥）；已有可用缩略图 → 跳过。
  *
  * 输出顺序与 `assets` 顺序一致（可预测，便于日志与断言）。
  */
@@ -142,34 +140,19 @@ export function planThumbRescue(
 
   const plan: ThumbRescuePlanItem[] = []
   const seen = new Set<string>()
-  const prefer = opts.prefer ?? {}
   for (const asset of assets) {
     if (plan.length >= limit) break
     const id = typeof asset?.id === 'string' ? asset.id : ''
     if (id.length === 0) continue
     if (seen.has(id)) continue
-    // ② 软删记录不救援（偏好也不能越过这条）
+    // ① 软删记录不救援
     if (typeof asset.deletedAt === 'number') continue
+    // ② `manual` / `named` 一律跳过（文件头 ⑥）：按产品不变量，这类资产显示封面。
+    //    即使盘上候选看起来像球图也不碰——把它挂回去就等于亲手制造"卡片显示球、
+    //    按设计该显示封面"的旧 bug。交给 `ensureMissingThumbs` 按封面 salt 生成。
+    if (asset.coverSource === 'manual' || asset.coverSource === 'named') continue
     const list = byId.get(id)
     if (!list || list.length === 0) continue
-
-    // ① 显式偏好：文件真的在盘上就优先于一切（含"已有图"那道门，见选项注释）
-    const preferredName = prefer[id]
-    if (preferredName) {
-      const hit = list.find((f) => f.name === preferredName)
-      if (hit) {
-        seen.add(id)
-        plan.push({
-          assetId: id,
-          thumbPath: hit.name,
-          mtimeMs: hit.mtimeMs,
-          candidates: list.length
-        })
-        continue
-      }
-      // 偏好文件不在本次列举结果里（被手动删了 / IPC 只回了部分）→ 回落 mtime 规则
-    }
-
     // ③ 已有可用缩略图 → 绝不碰
     if (asset.thumbPath && asset.thumbStatus === 'ready') continue
 
@@ -278,9 +261,14 @@ export async function applyThumbRescue(
  * 2026-10-23 事故：rescan 把 `renderParams` 抹成空。
  *
  * 值取自 LevelDB 历史日志（该资产 01:59–02:00 连续 5 次落库，最后一次 `uv = 3.10`），
- * 并已用文件名反算验证：
- * `ballThumbName(id, <固定槽位>, {uv:3.1}, 'sphere')` 的 hash **恰好等于**
- * 盘上那张 `…-e94039c0.png`（`tests/thumbRescue.test.ts` 用固定槽位 fixture 钉死）。
+ * 并已用文件名反算验证（**固定槽位 + 硬编码 rev=3 的字符串 fixture**，见测试）：
+ * `fnv1a('rev3\n<槽位>\n1.00,1.00,3.10')` **恰好等于**盘上那张 `…-e94039c0.png`。
+ *
+ * ⚠️ **只写 `renderParams`，不写 `thumbPath`**（team-lead 2026-10 裁定）：
+ * 那张 `e94039c0` 是用 `*.cover.jpg`（商品预览图）当 albedo 渲出来的**错图**，
+ * 而该资产是 `manual` 封面 → 球图管线永远轮不到它（`ballThumbTarget` 为 null）。
+ * 一旦把它 pin 住，用户会**永久**看到错图的球，albedo 修复对这个资产永远不生效。
+ * 参数是用户创作的东西，必须救；错的像素不该救。
  *
  * ⚠️ 只存**部分字段**：事故时用户只动过 UV，其余全部是默认值。
  * 写入前用 {@link restoreParamsFor} 补齐成完整结构（六个字段全就位），
@@ -292,36 +280,13 @@ export async function applyThumbRescue(
 export const RENDER_PARAMS_RESTORE: ReadonlyArray<{
   id: string
   params: Partial<BallParamScales>
-  /**
-   * 该记录应挂的**确切**缩略图文件名（一次性纠正"最新 ≠ 正确"）。
-   *
-   * 目标资产 id 下有两个球图：`…-e94039c0.png`（UV 3.10，正确）与
-   * `…-7933daa4.png`（默认 UV，mtime 更晚——事故后补齐流程又渲了一张）。
-   * 纯 mtime 规则会挑到后者，所以这里写死前者。文件不存在时自动回落 mtime 规则。
-   */
-  preferThumb?: string
 }> = [
   // 新中式复古仿古砖（UV=3.10，其余默认）
   {
     id: '5e4c3050-e057-4681-a70a-cb277890c309',
-    params: { uv: 3.1 },
-    preferThumb: '5e4c3050-e057-4681-a70a-cb277890c309-e94039c0.png'
+    params: { uv: 3.1 }
   }
 ]
-
-/**
- * `planThumbRescue` 的 `prefer` 入参：由 `RENDER_PARAMS_RESTORE` 的 `preferThumb` 汇总。
- *
- * 只包含**显式偏好**的条目（当前 1 条）。刻意做成"从表里算"而不是手写第二份，
- * 避免表与偏好两处漂移。
- */
-export const RESCUE_PREFER: Readonly<Record<string, string>> = Object.freeze(
-  Object.fromEntries(
-    RENDER_PARAMS_RESTORE.filter((e) => typeof e.preferThumb === 'string' && e.preferThumb.length > 0).map(
-      (e) => [e.id, e.preferThumb as string]
-    )
-  )
-)
 
 /** 把"部分参数"补齐成完整结构（缺省项取 `DEFAULT_PARAM_SCALES`，再整体规范化） */
 export function restoreParamsFor(entry: { params: Partial<BallParamScales> }): NormalizedBallParams {

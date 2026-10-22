@@ -66,8 +66,7 @@ import { buildDedupeSnapshot } from './logic/importConflict'
 import {
   applyThumbRescue,
   planRenderParamsRestore,
-  planThumbRescue,
-  RESCUE_PREFER
+  planThumbRescue
 } from './logic/thumbRescue'
 import {
   isTerminalStatus,
@@ -1548,8 +1547,7 @@ async function bootstrapMigrations(): Promise<void> {
 async function rescueDamagedIndex(assets: Asset[]): Promise<void> {
   try {
     const files = await window.modvault.listThumbs().catch(() => [])
-    const thumbPlan =
-      files.length > 0 ? planThumbRescue(assets, files, { prefer: RESCUE_PREFER }) : []
+    const thumbPlan = files.length > 0 ? planThumbRescue(assets, files) : []
     const paramsPlan = planRenderParamsRestore(assets)
     // ① 空跑保护：正常库每次启动都走到这里，必须零副作用
     if (thumbPlan.length === 0 && paramsPlan.length === 0) return
