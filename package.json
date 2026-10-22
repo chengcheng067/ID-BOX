@@ -1,0 +1,75 @@
+{
+  "name": "idbox",
+  "version": "0.6.8",
+  "private": true,
+  "type": "module",
+  "description": "ID BOX — 知末网模型/贴图压缩包拖入自动解压归档 + 本地分类浏览器",
+  "author": "杨雯丞",
+  "main": "./out/main/index.cjs",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "verify": "npm run typecheck:node && npm run typecheck:web && npm run test && npm run build",
+    "verify:real7z": "vitest run tests/extractorReal7z.test.ts",
+    "brand": "electron scripts/build-app-icon.cjs",
+    "package": "npm run build && electron-builder --win nsis -c.directories.output=release"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "chokidar": "^4.0.3",
+    "dexie": "^4.2.0",
+    "iconv-lite": "^0.6.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.186.1",
+    "trash": "^10.1.1",
+    "zod": "^3.23.8",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.186.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.9"
+  },
+  "build": {
+    "appId": "com.chengcheng.idbox",
+    "productName": "ID BOX",
+    "files": [
+      "out/**/*",
+      "package.json",
+      "resources/**/*",
+      "!resources/brand/**"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.png",
+      "artifactName": "IDBOX-Setup-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "language": "2052"
+    },
+    "artifactName": "IDBOX-Setup"
+  }
+}

@@ -1,0 +1,130 @@
+/** IPC 通道名（主进程 / 预加载 / 渲染进程共用）
+ *
+ * 约定：新增通道必须同时改 `shared/ipc.ts` + `preload/index.ts` + `main/index.ts`，三处缺一不可。
+ * `drag:start` 必须走 `ipcRenderer.send`（同步），不能用 invoke。
+ */
+export const IPC = {
+  importPaths: 'import:paths',
+  importEvent: 'import:event',
+  getSettings: 'settings:get',
+  setSettings: 'settings:set',
+  chooseLibrary: 'settings:chooseLibrary',
+  pickArchives: 'dialog:pickArchives',
+  pickWatchDir: 'dialog:pickWatchDir',
+  openPath: 'shell:openPath',
+  reveal: 'shell:reveal',
+  trashPaths: 'shell:trash',
+  openLibrary: 'shell:openLibrary',
+  renameAsset: 'asset:rename',
+  /**
+   * 批量重命名资产**文件夹**（0.6.0，docs/22 §3.4）。
+   * 入参 `RenameFolderPlanItem[]`；主进程先整体预检（目标越界 / 已存在 / 非法）再逐条
+   * `fs.rename`，任何一条失败 → **反向回滚已成功的**并返回 `rolledBack:true`。
+   * 只改文件夹名，**不改包内文件名**。
+   */
+  renameFolders: 'asset:renameFolders',
+  rescan: 'library:rescan',
+  sevenZipPath: 'env:sevenZip',
+  // ── T01 新增（T04 完成接线） ──────────────────────────────────
+  /**
+   * 拖出到 DCC：payload = 文件绝对路径 + 可选缩略图文件名 + 可选预渲染卡片 PNG
+   * `(absPath, thumbName, cardPng?: Uint8Array)`；必须 send 不是 invoke
+   * （`webContents.startDrag` 要在 dragstart 的同步段发起）。`cardPng` 缺失/解码失败时
+   * main 回退到 `resolveDragIcon(thumbName)`。
+   */
+  dragStart: 'drag:start',
+  thumbEnsure: 'thumb:ensure',
+  thumbDelete: 'thumb:delete',
+  /** 材质球调参持久化：单删某资产的**某一个**缓存文件（`thumbDelete` 是按 id 通配全删，不能复用） */
+  thumbDeleteOne: 'thumb:deleteOne',
+  thumbPrune: 'thumb:prune',
+  thumbClear: 'thumb:clear',
+  /** T04 追加：缓存数量 / 占用，设置面板显示用 */
+  thumbStats: 'thumb:stats',
+  diskFree: 'disk:free',
+  indexBackup: 'index:backup',
+  // ── T06 新增（分类体系，06 v1.0.2 §12.1） ──────────────────────
+  /** 指派分类：移动目录到 <大类>/<一级>/<二级>/，返回新 folder/relFolder */
+  assignCategory: 'asset:assignCategory',
+  /** 遗留布局迁移（2/3 段 → 4 段双哨兵），DB 驱动 */
+  migrateLayout: 'library:migrateLayout',
+  // ── 2026-10-19 材质大类合并（docs/14 §2.3，T-03） ─────────────────
+  /** 只读探测：库里是否还有 `贴图/` / `材质预设/` 待合并（启动探测用，零写入） */
+  detectMaterialMerge: 'library:detectMaterialMerge',
+  /** 执行迁移：逐资产搬进 `材质/`（>50 条且未 force 时只返回 needsManual） */
+  mergeMaterial: 'library:mergeMaterial',
+  /** 回滚：按 manifest 逆序搬回（P2 UI；函数与单测本批已交付） */
+  rollbackMaterialMerge: 'library:rollbackMaterialMerge',
+  /** 主进程 → 渲染进程：启动只读探测发现有旧大类目录待合并（Payload = MergeMaterialDetectResult） */
+  materialMergeNotice: 'library:materialMergeNotice',
+  // ── 2026-10 装机反馈：截图/本地图片设为封面（任务 3） ─────────────
+  /** 把剪贴板/本地图片写进资产文件夹并返回 rel 路径（main 侧校验 magic bytes/大小/路径） */
+  setCoverImage: 'asset:setCoverImage',
+  // ── 2026-10：材质球离屏渲染图落盘（任务 6） ──────────────────────
+  /** 渲染出的材质球 JPEG 写进 thumbs 目录；文件名与既有缩略图同格式，返回缓存文件名 */
+  saveBallThumb: 'thumb:saveBall',
+  // ── 2026-10 UI 规范 v0.2：无边框窗口自绘控制（§3.1/§4-2）+ 应用版本 ──
+  /** 最小化（send，fire-and-forget） */
+  winMinimize: 'win:minimize',
+  /** 最大化/还原切换（send；主进程切完经 winMaximizedEvent 广播新状态） */
+  winMaximizeToggle: 'win:maximize',
+  /** 主进程 → 渲染进程：最大化状态变化（WindowControls 切 □/❐ 图标） */
+  winMaximizedEvent: 'win:maximizedChanged',
+  /** 关闭窗口（send） */
+  winClose: 'win:close',
+  /** package.json 版本号（设置·关于 tab 版本胶囊 / 侧栏小字） */
+  getAppVersion: 'app:getVersion',
+  // ── 2026-10-19 AI 辅助分类（docs/15 §7，词表优先 + 模型兜底） ──────────
+  /** 请求一批资产名的分类结论（main 侧发 HTTP，渲染层有 CORS/CSP 限制） */
+  aiClassify: 'ai:classify',
+  /** 「测试连接」：发一条最小请求，回报成功 / 失败原因 */
+  aiClassifyTest: 'ai:test',
+  /** 主进程 → 渲染进程：一个导入批次已结束（Payload = ImportBatchDoneEvent） */
+  importBatchDone: 'import:batchDone',
+  // ── 2026-10 诊断日志（崩溃取证 + 用户自助导出） ──────────────────
+  /** 日志目录 / 文件数 / 总大小（设置页展示，invoke） */
+  logStats: 'log:stats',
+  /** 打包 logs 目录为 zip（主进程弹保存对话框）；返回 LogExportResult */
+  logExport: 'log:export',
+  /** 渲染进程 → 主进程：转发一条渲染侧日志（send，fire-and-forget；渲染层已限流） */
+  logWrite: 'log:write',
+  // ── C 线：库内「最近删除」（docs/20 §4） ─────────────────────────
+  /** 软删：资产目录 rename 到 `<库根>/.trash/`（保留期非 recycle 档用；返回 trashRel/deletedAt/size） */
+  trashSoftDelete: 'trash:softDelete',
+  /** 还原：从 `.trash/` 搬回原路径（重名追加序号，返回**最终落盘值**） */
+  trashRestore: 'trash:restore',
+  /** 彻底删除：指定软删项送进**系统回收站**（双保险） */
+  trashPurge: 'trash:purge',
+  /** 清空回收区：全部送进系统回收站 */
+  trashEmptyAll: 'trash:emptyAll',
+  /** 到期 / 超容量清理（启动 + 每 6 小时 + 设置页手动共用） */
+  trashSweep: 'trash:sweep',
+  // ── 知末封面抓取（docs/24，T-03） ──────────────────────────────
+  /**
+   * 从知末详情页抓模型主图当封面。
+   *
+   * 分工（与 `setCoverImage` 同款）：**抓取 + 落盘在主进程**
+   * （渲染进程受 CORS/CSP 约束，且封面必须写成资产文件夹内的真实文件
+   * `<资产名>.cover.<ext>` 才能被 `vault://asset/` 读到、rescan 才不会洗掉），
+   * **写 Dexie 在渲染层**（主进程拿不到 IndexedDB）。
+   * 入参 `FetchZhimoCoverPayload`，返回 `FetchZhimoCoverResult`（扁平结构，失败带 `reason`）。
+   * 主进程侧必须校验 `folder` 在库目录内；本通道**不抛错**。
+   */
+  fetchZhimoCover: 'zhimo:fetchCover',
+  // ── HDR 预览（0.6.5） ─────────────────────────────────────────────
+  /**
+   * 准备 HDR 预览：主进程流式解码 + 盒式降采样 + 落缓存（命中直接返回）。
+   *
+   * 入参 `{ path: string, targetWidth?: number }`（目标宽度白名单 512/2048/4096，
+   * 其他值夹到最近的，缺省 2048）。
+   * 返回 `HdrPrepareResult`：`{ ok:true, cachedPath, width, height, fromCache }`
+   * 或 `{ ok:false, reason }`（**不抛错**，IPC 表面只有一种形状）。
+   *
+   * 渲染进程拿到 `cachedPath` 后用 `hdr://<文件名>` 读（见 `main/protocol.ts` 的 hdr host）。
+   * 源图 300MB+ 的解码在主进程做，渲染进程只拿 ≤4096 宽的产物（16384 px 是很多显卡的
+   * MAX_TEXTURE_SIZE 上限，原尺寸 Float32 解码要 1.6GB —— 必须降采样）。
+   */
+  hdrPrepare: 'hdr:prepare',
+  /** 主进程 → 渲染进程：HDR 解码进度（`HdrProgressEvent = { path, ratio }`，按 path 区分） */
+  hdrProgress: 'hdr:progress'
+} as const

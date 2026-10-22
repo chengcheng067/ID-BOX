@@ -1,0 +1,50 @@
+%% docs/12 §8 — 材质球调参持久化 + 缓存键扩展的关键时序
+sequenceDiagram
+    participant U as 用户
+    participant D as CustomRenderDialog
+    participant S as store.ts
+    participant BP as shared/ballParams.ts
+    participant DB as VaultDB (assets)
+    participant M as main/ballThumb.ts
+    participant T as main/thumb.ts
+    participant FS as thumbs 目录
+
+    %% ── 1. 读回（详情面板 / 弹窗打开） ─────────────────────────
+    U->>D: 打开「自定义渲染」
+    D->>S: asset（含 renderParams?）
+    S->>BP: resolveRenderParams(asset)
+    BP-->>S: normalizeParams(renderParams) 或 DEFAULT_PARAM_SCALES
+    S-->>D: scales 初值（不是硬编码 DEFAULT）
+
+    %% ── 2. 滑块 change → 防抖持久化 ────────────────────────────
+    U->>D: 拖动滑块（step 0.1）
+    D->>D: 即时重渲预览（既有）
+    D->>S: persistRenderParams(assetId, scales)（防抖 400ms）
+    S->>BP: normalizeParams(scales)
+    BP-->>S: clamp + 2 位小数的确定值
+    alt 与已存值相同（规范化后）
+        S-->>S: return（不写库、不重渲）
+    else 有变化
+        S->>DB: commitAsset → db.assets.put(renderParams)
+        S->>S: enqueueBallThumb(asset)
+
+        %% ── 3. 缓存键扩展 + 先建新再删旧 ─────────────────────
+        S->>BP: ballThumbName(id, slots, params)
+        BP->>BP: slotRelPaths(slots).join('\n') + '\n' + paramsKey(params)
+        BP-->>S: `<id>-<8位hex>.jpg`（格式不变）
+        S->>S: ballThumbIsFresh? → false（名字变了）
+        S->>M: saveBallThumb({assetId, slots, params, base64Jpeg})
+        M->>BP: ballThumbFileName(assetId, slots, normalizeParams(params))
+        M->>FS: isWithinRoot 校验后写入 newName
+        M-->>S: newName
+        S->>T: deleteOneThumb(id, oldThumbPath)
+        T->>T: parseThumbFileName + p.id===id + isWithinRoot
+        T->>FS: rm(oldName)（仅当渲染成功；失败则保留旧文件）
+        T-->>S: true
+        S->>DB: thumbPath = newName, thumbStatus = 'ready'
+        S-->>U: 网格显示新球图
+    end
+
+    %% ── 4. 既有缓存管理对参数变体的盲区（缺陷确认） ───────────
+    Note over T: findOrphanThumbs 只认「id 不在 liveIds」<br/>参数变体属于 live id → 永不判孤儿<br/>必须显式 deleteOneThumb
+    Note over S: deleteThumb(id) 是通配全删<br/>会误删封面缩略图 / named 官方渲染图<br/>材质球禁用

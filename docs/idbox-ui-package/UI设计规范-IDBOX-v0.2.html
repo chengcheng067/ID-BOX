@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ID BOX · UI 设计规范 v0.2</title>
+<style>
+:root{
+  --bg:#F8FAFC;--card:#FFFFFF;--border:#E2E8F0;--ink:#1F2937;--sub:#4B5563;--mut:#6B7280;--faint:#9CA3AF;
+  --accent:#007AFF;--tint:#E1EFFF;--danger:#E5484D;
+  --shadow:0 8px 24px rgba(100,116,139,.1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Sarasa Gothic SC","Microsoft YaHei UI",sans-serif;background:var(--bg);color:var(--ink);padding:40px;max-width:1200px;margin:0 auto}
+h1{font-size:28px;font-weight:600}
+h2{font-size:19px;font-weight:600;margin:40px 0 16px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.meta{color:var(--mut);font-size:13px;margin-top:6px}
+.badge{display:inline-block;background:var(--tint);color:var(--accent);border-radius:999px;padding:3px 12px;font-size:12px;font-weight:600}
+.card{background:var(--card);border-radius:16px;box-shadow:var(--shadow);padding:24px;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)}
+th{color:var(--mut);font-weight:500;font-size:12px}
+code,pre{font-family:"Cascadia Code",Consolas,monospace}
+pre{background:#111113;color:#F2F2F4;border-radius:12px;padding:20px;font-size:12.5px;line-height:1.7;overflow-x:auto}
+pre .c{color:#636368}
+.sw{display:flex;align-items:center;gap:10px;padding:6px 0;font-size:12.5px}
+.dot{width:34px;height:26px;border-radius:7px;border:1px solid rgba(0,0,0,.08);flex:none}
+.shot{width:100%;border-radius:12px;box-shadow:var(--shadow);display:block;margin:8px 0 4px}
+.shot-label{font-size:12px;color:var(--mut);margin-bottom:18px}
+.rules li{margin:8px 0;font-size:13.5px;color:var(--sub);line-height:1.7}
+.ban{background:#FEF1F0;color:#C9352B;border-radius:8px;padding:12px 16px;font-size:13px;margin-top:12px}
+</style>
+</head>
+<body>
+
+<h1>ID BOX · UI 设计规范 <span class="badge">v0.2 交付开发版</span></h1>
+<p class="meta">2026-10-14 定稿 · 浅色 Soft UI / 深色 macOS Vibrancy · 强调色：系统蓝 · 字体：Sarasa Gothic SC · 设计稿：Ardot 736163821507042（14 屏）</p>
+
+<div class="ban">⛔ 全局禁用：橙色/棕色高亮 · 紫色系 · 玻璃拟态 backdrop-blur · 渐变 · 深色主题底色带色相</div>
+
+<h2>一、色彩 Token（CSS 变量，直接复制）</h2>
+<pre>
+:root, [data-theme="light"] {
+  <span class="c">/* Soft UI 浅色 */</span>
+  --bg-canvas:      #F8FAFC;   <span class="c">/* 画布/中栏 */</span>
+  --bg-sidebar:     #F1F5F9;   <span class="c">/* 侧栏/输入面/搜索框底 */</span>
+  --bg-elevated:    #E2E8F0;   <span class="c">/* 选中导航底（非强调态） */</span>
+  --surface-card:   #FFFFFF;   <span class="c">/* 卡片/弹窗/操作条 */</span>
+  --border:         #E2E8F0;   <span class="c">/* 1px 分隔线 */</span>
+  --text-primary:   #1F2937;   --text-secondary: #4B5563;
+  --text-tertiary:  #6B7280;   --text-muted:     #9CA3AF;
+  --accent:         #007AFF;   --accent-tint:    #E1EFFF;
+  --danger:         #E5484D;   --danger-tint:    #FEF1F0;
+  --success:        #30A46C;
+  --shadow-card:    0 8px 24px rgba(100,116,139,.10);   <span class="c">/* 柔影替代描边 */</span>
+  --shadow-card-active: 0 8px 24px rgba(0,122,255,.15);
+  --shadow-modal:   0 16px 48px rgba(38,48,64,.18);
+}
+[data-theme="dark"] {
+  <span class="c">/* macOS Vibrancy 深色：黑就黑下去，底色全中性 */</span>
+  --bg-canvas:      #111113;   --bg-sidebar:    #161618;
+  --surface-card:   #1C1C1E;   --bg-elevated:   #242428;
+  --bg-active-nav:  #1E2A38;   <span class="c">/* 选中导航（蓝 tint） */</span>
+  --border:         #2A2A2D;   <span class="c">/* 1px 描边是唯一分隔手段 */</span>
+  --text-primary:   #F2F2F4;   --text-secondary: #98989E;
+  --text-muted:     #636368;
+  --accent:         #0A84FF;   --accent-text:   #6DB2FF;
+  --accent-tint:    #1E2A38;
+  --danger:         #FF6961;   --danger-tint:   #2A1517;
+  --shadow-modal:   0 16px 48px rgba(0,0,0,.5);
+  <span class="c">/* 卡片不投影，靠 111113→161618→1C1C1E→242428 明度分层 */</span>
+}
+</pre>
+
+<h2>二、字体 / 圆角 / 间距</h2>
+<div class="grid">
+<div class="card"><table>
+<tr><th>Token</th><th>值</th><th>用途</th></tr>
+<tr><td>17 / Semi Bold</td><td>--fs-page-title</td><td>中栏标题</td></tr>
+<tr><td>16 / Semi Bold</td><td>--fs-modal-title</td><td>弹窗标题</td></tr>
+<tr><td>14 / Semi Bold</td><td>--fs-section</td><td>面板标题/资产名</td></tr>
+<tr><td>12 / Semi Bold·Regular</td><td>--fs-card-title/body</td><td>卡片名/按钮/导航</td></tr>
+<tr><td>11 / Regular</td><td>--fs-caption</td><td>辅助说明/文件行</td></tr>
+<tr><td>10 / Regular</td><td>--fs-micro</td><td>徽标/计数/库路径</td></tr>
+</table></div>
+<div class="card"><table>
+<tr><th>Token</th><th>值</th><th>用途</th></tr>
+<tr><td>--radius-btn</td><td>10px</td><td>按钮/输入框/CTA</td></tr>
+<tr><td>--radius-modal</td><td>14px</td><td>弹窗/预览区</td></tr>
+<tr><td>--radius-card</td><td>16px</td><td>资产卡片</td></tr>
+<tr><td>--radius-nav</td><td>9px</td><td>侧栏导航项</td></tr>
+<tr><td>--radius-chip</td><td>6px</td><td>徽标/chip</td></tr>
+<tr><td>--gap-card</td><td>16px</td><td>卡片网格间距</td></tr>
+<tr><td>--stroke-width</td><td>1px</td><td>描边一律 1px，选中 1.5-2px</td></tr>
+</table></div>
+</div>
+
+<h2>三、关键组件速查</h2>
+<div class="card"><table>
+<tr><th>组件</th><th>规格要点</th></tr>
+<tr><td>搜索框</td><td><b>默认收起 32×32 仅图标</b>；点击右对齐展开 380px，右缘与右栏详情面板齐平；失焦收起</td></tr>
+<tr><td>导入压缩包 CTA</td><td>132×32 实心 accent，唯一主 CTA；重新扫描不放顶栏（在设置·导入）</td></tr>
+<tr><td>窗口控制（自绘）</td><td>28×28 方钮 r7；最小化/最大化灰，<b>关闭钮 danger 红</b>；hover 浅色 rgba(0,0,0,.06) / 深色 rgba(255,255,255,.08)</td></tr>
+<tr><td>资产卡片</td><td>所有缩略图统一 <b>1:1</b>（用户拍板四卡等高，模型图裁切居中）；r16；浅色柔影代描边；<b>选中：2px accent 描边 + 右上角 22×22 蓝对勾徽章</b></td></tr>
+<tr><td>多选操作条</td><td>白/242428 底 r14 投影，<b>相对中栏水平居中</b>悬于网格底部；已选胶囊 → 指派分类（实心蓝）→ 删除（danger-tint）→ 取消</td></tr>
+<tr><td>详情文件槽位</td><td>按 基础色/法线/粗糙度/AO/置换/元数据/预览/其他 分组；每行可单独拖出到 SU/D5</td></tr>
+<tr><td>删除撤销</td><td>确认 + 底部 toast 内 <b>5 秒撤销条</b>（蓝底"撤销 Ns"倒计时）</td></tr>
+<tr><td>设置弹窗</td><td>760×560，左 tab（172px）右内容；导入 tab：处置三档单选+并发 stepper+重新扫描；外观 tab：主题三选卡（未实现项禁用标"v0.2 留位"）；关于 tab：<b>版本号胶囊醒目</b>+检查更新留位</td></tr>
+<tr><td>自定义渲染</td><td>只两个滑块：反光强度、凹凸强度；保存→离屏渲一帧存 JPG，coverSource='manual'</td></tr>
+</table></div>
+
+<h2>四、屏幕截图</h2>
+<div class="card">
+<h3 style="font-size:14px;margin-bottom:10px">浅色 · Soft UI</h3>
+<img class="shot" src="screens/01-主界面-浅色.png" alt="主界面浅色"><p class="shot-label">01 主界面（搜索展开态）</p>
+<div class="grid">
+<div><img class="shot" src="screens/02-设置-导入-浅色.png" alt=""><p class="shot-label">02 设置·导入</p></div>
+<div><img class="shot" src="screens/03-自定义渲染-浅色.png" alt=""><p class="shot-label">03 自定义渲染</p></div>
+<div><img class="shot" src="screens/05-设置-外观-浅色.png" alt=""><p class="shot-label">05 设置·外观</p></div>
+<div><img class="shot" src="screens/06-设置-关于-浅色.png" alt=""><p class="shot-label">06 设置·关于</p></div>
+<div><img class="shot" src="screens/07-多选操作条-浅色.png" alt=""><p class="shot-label">07 多选操作条</p></div>
+</div>
+<h3 style="font-size:14px;margin:24px 0 10px">深色 · macOS Vibrancy</h3>
+<img class="shot" src="screens/04-主界面-深色.png" alt="主界面深色"><p class="shot-label">04 主界面</p>
+<div class="grid">
+<div><img class="shot" src="screens/10-设置-导入-深色.png" alt=""><p class="shot-label">10 设置·导入</p></div>
+<div><img class="shot" src="screens/11-自定义渲染-深色.png" alt=""><p class="shot-label">11 自定义渲染</p></div>
+<div><img class="shot" src="screens/12-设置-外观-深色.png" alt=""><p class="shot-label">12 设置·外观</p></div>
+<div><img class="shot" src="screens/13-设置-关于-深色.png" alt=""><p class="shot-label">13 设置·关于</p></div>
+<div><img class="shot" src="screens/14-多选操作条-深色.png" alt=""><p class="shot-label">14 多选操作条</p></div>
+</div>
+<h3 style="font-size:14px;margin:24px 0 10px">总表</h3>
+<img class="shot" src="screens/09-UI设计规范.png" alt=""><p class="shot-label">09 设计规范面板</p>
+</div>
+
+<h2>五、待确认（不阻塞开发）</h2>
+<div class="card"><ul class="rules">
+<li><b>Q2 自动预分类</b>：建议按文件名/来源匹配词表，能配则配，配不进仍落未分类</li>
+<li><b>Q3 多图拖入</b>：各自独立成资产（当前设计）vs 合并贴图组</li>
+<li><b>窗口控制 hover</b>：稿中未画，建议浅 rgba(0,0,0,.06) / 深 rgba(255,255,255,.08)，关闭 hover 变红底白叉</li>
+</ul></div>
+
+<p class="meta" style="margin-top:32px">v0.2 · 2026-10-14 · 苏小匠按丞丞三轮反馈定稿 · 结构交互已拍板，视觉以本文 token 为准</p>
+</body>
+</html>

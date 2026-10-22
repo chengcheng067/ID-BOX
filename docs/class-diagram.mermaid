@@ -1,0 +1,131 @@
+%% docs/12 §8 — 材质球调参持久化 + 缓存键扩展
+%% 实线 = 既有；虚线/标注 = 本次设计新增（未实现）
+classDiagram
+    class BallParamScales {
+        +number roughness
+        +number bump
+        +number uv
+    }
+
+    class ballParams_shared["ballParams (shared/ballParams.ts — 新增)"] {
+        +DEFAULT_PARAM_SCALES: BallParamScales
+        +clampScale(v: number): number
+        +clampUv(v: number): number
+        +normalizeParams(p?: BallParamScales): BallParamScales
+        +paramsKey(p: BallParamScales): string
+        +isDefaultParams(p: BallParamScales): boolean
+        +resolveRenderParams(asset: Asset): BallParamScales
+        +fnv1a(s: string): string
+        +ballHash(slots: BallSlots, params: BallParamScales): string
+        +ballThumbName(assetId: string, slots: BallSlots, params?: BallParamScales): string
+    }
+
+    class Asset {
+        +string id
+        +string name
+        +AssetKind kind
+        +string folder
+        +string relFolder
+        +string? cover
+        +CoverSource? coverSource
+        +string? thumbPath
+        +ThumbStatus? thumbStatus
+        +AssetFile[] files
+        +string? category1
+        +string? category2
+        +string[]? styles
+        +{name?,tags?}? materialMeta
+        +BallParamScales? renderParams <<新增>>
+        +string[] tags
+        +string note
+        +string dedupeKey
+        +number importedAt
+        +number updatedAt
+    }
+
+    class SaveBallThumbPayload {
+        +string assetId
+        +BallSlots slots
+        +string base64Jpeg
+        +BallParamScales? params <<新增>>
+    }
+
+    class BallSlots {
+        +string? albedo
+        +string? normal
+        +string? roughness
+        +string? ao
+        +string? displacement
+    }
+
+    class VaultDB {
+        +Table~Asset,string~ assets
+        +Table~IndexBackup,string~ backups
+        +version(1) assets: id,kind,source,importedAt,updatedAt,*tags,dedupeKey
+        +version(2) +suVersion,suMajor,folder,coverSource +backups
+        +version(3) +category1,category2,*styles
+        +version(4) <<可选·仅快照，renderParams 不进索引>>
+    }
+
+    class thumb_shared["thumb (shared/thumb.ts)"] {
+        +thumbSalt(input, len): string
+        +parseThumbFileName(name): ParsedThumbName|null
+        +isThumbOf(name, id): boolean
+        +matchThumbNames(names, id): string[]
+        +findOrphanThumbs(names, liveIds): string[]
+    }
+
+    class main_ballThumb["main/ballThumb.ts"] {
+        +ballThumbFileName(assetId, slots, params?): string
+        +isValidBallAssetId(id): boolean
+        +validateBallJpegBase64(b64): boolean
+        +saveBallThumbBytes(assetId, slots, jpeg, thumbsRoot, params?): string|null
+    }
+
+    class main_thumb["main/thumb.ts"] {
+        +ensureThumb(id, coverAbs, opts): string|null
+        +deleteThumb(id): number
+        +pruneThumbs(liveIds): number
+        +clearThumbs(): number
+        +thumbAbsPath(name): string|null
+        +deleteOneThumb(id, name): boolean <<新增>>
+    }
+
+    class store["store.ts (renderer)"] {
+        +ballSlotsOf(asset): MaterialSlots|null
+        +ballThumbIsFresh(asset): boolean
+        +enqueueBallThumb(asset): void
+        +renderBallThumbFor(asset): Promise~void~
+        +runBallQueue(): Promise~void~
+        +persistRenderParams(assetId, scales): Promise~void~ <<新增·防抖400ms>>
+        +commitAsset(set, updated): void
+    }
+
+    class CustomRenderDialog {
+        +useState(scales) 初值 = resolveRenderParams(asset) <<改>>
+        +save(): Promise~void~
+    }
+
+    class MaterialBall {
+        +useState(scales) 初值 = resolveRenderParams(asset) <<改>>
+        +setParamScales(scales): void
+        +saveCover(): Promise~void~
+        +renderBallToJpeg(relFolder, slots, opts): Promise~Blob~
+    }
+
+    ballParams_shared ..> BallParamScales : 定义
+    ballParams_shared ..> BallSlots : hash 输入
+    Asset o-- BallParamScales : renderParams?（每材质各存）
+    ballParams_shared ..> Asset : resolveRenderParams 回落 DEFAULT
+    VaultDB o-- Asset : Table
+    VaultDB ..> ballParams_shared : renderParams 不进索引（无 version4）
+
+    main_ballThumb ..> ballParams_shared : 必须同源（消除层向违规）
+    store ..> ballParams_shared : ballThumbName / resolveRenderParams
+    store ..> main_thumb : deleteOneThumb（IPC thumb:deleteOne）
+    store ..> main_ballThumb : saveBallThumb（IPC thumb:saveBall）
+    store ..> thumb_shared : findOrphanThumbs 无法覆盖参数变体（缺陷）
+    main_thumb ..> thumb_shared : parseThumbFileName / matchThumbNames
+    CustomRenderDialog ..> ballParams_shared : 初值读回
+    MaterialBall ..> ballParams_shared : 初值读回
+    store ..> MaterialBall : renderBallToJpeg（必须补 params）

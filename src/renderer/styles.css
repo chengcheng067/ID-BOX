@@ -1,0 +1,699 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * ID BOX · UI 设计规范 v0.2 token（docs/idbox-ui-package/UI设计规范-IDBOX-v0.2.md §1/§2 逐色照抄）
+ * 浅色 = Soft UI（slate 浅底、白卡大圆角、柔影替代描边）
+ * 深色 = macOS Vibrancy（三档中性深灰、1px 描边、无投影）
+ * ⛔ 全局禁用：橙色/棕色高亮、紫色系、玻璃拟态 backdrop-blur、渐变
+ * ────────────────────────────────────────────────────────────────────────── */
+:root,
+[data-theme='light'] {
+  /* Soft UI 浅色（§1） */
+  --bg-canvas: #f8fafc; /* 画布/中栏 */
+  --bg-sidebar: #f1f5f9; /* 侧栏/输入面/搜索框底 */
+  --bg-elevated: #e2e8f0; /* 选中导航底（非强调态） */
+  --surface-card: #ffffff; /* 卡片/弹窗/操作条 */
+  --border: #e2e8f0; /* 1px 分隔线（通用档） */
+  /* 走查 v0.2.2 拍板：描边三档并存 —— 通用 / 面板 / 槽位组（画布实测值） */
+  --border-panel: #e8edf2; /* 面板描边（画布 2:124） */
+  --border-soft: #eef1f4; /* 槽位组描边（画布 2:140） */
+  /* 走查 v0.2.2 B2#4 拍板：右栏走白卡（画布 2:124 fill #FFFFFF） */
+  --panel-bg: #ffffff;
+  /* 走查 v0.2.2 拍板：中性灰 tint 专用 token（不再复用 --bg-elevated + --text-secondary）
+     使用位：① .badge（画布 2:113）② 顶层导航选中（B3#8，「全部」走中性档） */
+  --tint-neutral: #eef1f4;
+  --tint-neutral-text: #4b5563;
+  /* 走查 v0.2.2 B6#20（形态类按画布）：顶栏/中栏头胶囊底 —— 浅 sidebar 档，深走 card 档 */
+  --pill-bg: #f1f5f9;
+  /* 走查 v0.2.2 B6#22（形态类按画布）：toast 底是 canvas 灰不是白卡（画布 `2:168` #F8FAFC） */
+  --toast-bg: #f8fafc;
+  --text-primary: #1f2937;
+  --text-secondary: #4b5563;
+  --text-tertiary: #6b7280; /* 图标/次级文字 */
+  --text-muted: #9ca3af; /* 弱化/计数 */
+  --accent: #007aff; /* 系统蓝（浅色） */
+  --accent-text: #007aff;
+  --accent-tint: #e1efff; /* 选中导航/徽标/chip 底 */
+  --danger: #e5484d;
+  --danger-tint: #fef1f0;
+  --success: #30a46c;
+  /* 「Preview」测试版徽标（用户 2026-10-22 指定紫色）——只给顶栏那颗胶囊用，
+     不进任何功能语义，所以刻意不沿用 accent/danger 的色阶。 */
+  --preview: #7a5af8;
+  --preview-tint: #efe9fe;
+
+  /* Soft UI 阴影（替代描边，§1） */
+  --shadow-card: 0 8px 24px rgba(100, 116, 139, 0.1);
+  /* 反馈 6a：卡片 hover 上浮时比常态重一档（投影加大 + 加深，位移仍是 -2px） */
+  --shadow-card-hover: 0 12px 28px rgba(100, 116, 139, 0.16);
+  --shadow-card-active: 0 8px 24px rgba(0, 122, 255, 0.15);
+  --shadow-modal: 0 16px 48px rgba(38, 48, 64, 0.18);
+  --shadow-floatbar: 0 12px 32px rgba(38, 48, 64, 0.18);
+
+  /* 组件级补充 token（规范正文给值：§3.1 选中段白底 / §3.3 操作条白底 / §3.7 画布底） */
+  --seg-active: #ffffff;
+  --bg-floatbar: #ffffff;
+  /* v0.2.1 增补 1（覆盖 §3.7）：渲染画布浅色主题改白底，存 JPG 背景即所见 */
+  --render-canvas-bg: #ffffff;
+}
+
+[data-theme='dark'] {
+  /* macOS Vibrancy 深色（§1） */
+  --bg-canvas: #111113; /* 画布/中栏，黑就黑下去 */
+  --bg-sidebar: #161618; /* 侧栏/底栏/右栏 */
+  --surface-card: #1c1c1e; /* 卡片/弹窗 */
+  --bg-elevated: #242428; /* 浮起：输入框/操作条/tab hover */
+  --bg-active-nav: #1e2a38; /* 选中导航底（蓝 tint） */
+  --border: #2a2a2d; /* 1px 描边，唯一的分隔手段 */
+  /* 深色靠明度分层，三档描边同值（走查 v0.2.2 B2#5 拍板：深色两档与通用同值） */
+  --border-panel: #2a2a2d;
+  --border-soft: #2a2a2d;
+  /* 走查 v0.2.2 B2#4：深色右栏画布 2:402 是 #161618（sidebar 档），与浅色白卡不同 → 靠 --panel-bg 分主题 */
+  --panel-bg: #161618;
+  /* 走查 v0.2.2：深色无中性徽标样本（画布 2:375 实际是 accent tint）→ 取 elevated 同档 */
+  --tint-neutral: #242428;
+  --tint-neutral-text: #98989e;
+  /* 走查 v0.2.2 B6#20/#21：深色胶囊控件底走 card 档（画布 `2:361` = #1C1C1E） */
+  --pill-bg: #1c1c1e;
+  /* 走查 v0.2.2 B6#22：深色 toast 底走 canvas 档（画布 `2:446` = #161618） */
+  --toast-bg: #161618;
+  --text-primary: #f2f2f4;
+  --text-secondary: #98989e;
+  --text-muted: #636368;
+  --accent: #0a84ff; /* 系统蓝（深色） */
+  --accent-text: #6db2ff; /* 深色上的强调文字/徽标字 */
+  --accent-tint: #1e2a38;
+  --danger: #ff6961;
+  --danger-tint: #2a1517;
+  --success: #7a9268;
+  /* Preview 徽标（深色）：底色压到「比卡片再深一点」的紫，文字提亮保证在 #161618 上可读 */
+  --preview: #b18cff;
+  --preview-tint: #2b2140;
+
+  --shadow-modal: 0 16px 48px rgba(0, 0, 0, 0.5);
+  /* 卡片不加投影，靠 #111113 → #161618 → #1C1C1E → #242428 明度分层（§1） */
+  --shadow-card: none;
+  /* 反馈 6a：深色没有投影可用（--shadow-card 就是 none），hover 只能靠提亮底色 →
+     这个 token 固定 none，实际提亮在 `.card-hover` 的深色覆盖里做。 */
+  --shadow-card-hover: none;
+  --shadow-card-active: none;
+  --shadow-floatbar: none;
+
+  /* 组件级补充 token（§3.1 选中段 #2C2C2E / §3.3 操作条 #242428 / v0.2.1 增补 1 画布 #1C1C1E） */
+  --seg-active: #2c2c2e;
+  --bg-floatbar: #242428;
+  --render-canvas-bg: #1c1c1e;
+
+  /* 规范 §1 深色表未定义 --text-tertiary / --bg-active-nav 的浅色对应：
+     tertiary 沿用 secondary 值（#98989E），bg-active-nav 仅深色存在（选中导航用 accent-tint 即可）。 */
+  --text-tertiary: #98989e;
+
+  /* 圆角深色覆盖（走查 v0.2.2 拍板「按画布实测值逐屏改」，画布浅/深值不同）：
+     深色整体比浅色小一档，画布节点依据见走查文档 §B4-1。 */
+  --radius-card: 10px; /* 2:370 */
+  --radius-nav: 7px; /* 2:312 / 2:321 */
+  --radius-chip: 5px; /* 2:408 */
+  --radius-badge: 4px; /* 2:375（与浅色同值） */
+  --radius-preview: 10px; /* 2:403 */
+  --radius-coverbar: 7px; /* 2:404 */
+  --radius-slotgroup: 7px; /* 2:418 */
+  --radius-danger-btn: 8px; /* 2:444 */
+  --radius-toast-undo: 7px; /* 2:452 */
+  /* 深色弹窗四屏一致 14 → 不分组件（浅色的 settings/render 分档在深色收敛为 14） */
+  --radius-modal-settings: 14px; /* 2:879 / 2:935 */
+  --radius-modal-render: 14px; /* 2:842 */
+  --radius-pill-header: 7px; /* 2:361（浅色 2:83 = 9） */
+  /* C#14 顶栏控件深色覆盖：画布深屏全部比浅屏小一档 */
+  --radius-seg-group: 8px; /* 2:294 */
+  --radius-search: 8px; /* 2:284 */
+  --radius-cta: 8px; /* 2:304 */
+  --radius-toast-undo-inner: 5px; /* 2:454 */
+  /* 两主题同值、无需覆盖：--radius-logo 6 / --radius-seg 6 / --radius-theme-card 12 / --radius-tab 8 */
+}
+
+/* ── §2 字体 / 圆角 / 间距 ─────────────────────────────────── */
+:root {
+  --font-family: 'Sarasa Gothic SC', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+
+  --fs-page-title: 17px;
+  --fs-modal-title: 16px;
+  --fs-section: 14px;
+  --fs-card-title: 13px;
+  --fs-card-name: 12px;
+  --fs-body: 12px;
+  --fs-caption: 11px;
+  --fs-micro: 10px;
+
+  /* 圆角：走查 v0.2.2 拍板「全部按画布实测值逐屏改」→ 浅色在此定义，深色块内覆盖。
+     画布节点依据见 docs/idbox-ui-package/UI走查-IDBOX-v0.2.2-画布对照.md §B4-1。 */
+  --radius-btn: 10px; /* 2:655 / 2:660 */
+  --radius-modal: 14px; /* 通用（右键菜单 / DropOverlay / Modal，画布无样本） */
+  --radius-modal-settings: 16px; /* 2:479 / 2:541 */
+  --radius-modal-render: 12px; /* 2:179 / 2:242 */
+  --radius-card: 16px; /* 2:92 */
+  --radius-nav: 9px; /* 2:34 */
+  --radius-chip: 6px; /* 2:134 */
+  --radius-badge: 4px; /* 2:113 */
+  --radius-preview: 14px; /* 2:125（深色 2:403 = 10，深色块内覆盖） */
+  /* 渲染弹窗内画布：浅色 2:249 = 14、深色 2:851 = 14 → 两主题同值，不随 --radius-preview 覆盖。
+     这是走查发现的独立一档：深色下「右栏预览区 r10」与「弹窗内画布 r14」并存。 */
+  --radius-render-canvas: 14px; /* 2:249 / 2:851 */
+  --radius-coverbar: 9px; /* 2:126 */
+  --radius-slotgroup: 9px; /* 2:140 */
+  --radius-danger-btn: 10px; /* 2:166 */
+  --radius-toast: 8px; /* 2:168（深色 2:446 画布为 0，判漏设，保持 8） */
+  --radius-toast-undo: 8px; /* 2:174 */
+  --radius-floatbar: 14px; /* 2:652 */
+  --radius-pill: 999px; /* 2:653 全胶囊 */
+  /* 走查 v0.2.2 中栏头排序胶囊（画布浅 2:83 = 9 / 深 2:361 = 7）——独立一档，不复用 nav */
+  --radius-pill-header: 9px;
+  /* 走查 v0.2.2 C#14/C#15：顶栏控件圆角分主题（画布浅 10 / 深 8），Logo 与分段内段两主题同值 */
+  --radius-logo: 6px; /* 2:4 / 深 2:282 */
+  --radius-seg: 6px; /* 2:17 / 深 2:295（B5#18：实现原为 8） */
+  --radius-seg-group: 10px; /* 2:16（深 2:294 = 8） */
+  --radius-search: 10px; /* 2:6（深 2:284 = 8） */
+  --radius-cta: 10px; /* 2:26（深 2:304 = 8） */
+  --radius-theme-card: 12px; /* C#15：2:507/2:520/2:530（深 2:907/915/925 同值） */
+  --radius-toast-undo-inner: 6px; /* B6#24 两层撤销区：浅 2:176（深 2:454 = 5） */
+  --radius-tab: 8px; /* C#12 已拍板单立一档（两主题同值） */
+  /* C#15 补充：设置·关于页 Logo（画布 `2:955` = 16，两主题同值）——与顶栏 Logo r6 不同档 */
+  --radius-logo-lg: 16px;
+  --radius-winbtn: 7px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  /* 走查 v0.2.2 B5#16（已拍板 2026-10-15：按画布实测值）：网格 gap 16 → 14（两主题同值）。
+     ⚠️ 此前 `gap-card` 在构建产物里**根本没生成**——Tailwind 的 `gap-*` 读 `theme.spacing`，
+     `card` 不在其中 → 网格实际无间距。已在 tailwind.config.js 的 `extend.spacing` 补映射。 */
+  --gap-card: 14px;
+  --stroke-width: 1px;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-canvas text-primary font-sans antialiased;
+    font-family: var(--font-family);
+    user-select: none;
+  }
+  input,
+  textarea {
+    user-select: text;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full;
+    background: var(--border);
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
+    background-clip: content-box;
+    border: 3px solid transparent;
+  }
+}
+
+@layer components {
+  /* 类型徽标（§3.3）：tint 底，不是黑底白字。
+     默认 = 中性灰 tint，走专用 token --tint-neutral / --tint-neutral-text
+     （走查 v0.2.2 拍板：不再复用 --bg-elevated + --text-secondary；画布权威样本 2:113
+      fill #EEF1F4 + 字 #4B5563，圆角 4 → rounded-badge）。
+     贴图类走 .badge-accent（--accent-tint 底 + --accent-text 字）。 */
+  .badge {
+    @apply inline-flex items-center rounded-badge px-1.5 py-0.5 text-[11px] font-medium;
+    background: var(--tint-neutral);
+    color: var(--tint-neutral-text);
+  }
+  .badge-accent {
+    background: var(--accent-tint);
+    color: var(--accent-text);
+  }
+  .btn {
+    @apply inline-flex items-center gap-1.5 rounded-btn border border-line bg-card px-3 py-1.5 text-sm font-medium text-primary transition active:scale-[.98];
+  }
+  .btn-primary {
+    @apply border-accent bg-accent text-white;
+    /* hover 不自造色值：亮度滤波压暗 8%（规范禁自行取色） */
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(0.92);
+  }
+  /* 顶栏导入 CTA（§3.1：132×32 accent 底白字 12px Semi Bold） */
+  .btn-cta {
+    @apply inline-flex h-8 w-[132px] shrink-0 items-center justify-center gap-1.5 rounded-cta bg-accent text-[12px] font-semibold text-white transition active:scale-[.98];
+  }
+  .btn-cta:hover {
+    filter: brightness(0.92);
+  }
+  /* 实心 accent 钮（操作条「指派分类」/ 渲染弹窗「保存·设为封面」等） */
+  .btn-solid {
+    @apply inline-flex h-8 items-center justify-center gap-1.5 rounded-btn bg-accent px-3 text-[12px] font-semibold text-white transition active:scale-[.98];
+  }
+  .btn-solid:hover:not(:disabled) {
+    filter: brightness(0.92);
+  }
+  .btn-solid:disabled {
+    opacity: 0.4;
+  }
+  .btn-ghost {
+    @apply border-transparent bg-transparent hover:bg-elevated/60;
+  }
+  .btn-danger {
+    @apply border-transparent bg-transparent text-danger hover:bg-danger-tint;
+  }
+  .btn-outline-danger {
+    @apply border border-danger/40 bg-transparent text-danger;
+  }
+  .btn-outline-danger:hover {
+    @apply bg-danger-tint;
+  }
+  .input {
+    @apply w-full rounded-btn border border-line bg-card px-3 py-1.5 text-sm text-primary outline-none transition focus:border-accent/60 focus:ring-2 focus:ring-accent/15;
+  }
+  .input {
+    background-color: var(--surface-card);
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-chip border border-line bg-canvas px-2 py-0.5 text-xs text-secondary;
+  }
+  .chip-accent {
+    @apply inline-flex items-center gap-1 rounded-chip px-2 py-0.5 text-xs font-medium;
+    background: var(--accent-tint);
+    color: var(--accent-text);
+  }
+  .chip-ghost {
+    /* B6#34（形态类按画布）：画布 `2:134` 是**实线**描边，不是虚线。原实现 `border-dashed` 已改实线。 */
+    @apply inline-flex items-center gap-1 rounded-chip border border-line px-2 py-0.5 text-xs text-secondary transition;
+  }
+  .chip-ghost:hover {
+    @apply border-accent/50 text-accent-text;
+  }
+  /* ── B6#31（形态类按画布）：深色卡片有 1px 描边（画布未选 `2:378`/`2:386`/`2:394` = #2A2A2D，
+     选中 `2:370` = #0A84FF 描边）。浅色靠投影无描边 → 描边只在深色生效。
+     深色下选中不再用 `ring-2`（2px 投影环），改 1px 描边，与画布一致。 */
+  .card-surface {
+    border: 1px solid transparent;
+  }
+  [data-theme='dark'] .card-surface {
+    border-color: var(--border);
+  }
+  /* 选中态分主题：浅色走投影（无描边），深色走 1px 描边（无投影）。
+     所以 JSX 里不能再挂 `ring-2`（utilities 层会盖掉这里的 box-shadow），
+     选中视觉全部收进本规则，JSX 只挂 `card-surface` + `card-selected`。 */
+  .card-selected {
+    box-shadow: var(--shadow-card-active);
+  }
+  [data-theme='dark'] .card-selected {
+    border-color: var(--accent);
+    box-shadow: none;
+  }
+  /* B6#40：画布 `2:655`「指派分类」h36 pad14（实现 `.btn-solid` 是 h32）→ 单立一档，
+     不改 `.btn-solid`（渲染弹窗「保存·设为封面」等仍按 h32）。 */
+  .btn-solid-lg {
+    @apply inline-flex h-9 items-center justify-center gap-1.5 rounded-btn bg-accent px-3.5 text-[12px] font-semibold text-white transition active:scale-[.98];
+  }
+  .btn-solid-lg:hover:not(:disabled) {
+    filter: brightness(0.92);
+  }
+  .btn-solid-lg:disabled {
+    opacity: 0.4;
+  }
+  /* B6#40 补充（用户 2026-10-15 拍板「删除按钮也升到 h36」）：多选条内两个按钮必须等高，
+     否则「指派分类」h36 与「删除」h32 并排会错位。danger 档单独成规则，
+     不改 `.btn-outline-danger`（其他位置仍按 h32）。圆角仍走 --radius-danger-btn。 */
+  .btn-danger-lg {
+    @apply inline-flex h-9 items-center justify-center gap-1.5 rounded-danger-btn bg-danger-tint px-3.5 text-[12px] font-medium text-danger transition active:scale-[.98];
+  }
+  .btn-danger-lg:hover:not(:disabled) {
+    filter: brightness(0.97);
+  }
+  /* ── C#17（走查 v0.2.2）：中栏头计数灰阶分主题 ──
+     画布浅 `2:81` = #6B7280（tertiary ✓ 与实现一致）；
+     画布深 `2:359` = #636368（= muted，不是 tertiary）→ 必须分主题，不能共用 text-tertiary。 */
+  .header-count {
+    font-size: var(--fs-body); /* 12px（画布 2:81 / 2:359） */
+    color: var(--text-tertiary);
+  }
+  [data-theme='dark'] .header-count {
+    color: var(--text-muted);
+  }
+}
+
+@layer utilities {
+  /* ── 无边框窗口拖拽区（§4-2）：顶栏整体可拖，交互元素一律 no-drag ── */
+  .app-drag {
+    -webkit-app-region: drag;
+  }
+  .app-no-drag {
+    -webkit-app-region: no-drag;
+  }
+  /* ── 顶栏（§3.1）：浅色无底线 / 深色 1px --border ── */
+  .topbar {
+    background: var(--bg-canvas);
+  }
+  [data-theme='dark'] .topbar {
+    border-bottom: 1px solid var(--border);
+  }
+  /* ── 窗口控制钮（§3.1 / §6 待确认建议值）── */
+  .win-btn {
+    color: var(--text-tertiary);
+  }
+  .win-btn:hover {
+    background: rgba(0, 0, 0, 0.06);
+  }
+  [data-theme='dark'] .win-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  /* 关闭钮：默认 danger 色，hover 红底白叉（§3.1） */
+  .win-btn-close {
+    color: var(--danger);
+  }
+  .win-btn-close:hover {
+    background: var(--danger);
+    color: #ffffff;
+  }
+  /* ── 弹窗遮罩（2026-10-21 走查 P2⑦）──
+   * 原来是 `bg-black/30`：浅色主题下压不住底下的网格（白底 + 白卡），弹窗浮不起来，
+   * 边界靠那圈 1px 描边硬撑。深色主题底本来就暗，30% 黑几乎看不见分层。
+   * 两个主题给不同浓度，统一由这一个类承担——设置 / 渲染 / 通用 Modal 三处同源，
+   * 以后调深浅只改这里。 */
+  .dialog-scrim {
+    background: rgba(15, 18, 23, 0.42);
+  }
+  [data-theme='dark'] .dialog-scrim {
+    background: rgba(0, 0, 0, 0.6);
+  }
+  /* ── 卡片选中徽章（§3.3）：22×22 蓝底白勾，白描边 2px（深色用深底描边）── */
+  .check-badge {
+    box-shadow: 0 0 0 2px #ffffff;
+  }
+  [data-theme='dark'] .check-badge {
+    box-shadow: 0 0 0 2px var(--bg-canvas);
+  }
+  /* ── 表单滑块强调色（随主题 accent）── */
+  .slider-accent {
+    accent-color: var(--accent);
+  }
+  /* ── 反馈 6a：卡片 hover 上浮 2px（两主题都有效，但表现手段不同）──
+   * 浅色：投影重一档（--shadow-card-hover）。
+   * 深色：--shadow-card 本来就是 none，加投影看不见 → 改提亮底色 card → elevated。
+   * ⚠️ 必须 `:not(.card-selected)`：选中态的视觉（浅投影 / 深蓝描边）优先级更高，
+   *    不能被 hover 覆盖（`.card-selected` 的既有规则一字未动）。
+   * ⚠️ 类名不能挂在卡片上同时保留裸 `transition` 工具类——两套 transition 会互相覆盖，
+   *    这里统一由 `.card-hover` 提供（时长 150ms / 缓动 ease-out）。 */
+  .card-hover {
+    transition:
+      transform 150ms ease-out,
+      box-shadow 150ms ease-out,
+      background-color 150ms ease-out,
+      border-color 150ms ease-out;
+  }
+  .card-hover:not(.card-selected):hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-card-hover);
+  }
+  [data-theme='dark'] .card-hover:not(.card-selected):hover {
+    box-shadow: none;
+    background-color: var(--bg-elevated);
+  }
+  /* ── 框选（marquee / 橡皮筋）期间的卡片禁用态 ─────────────────────────────
+   * 拖动中卡片一律不接收指针事件：
+   * ① 不出 hover 高亮 / 不触发 `.card-hover` 上浮；
+   * ② 不会误触双击（双击进文件视图）；
+   * ③ 不会误起 HTML5 / 系统级拖出（拖出到建模软件是核心手势，与框选互斥）。
+   * 只在 `startMarquee` 越过 4px 阈值后置位，松手 / Esc 立刻摘掉。 */
+  [data-marquee='1'] [data-asset-card] {
+    pointer-events: none;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 中栏「资产的文件视图」进入 / 退出（Windows 8 磁贴风格）
+ *
+ * 用户口径：「模型文件就是双击进入以后…也应该加一个过渡动画，不论是进入还是退出，
+ * 用 Windows 8 的那个样子的磁贴进入和飞出的那种动画就好」。
+ *
+ * 结构（不要合并，两者职责不同）：
+ *   .folder-stage            = 盖在网格之上的整层（背景 / 裁剪 / 层级）
+ *   .folder-stage-enter      = 入场：130ms 淡入（网格先留着 → 无空白帧）
+ *   .folder-stage-leave      = 出场：260ms（前 46% 保持不透明，再淡出）+ `pointer-events: none`
+ *   .folder-anim-item        = 每条内容（文件行 / 文件卡），由父层 `data-folder-anim` 驱动
+ *   --folder-stagger         = 每条内容的递增延迟（JS 写内联样式，前 8 条递增）
+ *
+ * 三档 motionQuality（`data-motion`，取自 settings.motionQuality）——**同一套磁贴语言，只有强度不同**：
+ *   smooth   = 纯位移 + 缩放：入场 translateY(12px) scale(.97)，出场 -14px→-20px scale(1.03→1.04)
+ *   balanced = 标准：入场 perspective(600px) rotateY(-8°) scale(.96)，
+ *              出场 translateY(-18px→-26px) rotateY(5°→7°) scale(1.045→1.06)
+ *   ultra    = 在 balanced 上加入场 2px → 0 的轻微失焦（出场与 balanced 同）
+ * ⚠️ 只有 `smooth` 与 `ultra` 有 `[data-motion=...]` 选择器，**balanced 就是下面那条基础规则**
+ *    （不另写选择器，避免两份 3D 参数漂移）。所以"三档必须三组选择器"不是正确验收口径
+ *    （QA 2026-10-22 提过这条差异）。
+ * ⚠️ 2026-10-22 修正（一）：`smooth` 原先**只留 opacity**（`folder-fade-in`），观感上与"没有动画"
+ *    难以区分，用户原话「流畅档位是应该有这个磁贴语言的」。现在它也有位移+缩放，
+ *    并把入场错峰压到约 16ms（`calc(var(--folder-stagger) * 0.67)`，24ms → 16ms）。
+ *    `folder-fade-in` / `folder-fade-out` **只保留给下面的 reduced-motion 兜底**，不再是档位。
+ * ⚠️ 2026-10-22 修正（二）「退出的磁贴动画失效了」：真因是**舞台整层淡出把磁贴盖住了**
+ *    （实测：旧 160ms 淡出 + 6px 位移，t=40ms 整层只剩 62% 不透明、磁贴只动了 0.66px；
+ *    t=120ms 整层 9%、位移 4.19px —— 等于一次普通交叉淡入）。修法三条，缺一不可：
+ *    ① 舞台延迟淡出（前 46% 保持 opacity 1）；
+ *    ② 出场位移 6px→26px（balanced）/ 8px→20px（smooth），且前 60% 保持不透明；
+ *    ③ 出场也有错峰（`--folder-stagger × 0.5`，最多 96ms，最后一条 246ms 结束 < 260ms 卸载）。
+ * `prefers-reduced-motion: reduce` 一律压成 190ms 纯 opacity（且取消递增延迟）。
+ * ────────────────────────────────────────────────────────────────────────── */
+.folder-stage {
+  background: var(--bg-canvas);
+  will-change: opacity;
+}
+.folder-stage-enter {
+  animation: folder-stage-in 130ms ease-out both;
+}
+.folder-stage-leave {
+  /* 260ms：**前 46%（约 120ms）保持完全不透明**，最后 140ms 才淡出。
+   * 这是"磁贴飞出"能被看见的前提 —— 旧版 160ms 线性淡出与磁贴同时开跑，
+   * t=40ms 整层已剩 62%、t=120ms 只剩 9%，磁贴位移再大也被整块透明淹没。
+   * 与 `FOLDER_EXIT_MS`（260）逐字对齐；reduced-motion 会换成 190ms 纯 opacity。 */
+  animation: folder-stage-out 260ms ease-out both;
+  /* 飞出期间点击穿透 → 用户可以立刻点网格里的东西（动画不阻塞交互） */
+  pointer-events: none;
+}
+
+[data-folder-anim='enter'] .folder-anim-item {
+  transform-origin: 50% 50%;
+  /* `backwards` 而不是 `both`：延迟期间保持"未入场"（opacity 0）的状态，
+     动画结束后回到基础样式（= 结束帧），不把 transform 永久留在元素上 ——
+     几百行的文件列表里那会白建一堆合成层。 */
+  animation: folder-tile-in 240ms cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+  animation-delay: var(--folder-stagger, 0ms);
+}
+[data-folder-anim='leave'] .folder-anim-item {
+  /* 出场：**位移必须发生在前半段**，所以用 ease-out（前快后慢），不是 ease-in。
+   * 总时长 150ms，配合 `animation-delay: calc(var(--folder-stagger) * 0.5)`
+   * （最多 96ms）→ 最后一条在 246ms 结束，卸载时刻 260ms（`FOLDER_EXIT_MS`）留 14ms 余量。
+   * 见下方 `folder-tile-out`：opacity 前 60% 保持 1，位移在 opacity 掉下去之前就跑完大部分，
+   * 否则位移会被"整块变透明"吃掉（2026-10-22 用户反馈"退出的磁贴动画失效了"的真因）。 */
+  animation: folder-tile-out 150ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--folder-stagger, 0ms) * 0.5);
+}
+
+/* 流畅档：**同一套磁贴语言**，只去掉 3D 旋转与 blur，保留位移 + 缩放 + 错峰。
+ * 错峰用 `calc(... * 0.67)` 把 JS 写死的 24ms 收到约 16ms —— 不新建 TS 常量，
+ * 档位差异继续全部收敛在这一层（`AssetGrid.tsx` 一个字不用改）。 */
+[data-motion='smooth'][data-folder-anim='enter'] .folder-anim-item {
+  animation-name: folder-tile-slide-in;
+  animation-delay: calc(var(--folder-stagger, 0ms) * 0.67);
+}
+[data-motion='smooth'][data-folder-anim='leave'] .folder-anim-item {
+  animation-name: folder-tile-slide-out;
+}
+/* 极致档：入场带一点失焦（其它两档不 blur，免得小字发虚） */
+[data-motion='ultra'][data-folder-anim='enter'] .folder-anim-item {
+  animation-name: folder-tile-in-ultra;
+}
+
+@keyframes folder-stage-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes folder-stage-out {
+  /* 前 46% 完全不透明：给磁贴的位移留出"看得见"的窗口；之后 140ms 收干净。 */
+  0% {
+    opacity: 1;
+  }
+  46% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes folder-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes folder-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+/* 磁贴翻入：从"略小 + 后仰 8°"立起来。perspective 写在每条内容上（父子同变换会互相干扰） */
+@keyframes folder-tile-in {
+  from {
+    opacity: 0;
+    transform: perspective(600px) translate3d(0, 8px, 0) rotateY(-8deg) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: perspective(600px) translate3d(0, 0, 0) rotateY(0deg) scale(1);
+  }
+}
+/* 磁贴飞出：向上飞 26px + 放大 6% + 前倾 7°（Win8 的"往外飞"方向感）。
+ * ⚠️ 两个关键点（2026-10-22 修复"退出动画看起来没播"）：
+ *   ① 位移量从 6px 提到 26px —— 6px 在 184px 的卡上只有 3%，肉眼等于没动；
+ *   ② **前 60% 保持 opacity 1**：位移先跑完约 90%，最后 40% 才淡出。
+ *      旧版 opacity 与位移同时线性收尾，位移还没发生完，元素已经透明了。 */
+@keyframes folder-tile-out {
+  0% {
+    opacity: 1;
+    transform: perspective(600px) translate3d(0, 0, 0) rotateY(0deg) scale(1);
+  }
+  60% {
+    opacity: 1;
+    transform: perspective(600px) translate3d(0, -18px, 0) rotateY(5deg) scale(1.045);
+  }
+  100% {
+    opacity: 0;
+    transform: perspective(600px) translate3d(0, -26px, 0) rotateY(7deg) scale(1.06);
+  }
+}
+/* 流畅档磁贴：纯位移 + 缩放。刻意不带 perspective / rotateY / blur ——
+ * 低端机只吃合成层位移，不与 3D 变换抢光栅化预算，但"磁贴感"仍在。 */
+@keyframes folder-tile-slide-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 12px, 0) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+/* 飞出方向与 balanced 一致（向上飞 + 微放大），但不带 perspective / rotateY / blur。
+ * 位移同样提到 20px、且前 60% 保持不透明（理由见 `folder-tile-out` 的注释）。 */
+@keyframes folder-tile-slide-out {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  60% {
+    opacity: 1;
+    transform: translate3d(0, -14px, 0) scale(1.03);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, -20px, 0) scale(1.04);
+  }
+}
+@keyframes folder-tile-in-ultra {
+  from {
+    opacity: 0;
+    filter: blur(2px);
+    transform: perspective(600px) translate3d(0, 8px, 0) rotateY(-8deg) scale(0.96);
+  }
+  60% {
+    filter: blur(0px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0px);
+    transform: perspective(600px) translate3d(0, 0, 0) rotateY(0deg) scale(1);
+  }
+}
+
+/* ── 系统「减少动效」：全部退化成 190ms 纯 opacity（含取消 stagger 延迟）──
+ * 放最后并带 `!important`：它是无障碍兜底，必须压过上面所有档位选择器。 */
+@media (prefers-reduced-motion: reduce) {
+  .folder-stage-enter,
+  .folder-stage-leave {
+    animation-duration: 190ms !important;
+    animation-timing-function: linear !important;
+  }
+  /* 出场舞台换回**纯线性淡出**：`folder-stage-out` 里"前 46% 保持不透明"是为磁贴位移
+   * 留的窗口，reduced 已经把位移压成 0，再保留这段停顿只会让退场显得拖沓。 */
+  .folder-stage-leave {
+    animation-name: folder-fade-out !important;
+  }
+  .folder-anim-item {
+    animation-name: folder-fade-in !important;
+    animation-duration: 190ms !important;
+    animation-delay: 0ms !important;
+    animation-timing-function: linear !important;
+    transform: none !important;
+    filter: none !important;
+  }
+  [data-folder-anim='leave'] .folder-anim-item {
+    animation-name: folder-fade-out !important;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * HDR 预览器 · 不确定态进度条（0.6.5，**仅追加**，不改上方任何既有规则）
+ *
+ * 用于「正在烘焙环境…」：PMREM 烘焙没有可测进度，所以只表达"还在动"，
+ * 绝不伪装成百分比（百分比只由主进程的真实字节比驱动）。
+ * 颜色只走 token（--accent），不引入新的调色板色值；
+ * 低不透明度是为了压在 `bg-elevated` 轨道上不刺眼。
+ * ────────────────────────────────────────────────────────────────────────── */
+@keyframes hdr-indeterminate-sweep {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+
+.hdr-indeterminate-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 28%;
+  border-radius: 9999px;
+  background: var(--accent);
+  opacity: 0.55;
+  animation: hdr-indeterminate-sweep 1.4s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+}
+
+/* 无障碍兜底：减少动效时不扫动，退化为一条静态低对比填充 */
+@media (prefers-reduced-motion: reduce) {
+  .hdr-indeterminate-bar {
+    animation: none;
+    width: 100%;
+    opacity: 0.3;
+  }
+}

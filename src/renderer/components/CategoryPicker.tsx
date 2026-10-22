@@ -1,0 +1,442 @@
+import { useEffect, useRef, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { useVault } from '../store'
+import { KIND_LABEL, kindFolder } from '../../shared/classify'
+import { UNCLASSIFIED } from '../../shared/taxonomy'
+import { level1OptionsFor, level2OptionsFor } from '../logic/category'
+import { Modal } from './Modal'
+
+/**
+ * 分类级联选择器（T07）：大类 → 一级 → 二级。
+ *
+ * - 一级选项：model/texture 有词表册（`level1OptionsFor`），其余大类只有自由输入；
+ * - 二级级联：`level2OptionsFor(一级)` —— 有枚举出下拉、空数组（一级=未分类）锁定为未分类、
+ *   null（如材质预设）渲染为「可自由输入」（06 §3.3-②）；
+ * - 批量目标跨大类时禁用确认（父目录永远由 asset.kind 算，03 §5.3）；
+ * - 确认后调 `store.assignCategory`（RA3 缩略图顺序在 store 内保证），renamed/failed 走全局轻提示。
+ *
+ * 2026-10（用户反馈「不要系统的默认的东西出现」）：一级 / 二级两处**不再用原生 `<select>`**。
+ * 原生控件的选项弹层是 Chromium / 操作系统绘制的（灰底、系统字体与系统高亮），
+ * 加 `appearance-none` 只改得到控件外观、改不到弹层 → 与产品 UI 两个风格。
+ * 所以触发件仍是 `.input` 盒子，但展开层改成**自绘浮层**，与中栏头「排序」浮层同构：
+ *   - 容器 `fixed z-40 w-[176px] rounded-btn border border-line bg-card p-1 shadow-modal`；
+ *   - 小标题 `px-2 pb-1 pt-1 text-[10px] text-tertiary`；
+ *   - 选项行 `flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition`；
+ *   - 选中态只用 `bg-accent-tint font-medium text-accent-text` 一个指示（不再叠勾号）。
+ * 定位取触发按钮的 `getBoundingClientRect()` 算 `fixed` 坐标并**右对齐夹取**：
+ * 本组件挂在可滚动弹窗里，`absolute top-full` 会被祖先的 overflow 裁掉。
+ */
+
+/** 浮层宽度：与中栏头「排序」浮层同宽（`App.tsx` 的 `SORT_PANEL_WIDTH`），保证同一控件家族 */
+const CATEGORY_PANEL_WIDTH = 176
+/** 浮层顶边与触发按钮底边的间距：与排序浮层同值（`rect.bottom + 6`） */
+const CATEGORY_PANEL_GAP = 6
+/** 选项列表最高高度：一级词表有 33 项，不封顶会把浮层顶出窗口（超出则列表内滚动） */
+const CATEGORY_LIST_MAX_HEIGHT = 280
+/** 浮层自身除列表以外的固定高度：p-1 上下各 4px + 小标题行约 22px */
+const CATEGORY_PANEL_CHROME = 34
+/** 浮层与窗口边缘的最小留白（与排序浮层的 `Math.max(8, …)` 一致） */
+const CATEGORY_PANEL_MARGIN = 8
+
+/** 浮层里的一行：`value` 写回分类字段，`label` 只用于展示 */
+interface CategoryOption {
+  value: string
+  label: string
+}
+
+/** 浮层坐标（`fixed`）：`left/top` 是面板左上角，`listMaxHeight` 给选项列表封顶 */
+interface CategoryPanelPos {
+  left: number
+  top: number
+  listMaxHeight: number
+}
+
+/**
+ * 按**触发按钮**矩形算浮层坐标。
+ *
+ * `left` 右对齐并夹取到窗口内（面板比按钮宽时不会顶出右缘）；
+ * `top` 贴着按钮下方 6px；
+ * `listMaxHeight` 按剩余可视高度封顶，保证面板整体不出窗口。
+ */
+function panelPositionFor(anchor: HTMLElement | null): CategoryPanelPos | null {
+  if (!anchor) return null
+  const rect = anchor.getBoundingClientRect()
+  const left = Math.max(CATEGORY_PANEL_MARGIN, Math.round(rect.right - CATEGORY_PANEL_WIDTH))
+  const top = Math.round(rect.bottom + CATEGORY_PANEL_GAP)
+  const available = window.innerHeight - top - CATEGORY_PANEL_CHROME - CATEGORY_PANEL_MARGIN
+  return { left, top, listMaxHeight: Math.max(84, Math.min(CATEGORY_LIST_MAX_HEIGHT, available)) }
+}
+
+export function CategoryPicker() {
+  const pickerIds = useVault((s) => s.categoryPickerIds)
+  const assets = useVault((s) => s.assets)
+  const close = useVault((s) => s.closeCategoryPicker)
+  const assignCategory = useVault((s) => s.assignCategory)
+
+  const targets = pickerIds ? assets.filter((a) => pickerIds.includes(a.id)) : []
+  const kind = targets[0]?.kind
+  const crossKind = targets.length > 1 && new Set(targets.map((t) => t.kind)).size > 1
+
+  const [level1, setLevel1] = useState<string>(UNCLASSIFIED)
+  const [level2, setLevel2] = useState<string>(UNCLASSIFIED)
+  const [busy, setBusy] = useState(false)
+
+  /** 当前展开的是哪一处浮层；`null` = 都收起（两处互斥，不会同时挂两个面板） */
+  const [openField, setOpenField] = useState<'level1' | 'level2' | null>(null)
+  /** 浮层坐标：打开那一刻按触发按钮矩形写死（`fixed`，不随布局重排漂移） */
+  const [panelPos, setPanelPos] = useState<CategoryPanelPos | null>(null)
+  /** 键盘高亮下标（↑/↓ 移动，Enter 选中），与「排序」浮层同一套交互 */
+  const [l1Cursor, setL1Cursor] = useState(0)
+  const [l2Cursor, setL2Cursor] = useState(0)
+
+  const l1Ref = useRef<HTMLDivElement | null>(null)
+  const l1ButtonRef = useRef<HTMLButtonElement | null>(null)
+  const l2Ref = useRef<HTMLDivElement | null>(null)
+  const l2ButtonRef = useRef<HTMLButtonElement | null>(null)
+
+  // 目标集合变化（打开/切换）时重置为当前值（批量取第一个目标的现状）
+  useEffect(() => {
+    if (pickerIds && targets.length > 0) {
+      setLevel1(targets[0].category1 || UNCLASSIFIED)
+      setLevel2(targets[0].category2 || UNCLASSIFIED)
+    }
+    setOpenField(null) // 换了目标集合 → 任何展开中的浮层都要收起（坐标已失效）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickerIds])
+
+  /**
+   * 分类浮层的关闭路径：点浮层外 / Esc / 窗口 resize。
+   *
+   * - Esc 用**捕获阶段 + stopPropagation**：同一次 Esc 不能再被全局快捷键消费
+   *   （弹窗里一次按键关两层是最烦人的那种交互）。
+   * - resize 必须关：浮层是 `fixed`、坐标在打开那一刻按按钮矩形写死 → 尺寸一变就错位。
+   */
+  useEffect(() => {
+    if (!openField) return
+    const root = openField === 'level1' ? l1Ref.current : l2Ref.current
+    const onPointerDown = (e: MouseEvent): void => {
+      if (root && e.target instanceof Node && root.contains(e.target)) return
+      setOpenField(null)
+    }
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      setOpenField(null)
+    }
+    const onResize = (): void => setOpenField(null)
+    window.addEventListener('mousedown', onPointerDown)
+    window.addEventListener('keydown', onKeyDown, true)
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown)
+      window.removeEventListener('keydown', onKeyDown, true)
+      window.removeEventListener('resize', onResize)
+    }
+  }, [openField])
+
+  if (!pickerIds || targets.length === 0 || !kind) return null
+
+  const l1Options = level1OptionsFor(kind)
+  const l2Options = level2OptionsFor(level1) // null = 自由输入；[] = 锁定为未分类
+  const multi = targets.length > 1
+
+  /** 一级：词表 + 「未分类」哨兵（哨兵恒在首行，与原下拉顺序一致） */
+  const l1Items: readonly CategoryOption[] = [
+    { value: UNCLASSIFIED, label: UNCLASSIFIED },
+    ...l1Options.filter((v) => v !== UNCLASSIFIED).map((v) => ({ value: v, label: v }))
+  ]
+  /** 一级当前值不在词表里：只在触发件上标注「词表外」，**不新增可选行**（原值不会被改写） */
+  const l1OutOfVocab = level1 !== UNCLASSIFIED && !l1Options.includes(level1)
+  const l1Display = l1OutOfVocab ? `${level1}（词表外）` : level1
+
+  /**
+   * 二级：`level2OptionsFor` 已保证「一级/二级」成对显示（不同一级下会有同名二级，
+   * 只写二级名容易选错）；一级是「未分类」时该分支根本不渲染。
+   */
+  const l2Items: readonly CategoryOption[] = [
+    { value: UNCLASSIFIED, label: UNCLASSIFIED },
+    ...(l2Options ?? []).filter((v) => v !== UNCLASSIFIED).map((v) => ({ value: v, label: `${level1}/${v}` }))
+  ]
+  /** 二级当前值不在词表里：同样只在触发件上标注，不改写原值 */
+  const l2OutOfVocab = l2Options !== null && level2 !== UNCLASSIFIED && !l2Options.includes(level2)
+  const l2Display =
+    level2 === UNCLASSIFIED ? UNCLASSIFIED : `${level1}/${level2}${l2OutOfVocab ? '（词表外）' : ''}`
+
+  /** 打开一级浮层：定位 + 高亮落到当前值（当前值不在词表里时落到首行「未分类」） */
+  const openLevel1Panel = (cursor?: number): void => {
+    const pos = panelPositionFor(l1ButtonRef.current)
+    if (!pos) return
+    setPanelPos(pos)
+    setL1Cursor(cursor ?? Math.max(0, l1Items.findIndex((it) => it.value === level1)))
+    setOpenField('level1')
+  }
+
+  /** 点一级触发件：展开中则收起；否则展开 */
+  const toggleLevel1Panel = (): void => {
+    if (openField === 'level1') {
+      setOpenField(null)
+      return
+    }
+    openLevel1Panel()
+  }
+
+  /**
+   * 选中一级：写回一级 + **二级重置为「未分类」**（与原 `<select>` 的 onChange 同语义，
+   * 级联规则一字未改：改了一级，旧的二级可能已不在新词表里，必须先清掉）。
+   */
+  const applyLevel1 = (value: string): void => {
+    setLevel1(value)
+    setLevel2(UNCLASSIFIED)
+    setOpenField(null)
+  }
+
+  /** 打开二级浮层（选项已由 `level2OptionsFor(level1)` 按一级过滤过） */
+  const openLevel2Panel = (cursor?: number): void => {
+    const pos = panelPositionFor(l2ButtonRef.current)
+    if (!pos) return
+    setPanelPos(pos)
+    setL2Cursor(cursor ?? Math.max(0, l2Items.findIndex((it) => it.value === level2)))
+    setOpenField('level2')
+  }
+
+  /** 点二级触发件：展开中则收起；否则展开 */
+  const toggleLevel2Panel = (): void => {
+    if (openField === 'level2') {
+      setOpenField(null)
+      return
+    }
+    openLevel2Panel()
+  }
+
+  /** 选中二级：只写回二级并收起（一级不变 → 不触级联重置） */
+  const applyLevel2 = (value: string): void => {
+    setLevel2(value)
+    setOpenField(null)
+  }
+
+  /**
+   * 一级浮层的键盘操作（挂在触发件 + 浮层共同的容器上，事件从当前焦点元素冒泡上来）：
+   * ↑/↓ 移动高亮（循环，未展开时展开），Enter 选中高亮项。
+   * Esc 由上面的 window 捕获监听处理（这里不重复，避免一次按键关两层）。
+   */
+  const onLevel1KeyDown = (e: ReactKeyboardEvent<HTMLDivElement>): void => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (openField !== 'level1') {
+        openLevel1Panel(Math.max(0, l1Items.findIndex((it) => it.value === level1)))
+        return
+      }
+      const step = e.key === 'ArrowDown' ? 1 : -1
+      setL1Cursor((i) => (i + step + l1Items.length) % l1Items.length)
+      return
+    }
+    if (e.key === 'Enter' && openField === 'level1') {
+      // preventDefault：触发件是 button，Enter 的默认行为会再触发一次 click（把刚关掉的面板又打开）
+      e.preventDefault()
+      const item = l1Items[l1Cursor]
+      if (item) applyLevel1(item.value)
+    }
+  }
+
+  /** 二级浮层的键盘操作：规则与一级完全一致 */
+  const onLevel2KeyDown = (e: ReactKeyboardEvent<HTMLDivElement>): void => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (openField !== 'level2') {
+        openLevel2Panel(Math.max(0, l2Items.findIndex((it) => it.value === level2)))
+        return
+      }
+      const step = e.key === 'ArrowDown' ? 1 : -1
+      setL2Cursor((i) => (i + step + l2Items.length) % l2Items.length)
+      return
+    }
+    if (e.key === 'Enter' && openField === 'level2') {
+      e.preventDefault()
+      const item = l2Items[l2Cursor]
+      if (item) applyLevel2(item.value)
+    }
+  }
+
+  const confirm = async () => {
+    if (busy || crossKind) return
+    setBusy(true)
+    const c1 = level1.trim() || UNCLASSIFIED
+    const c2 = c1 === UNCLASSIFIED ? UNCLASSIFIED : level2.trim() || UNCLASSIFIED
+    await assignCategory(targets.map((t) => t.id), c1, c2).catch(() => undefined)
+    setBusy(false)
+    close()
+  }
+
+  return (
+    <Modal title={multi ? `指派分类（${targets.length} 个资产）` : '指派分类'} onClose={close} width="max-w-md">
+      <div className="mb-3 text-[12px] text-muted">
+        大类：<span className="font-medium text-primary">{kindFolder(kind)}（{KIND_LABEL[kind]}）</span>
+        {multi && '（父目录由各大类自身决定，因此跨大类不能批量指派）'}
+      </div>
+
+      {crossKind && (
+        <div className="mb-3 rounded-lg border border-danger/40 bg-danger-tint px-3 py-2 text-[12px] text-danger">
+          选中项跨多个大类，无法批量指派。请先取消多余的大类（Ctrl+点击可切换多选）。
+        </div>
+      )}
+
+      {/* 一级分类 */}
+      <div className="mb-1 text-[12px] font-medium">一级分类</div>
+      {l1Options.length > 0 ? (
+        <div ref={l1Ref} onKeyDown={onLevel1KeyDown}>
+          <button
+            ref={l1ButtonRef}
+            type="button"
+            className="input flex items-center justify-between gap-2 text-left"
+            aria-haspopup="listbox"
+            aria-expanded={openField === 'level1'}
+            aria-label={`一级分类：${l1Display}`}
+            onClick={toggleLevel1Panel}
+          >
+            <span className="min-w-0 truncate">{l1Display}</span>
+            <span aria-hidden className="pointer-events-none shrink-0 text-[9px] text-tertiary">
+              ▾
+            </span>
+          </button>
+
+          {openField === 'level1' && panelPos && (
+            <div
+              className="fixed z-40 w-[176px] rounded-btn border border-line bg-card p-1 shadow-modal"
+              style={{ left: panelPos.left, top: panelPos.top }}
+            >
+              {/* 小标题放在 listbox **外面**：listbox 的直接子节点只能是 option / group */}
+              <div className="px-2 pb-1 pt-1 text-[10px] text-tertiary">一级分类</div>
+              <div
+                role="listbox"
+                aria-label="一级分类"
+                className="overflow-y-auto"
+                style={{ maxHeight: panelPos.listMaxHeight }}
+              >
+                {l1Items.map((opt, i) => {
+                  const active = opt.value === level1
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      role="option"
+                      aria-selected={active}
+                      title={opt.label}
+                      // 选中态**只用一个指示**（与排序浮层同款 accent-tint），不再叠勾号
+                      className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
+                        active
+                          ? 'bg-accent-tint font-medium text-accent-text'
+                          : i === l1Cursor
+                            ? 'bg-elevated/60 text-secondary'
+                            : 'text-secondary hover:bg-elevated/60'
+                      }`}
+                      onClick={() => applyLevel1(opt.value)}
+                    >
+                      <span className="min-w-0 truncate">{opt.label}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <input
+          className="input"
+          value={level1 === UNCLASSIFIED ? '' : level1}
+          placeholder="可自由输入，留空则归入「未分类」"
+          onChange={(e) => {
+            setLevel1(e.target.value)
+            setLevel2(UNCLASSIFIED)
+          }}
+        />
+      )}
+
+      {/* 二级分类（级联） */}
+      <div className="mb-1 mt-3 text-[12px] font-medium">二级分类</div>
+      {level1 === UNCLASSIFIED ? (
+        <input className="input opacity-50" value="未分类" disabled title="未指派一级分类时，二级强制为「未分类」" />
+      ) : l2Options === null ? (
+        <input
+          className="input"
+          value={level2 === UNCLASSIFIED ? '' : level2}
+          placeholder="该一级分类无级联词表，可自由输入，留空则归入「未分类」"
+          onChange={(e) => setLevel2(e.target.value)}
+        />
+      ) : (
+        <div ref={l2Ref} onKeyDown={onLevel2KeyDown}>
+          <button
+            ref={l2ButtonRef}
+            type="button"
+            className="input flex items-center justify-between gap-2 text-left"
+            aria-haspopup="listbox"
+            aria-expanded={openField === 'level2'}
+            aria-label={`二级分类：${l2Display}`}
+            title="按「一级/二级」成对显示：不同一级分类下会有同名的二级分类，只写二级名容易选错"
+            onClick={toggleLevel2Panel}
+          >
+            <span className="min-w-0 truncate">{l2Display}</span>
+            <span aria-hidden className="pointer-events-none shrink-0 text-[9px] text-tertiary">
+              ▾
+            </span>
+          </button>
+
+          {openField === 'level2' && panelPos && (
+            <div
+              className="fixed z-40 w-[176px] rounded-btn border border-line bg-card p-1 shadow-modal"
+              style={{ left: panelPos.left, top: panelPos.top }}
+            >
+              <div className="px-2 pb-1 pt-1 text-[10px] text-tertiary">二级分类</div>
+              <div
+                role="listbox"
+                aria-label="二级分类"
+                className="overflow-y-auto"
+                style={{ maxHeight: panelPos.listMaxHeight }}
+              >
+                {l2Items.map((opt, i) => {
+                  const active = opt.value === level2
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      role="option"
+                      aria-selected={active}
+                      title={opt.label}
+                      className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
+                        active
+                          ? 'bg-accent-tint font-medium text-accent-text'
+                          : i === l2Cursor
+                            ? 'bg-elevated/60 text-secondary'
+                            : 'text-secondary hover:bg-elevated/60'
+                      }`}
+                      onClick={() => applyLevel2(opt.value)}
+                    >
+                      <span className="min-w-0 truncate">{opt.label}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      <p className="mt-3 text-[11px] leading-relaxed text-muted">
+        确认后会把资产目录移动到「{kindFolder(kind)} / 一级 / 二级 /」下；目标位置已有同名目录时自动追加序号，永不覆盖。
+      </p>
+
+      <div className="mt-4 flex justify-end gap-2">
+        <button className="btn" onClick={close}>
+          取消
+        </button>
+        <button
+          className="btn btn-primary"
+          onClick={() => void confirm()}
+          disabled={busy || crossKind}
+          title={crossKind ? '选中项跨大类，不能批量指派' : undefined}
+        >
+          {busy ? '移动中…' : multi ? `指派 ${targets.length} 个` : '指派'}
+        </button>
+      </div>
+    </Modal>
+  )
+}

@@ -1,0 +1,31 @@
+node_modules/
+out/
+
+# 构建产物（release / release-v001 / release-dbg4 …）
+release*/
+*.log
+.DS_Store
+
+# 调试与探针残留
+.asar-check-*
+.probe/
+/*.png
+/*.jpg
+
+# 探针抓下来的原始样本（体积大，结论已写进 docs/*.md）
+docs/probe/
+
+# 设计包的压缩副本（与 docs/idbox-ui-package/ 目录重复）
+docs/idbox-ui-package-v0.2.zip
+
+# 历史单文件原型（真实入口是 src/main/index.ts → out/main/index.cjs）
+/index.js
+
+# 早期一次性原型目录，不参与构建
+/prototype/
+
+# 品牌源图里的个人信息：真实微信二维码不进公开仓库
+# （仓库里提交的是 src/renderer/assets/brand/contact-qr.png 的占位图；
+#   要换成本机真实码 → resources/brand/contact-wechat.local.jpg 后跑 npm run brand）
+resources/brand/contact-wechat.jpg
+resources/brand/*.local.*
