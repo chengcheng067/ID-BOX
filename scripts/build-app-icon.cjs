@@ -471,6 +471,12 @@ function main() {
     // 反馈码源图可能不存在（公开仓库不带真实二维码）→ 跳过，保留已有产物（占位图）
     if (fs.existsSync(SRC_CONTACT)) {
       buildQr(SRC_CONTACT, OUT_CONTACT_QR, '加好友码')
+      // ⚠️ 产物路径是**被 git 跟踪**的占位图那一份：本机跑完这里就变成你的真码了。
+      // 提交前务必还原，否则真实二维码会被推到公开仓库。
+      console.log(
+        '[brand] ⚠️ 已用本机源图覆盖 contact-qr.png。' +
+          '提交前请还原占位图：git checkout -- src/renderer/assets/brand/contact-qr.png'
+      )
     } else {
       console.log(
         '[brand] 未找到 contact-wechat.local.jpg / contact-wechat.jpg → 跳过反馈码，' +

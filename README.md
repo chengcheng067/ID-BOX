@@ -149,6 +149,10 @@ npm run brand
 > 真实微信二维码属于个人信息，不进公开仓库。
 > 要换成你自己的：把图存成 `resources/brand/contact-wechat.local.jpg` → `npm run brand`，
 > 产物会覆盖占位图；源图不存在时脚本会跳过、保留占位图，不会报错。
+>
+> **注意**：`contact-qr.png` 是被 git 跟踪的文件，所以在自己机器上跑过 `npm run brand` 之后，
+> 提交前请还原占位图——`git checkout -- src/renderer/assets/brand/contact-qr.png`。
+> 否则你的个人二维码会跟着 commit 进公开仓库。
 
 ---
 
