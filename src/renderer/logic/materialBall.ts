@@ -289,6 +289,9 @@ export function dataChannelLabel(files: readonly AssetFile[]): string | null {
 import {
   DEFAULT_PARAM_SCALES,
   ballHash,
+  clampAlpha,
+  clampLight,
+  clampMetal,
   clampScale,
   clampUv,
   normalizeParams,
@@ -299,7 +302,15 @@ import {
 // 既有调用方（tests/ballParams.test.ts、MaterialBall.tsx、CustomRenderDialog.tsx）
 // 的 import 路径一行都不用改。
 export type { BallParamScales } from '../../shared/ballParams'
-export { DEFAULT_PARAM_SCALES, clampScale, clampUv } from '../../shared/ballParams'
+export {
+  DEFAULT_PARAM_SCALES,
+  clampAlpha,
+  clampLight,
+  clampMetal,
+  clampScale,
+  clampUv,
+  normalizeParams
+} from '../../shared/ballParams'
 
 /**
  * 平铺倍率 = 形态基准 repeat × UV 倍率（v0.2.1 增补 2）。
@@ -307,6 +318,40 @@ export { DEFAULT_PARAM_SCALES, clampScale, clampUv } from '../../shared/ballPara
  */
 export function effectiveUvRepeat(baseRepeat: number, mult: number): number {
   return baseRepeat * clampUv(mult)
+}
+
+/**
+ * 球面 UV 的 u:v **弧长比** = 2（不是 1）。
+ *
+ * `SphereGeometry` 是等距圆柱投影：`u` 走满一圈对应赤道弧长 `2πr`，`v` 走满半圈
+ * （南极→北极）对应弧长 `πr`，所以 **u 方向每单位 UV 覆盖的球面长度是 v 方向的 2 倍**。
+ * 一张正方的砖纹贴图铺上去，横向被拉伸 2 倍 → 用户看到的「方砖变长砖」。
+ * 补偿方式：u 的 repeat 必须是 v 的 2 倍（不是把球切细、更不是改相机）。
+ */
+export const UV_ASPECT_SPHERE = 2
+
+/**
+ * 形态 → UV 弧长比。
+ *
+ * 只有球面需要补偿：平面是正方形（2.2×2.2，u/v 各 0→1，1:1），圆角盒的每个面也按
+ * 面内 0→1 展开（近似 1:1）。给它们也乘 2 反而会把方块贴图**压扁**成竖长条。
+ */
+export function uvAspectOf(shape: 'sphere' | 'plane' | 'roundedBox'): number {
+  return shape === 'sphere' ? UV_ASPECT_SPHERE : 1
+}
+
+/**
+ * 写贴图平铺（**唯一写入口径**）：`repeat.x = scale × aspect`、`repeat.y = scale`。
+ *
+ * 参数只需一个 `repeat.set()`，因此单测传一个最小桩对象即可，不需要 three / WebGL。
+ * 默认 `aspect = UV_ASPECT_SPHERE`（球面），二维形态请显式传 `uvAspectOf(shape)`。
+ */
+export function applyUvRepeat(
+  tex: { repeat: { set(x: number, y: number): void } },
+  scale: number,
+  aspect: number = UV_ASPECT_SPHERE
+): void {
+  tex.repeat.set(scale * aspect, scale)
 }
 
 /**
@@ -351,7 +396,8 @@ function slotsHash(slots: MaterialSlots, params: BallParamScales): string {
  * 用 PNG 的理由见 shared 版注释（无 alpha 通道的 JPEG 会把纸色烤死，深色主题下变白块）。
  *
  * 2026-10 调参持久化（docs/12 §3.3，方案 B）：第三参 `params` 可选——
- * **默认参数（1,1,1）不贡献 hash**，所以未调参资产的既有缓存全部保留、不重渲；
+ * **默认参数（倍率 1/1/1 + 光 1 + 非金属 + 不透明）不贡献 hash**，所以未调参资产的
+ * 既有缓存保留、不重渲（唯一例外是 `RENDER_REV` 变化时的一次性失效）；
  * 只有真调过参的材质才会算出不同的名字。参数串只进 hash，不进文件名字面。
  */
 export function ballThumbName(
@@ -400,8 +446,20 @@ export interface MaterialParamValues {
   normalScale: number
   /** displacementScale */
   displacementScale: number
-  /** 贴图平铺倍率 */
+  /** 贴图平铺倍率（由调用方再乘 `uvAspectOf(shape)` 写进 repeat） */
   uv: number
+  /** 金属度绝对值（0-1）→ `material.metalness` */
+  metal: number
+  /** 不透明度（0.1-1）→ `material.opacity`；1 时不透明 */
+  alpha: number
+  /**
+   * 光线强度（0.2-2）→ `scene.environmentIntensity`。
+   *
+   * **它不是材质属性**，所以 `applyMaterialParams` 不写它（写进 material 会被
+   * three 忽略）——由 `BallScene.applyParams` 单独写进 scene。放在同一个值对象里
+   * 是为了让"按当前倍率 + 最终基准重算"这一次计算把六个参数一次算全。
+   */
+  light: number
 }
 
 /**
@@ -413,13 +471,26 @@ export interface ParamMaterialTarget {
   roughness: number
   normalScale: { set(x: number, y: number): void }
   displacementScale: number
+  metalness: number
+  transparent: boolean
+  opacity: number
 }
 
-/** 把解析好的参数值写进材质（BallScene 与单测共用这一份写入口径） */
+/**
+ * 把解析好的参数值写进材质（BallScene 与单测共用这一份写入口径）。
+ *
+ * 透明度：`alpha === 1` 时把 `transparent` 关掉（不留半透明排序开销，也让不透明球
+ * 走既有的快速路径）；`alpha < 1` 才开。球是**单个物体**、默认 `side: FrontSide`
+ * （背面不画），所以半透明时不存在"正面/背面谁先画"的自排序问题，
+ * `depthWrite` 保持默认 true 即可，不需要额外处理。
+ */
 export function applyMaterialParams(target: ParamMaterialTarget, values: MaterialParamValues): void {
   target.roughness = values.roughness
   target.normalScale.set(values.normalScale, values.normalScale)
   target.displacementScale = values.displacementScale
+  target.metalness = values.metal
+  target.transparent = values.alpha < 1
+  target.opacity = values.alpha
 }
 
 /**
@@ -536,7 +607,11 @@ export class ParamScaleState {
       ),
       normalScale: effectiveBumpScale(this.basis.baseNormalScale, b),
       displacementScale: effectiveBumpScale(this.basis.baseDisplacementScale, b),
-      uv: clampUv(this.scales.uv)
+      uv: clampUv(this.scales.uv),
+      // 后三个参数与基准（map 有无）无关：直接 clamp 即可，clamp 同时负责 NaN 回落
+      metal: clampMetal(this.scales.metal),
+      alpha: clampAlpha(this.scales.alpha),
+      light: clampLight(this.scales.light)
     }
   }
 }

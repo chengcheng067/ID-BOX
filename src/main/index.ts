@@ -12,6 +12,9 @@ import {
   type Asset,
   type FetchZhimoCoverPayload,
   type FetchZhimoCoverResult,
+  type ImportConflictAnswer,
+  type ImportConflictAsk,
+  type ImportConflictContext,
   type ImportEvent,
   type LogExportResult,
   type MergeMaterialAssetRef,
@@ -70,6 +73,7 @@ import {
   rollbackMaterialMerge
 } from './materialMerge'
 import { isWithinRoot } from '../shared/vault'
+import { probeSizes } from './probeSizes'
 import { isKindFolderName } from '../shared/classify'
 import { composeRelFolder, normalizeCategoryPair } from '../shared/naming'
 import {
@@ -78,6 +82,7 @@ import {
   importPaths,
   renameAssetFolder
 } from './importer'
+import { createConflictGate } from './conflictGate'
 
 /**
  * HDR 预览缓存目录（0.6.5）：`<userData>/hdr-cache`。
@@ -146,7 +151,181 @@ async function disposeArchiveWithStrategy(src: string, mode: Settings['archiveDi
 
 function emitImportEvent(ev: ImportEvent): void {
   win?.webContents.send(IPC.importEvent, ev)
-  if (ev.status === 'done' || ev.status === 'error') watcher.markDone(ev.item)
+  // `skipped` 也算「该源文件已有结论」：watcher 不能把它的 inflight 占位一直挂着
+  if (ev.status === 'done' || ev.status === 'error' || ev.status === 'skipped') {
+    watcher.markDone(ev.item)
+  }
+}
+
+// ── 导入重复处置（docs/27 T-05）────────────────────────────────────────
+//
+// 两个模块级状态：
+// - `batchChain`：**批次串行锁**（D18）。两个批次并发写同一个 cat2 目录时，
+//   `uniqueName` + 批内台账 + 覆盖的「挪旧/落新」会互相踩（尤其覆盖把旧目录改名，
+//   另一批正好在读到这个名字）。第二个批次排队等第一个跑完，UI 里它以 pending 挂着。
+// - `pendingAsks`：`requestId → 兑现函数`。渲染进程答复 / 超时 / 关窗 / 渲染进程崩溃
+//   都从这里收口，保证**任何情况下都不会有 Promise 永久悬挂**（D08）。
+
+/** 重复询问的超时（§4.4：20 行明细 + 逐条判断，60s 会掐断正在认真读的用户） */
+const CONFLICT_ASK_TIMEOUT_MS = 120_000
+
+let batchChain: Promise<unknown> = Promise.resolve()
+const pendingAsks = new Map<string, (answer: ImportConflictAnswer | null) => void>()
+
+/**
+ * 发一次重复询问给渲染层，等用户裁决（§4.3）。
+ *
+ * - **窗口不可用 → 立刻返回 null**（= 全部跳过），绝不等 120s；
+ * - 120s 无人应答 → 兑现 null（= 全部跳过，D08）；
+ * - 答复经 `IPC.importConflictAnswer` handler 兑现；过期 requestId 的答复被丢弃（幂等）。
+ */
+function sendConflictAsk(ask: ImportConflictAsk): Promise<ImportConflictAnswer | null> {
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) {
+    logInfo('import:conflict', {
+      requestId: ask.requestId,
+      items: ask.items.length,
+      batchDefault: ask.batchDefault,
+      timedOut: false,
+      phase: 'no-window'
+    })
+    return Promise.resolve(null)
+  }
+  const target = win
+  return new Promise<ImportConflictAnswer | null>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingAsks.delete(ask.requestId)
+      // ── 作废事件（真机 P1 补丁）────────────────────────────────────
+      // 超时是主进程**单方面**结束：不通知的话，渲染层的 conflictAsk 仍非 null → 弹窗一直
+      // 挂在屏幕上；用户之后点「确定」/「全部取消」只会命中答复 handler 的 stale 分支
+      // （幂等丢弃，语义正确），表现却是「点了没反应、弹窗不关」。
+      // ⚠️ 只在这里发（超时路径）。`clearPendingAsks()` 走的是渲染进程已崩 / 窗口正在销毁 /
+      //    退出中，那三条路要么没有接收方、要么窗口正在销毁 —— 发过去只会在日志里造噪音。
+      let notified = false
+      if (!target.isDestroyed() && !target.webContents.isDestroyed()) {
+        try {
+          target.webContents.send(IPC.importConflictExpired, { requestId: ask.requestId })
+          notified = true
+        } catch (err) {
+          // 发送失败只记日志：Promise 必须照常兑现（绝不能让窗口状态影响导入批次收尾）
+          logWarn('import:conflict', {
+            requestId: ask.requestId,
+            phase: 'expire-send-failed',
+            error: err instanceof Error ? err.message : String(err)
+          })
+        }
+      }
+      logInfo('import:conflict', {
+        requestId: ask.requestId,
+        items: ask.items.length,
+        batchDefault: ask.batchDefault,
+        timedOut: true,
+        // 是否成功推送了「询问已作废」事件（排障用：false = 弹窗可能仍挂在屏幕上）
+        notified,
+        phase: 'timeout'
+      })
+      resolve(null)
+    }, CONFLICT_ASK_TIMEOUT_MS)
+
+    pendingAsks.set(ask.requestId, (answer) => {
+      clearTimeout(timer)
+      resolve(answer)
+    })
+    logInfo('import:conflict', {
+      requestId: ask.requestId,
+      items: ask.items.length,
+      batchDefault: ask.batchDefault,
+      remainingItems: ask.remainingItems,
+      timedOut: false,
+      phase: 'ask'
+    })
+    try {
+      target.webContents.send(IPC.importConflictAsk, ask)
+    } catch (err) {
+      // 发送瞬间窗口没了：按超时兜底（绝不把异常漏给整批导入）
+      pendingAsks.delete(ask.requestId)
+      clearTimeout(timer)
+      logWarn('import:conflict', {
+        requestId: ask.requestId,
+        phase: 'send-failed',
+        error: err instanceof Error ? err.message : String(err)
+      })
+      resolve(null)
+    }
+  })
+}
+
+/**
+ * 清场：兑现所有挂起的询问为 `null`（= 全部跳过）并清空表。
+ *
+ * 三个调用点：`render-process-gone` / `win.on('closed')` / `before-quit`。
+ * 渲染进程崩了不能干等 120s（§4.3 / 端到端验收 6）。
+ */
+function clearPendingAsks(reason: string): void {
+  if (pendingAsks.size === 0) return
+  const count = pendingAsks.size
+  for (const resolve of pendingAsks.values()) resolve(null)
+  pendingAsks.clear()
+  logWarn('import:conflict:cancelled', { pending: count, reason })
+}
+
+/**
+ * 执行一个导入批次。
+ *
+ * `ctx` = 渲染层算好的判重快照（docs/27）：不传 → 完全不判重、不询问，
+ * 行为与 0.6.9 逐字节等价（D21）。主进程**不自己扫盘**（D22）。
+ */
+async function runImport(paths: string[], ctx?: ImportConflictContext): Promise<Asset[]> {
+  // 一批一个询问门：聚合窗口、逐键复用、超时锁定都只在本批次内生效
+  const gate = createConflictGate({ sendAsk: sendConflictAsk })
+  try {
+    const assets = await importPaths(paths, {
+      libraryDir: settings.libraryDir,
+      sevenZipPath: settings.sevenZipPath ?? findSevenZip(),
+      archiveDisposal: settings.archiveDisposal,
+      defaultSource: settings.defaultSource,
+      codepage: settings.codepage,
+      timeoutMs: settings.extractTimeoutMs,
+      maxBytesForJsFallback: settings.maxBytesForJsFallback,
+      spaceSafetyFactor: settings.spaceSafetyFactor,
+      // §3.6 导入 tab「同时解压任务数」stepper（默认 2，旧档无此键时回退 importer 内置值）
+      concurrency: settings.extractConcurrency ?? DEFAULT_CONCURRENCY,
+      // T04 核心接线点：真实缩略图服务注入（原来是 placeholderEnsureThumb）
+      ensureThumb: (id, coverAbs) => ensureThumb(id, coverAbs, { maxPx: settings.thumbMaxPx }),
+      // P0-16/P0-5：原包处置走回收站策略（shell.trashItem 优先，打包态可靠）
+      disposeArchive: disposeArchiveWithStrategy,
+      // docs/27：判重快照 + 询问门 + 覆盖时旧目录进**系统回收站**（D11，不进库内 .trash）
+      conflictContext: ctx,
+      askConflict: (query) => gate.ask(query),
+      trashFolder: (abs) => trashOne(abs, trashStrategy),
+      warn: (event, context) => logWarn(event, context),
+      emit: emitImportEvent
+    })
+    // ── AI 辅助分类触发点（docs/15 §7）────────────────────────────────
+    // 批次结束后**通知渲染层**去后台补分类：这里只 `send`（fire-and-forget），
+    // **不 await 任何网络请求**——导入耗时与是否配置 AI 完全无关。
+    // 覆盖两条导入入口：UI 的 import:paths 与监控目录（watcher 直接调 runImport）。
+    try {
+      win?.webContents.send(IPC.importBatchDone, { count: assets.length })
+    } catch {
+      /* 窗口已销毁：忽略（导入本身已成功） */
+    }
+    return assets
+  } finally {
+    // 批次结束（含异常）：兑现所有还挂着的询问，绝不留 pending
+    gate.cancelAll()
+  }
+}
+
+function restartWatcher(): void {
+  watcher.stop()
+  if (settings.watchEnabled && settings.watchDir) {
+    watcher.start(settings.watchDir, (p) => {
+      // docs/27 D19：监控目录的自动导入**不弹窗**（后台任务弹窗会在用户不在电脑前时
+      // 长期挂起），固定按现状「同时存在并重命名」。显式传空快照 = 不判重、不询问，
+      // 与不传 ctx 完全等价（D21），写出来是为了让后来者一眼看到这是刻意的。
+      void runImport([p], { index: [] })
+    })
+  }
 }
 
 /**
@@ -263,44 +442,6 @@ function resolveDragCard(cardPng: unknown): DragIconResolution | null {
   }
 }
 
-async function runImport(paths: string[]): Promise<Asset[]> {
-  const assets = await importPaths(paths, {
-    libraryDir: settings.libraryDir,
-    sevenZipPath: settings.sevenZipPath ?? findSevenZip(),
-    archiveDisposal: settings.archiveDisposal,
-    defaultSource: settings.defaultSource,
-    codepage: settings.codepage,
-    timeoutMs: settings.extractTimeoutMs,
-    maxBytesForJsFallback: settings.maxBytesForJsFallback,
-    spaceSafetyFactor: settings.spaceSafetyFactor,
-    // §3.6 导入 tab「同时解压任务数」stepper（默认 2，旧档无此键时回退 importer 内置值）
-    concurrency: settings.extractConcurrency ?? DEFAULT_CONCURRENCY,
-    // T04 核心接线点：真实缩略图服务注入（原来是 placeholderEnsureThumb）
-    ensureThumb: (id, coverAbs) => ensureThumb(id, coverAbs, { maxPx: settings.thumbMaxPx }),
-    // P0-16/P0-5：原包处置走回收站策略（shell.trashItem 优先，打包态可靠）
-    disposeArchive: disposeArchiveWithStrategy,
-    emit: emitImportEvent
-  })
-  // ── AI 辅助分类触发点（docs/15 §7）────────────────────────────────
-  // 批次结束后**通知渲染层**去后台补分类：这里只 `send`（fire-and-forget），
-  // **不 await 任何网络请求**——导入耗时与是否配置 AI 完全无关。
-  // 覆盖两条导入入口：UI 的 import:paths 与监控目录（watcher 直接调 runImport）。
-  try {
-    win?.webContents.send(IPC.importBatchDone, { count: assets.length })
-  } catch {
-    /* 窗口已销毁：忽略（导入本身已成功） */
-  }
-  return assets
-}
-
-function restartWatcher(): void {
-  watcher.stop()
-  if (settings.watchEnabled && settings.watchDir) {
-    watcher.start(settings.watchDir, (p) => {
-      void runImport([p])
-    })
-  }
-}
 
 /**
  * 崩溃现场捕获 + staging 三重清理（K2）。
@@ -314,6 +455,9 @@ function restartWatcher(): void {
  */
 function installCrashHandlers(): void {
   const cleanup = (): void => {
+    // 退出前必须把挂起的重复询问兑现掉，否则正在等答复的批次会卡在 await 上，
+    // `cleanupStaging` 会把它的 staging 删掉而 Promise 永远不返回（docs/27 §4.3）
+    clearPendingAsks('before-quit')
     void cleanupStaging(settings.libraryDir)
   }
   app.on('before-quit', cleanup)
@@ -353,6 +497,9 @@ function installCrashHandlers(): void {
         }
       })()
     })
+    // 渲染进程没了 = 没人能回答重复询问：**立刻**全按「跳过」收尾，绝不干等 120s
+    // （docs/27 §4.3 / 端到端验收 6：kill 渲染进程后主进程要立即收尾）
+    clearPendingAsks('render-gone')
     flushLogsSync()
   })
 
@@ -393,6 +540,11 @@ function createWindow(): void {
   }
   win.on('maximize', sendMaximized)
   win.on('unmaximize', sendMaximized)
+
+  // 窗口关掉 = 没人能回答重复询问（docs/27 §4.3）：立即按「跳过」收尾
+  win.on('closed', () => {
+    clearPendingAsks('window-closed')
+  })
 
   const devUrl = process.env['ELECTRON_RENDERER_URL']
   if (devUrl) {
@@ -526,7 +678,50 @@ app.on('window-all-closed', () => {
 
 // ── IPC ──────────────────────────────────────────────────────────
 
-ipcMain.handle(IPC.importPaths, (_e, paths: string[]) => runImport(paths))
+/**
+ * 导入入口（docs/27 T-05）。
+ *
+ * **批次串行**（D18）：`batchChain` 让第二个批次排队等第一个跑完 —— 两个批次并发写
+ * 同一个 cat2 目录时，`uniqueName` + 台账 + 覆盖的「挪旧/落新」会互相踩。
+ * `batchChain` 用「then(空, 空)」吸收失败，失败的批次不会卡死后续所有导入。
+ *
+ * `ctx` 缺省 = 不判重（D21，与 0.6.9 等价）；老渲染层不传第二个参数也不会报错。
+ */
+ipcMain.handle(IPC.importPaths, (_e, paths: string[], ctx?: ImportConflictContext) => {
+  const list = Array.isArray(paths) ? paths : []
+  const run = batchChain.then(() => runImport(list, ctx))
+  batchChain = run.then(
+    () => undefined,
+    () => undefined
+  )
+  return run
+})
+
+/**
+ * 重复询问的答复（docs/27 §4.3）。
+ *
+ * 按 `requestId` 兑现挂起的 Promise；**过期 requestId 幂等丢弃**（超时后才到的答复
+ * 不能影响后续批次）。渲染层被注入也不会造成越权：这里只认主进程自己发出去的 id。
+ */
+ipcMain.handle(IPC.importConflictAnswer, (_e, answer: ImportConflictAnswer | undefined) => {
+  const requestId = typeof answer?.requestId === 'string' ? answer.requestId : ''
+  if (!requestId) return
+  const resolve = pendingAsks.get(requestId)
+  if (!resolve) {
+    logWarn('import:conflict:answer', { requestId, phase: 'stale' })
+    return
+  }
+  pendingAsks.delete(requestId)
+  logInfo('import:conflict', {
+    requestId,
+    items: Array.isArray(answer?.overrides) ? answer!.overrides!.length : 0,
+    batchDefault: answer?.batchDefault ?? null,
+    cancelled: answer?.cancelled === true,
+    timedOut: false,
+    phase: 'answer'
+  })
+  resolve(answer ?? null)
+})
 
 ipcMain.handle(IPC.getSettings, () => settings)
 
@@ -1062,6 +1257,39 @@ ipcMain.handle(IPC.saveBallThumb, async (_e, payload: SaveBallThumbPayload) => {
     console.error('[idbox] thumb:saveBall 写盘失败：', payload.assetId, err)
     logError('thumb:saveBall-failed', err, { assetId: payload.assetId })
     return null
+  }
+})
+
+/**
+ * 尺寸**回填**（2026-10「分辨率筛选在材质与 HDR 都失效」）。
+ *
+ * 老库的资产从没采过 `w/h`（0.6.0 起才在导入时采集），所以这里给渲染层一条
+ * **只读探测**通道：它只读文件头（64KB）、不解码整图，也不做任何回填调度 ——
+ * 什么时候探、怎么落库全由调用方决定。
+ *
+ * 安全边界（与 `drag:start` / `setCoverImage` 同口径）：`folder` 必须 resolve 后
+ * 位于库目录内。核心模块 `probeSizes` **故意不做**这条校验（它只认 folder 字符串），
+ * 所以 IPC 这层是唯一的防线，越界一律返回空数组（IPC 表面只有一种形状）。
+ */
+ipcMain.handle(IPC.probeSizes, async (_e, folder: string, rels: string[]) => {
+  if (typeof folder !== 'string' || folder.length === 0) return []
+  if (!Array.isArray(rels)) return []
+
+  const lib = path.resolve(settings.libraryDir)
+  const target = path.resolve(folder)
+  if (!isWithinRoot(lib, target, path.sep)) {
+    console.warn('[idbox] [probeSizes] 拒绝越界资产目录：', folder)
+    logWarn('probe-sizes:rejected-outside-library', { folder })
+    return []
+  }
+
+  try {
+    return await probeSizes(target, rels.filter((r): r is string => typeof r === 'string'))
+  } catch (err) {
+    // probeSizes 内部已逐条静默容错，走到这里只可能是意料之外（如 settings 未就绪）
+    console.error('[idbox] [probeSizes] 探测失败：', target, err)
+    logWarn('probe-sizes:failed', { folder: target })
+    return []
   }
 })
 

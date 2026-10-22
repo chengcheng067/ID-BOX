@@ -30,10 +30,10 @@
  */
 import { useEffect, useRef, useState, useSyncExternalStore, type MutableRefObject } from 'react'
 import {
-  ACESFilmicToneMapping,
   Color,
   Mesh,
   MeshPhysicalMaterial,
+  NeutralToneMapping,
   PMREMGenerator,
   PerspectiveCamera,
   PlaneGeometry,
@@ -62,11 +62,14 @@ import {
   SLOT_ORDER,
   ParamScaleState,
   applyMaterialParams,
+  applyUvRepeat,
   decodeTextureBitmap,
   effectiveUvRepeat,
+  normalizeParams,
   planTextureDecode,
   slotUrls,
   synthNormalSize,
+  uvAspectOf,
   type BallParamScales,
   type MaterialParamValues,
   type MaterialSlotKey,
@@ -74,6 +77,7 @@ import {
   type MaterialSlotUrls,
   type ParamBasisPatch
 } from '../logic/materialBall'
+import type { NormalizedBallParams } from '../../shared/ballParams'
 import {
   formatBitmapCacheStats,
   textureBitmapCache
@@ -561,7 +565,19 @@ export class BallScene {
       this.renderer.capabilities.getMaxAnisotropy()
     )
     this.renderer.outputColorSpace = SRGBColorSpace
-    this.renderer.toneMapping = ACESFilmicToneMapping
+    /**
+     * 色调映射：**Neutral（Khronos PBR Neutral）**，不是 ACES Filmic。
+     *
+     * 用户原话：「现在光线有些时候太强了，它和贴图原本的颜色色差是比较大的」。
+     * ACES 的设计目标是「电影感」：它把中间调提亮、把高光的饱和度压掉（肩部去饱和），
+     * 于是贴图上原本的砖红/混凝土灰会被推亮推灰 —— 这正是"色差大"的来源。
+     * Neutral 是 Khronos 为**商品/材质本色还原**定义的曲线：只有超过 0.76 的高光才
+     * 做滚降压缩，中间调是线性的，因此贴图颜色能一比一落回屏幕。
+     *
+     * 曝光保持 1.0（曝光交给「光线强度」滑块的 `scene.environmentIntensity`，
+     * 见 `applyParams` —— 改 exposure 会连高光滚降一起推，用户要的只是"光弱一点"）。
+     */
+    this.renderer.toneMapping = NeutralToneMapping
     this.renderer.toneMappingExposure = 1.0
 
     this.scene = new Scene()
@@ -584,9 +600,12 @@ export class BallScene {
     this.material = new MeshPhysicalMaterial({
       color: BASE_COLOR,
       roughness: this.baseRoughness,
-      metalness: 0.0,
-      // 单图资产靠环境反射补一点"表面感"；有真 PBR 贴图时这个值不会喧宾夺主
-      envMapIntensity: 1.1
+      metalness: 0.0
+      // ⚠️ 这里**故意不设** `envMapIntensity`：环境反射强度由 `scene.environmentIntensity`
+      // 统一控制（「光线强度」滑块的唯一作用点，见 applyParams）。three 在
+      // `material.envMap === null && scene.environment !== null` 时每帧用 scene 的值
+      // 覆盖 material 的同名 uniform（WebGLRenderer 的 refreshMaterialUniforms），
+      // 所以写在这里是**死值**——留着只会让人误以为反射默认 1.1，"调"它却毫无反应。
     })
     this.geometry = createGeometry(opts.shape)
     this.mesh = new Mesh(this.geometry, this.material)
@@ -624,11 +643,18 @@ export class BallScene {
   /**
    * 平铺：形态基准（平面 2×2 检查接缝，球 / 盒 1×1）× UV 大小倍率（v0.2.1 增补 2）。
    * three 支持小数 repeat + RepeatWrapping，倍率 0.1–4 全程有效。
+   *
+   * 球面还要再乘 UV 弧长比 2（见 `applyUvRepeat` 的说明）——这个倍率**只作用于 u**，
+   * 是"方砖不变长砖"的唯一正确解：`SphereGeometry` 的 u 一圈 = 2πr、v 半圈 = πr。
    */
   private applyRepeat(): void {
+    for (const t of this.maps) this.repeatTexture(t)
+  }
+
+  /** 单张贴图的重复写入口径（所有贴图共用；缺一处就会出现"弹窗正常、卡片还是长砖"） */
+  private repeatTexture(tex: Texture): void {
     const base = this.currentShape === 'plane' ? PLANE_REPEAT : 1
-    const r = effectiveUvRepeat(base, this.uvMult)
-    for (const t of this.maps) t.repeat.set(r, r)
+    applyUvRepeat(tex, effectiveUvRepeat(base, this.uvMult), uvAspectOf(this.currentShape))
   }
 
   /**
@@ -639,7 +665,9 @@ export class BallScene {
    *   按 `base × mult` 计算并夹到 [0,1]（纯逻辑见 logic/materialBall.ts 的
    *   `effectiveRoughness`，单测覆盖）；
    * - 凹凸强度：normalScale 与 displacementScale 同倍率缩放（0 = 拍平）；
-   * - UV 大小（v0.2.1 增补 2）：贴图平铺倍率，变化时重新 applyRepeat()。
+   * - UV 大小（v0.2.1 增补 2）：贴图平铺倍率，变化时重新 applyRepeat()；
+   * - 金属度 / 透明度：写 `material.metalness` / `opacity`（透明度 <1 才开 transparent）；
+   * - 光线强度：写 `scene.environmentIntensity`。
    *
    * ★ 本批贴图还没落定时调用：值先上去（滑块要即时），但状态机会记 `pending`，
    *   `markSettled()` 时**必然**再算一次（任务 1 的收敛点）。
@@ -673,10 +701,15 @@ export class BallScene {
     this.applyParams(this.paramState.setBasis({ baseRoughness: this.baseRoughness }))
   }
 
-  /** 把状态机算出的值写进材质（唯一写入口径：roughness / normalScale / displacement + UV） */
+  /** 把状态机算出的值写进材质（唯一写入口径：roughness / normalScale / displacement + UV + 金属 + 透明） */
   private applyParams(values: MaterialParamValues): void {
     if (this.disposed) return
     applyMaterialParams(this.material, values)
+    // 光线强度：**只影响照度，不影响贴图采样** —— 调暗就是少给环境光，贴图颜色本身
+    // 一点不改（改 exposure 会连高光滚降一起推，不是用户要的"光弱一点"）。
+    // three 在 `material.envMap === null && scene.environment !== null` 时会用
+    // `scene.environmentIntensity` 覆盖 material.envMapIntensity，所以这里是唯一作用点。
+    this.scene.environmentIntensity = values.light
     if (values.uv !== this.uvMult) {
       this.uvMult = values.uv
       this.applyRepeat()
@@ -799,9 +832,7 @@ export class BallScene {
     const tex = normalFromBitmap(image)
     if (!tex) return
     tex.anisotropy = this.maxAnisotropy
-    const base = this.currentShape === 'plane' ? PLANE_REPEAT : 1
-    const r = effectiveUvRepeat(base, this.uvMult)
-    tex.repeat.set(r, r)
+    this.repeatTexture(tex)
     this.maps.push(tex)
     assignMap(this.material, 'normal', tex)
     this.material.needsUpdate = true
@@ -825,10 +856,8 @@ export class BallScene {
     // 色彩空间纪律：albedo 是 sRGB；normal/roughness/ao/displacement 是数据图，保持线性
     if (slot === 'albedo') tex.colorSpace = SRGBColorSpace
     tex.anisotropy = this.maxAnisotropy
-    // 平铺 = 形态基准 × UV 大小倍率（v0.2.1 增补 2）
-    const base = this.currentShape === 'plane' ? PLANE_REPEAT : 1
-    const r = effectiveUvRepeat(base, this.uvMult)
-    tex.repeat.set(r, r)
+    // 平铺 = 形态基准 × UV 大小倍率（v0.2.1 增补 2）+ 球面 u 方向弧长补偿（见 repeatTexture）
+    this.repeatTexture(tex)
     this.maps.push(tex)
     assignMap(this.material, slot, tex)
     // albedo 是**乘法**着色：底色 0xb9b6b0 会把所有贴图整体压暗偏灰。
@@ -1147,7 +1176,9 @@ export function MaterialBall({
   // 调参渲染（需求书 §3.3）：面板默认收起，滑块实时作用于预览；
   // 受控 params（§3.7 弹窗）优先：外部状态 → 内部 state → 场景
   const [paramOpen, setParamOpen] = useState(false)
-  const [scales, setScales] = useState<BallParamScales>(params ?? DEFAULT_PARAM_SCALES)
+  // 六参数化后**必须**规范化一次：`params` 里 light/metal/alpha 可选（历史参数只有三个），
+  // 直接拿来当状态会让滑块 `value={undefined}` 变成非受控输入。
+  const [scales, setScales] = useState<NormalizedBallParams>(() => normalizeParams(params))
   const [saving, setSaving] = useState(false)
   /**
    * 场景里**当前**倍率（任务 1）。
@@ -1191,14 +1222,18 @@ export function MaterialBall({
 
   /** 滑块 / 恢复默认的统一入口：改 UI 状态 + 抛给调用方（方案 A：重置即落库） */
   const applyScales = (next: BallParamScales): void => {
-    setScales(next)
-    notifyParams(next)
+    // 规范化后再进 state：新参数可选，`{...scales, roughness}` 里 light/metal/alpha 可能是
+    // undefined（历史参数），直接进 state 会让滑块变成非受控输入。
+    const normalized = normalizeParams(next)
+    setScales(normalized)
+    notifyParams(normalized)
   }
 
   // 受控同步：弹窗滑块拖动 → params 变 → 内部 state 变 → 既有 effect 应用到场景
   useEffect(() => {
-    if (params) setScales(params)
-  }, [params?.roughness, params?.bump, params?.uv]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (params) setScales(normalizeParams(params))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params?.roughness, params?.bump, params?.uv, params?.light, params?.metal, params?.alpha])
 
   // 滑块 → 场景（只改 material 属性，不重建 WebGL 上下文）。
   // ★ `mapsVersion` 也进 deps（任务 1）：贴图批次落定后必须再同步一次，
@@ -1370,13 +1405,30 @@ export function MaterialBall({
                 : 'border-line bg-elevated/90 text-muted hover:text-primary'
             }`}
             onClick={() => setParamOpen((o) => !o)}
-            title="自定义渲染：调整反光与凹凸后可保存为封面"
+            title="自定义渲染：光线 / 材质 / UV 调参后可保存为封面"
           >
             自定义渲染{paramOpen ? ' ▾' : ' ▸'}
           </button>
           {paramOpen && (
-            <div className="absolute bottom-9 left-2 w-52 rounded-xl border border-line bg-card/95 p-3 text-[11px] shadow-pop">
+            <div className="absolute bottom-9 left-2 max-h-[336px] w-52 overflow-y-auto rounded-xl border border-line bg-card/95 p-3 text-[11px] shadow-pop">
+              {/* 顺序（0.6.9 用户拍板）：光线强度 → 反光强度 → 凹凸强度 → 金属度 → 透明度 → UV 大小 */}
               <label className="block">
+                <span className="flex items-baseline justify-between text-muted">
+                  光线强度
+                  <span className="font-medium text-primary">×{scales.light.toFixed(2)}</span>
+                </span>
+                <input
+                  type="range"
+                  min={0.2}
+                  max={2}
+                  step={0.05}
+                  value={scales.light}
+                  onChange={(e) => applyScales({ ...scales, light: Number(e.target.value) })}
+                  className="slider-accent mt-1 w-full"
+                  title="环境光照度：跟贴图颜色无关，只把球照亮 / 调暗（0.2–2）"
+                />
+              </label>
+              <label className="mt-2 block">
                 <span className="flex items-baseline justify-between text-muted">
                   反光强度
                   <span className="font-medium text-primary">×{scales.roughness.toFixed(2)}</span>
@@ -1406,6 +1458,38 @@ export function MaterialBall({
                   onChange={(e) => applyScales({ ...scales, bump: Number(e.target.value) })}
                   className="slider-accent mt-1 w-full"
                   title="法线 / 置换倍率：越大凹凸越明显（0 = 拍平）"
+                />
+              </label>
+              <label className="mt-2 block">
+                <span className="flex items-baseline justify-between text-muted">
+                  金属度
+                  <span className="font-medium text-primary">{Math.round(scales.metal * 100)}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={scales.metal}
+                  onChange={(e) => applyScales({ ...scales, metal: Number(e.target.value) })}
+                  className="slider-accent mt-1 w-full"
+                  title="金属度：0 = 非金属（现状），1 = 纯金属（金属靠环境反射出质感）"
+                />
+              </label>
+              <label className="mt-2 block">
+                <span className="flex items-baseline justify-between text-muted">
+                  透明度
+                  <span className="font-medium text-primary">{Math.round(scales.alpha * 100)}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={0.1}
+                  max={1}
+                  step={0.05}
+                  value={scales.alpha}
+                  onChange={(e) => applyScales({ ...scales, alpha: Number(e.target.value) })}
+                  className="slider-accent mt-1 w-full"
+                  title="不透明度：100% = 不透明（默认），越小越透"
                 />
               </label>
               <label className="mt-2 block">

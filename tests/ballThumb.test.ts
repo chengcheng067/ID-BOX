@@ -135,9 +135,9 @@ describe('ballThumbFileName · 参数进 hash（docs/12 §3.3 方案 B）', () =
     const base = ballThumbFileName(ID, SLOTS)
     const tuned = ballThumbFileName(ID, SLOTS, TUNED)
     expect(tuned).not.toBe(base)
-    // golden 锁（§3.3 第一组 + 1.50,1.00,0.50 → 4f8cc160）
-    expect(tuned).toBe(`${ID}-4f8cc160.png`)
-    expect(base).toBe(`${ID}-3766c782.png`)
+    // golden 锁（§3.3 第一组 + 1.50,1.00,0.50 → 493f20b5）
+    expect(tuned).toBe(`${ID}-493f20b5.png`)
+    expect(base).toBe(`${ID}-2e32e561.png`)
   })
 
   it('显式传默认 params → 与不传完全一致（既有磁盘缓存全部保留，零重渲）', () => {
@@ -153,7 +153,7 @@ describe('ballThumbFileName · 参数进 hash（docs/12 §3.3 方案 B）', () =
     const parsed = parseThumbFileName(name)
     expect(parsed).not.toBeNull()
     expect(parsed!.id).toBe(ID)
-    expect(parsed!.salt).toBe('4f8cc160')
+    expect(parsed!.salt).toBe('493f20b5')
   })
 
   it('main 与 shared 是同一份 hash 实现（跨进程必须算出同一个值）', () => {
@@ -167,9 +167,9 @@ describe('ballThumbFileName · 参数进 hash（docs/12 §3.3 方案 B）', () =
     // ⚠️ 断言值曾写错（2026-10-15 QA 独立复算）：`clampUv` 上界是 **4**（不是 1），
     // 所以 `{NaN, +Inf, 5}` 规范化后是 `{1, 1, 4}` —— 不等于默认参数，**会贡献 hash**。
     // NaN/Infinity 各自回落 1，但 uv=5 被夹到 4 → hash 输入串是 `1.00,1.00,4.00`。
-    // 独立复算 golden：slots + `1.00,1.00,4.00` → `a391a1f4`（与 `ballParams.test.ts:123`
+    // 独立复算 golden：slots + `1.00,1.00,4.00` → `34aa2e59`（与 `ballParams.test.ts:123`
     // 的 clamp 口径一致；这里改断言，**不改 `clampUv`**）。
-    expect(dirty).toBe(`${ID}-a391a1f4.png`)
+    expect(dirty).toBe(`${ID}-34aa2e59.png`)
   })
 })
 
@@ -179,7 +179,7 @@ describe('saveBallThumbBytes · params 参与落盘文件名（第 5 参）', ()
     const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9])
     const name = await saveBallThumbBytes(ID, SLOTS, bytes, dir, TUNED)
     expect(name).toBe(ballThumbFileName(ID, SLOTS, TUNED))
-    expect(name).toBe(`${ID}-4f8cc160.png`)
+    expect(name).toBe(`${ID}-493f20b5.png`)
     const written = await fs.readFile(path.join(dir, name!))
     expect(written.equals(bytes)).toBe(true)
   })
@@ -202,6 +202,6 @@ describe('saveBallThumbBytes · params 参与落盘文件名（第 5 参）', ()
   it('不传 params（既有 4 参调用）仍走默认 hash —— 既有断言不受影响（§6.1）', async () => {
     const dir = await tmpDir()
     const name = await saveBallThumbBytes(ID, SLOTS, Buffer.from([1]), dir)
-    expect(name).toBe(`${ID}-3766c782.png`)
+    expect(name).toBe(`${ID}-2e32e561.png`)
   })
 })

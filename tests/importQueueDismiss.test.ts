@@ -90,6 +90,9 @@ const modvault = {
   detectMaterialMerge: vi.fn(async () => ({ needMerge: false, count: 0, sources: [] })),
   onMaterialMergeNotice: vi.fn(),
   onImportBatchDone: vi.fn(),
+  // docs/27：init() 会订阅「导入发现重复，请裁决」+「询问已作废」（幂等），桩必须返回退订函数
+  onImportConflictAsk: vi.fn(() => () => undefined),
+  onImportConflictExpired: vi.fn(() => () => undefined),
   onImportEvent: vi.fn((cb: (ev: ImportEvent) => void) => {
     importHandler = cb
     return () => undefined

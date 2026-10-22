@@ -312,7 +312,7 @@ describe('logic/materialBall · golden 锁（用户样本 B，防 hash 输入格
   const id = 'a1b2c3d4-9f3c-1a2b-3c4d-5e6f7a8b9c0d'
   const slots = materialSlots(sampleB())
 
-  it('样本 B 的 5 槽位集合（排序后）→ af26be35（方案 B：默认参数不贡献 hash）', () => {
+  it('样本 B 的 5 槽位集合（排序后）→ 430d90cc（方案 B：默认参数不贡献 hash）', () => {
     // 排序基串（slotRelPaths 去重 + sort 的结果，逐字锁死）
     expect(slotRelPaths(slots)).toEqual([
       'vh1sbjl_2K_AO.jpg',
@@ -321,16 +321,16 @@ describe('logic/materialBall · golden 锁（用户样本 B，防 hash 输入格
       'vh1sbjl_2K_Normal.jpg',
       'vh1sbjl_2K_Roughness.jpg'
     ])
-    expect(ballHash(slots, DEFAULT_PARAM_SCALES)).toBe('af26be35')
-    expect(ballThumbName(id, slots)).toBe(`${id}-af26be35.png`)
+    expect(ballHash(slots, DEFAULT_PARAM_SCALES)).toBe('430d90cc')
+    expect(ballThumbName(id, slots)).toBe(`${id}-430d90cc.png`)
     // 转发口径：renderer 与 shared 必须给出同一个名字（主进程与渲染进程同一 hash）
     expect(ballThumbName(id, slots)).toBe(ballThumbNameShared(id, slots))
   })
 
-  it('样本 B + (1.50,1.00,0.50) → 843cec29（调参后名字变，既有缓存保留）', () => {
-    expect(ballHash(slots, { roughness: 1.5, bump: 1, uv: 0.5 })).toBe('843cec29')
+  it('样本 B + (1.50,1.00,0.50) → 1d4fe276（调参后名字变，既有缓存保留）', () => {
+    expect(ballHash(slots, { roughness: 1.5, bump: 1, uv: 0.5 })).toBe('1d4fe276')
     expect(ballThumbName(id, slots, { roughness: 1.5, bump: 1, uv: 0.5 })).toBe(
-      `${id}-843cec29.png`
+      `${id}-1d4fe276.png`
     )
     expect(ballThumbName(id, slots, { roughness: 1.5, bump: 1, uv: 0.5 })).not.toBe(
       ballThumbName(id, slots)
@@ -339,7 +339,7 @@ describe('logic/materialBall · golden 锁（用户样本 B，防 hash 输入格
 
   it('显式默认参数与不传参数 → 同一个名字（方案 B 硬约束）', () => {
     expect(ballThumbName(id, slots)).toBe(ballThumbName(id, slots, DEFAULT_PARAM_SCALES))
-    expect(ballThumbName(id, slots)).toBe(`${id}-af26be35.png`)
+    expect(ballThumbName(id, slots)).toBe(`${id}-430d90cc.png`)
   })
 })
 

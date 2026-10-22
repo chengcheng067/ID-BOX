@@ -55,6 +55,9 @@ const modvault = {
   /** TODO-3：风格落库的 debug 日志（断言"站方词不在词表"用） */
   reportLog: vi.fn(),
   onMaterialMergeNotice: vi.fn(() => () => {}),
+  // docs/27：init() 会订阅「导入发现重复，请裁决」+「询问已作废」（幂等），桩必须返回退订函数
+  onImportConflictAsk: vi.fn(() => () => {}),
+  onImportConflictExpired: vi.fn(() => () => {}),
   onImportEvent: vi.fn((cb: ImportEventCb) => {
     importEventCb = cb
     return () => {}

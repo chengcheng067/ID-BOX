@@ -24,6 +24,7 @@ const read = (rel: string): string => fs.readFileSync(path.join(process.cwd(), r
 const SIDEBAR = 'src/renderer/components/Sidebar.tsx'
 const TOOLBAR = 'src/renderer/components/Toolbar.tsx'
 const APP = 'src/renderer/App.tsx'
+const FILTERS = 'src/renderer/logic/filters.ts'
 
 // ── ① 左栏：风格整块已移除，分组顺序不变 ────────────────────────
 
@@ -122,10 +123,17 @@ describe('App 中栏头：风格入口与筛选语义', () => {
 
   it('计数口径与左栏原实现一致：只算在库资产（软删记录不计）', () => {
     const app = read(APP)
-    expect(app).toContain('isDeletedAsset')
-    expect(app).toContain('for (const s of a.styles ?? [])')
-    // 入口渲染条件：有风格可选、或已有筛选在生效
-    expect(app).toContain('const showStyleEntry = styleCounts.length > 0 || filters.styles.length > 0')
+    // 2026-10「筛选域收敛」：计数循环搬进纯逻辑 `filters.styleCountsFor`（可单测），
+    // App 只做 useMemo 接线，且统计范围收窄到**当前大类视图**（否则材质视图会冒出风格 chip）
+    expect(app).toContain('styleCountsFor(scoped)')
+    expect(app).toContain('kindsOfFilter(filters.kind)')
+    const filtersSrc = read(FILTERS)
+    expect(filtersSrc).toContain('for (const s of a.styles ?? [])')
+    expect(filtersSrc).toContain('isDeletedAsset')
+    // 入口渲染条件：能力表支持风格 **且**（有风格可选 或 已有筛选在生效）
+    expect(app).toMatch(
+      /const showStyleEntry =\s*capsOfFilter\(filters\.kind, 'style'\) && \(styleCounts\.length > 0 \|\| filters\.styles\.length > 0\)/
+    )
   })
 
   it('已选数量显示在 chip 上（与色标同规矩）', () => {

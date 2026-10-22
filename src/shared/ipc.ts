@@ -63,6 +63,15 @@ export const IPC = {
   // ── 2026-10：材质球离屏渲染图落盘（任务 6） ──────────────────────
   /** 渲染出的材质球 JPEG 写进 thumbs 目录；文件名与既有缩略图同格式，返回缓存文件名 */
   saveBallThumb: 'thumb:saveBall',
+  /**
+   * 尺寸**回填**（2026-10「分辨率筛选失效」）：`(folder, rels)` → `ProbedImageSize[]`。
+   *
+   * 只读文件头（64KB）、不解码整图，读不出的条目**静默省略**（返回条数可能少于入参）。
+   * 单次上限 `PROBE_SIZES_MAX`（200 条），渲染层自己分片。**不做任何回填调度**：
+   * 落库完全由调用方按返回的 `rel` 决定。
+   * main 侧必须校验 `folder` 在库目录内，越界返回空数组。
+   */
+  probeSizes: 'asset:probeSizes',
   // ── 2026-10 UI 规范 v0.2：无边框窗口自绘控制（§3.1/§4-2）+ 应用版本 ──
   /** 最小化（send，fire-and-forget） */
   winMinimize: 'win:minimize',
@@ -138,5 +147,32 @@ export const IPC = {
    */
   hdrPrepare: 'hdr:prepare',
   /** 主进程 → 渲染进程：HDR 解码进度（`HdrProgressEvent = { path, ratio }`，按 path 区分） */
-  hdrProgress: 'hdr:progress'
+  hdrProgress: 'hdr:progress',
+  // ── 2026-10 导入重复处置（docs/27） ────────────────────────────────
+  /**
+   * 主进程 → 渲染进程：导入中发现重复，请用户裁决（Payload = `ImportConflictAsk`）。
+   *
+   * **一次导入只发一次**（整批聚合，800ms 聚合窗口 + 每来一条新冲突 +400ms、上限 2500ms）。
+   * 之后才发现的冲突一律按答复里的 `batchDefault` 处理，不再打扰用户。
+   */
+  importConflictAsk: 'import:conflictAsk',
+  /**
+   * 渲染进程 → 主进程：裁决结果（Payload = `ImportConflictAnswer`）。
+   *
+   * 主进程按 `requestId` 兑现挂起的 Promise；**未知 / 过期 requestId 必须静默丢弃**
+   * （超时之后迟到的答复不能影响下一批）。用 `invoke` 只是为了拿到兑现确认，
+   * 主进程侧返回 void。
+   */
+  importConflictAnswer: 'import:conflictAnswer',
+  /**
+   * 主进程 → 渲染进程：**这次询问已作废**（Payload = `ImportConflictExpired`）。
+   *
+   * 只在**主进程单方面结束**时必须发：120s 超时。渲染层收到就关掉弹窗——
+   * 否则弹窗会挂在屏幕上，而用户之后的每次点击都会被当作「过期答复」静默丢弃
+   * （`requestId` 已从 `pendingAsks` 移除），表现为"关不掉、点了没反应"（DEF-19-1）。
+   *
+   * 其它终止路径不需要发：用户自己答复时渲染层会主动清 `conflictAsk`；
+   * 渲染进程崩溃时已经没有接收方。
+   */
+  importConflictExpired: 'import:conflictExpired'
 } as const

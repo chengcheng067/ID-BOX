@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useVault } from '../store'
-import { resolveRenderParams, type BallParamScales } from '../../shared/ballParams'
+import { resolveRenderParams, type NormalizedBallParams } from '../../shared/ballParams'
 import { displayName } from '../../shared/naming'
 import { IconClose } from '../icons'
 import type { Asset } from '../../shared/types'
@@ -31,9 +31,10 @@ const MaterialBall = lazy(() =>
  *
  * - 左：渲染画布 460×420（底 `--render-canvas-bg`：浅色白 / 深色 #1C1C1E，
  *   v0.2.1 增补 1 覆盖 §3.7 的近黑）+ 底注「实时预览 · 拖动滑块即时重渲」；
- * - 右：三个滑块（v0.2.1 增补 2 拍板顺序）：反光强度（roughness 倍率）、
- *   凹凸强度（normal/displacement 倍率），0-2；UV 大小（贴图平铺倍率）0.1-4，
- *   拖动即时重渲；保存时三参数一并生效；
+ * - 右：六个滑块（0.6.9 用户拍板顺序）：光线强度（环境光照度 0.2-2）、
+ *   反光强度（roughness 倍率）、凹凸强度（normal/displacement 倍率）0-2、
+ *   金属度（metalness 绝对值 0-1）、透明度（0.1-1）、UV 大小（平铺倍率 0.1-4）；
+ *   拖动即时重渲；保存时六参数一并生效；
  * - 底部：`保存 · 设为封面` 实心 accent 通栏钮 → 离屏渲染一帧存 JPG →
  *   `asset:setCoverImage` 落盘 + `setCover`（coverSource='manual'，能力既有）。
  *
@@ -52,7 +53,8 @@ export function CustomRenderDialog({
 }) {
   // 初值读回该资产已存的参数（docs/12 §3.4 表 / §5.2 末段）——弹窗内 useState 仍保留
   // （即时重渲预览需要），只是不再从 DEFAULT 起步，否则网格与弹窗显示不一致。
-  const [scales, setScales] = useState<BallParamScales>(() => resolveRenderParams(asset))
+  // 类型用规范化形态：六参数全部就位，滑块才是受控的（历史参数只有三个字段）。
+  const [scales, setScales] = useState<NormalizedBallParams>(() => resolveRenderParams(asset))
   const [saving, setSaving] = useState(false)
   const renderable = useMemo(() => !!slots.albedo, [slots])
 
@@ -278,61 +280,115 @@ export function CustomRenderDialog({
             <div className="mt-2 text-[11px] text-muted">实时预览 · 拖动滑块即时重渲</div>
           </div>
 
-          {/* 右：三个滑块（§3.7 两滑块 + v0.2.1 增补 2 的 UV 大小）+ 底部保存 */}
+          {/* 右：六个滑块（0.6.9：光线强度 / 反光强度 / 凹凸强度 / 金属度 / 透明度 / UV 大小）
+              + 底部保存。滑块区可滚动：六块内容比原来的三块高，收起时不留滚动条，超出才有。 */}
           <div className="flex min-w-0 flex-1 flex-col">
-            <label className="block">
-              <span className="flex items-baseline justify-between text-[13px] text-secondary">
-                反光强度
-                <span className="text-[12px] font-medium text-accent-text">×{scales.roughness.toFixed(1)}</span>
-              </span>
-              <input
-                type="range"
-                min={0}
-                max={2}
-                step={0.1}
-                value={scales.roughness}
-                onChange={(e) => setScales((s) => ({ ...s, roughness: Number(e.target.value) }))}
-                className="slider-accent mt-2 w-full"
-                title="roughness 倍率：越大越哑光（0 = 镜面）"
-              />
-            </label>
-            <label className="mt-5 block">
-              <span className="flex items-baseline justify-between text-[13px] text-secondary">
-                凹凸强度
-                <span className="text-[12px] font-medium text-accent-text">×{scales.bump.toFixed(1)}</span>
-              </span>
-              <input
-                type="range"
-                min={0}
-                max={2}
-                step={0.1}
-                value={scales.bump}
-                onChange={(e) => setScales((s) => ({ ...s, bump: Number(e.target.value) }))}
-                className="slider-accent mt-2 w-full"
-                title="法线 / 置换倍率：越大凹凸越明显（0 = 拍平）"
-              />
-              <div className="mt-2 text-[11px] text-muted">作用于 Normal / Displacement 槽位倍率</div>
-            </label>
-            {/* v0.2.1 增补 2：第三个滑块 UV 大小（贴图平铺倍率），与另两个同口径 */}
-            <label className="mt-5 block">
-              <span className="flex items-baseline justify-between text-[13px] text-secondary">
-                UV 大小
-                <span className="text-[12px] font-medium text-accent-text">×{scales.uv.toFixed(1)}</span>
-              </span>
-              <input
-                type="range"
-                min={0.1}
-                max={4}
-                step={0.1}
-                value={scales.uv}
-                onChange={(e) => setScales((s) => ({ ...s, uv: Number(e.target.value) }))}
-                className="slider-accent mt-2 w-full"
-                title="贴图平铺倍率：越大贴图越小（平铺越密）"
-              />
-              <div className="mt-2 text-[11px] text-muted">贴图平铺倍率 · 默认 1.0（0.1–4.0）</div>
-            </label>
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+              <label className="block">
+                <span className="flex items-baseline justify-between text-[13px] text-secondary">
+                  光线强度
+                  <span className="text-[12px] font-medium text-accent-text">×{scales.light.toFixed(1)}</span>
+                </span>
+                <input
+                  type="range"
+                  min={0.2}
+                  max={2}
+                  step={0.1}
+                  value={scales.light}
+                  onChange={(e) => setScales((s) => ({ ...s, light: Number(e.target.value) }))}
+                  className="slider-accent mt-1.5 w-full"
+                  title="环境光照度：只把球照亮 / 调暗，不改贴图颜色（值越小越暗）"
+                />
+                <div className="mt-1 text-[11px] text-muted">光照强度 · 默认 1.0（0.2–2.0）</div>
+              </label>
+              <label className="block">
+                <span className="flex items-baseline justify-between text-[13px] text-secondary">
+                  反光强度
+                  <span className="text-[12px] font-medium text-accent-text">×{scales.roughness.toFixed(1)}</span>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  value={scales.roughness}
+                  onChange={(e) => setScales((s) => ({ ...s, roughness: Number(e.target.value) }))}
+                  className="slider-accent mt-1.5 w-full"
+                  title="roughness 倍率：越大越哑光（0 = 镜面）"
+                />
+                <div className="mt-1 text-[11px] text-muted">粗糙度倍率 · 默认 1.0（0.0–2.0）· 越大越哑光</div>
+              </label>
+              <label className="block">
+                <span className="flex items-baseline justify-between text-[13px] text-secondary">
+                  凹凸强度
+                  <span className="text-[12px] font-medium text-accent-text">×{scales.bump.toFixed(1)}</span>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  value={scales.bump}
+                  onChange={(e) => setScales((s) => ({ ...s, bump: Number(e.target.value) }))}
+                  className="slider-accent mt-1.5 w-full"
+                  title="法线 / 置换倍率：越大凹凸越明显（0 = 拍平）"
+                />
+                <div className="mt-1 text-[11px] text-muted">法线 / 置换倍率 · 默认 1.0（0.0–2.0）</div>
+              </label>
+              <label className="block">
+                <span className="flex items-baseline justify-between text-[13px] text-secondary">
+                  金属度
+                  <span className="text-[12px] font-medium text-accent-text">{Math.round(scales.metal * 100)}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={scales.metal}
+                  onChange={(e) => setScales((s) => ({ ...s, metal: Number(e.target.value) }))}
+                  className="slider-accent mt-1.5 w-full"
+                  title="金属度：0 = 非金属，1 = 纯金属（金属靠环境反射出质感）"
+                />
+                <div className="mt-1 text-[11px] text-muted">无金属贴图，直接设定 · 0–100%</div>
+              </label>
+              <label className="block">
+                <span className="flex items-baseline justify-between text-[13px] text-secondary">
+                  透明度
+                  <span className="text-[12px] font-medium text-accent-text">{Math.round(scales.alpha * 100)}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={0.1}
+                  max={1}
+                  step={0.05}
+                  value={scales.alpha}
+                  onChange={(e) => setScales((s) => ({ ...s, alpha: Number(e.target.value) }))}
+                  className="slider-accent mt-1.5 w-full"
+                  title="不透明度：100% = 完全不透明（默认），越小越透"
+                />
+                <div className="mt-1 text-[11px] text-muted">不透明度 · 默认 100%（10%–100%）</div>
+              </label>
+              <label className="block">
+                <span className="flex items-baseline justify-between text-[13px] text-secondary">
+                  UV 大小
+                  <span className="text-[12px] font-medium text-accent-text">×{scales.uv.toFixed(1)}</span>
+                </span>
+                <input
+                  type="range"
+                  min={0.1}
+                  max={4}
+                  step={0.1}
+                  value={scales.uv}
+                  onChange={(e) => setScales((s) => ({ ...s, uv: Number(e.target.value) }))}
+                  className="slider-accent mt-1.5 w-full"
+                  title="贴图平铺倍率：越大贴图越小（平铺越密）。球面已按 2:1 弧长补偿，方块贴图不会被拉长"
+                />
+                <div className="mt-1 text-[11px] text-muted">平铺倍率 · 默认 1.0（0.1–4.0）</div>
+              </label>
+            </div>
 
-            <div className="mt-auto">
+            <div className="mt-3 shrink-0">
               {/* §3.7：保存 · 设为封面（实心 accent 通栏钮） */}
               <button className="btn-solid w-full !h-10 !text-[13px]" disabled={saving} onClick={() => void save()}>
                 {saving ? '渲染中…' : '保存 · 设为封面'}

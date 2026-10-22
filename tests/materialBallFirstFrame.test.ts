@@ -56,7 +56,15 @@ function fakeMaterial(): FakeMaterial {
       this.y = y
     }
   }
-  const target: ParamMaterialTarget = { roughness: 0.5, normalScale: ns, displacementScale: 0.04 }
+  // 金属度 / 透明度是 0.6.9 新增的写入口径（默认值 = 与旧观感一致：非金属、不透明）
+  const target: ParamMaterialTarget = {
+    roughness: 0.5,
+    normalScale: ns,
+    displacementScale: 0.04,
+    metalness: 0,
+    transparent: false,
+    opacity: 1
+  }
   return {
     target,
     read: () => ({

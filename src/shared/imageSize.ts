@@ -3,22 +3,49 @@
  *
  * 设计口径（docs/22 §3.1）：
  * - **只解析文件头**，绝不解码整图（大库重扫时逐张解码会直接卡死主进程）；
- * - 只认 PNG 与 JPEG —— 它们覆盖了贴图库的绝对多数，且头部格式固定；
- * - 其余格式（webp / bmp / tga / exr / gif …）一律返回 `null`。
+ * - `imageSizeOf` 只认 PNG 与 JPEG —— 它们覆盖了贴图库的绝对多数，且头部格式固定；
+ *   其余格式（webp / bmp / tga / exr / gif …）一律返回 `null`。
  *   「未知就是未知」：调用方据此把该资产排除在 2K / 4K 档之外，
  *   而不是按扩展名猜一个体积估值（猜错会让筛选结果不可信）。
+ * - HDR / EXR 走**另一个**入口 `hdrSizeOf`（2026-10「HDR 分辨率筛选」新增）。
+ *   它们没并进 `imageSizeOf` / `IMAGE_FILE_EXTS`：那张白名单同时是材质球的兜底取图表，
+ *   收进 `exr` 会让 `Displacement.exr` 被当 albedo 贴到球上（见 `shared/hdrExts.ts` 头注）。
  *
- * 放在 `shared/` 的原因：主进程（importer / rescan）负责读字节，
+ * 放在 `shared/` 的原因：主进程（importer / rescan / probeSizes）负责读字节，
  * 渲染层与单测也需要同一份语义；这里不 import 任何 node/electron API。
  */
 
+import { isHdrExt } from './hdrExts'
+
 /** 读文件头时建议截取的字节数（JPEG 的 SOF 段几乎总在 64KB 内） */
 export const IMAGE_SIZE_HEAD_BYTES = 65_536
+
+/**
+ * **升级档**读头字节数（1MB）：只给"小头解析失败且确实是 JPEG"的极少数文件用。
+ *
+ * 为什么需要：实测用户库里有一张图的 `SOF0` 落在 **678557 字节**处（前面是一大段
+ * APP2 / ICC 配置），64KB 永远解析不到 → 该文件 `w/h` 永久为空 → 2K/4K 筛选对它永久为假。
+ *
+ * 为什么不能把主常量直接提到 1MB：9500 个文件 × 1MB = 10GB 读放大（现在只读 600MB）。
+ * 所以读头是**先 64KB、失败且是 jpeg 才升一次**（见 `main/probeSizes.readHeadForSize`），
+ * 每个文件最多升级一次，不再往上试探 2MB / 4MB。
+ *
+ * PNG / hdr / exr **不用**这一档：它们的尺寸在固定偏移或首个属性里，64KB 足够。
+ */
+export const IMAGE_SIZE_HEAD_BYTES_LARGE = 1_048_576
 
 /** 图片宽高（像素，均为正整数） */
 export interface ImageSize {
   w: number
   h: number
+}
+
+/**
+ * 尺寸回填通道（`IPC.probeSizes`）的返回项：`rel` 相对调用方给的资产文件夹。
+ * `rel` 原样回传（调用方按它落位），不是绝对路径。
+ */
+export interface ProbedImageSize extends ImageSize {
+  rel: string
 }
 
 /** PNG 固定 8 字节签名 */
@@ -125,4 +152,162 @@ export function imageSizeOf(buf: Uint8Array): ImageSize | null {
   const png = pngSize(buf)
   if (png) return png
   return jpegSize(buf)
+}
+
+// ── HDR / EXR（2026-10「分辨率筛选在材质与 HDR 都失效」的补采端） ──────────
+
+/** Radiance 允许的两种魔法行前缀（`#?RGBE` 是少数旧工具的输出） */
+const RADIANCE_MAGICS: readonly string[] = ['#?RADIANCE', '#?RGBE']
+
+/** OpenEXR 魔数 `76 2f 31 01`（小端写死的 20000630） */
+const EXR_MAGIC: readonly number[] = [0x76, 0x2f, 0x31, 0x01]
+
+/**
+ * 按 latin1（字节 -> 同码位字符）解码一段字节。
+ * 头部的注释 / 属性名都是 ASCII，latin1 就够了；不用 TextDecoder 是为了保持零依赖。
+ */
+function latin1(buf: Uint8Array, start: number, end: number): string {
+  const stop = Math.min(end, buf.length)
+  let out = ''
+  for (let i = start; i < stop; i += 1) out += String.fromCharCode(buf[i])
+  return out
+}
+
+/**
+ * 读一行（`\n` 分隔，容忍行尾 `\r`）。
+ * @returns 行文本与下一行起点；缓冲区里没有换行符（= 行被截断）→ `null`
+ */
+function readLine(buf: Uint8Array, from: number): { text: string; next: number } | null {
+  if (from >= buf.length) return null
+  const nl = buf.indexOf(0x0a, from)
+  if (nl < 0) return null
+  const end = nl > from && buf[nl - 1] === 0x0d ? nl - 1 : nl
+  return { text: latin1(buf, from, end), next: nl + 1 }
+}
+
+/** Radiance 分辨率行：`-Y 8192 +X 16384`（两个轴的**顺序与符号都不保证**） */
+const RADIANCE_RES_RE = /^([+-])([XY])\s+(\d+)\s+([+-])([XY])\s+(\d+)$/
+
+function parseRadianceResolution(text: string): ImageSize | null {
+  const m = RADIANCE_RES_RE.exec(text.trim())
+  if (!m) return null
+  const axis1 = m[2]
+  const axis2 = m[5]
+  // 两个轴必须一个是 X、一个是 Y（`-Y 10 -Y 20` 这种坏头直接判废）
+  if (axis1 === axis2) return null
+  const v1 = Number.parseInt(m[3], 10)
+  const v2 = Number.parseInt(m[6], 10)
+  if (!Number.isSafeInteger(v1) || !Number.isSafeInteger(v2)) return null
+  const w = axis1 === 'X' ? v1 : v2
+  const h = axis1 === 'Y' ? v1 : v2
+  if (!(w > 0) || !(h > 0)) return null
+  return { w, h }
+}
+
+/**
+ * Radiance `.hdr`（RGBE）：魔法行 → 若干 `KEY=VALUE` 注释 → **空行** → 分辨率行。
+ * 分辨率行的符号只表示扫描方向（`-Y` = 自上而下、`-X` = 从右到左），宽高取绝对值。
+ * 只读文本头，像素数据一个字节都不碰。
+ */
+function radianceSize(buf: Uint8Array): ImageSize | null {
+  const first = readLine(buf, 0)
+  if (!first) return null
+  if (!RADIANCE_MAGICS.some((magic) => first.text.startsWith(magic))) return null
+
+  // 跳到第一个空行（头部结束标志）
+  let pos = first.next
+  for (;;) {
+    const line = readLine(buf, pos)
+    if (!line) return null
+    pos = line.next
+    if (line.text.length === 0) break
+  }
+  // 空行之后的第一条非空行就是分辨率行
+  for (;;) {
+    const line = readLine(buf, pos)
+    if (!line) return null
+    pos = line.next
+    if (line.text.length > 0) return parseRadianceResolution(line.text)
+  }
+}
+
+/** 小端读 32 位有符号（EXR 全小端；`box2i` 的坐标可以是负数） */
+function i32le(buf: Uint8Array, at: number): number {
+  return buf[at] | (buf[at + 1] << 8) | (buf[at + 2] << 16) | (buf[at + 3] << 24)
+}
+
+/** 读一个 NUL 结尾的字符串；没找到终止符（= 被截断）→ `null` */
+function readCString(buf: Uint8Array, at: number): { text: string; next: number } | null {
+  if (at >= buf.length) return null
+  const end = buf.indexOf(0x00, at)
+  if (end < 0) return null
+  return { text: latin1(buf, at, end), next: end + 1 }
+}
+
+/**
+ * OpenEXR `.exr`：魔数 + version(4B) 之后是**属性列表**，
+ * 每项 = `name\0` + `type\0` + `size(int32 LE)` + value(size 字节)，空 name 结束。
+ *
+ * 属性**顺序任意**、前面可能塞着任意多别的属性，所以只能逐项按 `size` 跳过，
+ * 绝不能假设 `dataWindow` 在固定偏移。`dataWindow`（`box2i`，16 字节）给的是
+ * `xMin, yMin, xMax, yMax`，宽高 = max - min + 1。
+ *
+ * 头部缓冲区只有 64KB：任何一处越界（属性名无终止符 / size 越过缓冲区结尾 /
+ * 数字非法）都返回 `null` —— **绝不抛异常**，未知就是未知。
+ */
+function exrSize(buf: Uint8Array): ImageSize | null {
+  if (buf.length < 8) return null
+  if (!startsWith(buf, EXR_MAGIC)) return null
+
+  let pos = 8 // 魔数 4 + version 4
+  for (;;) {
+    const name = readCString(buf, pos)
+    if (!name) return null
+    pos = name.next
+    if (name.text.length === 0) return null // 属性列表结束仍未见到 dataWindow
+
+    const type = readCString(buf, pos)
+    if (!type) return null
+    pos = type.next
+
+    if (pos + 4 > buf.length) return null
+    const size = i32le(buf, pos)
+    pos += 4
+    if (size < 0 || pos + size > buf.length) return null
+
+    if (name.text === 'dataWindow') {
+      if (type.text !== 'box2i' || size !== 16) return null
+      const w = i32le(buf, pos + 8) - i32le(buf, pos) + 1
+      const h = i32le(buf, pos + 12) - i32le(buf, pos + 4) + 1
+      if (!(w > 0) || !(h > 0)) return null
+      return { w, h }
+    }
+
+    pos += size
+  }
+}
+
+/**
+ * 解析 HDR / EXR 文件的宽高（**纯函数、零 IO、不解码像素**）。
+ *
+ * @param head 文件**开头**的字节（建议 `IMAGE_SIZE_HEAD_BYTES`）
+ * @returns `{w,h}`；非 Radiance/OpenEXR、头部不完整、尺寸非法 → `null`
+ */
+export function hdrSizeOf(head: Uint8Array): ImageSize | null {
+  if (!(head instanceof Uint8Array) || head.length < 4) return null
+  const radiance = radianceSize(head)
+  if (radiance) return radiance
+  return exrSize(head)
+}
+
+/**
+ * 按扩展名选解析器：`hdr` / `exr` → `hdrSizeOf`，其余 → `imageSizeOf`。
+ *
+ * 两个调用方共用（`main/importer.fillImageSizes` 与 `main/probeSizes`），
+ * 免得"导入时能读、回填时读不到"这种口径漂移。
+ *
+ * @param ext 扩展名（可带前导点、大小写不限）
+ */
+export function imageSizeOfExt(ext: string, head: Uint8Array): ImageSize | null {
+  return isHdrExt(ext) ? hdrSizeOf(head) : imageSizeOf(head)
 }

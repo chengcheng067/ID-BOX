@@ -81,10 +81,13 @@ describe('常量与选项表', () => {
     ])
   })
 
-  it('resolutionMinEdge：未知值不会变成阈值', () => {
+  it('resolutionMinEdge：未知值不会变成阈值；8K / 16K 已升格为合法档', () => {
     expect(resolutionMinEdge(null)).toBeNull()
+    // 2026-10 HDR 分档：8K / 16K 成为真实阈值（此前被当脏值丢弃）
+    expect(resolutionMinEdge('8k')).toBe(8192)
+    expect(resolutionMinEdge('16k')).toBe(16384)
     // 运行时脏值（旧 settings / 手改 json）→ 视为不启用
-    expect(resolutionMinEdge('8k' as unknown as '2k')).toBeNull()
+    expect(resolutionMinEdge('32k' as unknown as '2k')).toBeNull()
   })
 })
 

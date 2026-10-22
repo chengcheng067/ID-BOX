@@ -24,19 +24,43 @@ import type { Asset, BallSlots } from './types'
 import { PBR_SLOT_ORDER } from './pbrSlots'
 
 /**
- * 调参渲染的**三个用户可调参数**（需求书 §3.3 前两版 + v0.2.1 增补 2 第三个）：
+ * 调参渲染的**用户可调参数**（需求书 §3.3 前两版 + v0.2.1 增补 2 + 0.6.9 增补 3）：
  * - `roughness`：反光强度 = roughness 倍率（0-2；对 roughnessMap 值整体缩放）；
  * - `bump`：凹凸强度 = normalScale / displacementScale 倍率（0-2）；
- * - `uv`：UV 大小 = 贴图平铺倍率（0.1-4，v0.2.1 增补 2）。
+ * - `uv`：UV 大小 = 贴图平铺倍率（0.1-4，v0.2.1 增补 2）；
+ * - `light`：光线强度 = `scene.environmentIntensity`（0.2-2，默认 1）；
+ * - `metal`：金属度 = `material.metalness` **绝对值**（0-1，默认 0 = 现状非金属）；
+ * - `alpha`：不透明度（0.1-1，默认 1 = 不透明）。
+ *
+ * 后三个字段**可选**：历史 DB 里只有前三个字段（`renderParams` 落库早于本轮），
+ * 读回来时 `light/metal/alpha` 是 `undefined`，由 `normalizeParams` 补默认值。
+ * 保留可选还让大量既有调用点（测试 / 弹窗 / store）不必逐个补字段。
+ *
+ * ⚠️ `metal` 是**绝对值**而不是倍率：本项目的 `PBR_SLOT_ORDER` 里没有 metalness
+ * 槽位（`MaterialSlots` 只有 albedo/normal/roughness/ao/displacement），所以不存在
+ * "metalnessMap × 倍率"这条口径。哪天补了 metalness 槽位，这里要改成"有贴图时当倍率"。
  */
 export interface BallParamScales {
   roughness: number
   bump: number
   uv: number
+  light?: number
+  metal?: number
+  alpha?: number
 }
 
-/** 默认（不调参）= 全部 1 倍，与未加调参功能前的渲染结果完全一致 */
-export const DEFAULT_PARAM_SCALES: BallParamScales = { roughness: 1, bump: 1, uv: 1 }
+/** 规范化后的参数（六个字段全部就位）——UI / 状态机 / hash 都用这个形态 */
+export type NormalizedBallParams = Required<BallParamScales>
+
+/** 默认（不调参）= 倍率 1、光强 1、非金属、不透明，与未加调参功能前的渲染结果一致 */
+export const DEFAULT_PARAM_SCALES: NormalizedBallParams = {
+  roughness: 1,
+  bump: 1,
+  uv: 1,
+  light: 1,
+  metal: 0,
+  alpha: 1
+}
 
 /** 滑块合法区间 [0, 2]；非法输入（NaN/Infinity）回落到 1（不调参），不抛错 */
 export function clampScale(v: number): number {
@@ -50,6 +74,33 @@ export function clampUv(v: number): number {
   return Math.min(4, Math.max(0.1, v))
 }
 
+/**
+ * 光线强度 [0.2, 2]；非法输入回落到 **1**（= 默认光照，不是 0——0 会让球全黑）。
+ *
+ * 非有限值回落 1 与其它 clamp 同一纪律：这是"NaN 不许进 hash"的那道防线。
+ */
+export function clampLight(v: number | undefined): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 1
+  return Math.min(2, Math.max(0.2, v))
+}
+
+/**
+ * 金属度 [0, 1]；非法输入回落到 **0**（非金属 = 现有观感）。
+ *
+ * 默认值刻意是 0 而不是 1：本参数诞生前所有资产都是 `metalness: 0`，默认必须是
+ * "与旧渲染一致"，否则旧缓存／旧观感全部漂移。
+ */
+export function clampMetal(v: number | undefined): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 0
+  return Math.min(1, Math.max(0, v))
+}
+
+/** 不透明度 [0.1, 1]；非法输入回落到 **1**（不透明 = 现有观感） */
+export function clampAlpha(v: number | undefined): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 1
+  return Math.min(1, Math.max(0.1, v))
+}
+
 /** 2 位小数（hash 输入与落库值都用它，保证 DB 值与 hash 输入不漂移） */
 function round2(v: number): number {
   return Math.round(v * 100) / 100
@@ -60,35 +111,58 @@ function round2(v: number): number {
  *
  * 颠倒的后果：`NaN.toFixed(2)` → `"NaN"` → hash 里出现非 hex 字符 →
  * `parseThumbFileName`（shared/thumb.ts:56）解析失败 → 该资产的缓存管理全线失效。
- * clamp 的非法输入回落是 **1**（不是 0），这正是防 NaN 进 hash 的那道防线。
+ * clamp 的非法输入回落是默认值（roughness/bump/uv/light/alpha 回 1，metal 回 0），
+ * 这正是防 NaN 进 hash 的那道防线。
  */
-export function normalizeParams(p?: BallParamScales): BallParamScales {
+export function normalizeParams(p?: BallParamScales): NormalizedBallParams {
   const s = p ?? DEFAULT_PARAM_SCALES
   return {
     roughness: round2(clampScale(s.roughness)),
     bump: round2(clampScale(s.bump)),
-    uv: round2(clampUv(s.uv))
+    uv: round2(clampUv(s.uv)),
+    light: round2(clampLight(s.light)),
+    metal: round2(clampMetal(s.metal)),
+    alpha: round2(clampAlpha(s.alpha))
   }
 }
 
 /**
- * hash 输入串：**固定字段顺序 roughness, bump, uv**（不是对象键序）。
+ * hash 输入串：**固定字段顺序 roughness, bump, uv**（不是对象键序），
+ * 后三个参数**只在非默认时**追加，且带 `L/M/A` 前缀。
  *
- * UI 两处都用 `{ ...s, roughness: x }` 构造对象，展开语法保留插入顺序但**不保证**
- * 跨进程一致 → hash 必须与键序无关（与 `slotRelPaths` 的 `sort()` 同理）。
+ * 两条硬约束：
+ * 1. 默认参数时输出必须与引入新参数前**逐字符一致**（`'1.00,1.00,1.00'`）——
+ *    历史参数串（DB 里存的、测试里 golden 的）不会因为多加了三个参数而变形；
+ * 2. 前缀字母让"哪个参数变了"在日志里可读，也避免 `,1.50` 这种无主片段。
+ *
+ * 键序无关：UI 两处都用 `{ ...s, roughness: x }` 构造对象，展开语法保留插入顺序
+ * 但**不保证**跨进程一致 → 这里按固定顺序拼，不读对象键序。
  * 2 位小数是下限：滑块 step 0.1 时 2 位是超集，且能吸收 `Number(e.target.value)`
  * 的浮点噪声（`0.30000000000000004.toFixed(2) === '0.30'`）——否则同一个参数会
  * 算出两个名字，缓存无限膨胀。
+ *
+ * `parseThumbFileName` 不受影响：参数串只进 hash，不进文件名字面。
  */
 export function paramsKey(p: BallParamScales): string {
   const n = normalizeParams(p)
-  return `${n.roughness.toFixed(2)},${n.bump.toFixed(2)},${n.uv.toFixed(2)}`
+  const parts = [n.roughness.toFixed(2), n.bump.toFixed(2), n.uv.toFixed(2)]
+  if (n.light !== 1) parts.push(`L${n.light.toFixed(2)}`)
+  if (n.metal !== 0) parts.push(`M${n.metal.toFixed(2)}`)
+  if (n.alpha !== 1) parts.push(`A${n.alpha.toFixed(2)}`)
+  return parts.join(',')
 }
 
-/** 是否等于默认（1,1,1）——方案 B 的判据：默认参数不贡献 hash（docs/12 §3.3） */
+/** 是否等于默认（1,1,1 + 光 1 + 非金属 + 不透明）——方案 B 的判据：默认参数不贡献 hash */
 export function isDefaultParams(p: BallParamScales): boolean {
   const n = normalizeParams(p)
-  return n.roughness === 1 && n.bump === 1 && n.uv === 1
+  return (
+    n.roughness === 1 &&
+    n.bump === 1 &&
+    n.uv === 1 &&
+    n.light === 1 &&
+    n.metal === 0 &&
+    n.alpha === 1
+  )
 }
 
 /**
@@ -98,7 +172,7 @@ export function isDefaultParams(p: BallParamScales): boolean {
  * 而方案 B 的缓存兼容恰好依赖这个区分（历史缓存文件名是「只 hash 槽位」）。
  * 读时再规范化一次：防历史脏值（`0.30000000000000004`）。
  */
-export function resolveRenderParams(asset: Asset): BallParamScales {
+export function resolveRenderParams(asset: Asset): NormalizedBallParams {
   if (!asset.renderParams) return DEFAULT_PARAM_SCALES
   return normalizeParams(asset.renderParams)
 }
@@ -154,12 +228,19 @@ export function ballSlotsRelPaths(slots: BallSlots): string[] {
 /**
  * 渲染修订号（缓存失效闸门，docs/12 §3.3）。
  *
- * 规则：**只要球的观感变了就 +1**（本轮：环境光照全进程共享 + 贴图降采样 + 单图合成法线）。
+ * 规则：**只要球的观感变了就 +1**。历史：
+ * - 2：环境光照全进程共享 + 贴图降采样 + 单图合成法线；
+ * - 3（本轮）：**ACES → Neutral 色调映射** + **球面 UV 等距补偿**（u 方向 repeat ×2）
+ *   + 环境光强度参数化。这三件事都改变成像，但**参数可以完全没变**（默认参数
+ *   资产照样变样）——不加这个修订号，用户会一直看到磁盘上那张旧渲染图。
+ *   因此本轮的 +1 会让**所有旧球图缓存一次性作废**（`regenThumbSweep` 会清掉旧的），
+ *   这是有意为之，不是副作用。
+ *
  * 它只进 hash 输入的**前缀**，不参与任何计算、不进参数串 —— 用户调过的参数不会错位
  * （参数串仍然只在非默认时追加）。主进程与渲染进程都只用本文件的 `ballThumbName`
  * 算名字，因此两边天然算出同一个名字。
  */
-export const RENDER_REV = 2
+export const RENDER_REV = 3
 
 export function ballHash(slots: BallSlots, params: BallParamScales): string {
   const base = ballSlotsRelPaths(slots).join('\n')

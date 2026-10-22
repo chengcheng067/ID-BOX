@@ -13,8 +13,12 @@ import {
   effectiveUvRepeat
 } from '../src/renderer/logic/materialBall'
 import {
+  RENDER_REV,
   ballHash,
   ballThumbName,
+  clampAlpha,
+  clampLight,
+  clampMetal,
   fnv1a,
   isDefaultParams,
   normalizeParams,
@@ -26,7 +30,15 @@ import type { Asset } from '../src/shared/types'
 
 describe('logic/materialBall · 调参渲染（需求书 §3.3）', () => {
   it('DEFAULT_PARAM_SCALES = 1 倍 × 1 倍 × 1 倍（未调参 = 与旧渲染完全一致）', () => {
-    expect(DEFAULT_PARAM_SCALES).toEqual({ roughness: 1, bump: 1, uv: 1 })
+    // 0.6.9 追加三个参数：光强 1（默认照度）、金属 0（非金属=现状）、不透明 1
+    expect(DEFAULT_PARAM_SCALES).toEqual({
+      roughness: 1,
+      bump: 1,
+      uv: 1,
+      light: 1,
+      metal: 0,
+      alpha: 1
+    })
     // 1 倍时 roughness 恒等于基准、bump 恒等于基准、UV 恒等于形态基准（回归保障）
     expect(effectiveRoughness(false, 0.55, 1)).toBeCloseTo(0.55)
     expect(effectiveRoughness(true, 0.55, 1)).toBeCloseTo(1) // 有 map：1 倍 = map 原值
@@ -149,30 +161,30 @@ describe('shared/ballParams · 规范化（docs/12 §3.1，先 clamp 再 round2�
 })
 
 describe('shared/ballParams · golden 锁（docs/12 §3.3 实测值，防 hash 输入格式漂移）', () => {
-  it('第一组槽位 → 3766c782（方案 B + RENDER_REV=2）', () => {
-    expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe('3766c782')
-    expect(ballThumbName(ID, SLOTS)).toBe(`${ID}-3766c782.png`)
+  it('第一组槽位 → 2e32e561（方案 B + RENDER_REV=3）', () => {
+    expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe('2e32e561')
+    expect(ballThumbName(ID, SLOTS)).toBe(`${ID}-2e32e561.png`)
   })
 
-  it("['a.jpg','b.jpg'] → 31f9265d", () => {
-    expect(ballHash({ albedo: 'a.jpg', normal: 'b.jpg' }, DEFAULT_PARAM_SCALES)).toBe('31f9265d')
+  it("['a.jpg','b.jpg'] → 4f3a0eb2", () => {
+    expect(ballHash({ albedo: 'a.jpg', normal: 'b.jpg' }, DEFAULT_PARAM_SCALES)).toBe('4f3a0eb2')
   })
 
-  it('空 slots → 80eea59e（RENDER_REV 前缀 + FNV-1a）', () => {
-    expect(ballHash({}, DEFAULT_PARAM_SCALES)).toBe('80eea59e')
+  it('空 slots → a2f119bb（RENDER_REV 前缀 + FNV-1a）', () => {
+    expect(ballHash({}, DEFAULT_PARAM_SCALES)).toBe('a2f119bb')
     expect(fnv1a('')).toBe('811c9dc5')
   })
 
   it("第一组 + '1.00,1.00,1.00' → c2dbee32（方案 A 形态，仅作为 golden 记录）", () => {
-    // 方案 B 下默认参数不贡献 hash，所以 ballHash 仍是 7694126f；
+    // 方案 B 下默认参数不贡献 hash，所以 ballHash 仍是 2e32e561；
     // 这里锁的是「若无条件贡献会算出什么」——防止有人把方案 B 改成方案 A 而无人察觉。
     expect(fnv1a(BASE + '\n' + paramsKey(DEFAULT_PARAM_SCALES))).toBe('c2dbee32')
     expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).not.toBe('c2dbee32')
   })
 
-  it("第一组 + '1.50,1.00,0.50' → 4f8cc160（参数变化 + RENDER_REV → 名字变）", () => {
+  it("第一组 + '1.50,1.00,0.50' → 493f20b5（参数变化 + RENDER_REV → 名字变）", () => {
     expect(fnv1a(BASE + '\n' + paramsKey({ roughness: 1.5, bump: 1, uv: 0.5 }))).toBe('340ed45f')
-    expect(ballHash(SLOTS, { roughness: 1.5, bump: 1, uv: 0.5 })).toBe('4f8cc160')
+    expect(ballHash(SLOTS, { roughness: 1.5, bump: 1, uv: 0.5 })).toBe('493f20b5')
   })
 
   it('hash 输入必须带 \\n 分隔符（无分隔符会算出 4c25a542，与 golden 不符）', () => {
@@ -211,14 +223,22 @@ describe('shared/ballParams · 参数进 hash 后的缓存语义（docs/12 §6.3
   it('⑩ resolveRenderParams：undefined 回落默认；脏值走 clamp', () => {
     const asset = { id: ID, renderParams: undefined } as unknown as Asset
     expect(resolveRenderParams(asset)).toEqual(DEFAULT_PARAM_SCALES)
-    expect(resolveRenderParams(asset as Asset)).toEqual({ roughness: 1, bump: 1, uv: 1 })
+    // 历史 DB 只有三段（light/metal/alpha 缺失）→ 读回时补默认值
+    expect(resolveRenderParams(asset as Asset)).toEqual({
+      roughness: 1,
+      bump: 1,
+      uv: 1,
+      light: 1,
+      metal: 0,
+      alpha: 1
+    })
     expect(
       resolveRenderParams({ renderParams: { roughness: 9, bump: -1, uv: 0.05 } } as unknown as Asset)
-    ).toEqual({ roughness: 2, bump: 0, uv: 0.1 })
+    ).toEqual({ roughness: 2, bump: 0, uv: 0.1, light: 1, metal: 0, alpha: 1 })
     // 历史脏值（浮点噪声）读时再规范化一次 → 与 hash 输入一致
     expect(
       resolveRenderParams({ renderParams: { roughness: 0.30000000000000004, bump: 1, uv: 1 } } as unknown as Asset)
-    ).toEqual({ roughness: 0.3, bump: 1, uv: 1 })
+    ).toEqual({ roughness: 0.3, bump: 1, uv: 1, light: 1, metal: 0, alpha: 1 })
   })
 
   it('方案 B 硬约束：未调参（undefined）与显式默认值算出同一个名字（既有缓存全部保留）', () => {
@@ -226,5 +246,105 @@ describe('shared/ballParams · 参数进 hash 后的缓存语义（docs/12 §6.3
     expect(ballThumbName(ID, SLOTS)).toBe(
       ballThumbName(ID, SLOTS, resolveRenderParams({ id: ID } as unknown as Asset))
     )
+  })
+})
+
+// ── 0.6.9：光线强度 / 金属度 / 透明度（用户反馈「光太强色差大」「金属体现不出质感」）──
+// 三个参数的**默认值必须不改变既有成像**：光 1、金属 0（= 现状 `metalness:0`）、不透明 1。
+
+describe('shared/ballParams · 0.6.9 新增三参数（light / metal / alpha）', () => {
+  it('clampLight：区间 [0.2, 2]，越界夹紧，非法输入回落 1（不是 0——0 会全黑）', () => {
+    expect(clampLight(0.1)).toBe(0.2) // 下界
+    expect(clampLight(0.2)).toBe(0.2)
+    expect(clampLight(1)).toBe(1)
+    expect(clampLight(2.5)).toBe(2) // 上界
+    expect(clampLight(-3)).toBe(0.2)
+    expect(clampLight(Number.NaN)).toBe(1)
+    expect(clampLight(Number.POSITIVE_INFINITY)).toBe(1)
+    expect(clampLight(undefined)).toBe(1) // 历史参数没有这个字段
+  })
+
+  it('clampMetal：区间 [0, 1]（绝对值），非法输入回落 0（非金属 = 现状观感）', () => {
+    expect(clampMetal(-0.4)).toBe(0)
+    expect(clampMetal(0)).toBe(0)
+    expect(clampMetal(0.35)).toBeCloseTo(0.35)
+    expect(clampMetal(1)).toBe(1)
+    expect(clampMetal(9)).toBe(1)
+    expect(clampMetal(Number.NaN)).toBe(0)
+    expect(clampMetal(undefined)).toBe(0)
+  })
+
+  it('clampAlpha：区间 [0.1, 1]，非法输入回落 1（不透明）', () => {
+    expect(clampAlpha(0)).toBe(0.1) // 下界（0.1 而不是 0：0 等于看不见）
+    expect(clampAlpha(0.1)).toBe(0.1)
+    expect(clampAlpha(0.55)).toBeCloseTo(0.55)
+    expect(clampAlpha(1)).toBe(1)
+    expect(clampAlpha(3)).toBe(1)
+    expect(clampAlpha(Number.NaN)).toBe(1)
+    expect(clampAlpha(undefined)).toBe(1)
+  })
+
+  it('normalizeParams 六参数：先 clamp 再 round2（NaN 不许进 hash）', () => {
+    expect(
+      normalizeParams({ roughness: 1.374, bump: 0.04, uv: 4.6, light: 0.1, metal: 1.9, alpha: 0 })
+    ).toEqual({ roughness: 1.37, bump: 0.04, uv: 4, light: 0.2, metal: 1, alpha: 0.1 })
+    // 全非法 → 全默认；hash 输入里不会出现 "NaN"
+    const bad = normalizeParams({
+      roughness: Number.NaN,
+      bump: Number.NaN,
+      uv: Number.NaN,
+      light: Number.NaN,
+      metal: Number.NaN,
+      alpha: Number.NaN
+    })
+    expect(bad).toEqual(DEFAULT_PARAM_SCALES)
+    expect(paramsKey(bad)).toBe('1.00,1.00,1.00')
+  })
+
+  it('★paramsKey 兼容：默认参数下与旧的三段串**逐字符一致**（老缓存 / 老参数串仍算同一个键）', () => {
+    // 引入新参数之前唯一合法的默认键就是这个字符串
+    expect(paramsKey(DEFAULT_PARAM_SCALES)).toBe('1.00,1.00,1.00')
+    expect(paramsKey({ roughness: 1, bump: 1, uv: 1 })).toBe('1.00,1.00,1.00')
+    // 显式写全默认值也必须一样（历史 DB 读回来就是六字段形态）
+    expect(paramsKey({ roughness: 1, bump: 1, uv: 1, light: 1, metal: 0, alpha: 1 })).toBe(
+      '1.00,1.00,1.00'
+    )
+    // 等价于「默认参数不贡献 hash」：老资产的缓存文件名不变
+    expect(ballThumbName(ID, SLOTS, { roughness: 1, bump: 1, uv: 1 })).toBe(
+      ballThumbName(ID, SLOTS, DEFAULT_PARAM_SCALES)
+    )
+  })
+
+  it('非默认任一参数 → key 变化（三个参数各一条）', () => {
+    const base = paramsKey(DEFAULT_PARAM_SCALES)
+    expect(paramsKey({ roughness: 1, bump: 1, uv: 1, light: 1.5 })).toBe('1.00,1.00,1.00,L1.50')
+    expect(paramsKey({ roughness: 1, bump: 1, uv: 1, metal: 1 })).toBe('1.00,1.00,1.00,M1.00')
+    expect(paramsKey({ roughness: 1, bump: 1, uv: 1, alpha: 0.5 })).toBe('1.00,1.00,1.00,A0.50')
+    for (const p of [
+      { roughness: 1, bump: 1, uv: 1, light: 1.5 },
+      { roughness: 1, bump: 1, uv: 1, metal: 0.5 },
+      { roughness: 1, bump: 1, uv: 1, alpha: 0.5 }
+    ]) {
+      expect(paramsKey(p)).not.toBe(base)
+      // 参数变 → 缓存名变（否则新观感会写进旧名字的缓存文件）
+      expect(ballThumbName(ID, SLOTS, p)).not.toBe(ballThumbName(ID, SLOTS, DEFAULT_PARAM_SCALES))
+    }
+  })
+
+  it('isDefaultParams 把新参数算进去（默认 true；任一非默认 false）', () => {
+    expect(isDefaultParams(DEFAULT_PARAM_SCALES)).toBe(true)
+    expect(isDefaultParams({ roughness: 1, bump: 1, uv: 1, light: 1.001 })).toBe(true) // round2 后 1
+    expect(isDefaultParams({ roughness: 1, bump: 1, uv: 1, light: 1.2 })).toBe(false)
+    expect(isDefaultParams({ roughness: 1, bump: 1, uv: 1, metal: 0.05 })).toBe(false)
+    expect(isDefaultParams({ roughness: 1, bump: 1, uv: 1, alpha: 0.8 })).toBe(false)
+    expect(isDefaultParams({ roughness: 1, bump: 1, uv: 1, light: Number.NaN })).toBe(true)
+  })
+
+  it('★RENDER_REV 固定为 3 且无条件进 hash 前缀（UV 补偿 + Neutral 换了成像 → 旧图必须作废）', () => {
+    // 这个数字只许往上加：改回 2 会让用户继续看到磁盘上那张 ACES + 长砖的旧图
+    expect(RENDER_REV).toBe(3)
+    expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe(fnv1a(`rev${RENDER_REV}\n` + BASE))
+    // 参数没变、只有修订号变 → 名字必须不同（否则"作废旧缓存"这件事根本没发生）
+    expect(fnv1a('rev2\n' + BASE)).not.toBe(fnv1a('rev3\n' + BASE))
   })
 })

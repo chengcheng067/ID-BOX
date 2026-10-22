@@ -6,6 +6,8 @@ import type {
   AssetFile,
   ColorTag,
   FetchZhimoCoverResult,
+  ImportConflictAnswer,
+  ImportConflictAsk,
   ImportEvent,
   MergeMaterialDetectResult,
   MergeMaterialSource,
@@ -22,6 +24,7 @@ import {
   applyFilters,
   filtersFromSavedView,
   normalizeRating,
+  sanitizeFiltersForKind,
   snapshotFilters,
   type Filters,
   type LibraryView
@@ -59,8 +62,177 @@ import {
   type ZhimoCoverTarget
 } from './logic/zhimoCover'
 import { resolveZhimoStyle } from './logic/zhimoStyle'
+import { buildDedupeSnapshot } from './logic/importConflict'
+import {
+  isTerminalStatus,
+  overwriteSummaryText,
+  skippedSummaryText
+} from './logic/importText'
 
 export type { Filters, SortKey, KindFilter } from './logic/filters'
+
+/**
+ * 导入重复处置（docs/27 T-06）的**模块级**状态。
+ *
+ * 为什么不在 store 里：
+ * ① `onImportConflictAsk` 的订阅只能注册一次（重复注册 = 一次询问被处理多次）；
+ *    放在 store 状态里每次 init 都会重订，必须由模块级的"已订阅"标志兜住；
+ * ② 批次计数是"当前批次的临时账"，不是 UI 状态——批次结束即归零，不该进 store 快照
+ *    （否则每条跳过 / 覆盖都触发全库订阅者重渲染）。
+ */
+/** 已注册的退订函数（下标 0 = ask / 1 = expired）；非空 = 已订阅，保证只订一次 */
+let conflictUnsubscribers: Array<() => void> = []
+let skippedInBatchCount = 0
+/** 本批次 `resolution='overwrite'` 的条数（含退化分支） */
+let overwrittenInBatchCount = 0
+/** 其中走了退化路径的条数（`ImportEvent.conflict.degraded === true`：旧版没进回收站） */
+let overwrittenDegradedCount = 0
+
+/**
+ * 「询问过期」看门狗（DEF-19-1 兜底）：
+ *
+ * 正常路径是主进程超时后推 `import:conflictExpired`（见 `ensureConflictAskSubscribed`），
+ * 渲染层据此清 `conflictAsk`。这个计时器是**最后一道保险**——万一那条事件没到
+ * （旧主进程 / 消息丢失 / 主进程在超时瞬间异常），`conflictAsk` 仍会永久残留，
+ * 弹窗又变成"点得动但永不生效"的僵尸。
+ *
+ * 取值 = 主进程 `CONFLICT_ASK_TIMEOUT_MS`（`main/index.ts:170` = 120_000）**+ 1s 余量**，
+ * 确保主进程（唯一权威）先兜底。文案与 expired 事件**完全一致**，两条路径不会互相矛盾；
+ * 先到的那条把 `conflictAsk` 清空，后到的看到 null 就什么都不做（幂等）。
+ * 用户答复 / 主动关闭时立即撤表。
+ */
+const CONFLICT_ASK_WATCHDOG_MS = 121_000
+let conflictAskWatchdog: ReturnType<typeof setTimeout> | null = null
+
+/** 超时的统一提示（expired 事件与看门狗共用，别写两份文案） */
+const CONFLICT_EXPIRED_NOTICE = '已超时未答复，本次重复项已全部按跳过处理'
+
+function clearConflictAskWatchdog(): void {
+  if (conflictAskWatchdog !== null) {
+    clearTimeout(conflictAskWatchdog)
+    conflictAskWatchdog = null
+  }
+}
+
+function armConflictAskWatchdog(requestId: string): void {
+  clearConflictAskWatchdog()
+  conflictAskWatchdog = setTimeout(() => {
+    conflictAskWatchdog = null
+    clearExpiredAsk(requestId)
+  }, CONFLICT_ASK_WATCHDOG_MS)
+}
+
+/**
+ * 清掉一条**已作废**的询问（expired 事件与看门狗共用；事件是权威路径，看门狗只是兜底）。
+ *
+ * - `requestId` 必须与当前 `conflictAsk` 相等才清：迟到的作废绝不能把**下一次**询问关掉；
+ * - 当前本来就是 null → 直接 return：这同时是"同一 requestId 只入队一次提示"的闸门
+ *   （事件与看门狗都可能触发，先到的清空 + 入队，后到的看到 null 什么都不做）；
+ * - 提示**走 `enqueueNotice()` 而不是裸写 `notice`**：同一批次的「已跳过 N 个重复素材，
+ *   原文件保留在原位」等汇总也走这条队列，裸写会把正在展示的那条顶掉。
+ *   实际到达顺序由主进程钉死：`send(importConflictExpired)` 在 `resolve(null)` **之前**，
+ *   所以渲染层先收到作废事件 → 「超时」提示立即展示；随后该条被 skip、`batchDone` 到达
+ *   → 批次汇总入队，4.5s 后才轮到。两条都会出现（顺序不人为调整：宁可保证"一定说出口"）。
+ */
+function clearExpiredAsk(requestId: string): void {
+  const current = useVault.getState().conflictAsk
+  if (!current || current.requestId !== requestId) return
+  clearConflictAskWatchdog()
+  useVault.setState({ conflictAsk: null })
+  enqueueNotice(CONFLICT_EXPIRED_NOTICE)
+}
+
+/**
+ * 订阅「导入发现重复，请裁决」+「询问已作废」（幂等：进程内只注册一次）。
+ *
+ * 必须幂等的原因：`init()` 在开发模式（React StrictMode / HMR）与"重扫后重建"路径上
+ * 都可能被调用多次；若每次都 `ipcRenderer.on`，主进程发来的**同一次询问**会被
+ * 多个 handler 依次处理 → 弹窗状态被覆盖、答复被发出多次。两个通道共用一个守卫，
+ * 退订函数全部模块级保存。
+ */
+export function ensureConflictAskSubscribed(): void {
+  if (conflictUnsubscribers.length > 0) return
+  conflictUnsubscribers = [
+    window.modvault.onImportConflictAsk((ask) => {
+      useVault.setState({ conflictAsk: ask })
+      armConflictAskWatchdog(ask.requestId)
+    }),
+    // 主进程 120s 超时是**单方面**结束（内部 resolve(null) = 全跳过），这条事件
+    // 是它唯一会回推的通知；不是自己答复的场合，只有它能证明"这条询问已经作废"。
+    window.modvault.onImportConflictExpired((ev) => {
+      clearExpiredAsk(ev.requestId)
+    })
+  ]
+}
+
+/**
+ * 底部 toast 的展示时长，与 `NoticeToast.tsx` 的 `setTimeout(..., 4500)` 一致。
+ * 只有"需要排队"时才会用到这个值（见 `enqueueNotice`）。
+ */
+const NOTICE_SHOW_MS = 4500
+
+/** 待展示的 toast 文案（顺序即发生顺序） */
+const noticeQueue: string[] = []
+let noticeTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * 把一条 toast 排进队列并立刻尝试展示（同一批次可能同时有"跳过"和"覆盖"两条汇总）。
+ *
+ * 为什么要队列：`notice` 是单字段，直接连写两次 `set({ notice })` 在同一个 tick 里
+ * 只有最后一条能看见 —— 两条汇总互不吞并必须靠**依次展示**（每条 4.5s）。
+ * `NoticeToast` 的自动消失逻辑不受影响（它只看当前 `notice`）。
+ *
+ * 自愈：若排期期间「正在展示的那条」已被清空（用户关掉 / 4.5s 到 / 别处 setNotice），
+ * 就立即续上下一条，不会白等 4.5 秒。
+ */
+function enqueueNotice(text: string): void {
+  noticeQueue.push(text)
+  drainNoticeQueue()
+}
+
+function drainNoticeQueue(): void {
+  if (noticeTimer !== null) {
+    // 正在展示中：等它到点（下面是续排逻辑）
+    if (useVault.getState().notice !== null) return
+    clearTimeout(noticeTimer)
+    noticeTimer = null
+  }
+  const next = noticeQueue.shift()
+  if (next === undefined) return
+  useVault.setState({ notice: next })
+  noticeTimer = setTimeout(() => {
+    noticeTimer = null
+    drainNoticeQueue()
+  }, NOTICE_SHOW_MS)
+}
+
+/**
+ * 批次结束：把本轮跳过数汇总成一条 toast（docs/27 §3.1）。
+ * 文案：`已跳过 N 个重复素材，原文件保留在原位`；N=0 不发。
+ */
+function flushSkippedSummary(): void {
+  const n = skippedInBatchCount
+  skippedInBatchCount = 0
+  const text = skippedSummaryText(n)
+  if (text) enqueueNotice(text)
+}
+
+/**
+ * 批次结束：把本轮覆盖数汇总成一条 toast。
+ *
+ * 为什么覆盖也要汇总（而不是只靠导入队列明细）：覆盖**有副作用**——旧版本要去系统回收站，
+ * 而队列条目 6 秒就自动消失、批量导入时还会被后续条目顶掉，用户很可能一次都没看见
+ * 「已覆盖到「…」」。这里有任意一条走了退化分支（旧版没进回收站 / 旧目录已不存在）时
+ * 必须如实改口，不能说成"在回收站"。
+ */
+function flushOverwriteSummary(): void {
+  const total = overwrittenInBatchCount
+  const degraded = overwrittenDegradedCount
+  overwrittenInBatchCount = 0
+  overwrittenDegradedCount = 0
+  const text = overwriteSummaryText(total, degraded)
+  if (text) enqueueNotice(text)
+}
 
 /** 本会话已尝试过生成缩略图且失败的资产 id（防止网格反复触发同一个失败的 ensureThumb） */
 const thumbAttempted = new Set<string>()
@@ -332,7 +504,12 @@ export interface ImportItem {
   needBytes?: number
   freeBytes?: number
   /**
-   * 进入终态（done / error）的**绝对时间戳**；进行中为 undefined。
+   * 重复处置结果（docs/27）。`done` + `overwrite` / `keep-both` 时用来改写明细文案
+   * （「已覆盖到「…」」/「已保留为「…」」），`skipped` 时随事件存在但文案走 `message`。
+   */
+  conflict?: ImportEvent['conflict']
+  /**
+   * 进入终态（done / error / skipped）的**绝对时间戳**；进行中为 undefined。
    *
    * 队列条目的自动消失倒计时以它为起点（见 `logic/importText.ts` 的
    * `dismissRemainingMs`）。用时间戳而不是"收到事件后 setTimeout"，
@@ -493,6 +670,21 @@ interface VaultState {
    * 软删过滤本身落在 `applyFilters(..., view)`（唯一落点），这里只持有状态。
    */
   libraryView: LibraryView
+  /**
+   * 导入中发现重复时的询问载荷（docs/27 T-06 / T-07 的约定）；`null` = 没有弹窗。
+   *
+   * 由 `onImportConflictAsk` 推送写入（模块级只订阅一次），由 `ImportConflictDialog`
+   * 只读渲染；答复后（含取消）必须归空 —— 用户没答完时**不存在第二个弹窗**
+   * （主进程一次导入只问一次，见 §4.5）。
+   */
+  conflictAsk: ImportConflictAsk | null
+  /**
+   * 答复一次重复询问：调 `window.modvault.answerImportConflict` 后**无论如何清空** `conflictAsk`。
+   *
+   * 清空放在 `finally`：主进程已崩溃 / 窗口正在关闭时 invoke 会 reject，
+   * 若此时不清，弹窗会永远挂在屏幕上（用户只能强行关窗口）。
+   */
+  answerConflict: (answer: ImportConflictAnswer) => Promise<void>
   /** 切换视图；进入回收站时清空选择 / 关闭文件视图（右栏不能停在一个当前视图看不见的资产上） */
   setLibraryView: (view: LibraryView) => void
   init: () => Promise<void>
@@ -1246,6 +1438,7 @@ export const useVault = create<VaultState>((set, get) => ({
   hdrPreviewAssetId: null,
   dupOnly: false,
   libraryView: 'assets',
+  conflictAsk: null,
 
   async init() {
     const [settings, assets] = await Promise.all([
@@ -1281,12 +1474,20 @@ export const useVault = create<VaultState>((set, get) => ({
       scheduleAiClassify()
       // 知末封面（docs/24，T-04）：同一时机、同样 `setTimeout(0)`，绝不 await
       scheduleZhimoCovers()
+      // docs/27 §3.1：批次结束后把「已跳过 N 个」/「已覆盖 N 个」各汇总成一条 toast。
+      // 两条**互不吞并**（用 `enqueueNotice` 依次展示）：先跳过、后覆盖，顺序即发生顺序。
+      flushSkippedSummary()
+      flushOverwriteSummary()
     })
 
+    // docs/27 T-06：重复询问的订阅（**幂等**，模块级只注册一次；重复订阅会让一次询问被处理多次）
+    ensureConflictAskSubscribed()
+
     window.modvault.onImportEvent((ev) => {
-      // 终态（done / error）记下**绝对时间戳**：ImportQueue 的自动消失倒计时以它为起点，
+      // 终态（done / error / skipped）记下**绝对时间戳**：ImportQueue 的自动消失倒计时以它为起点，
       // 悬停暂停 / 恢复、重建 timer 都不会重新计时（见 logic/importText.ts）。
-      const settled = ev.status === 'done' || ev.status === 'error'
+      // ⚠️ `skipped` 必须是终态：它不是进行中，没有倒计时条目就永远留在队列里。
+      const settled = isTerminalStatus(ev.status)
       set((s) => ({
         imports: [
           ...s.imports.filter((i) => i.item !== ev.item),
@@ -1298,10 +1499,24 @@ export const useVault = create<VaultState>((set, get) => ({
             asset: ev.asset,
             needBytes: ev.needBytes,
             freeBytes: ev.freeBytes,
+            conflict: ev.conflict,
             settledAt: settled ? Date.now() : undefined
           }
         ]
       }))
+      // 跳过的重复素材：只累计，等批次结束汇总成一条 notice（§3.1）
+      if (ev.status === 'skipped') skippedInBatchCount += 1
+      // 覆盖的重复素材：批次级汇总的累计。
+      // 退化判定**只读结构化字段** `ImportEvent.conflict.degraded`（`: true` 仅当 overwrite 走了
+      // 退化路径：旧目录不存在 / kind 变 / 库外 / 旧版没进回收站）。
+      // 不嗅探 `message` 文案；`degraded === undefined`（旧主进程 / 老日志）按 false ——
+      // 同包发布、不存在跨版本混用，这是唯一能从类型上做出的判断。
+      if (ev.status === 'done' && ev.conflict?.resolution === 'overwrite') {
+        overwrittenInBatchCount += 1
+        if (ev.conflict.degraded === true) {
+          overwrittenDegradedCount += 1
+        }
+      }
       if (ev.status === 'done' && ev.asset) {
         void db.assets.put(ev.asset)
         set((s) => ({ assets: upsert(s.assets, ev.asset!) }))
@@ -1313,7 +1528,14 @@ export const useVault = create<VaultState>((set, get) => ({
     })
   },
 
-  setFilter: (patch) => set((s) => ({ filters: { ...s.filters, ...patch } })),
+  setFilter: (patch) =>
+    set((s) => {
+      const merged: Filters = { ...s.filters, ...patch }
+      // 切大类时才归一化（`sanitizeFiltersForKind`）：新视图不支持的维度 / 新视图没有的
+      // 分辨率档必须清掉，否则入口消失了条件还在生效 → 网格空着且用户找不到原因。
+      // 只在 `patch.kind` 存在时跑：改其它维度不必每次重建对象（memo 引用稳定）。
+      return { filters: 'kind' in patch ? sanitizeFiltersForKind(merged) : merged }
+    }),
 
   // ── 0.6.0 智能集合 ─────────────────────────────────────────
 
@@ -1477,13 +1699,36 @@ export const useVault = create<VaultState>((set, get) => ({
         ...s.imports
       ]
     }))
-    await window.modvault.importPaths(paths)
+    // docs/27 §4.1 / D22：判重快照由**渲染层**在调用时一次性传入（主进程拿不到 Dexie）。
+    // 快照排除软删资产（D17）；`index` 为空数组 = 不判重 = 0.6.9 的旧行为。
+    const ctx = { index: buildDedupeSnapshot(get().assets) }
+    await window.modvault.importPaths(paths, ctx)
     // 导入批次结束 → 后台补分类（docs/15 §7）。
     // ⚠️ `scheduleAiClassify` 只是 `setTimeout(..., 0)`，**没有 await 任何网络请求**：
     // 导入动作的耗时不因配置了 AI 而增加一个毫秒（main 侧也会推 import:batchDone，双保险）。
     scheduleAiClassify()
     // 同上：知末封面是**后置任务**，不在导入链路上（双触发由 pending 清空 + 重入锁去重）
     scheduleZhimoCovers()
+  },
+
+  /**
+   * 答复一次重复询问（docs/27 T-07 提交入口）。
+   *
+   * `conflictAsk` 的清空放在 `finally`：主进程崩溃 / 窗口关闭时 invoke 会 reject，
+   * 不清就会留一个永远点不掉的弹窗。失败不抛给 UI（用户没有可行动项，且主进程侧
+   * 超时兜底本身就会全跳过）。
+   */
+  async answerConflict(answer) {
+    // **先同步清再等 IPC**：主进程可能早已超时、根本不理这条答复（回 `phase:'stale'`），
+    // 若等返回值再清，弹窗会卡在屏幕上（DEF-19-1 的真机症状）。所以任何用户点击
+    // 都必须立刻让弹窗消失，与 IPC 成败无关。
+    clearConflictAskWatchdog()
+    set({ conflictAsk: null })
+    try {
+      await window.modvault.answerImportConflict(answer)
+    } catch {
+      // 主进程已不可达：答复必然已被超时兜底接住，UI 已经收场，无需再做什么
+    }
   },
 
   dismissImport: (item) => set((s) => ({ imports: s.imports.filter((i) => i.item !== item) })),

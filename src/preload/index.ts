@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { IPC } from '../shared/ipc'
+import type { ProbedImageSize } from '../shared/imageSize'
 import type {
   AiClassifyBatchResult,
   AiClassifyPayload,
@@ -13,6 +14,10 @@ import type {
   HdrPrepareResult,
   HdrProgressEvent,
   ImportBatchDoneEvent,
+  ImportConflictAnswer,
+  ImportConflictAsk,
+  ImportConflictContext,
+  ImportConflictExpired,
   ImportEvent,
   LayoutApplyResult,
   LogExportResult,
@@ -45,7 +50,46 @@ import type {
  */
 const api = {
   // ── 导入 ────────────────────────────────────────────────────
-  importPaths: (paths: string[]): Promise<Asset[]> => ipcRenderer.invoke(IPC.importPaths, paths),
+  /**
+   * 导入一批路径（压缩包 / 单图）。
+   *
+   * `ctx`（docs/27）：判重快照。渲染层在调用前用当前库算出 `ImportDedupeEntry[]`
+   * 一次传进来（主进程拿不到 Dexie）；**不传 = 不做重复检测**，行为与 0.6.9 完全一致
+   * （静默保留两者）。主进程仍会对每条 `folder` 做库内校验，不能靠它绕过安全边界。
+   */
+  importPaths: (paths: string[], ctx?: ImportConflictContext): Promise<Asset[]> =>
+    ipcRenderer.invoke(IPC.importPaths, paths, ctx),
+  /**
+   * 订阅「导入发现重复，请裁决」（docs/27）。
+   *
+   * 返回退订函数（与 `onImportEvent` 同款）：组件卸载必须调用，否则重复注册会让
+   * 同一次询问被处理多次。
+   */
+  onImportConflictAsk: (cb: (ask: ImportConflictAsk) => void): (() => void) => {
+    const handler = (_: unknown, ask: ImportConflictAsk) => cb(ask)
+    ipcRenderer.on(IPC.importConflictAsk, handler)
+    return () => {
+      ipcRenderer.off(IPC.importConflictAsk, handler)
+    }
+  },
+  /**
+   * 答复一次重复询问。主进程按 `requestId` 兑现挂起的 Promise；
+   * **过期 requestId 会被静默丢弃**（超时后迟到的答复不能影响后续批次）。
+   */
+  answerImportConflict: (answer: ImportConflictAnswer): Promise<void> =>
+    ipcRenderer.invoke(IPC.importConflictAnswer, answer),
+  /**
+   * 订阅「这次询问已作废」（主进程 120s 超时后单方面结束）。
+   * 收到后必须立刻关掉弹窗——否则它会挂在屏幕上，而用户之后的点击都会被当成过期答复丢弃。
+   * 返回退订函数（与其它 `on*` 同款）。
+   */
+  onImportConflictExpired: (cb: (ev: ImportConflictExpired) => void): (() => void) => {
+    const handler = (_: unknown, ev: ImportConflictExpired) => cb(ev)
+    ipcRenderer.on(IPC.importConflictExpired, handler)
+    return () => {
+      ipcRenderer.off(IPC.importConflictExpired, handler)
+    }
+  },
   onImportEvent: (cb: (ev: ImportEvent) => void): (() => void) => {
     const handler = (_: unknown, ev: ImportEvent) => cb(ev)
     ipcRenderer.on(IPC.importEvent, handler)
@@ -222,6 +266,21 @@ const api = {
    */
   saveBallThumb: (payload: SaveBallThumbPayload): Promise<string | null> =>
     ipcRenderer.invoke(IPC.saveBallThumb, payload),
+
+  // ── 2026-10：尺寸回填（分辨率筛选） ─────────────────────────────
+  /**
+   * 只读探测一批文件的宽高（主进程读文件头，64KB，不解码整图）。
+   *
+   * 用途：老库的资产从来没采过 `w/h`（0.6.0 起才在导入时采集），筛选因此"失效"。
+   * 渲染层按自己的节奏分批调用，把结果写回 Dexie。
+   *
+   * @param folder 资产文件夹**绝对路径**（必须在库根内，main 侧越界校验不过返回空数组）
+   * @param rels   相对该文件夹的 posix 路径（如 `pbugp_2K_Albedo.jpg`）
+   * @returns 读得出尺寸的条目（`rel` 原样回传，调用方按它落位）；
+   *          单次最多 200 条，读不出 / 越界的条目**静默省略**（永不 reject）
+   */
+  probeSizes: (folder: string, rels: string[]): Promise<ProbedImageSize[]> =>
+    ipcRenderer.invoke(IPC.probeSizes, folder, rels),
 
   // ── 2026-10 UI 规范 v0.2：无边框窗口控制（§3.1/§4-2）+ 应用版本 ──
   /** 最小化窗口（send） */

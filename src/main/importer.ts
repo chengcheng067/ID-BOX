@@ -20,10 +20,20 @@ import { composeRelFolder, dedupeKeyOf, pickAssetName, sanitizeName, stripNoise,
 import { classifyAssetName } from '../shared/classifyAsset'
 import { parseSkpVersion, SKP_HEAD_BYTES } from '../shared/skpVersion'
 import { IMAGE_FILE_EXTS } from '../shared/imageExts'
-import { IMAGE_SIZE_HEAD_BYTES, imageSizeOf } from '../shared/imageSize'
+import { readHeadForSize } from './probeSizes'
 import { parseMaterialMetaJsonText } from './materialMeta'
 import { writeSkpPreviewInto } from './skpPreview'
 import { humanGB } from '../shared/space'
+import {
+  BatchLedger,
+  buildDedupeIndex,
+  matchConflict,
+  type ConflictMatch,
+  type DedupeIndex
+} from './importConflict'
+// 只借类型（`import type` 编译后完全擦除，不产生运行时依赖）：
+// 询问门的 `ConflictQuery` 就是「一条待裁决的冲突」，与 importer 的判重点一一对应。
+import type { ConflictQuery } from './conflictGate'
 import type {
   ArchiveDisposal,
   Asset,
@@ -31,6 +41,10 @@ import type {
   AssetKind,
   Codepage,
   CoverSource,
+  ImportConflictContext,
+  ImportConflictExisting,
+  ImportConflictResolution,
+  ImportDedupeEntry,
   ImportEvent,
   ThumbStatus
 } from '../shared/types'
@@ -66,6 +80,28 @@ export interface ImportDeps {
   ensureThumb?: (assetId: string, coverAbs: string | null) => Promise<string | null>
   /** 原包处置的注入点（测试用 stub 替代真实 trash） */
   disposeArchive?: (src: string, mode: ArchiveDisposal) => Promise<void>
+  /**
+   * 判重快照（docs/27 D21）。**不传 / `index` 为空 → 完全不判重、不询问**，
+   * 行为与 0.6.9 逐字节等价（既有 `tests/importer*.test.ts` 是硬门槛）。
+   */
+  conflictContext?: ImportConflictContext
+  /**
+   * 冲突裁决（docs/27 T-03）。由 `runImport` 注入 `conflictGate.ask`；
+   * 不注入时冲突项按「同时存在并重命名」处理（= 旧行为，绝不静默丢弃用户的包）。
+   */
+  askConflict?: (query: ConflictQuery) => Promise<ImportConflictResolution>
+  /**
+   * 覆盖时旧目录的去处（docs/27 D11）：系统回收站。
+   * 主进程注入 `shell.trashItem`；未注入时退回 `trash` 包（与 `disposeArchive` 同款兜底）。
+   * ⚠️ 失败时**绝不** `fs.rm` 兜底 —— 那是永久删除用户数据，超出「覆盖」的授权。
+   */
+  trashFolder?: (abs: string) => Promise<void>
+  /**
+   * 诊断日志注入点（importer 不 import logger/electron，测试里可注入 spy）。
+   * 只有两处用：`import:conflict:folder-outside`（快照脏数据，绝不对库外路径动手）
+   * 与 `import:conflict:trash-failed`（旧版本没能进回收站）。
+   */
+  warn?: (event: string, context?: unknown) => void
   emit: (ev: ImportEvent) => void
 }
 
@@ -76,9 +112,17 @@ const activeStaging = new Set<string>()
  * 给**图片文件**补 `w` / `h`（0.6.0「贴图分辨率筛选」的采集端）。
  *
  * 口径（docs/22 §3.1 / §5「不改磁盘结构」）：
- * - 只读文件**头部**（`IMAGE_SIZE_HEAD_BYTES` = 64KB），不解码整图 —— 大库重扫时
- *   逐张 `sharp`/canvas 解码会把主进程卡死；
- * - 只处理 `IMAGE_FILE_EXTS` 里的扩展名，且只认 PNG / JPEG（`imageSizeOf` 的判定）；
+ * - 只读文件**头部**，不解码整图 —— 大库重扫时逐张 `sharp`/canvas 解码会把主进程卡死；
+ * - 读头走 `probeSizes.readHeadForSize`（**与回填同一条口径**）：默认 64KB，
+ *   解析失败且是 `jpg/jpeg` 时升到 1MB 重试一次（APP2/ICC 能到几百 KB，
+ *   实测有图 SOF0 在 678557 字节处）；PNG / hdr / exr 不升级；
+ * - 扩展名分两条分支（2026-10「HDR 分辨率筛选失效」补）：
+ *   `hdr` / `exr` → `hdrSizeOf`（Radiance 文本头 / OpenEXR 属性列表），
+ *   其余 → `imageSizeOf`（只认 PNG / JPEG）；
+ * - 为什么 HDR 不能并进 `IMAGE_FILE_EXTS`：那张表同时是材质球的**兜底取图表**
+ *   （`renderer/logic/materialBall.ts`），收进 `exr` 会让 `Displacement.exr`
+ *   被当 albedo 贴到球上（球变灰/花）。所以这里按 `isHdrExt` 单独放行，
+ *   白名单本身保持原样（详见 `shared/hdrExts.ts` 头注）；
  * - **失败静默**：读不出 / 格式不认识 → 不写 `w/h`（= 未知尺寸）。绝不能因为
  *   「读不出尺寸」让整条导入失败（尺寸只是筛选的辅助信息）。
  *
@@ -90,10 +134,9 @@ const activeStaging = new Set<string>()
  */
 export async function fillImageSizes(folder: string, files: AssetFile[]): Promise<void> {
   for (const file of files) {
-    if (!IMAGE_FILE_EXTS.has(file.ext)) continue
+    if (!IMAGE_FILE_EXTS.has(file.ext) && !isHdrExt(file.ext)) continue
     try {
-      const head = await readHead(safeJoin(folder, file.rel), IMAGE_SIZE_HEAD_BYTES)
-      const size = imageSizeOf(head)
+      const size = await readHeadForSize(safeJoin(folder, file.rel), file.ext)
       if (!size) continue
       file.w = size.w
       file.h = size.h
@@ -178,6 +221,20 @@ export function isInsideLibraryDir(libraryDir: string, target: string): boolean 
   return p === root || p.startsWith(root + path.sep)
 }
 
+/**
+ * 一个导入批次的共享上下文（docs/27 T-04）。
+ *
+ * - `index`：判重快照编成的两张表（**整批共用**，不逐条重编）；
+ * - `ledger`：批内名字台账（§5.1 修「并发 3 下同名包互踩」）；
+ * - `total` / `settled`：算 `ImportConflictAsk.remainingItems`（弹窗提示「还有 N 个在检查」）。
+ */
+interface ImportBatch {
+  index: DedupeIndex
+  ledger: BatchLedger
+  total: number
+  settled: number
+}
+
 /** 批量导入（并发 ≤3，单个失败不阻断其余） */
 export async function importPaths(paths: string[], deps: ImportDeps): Promise<Asset[]> {
   const assets: Asset[] = []
@@ -200,16 +257,27 @@ export async function importPaths(paths: string[], deps: ImportDeps): Promise<As
   }
   if (accepted.length === 0) return assets
 
+  // 判重快照为空 / 未传 → 索引为空 → `matchConflict` 恒 null → 行为与 0.6.9 完全一致（D21）
+  const batch: ImportBatch = {
+    index: buildDedupeIndex(deps.conflictContext?.index),
+    ledger: new BatchLedger(),
+    total: accepted.length,
+    settled: 0
+  }
+
   await mapWithConcurrency(
     accepted,
     deps.concurrency || DEFAULT_CONCURRENCY,
     async (p) => {
       // 双保险：mapWithConcurrency 已兜底，这里再包一层以保留原有错误语义
       try {
-        const asset = await importOne(p, deps)
+        const asset = await importOne(p, deps, batch)
         if (asset) assets.push(asset)
       } catch (err) {
         emitFailure(deps, p, err)
+      } finally {
+        // 无论成功/跳过/失败，该条都"出结果了" → remainingItems 减一
+        batch.settled += 1
       }
     },
     (err, p) => emitFailure(deps, p, err)
@@ -233,7 +301,300 @@ function failureMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-async function importOne(src: string, deps: ImportDeps): Promise<Asset | null> {
+// ══════════════════════════════════════════════════════════════════
+// 导入重复处置（docs/27 T-04）
+//
+// 三段职责：
+// ① `resolveConflict()` —— 判定 + 询问（**必须早于任何 mkdir**，见 §6.1 判据 ①）；
+// ② `replaceAssetFolder()` —— 覆盖的三步执行（挪旧 → 落新 → 销毁旧，D13）；
+// ③ `applyOverwriteInherit()` —— 覆盖后的元数据继承（D12）。
+// ══════════════════════════════════════════════════════════════════
+
+/** 判重结果 + 用户裁决 */
+interface ConflictDecision {
+  match: ConflictMatch
+  resolution: ImportConflictResolution
+}
+
+/** 判重条目 → 弹窗用的瘦投影（不带 folder / meta：UI 看不到也不该看到库外路径） */
+function conflictExistingOf(match: ConflictMatch): ImportConflictExisting {
+  const e = match.existing
+  return {
+    id: e.id,
+    name: e.name,
+    kind: e.kind,
+    relFolder: e.relFolder,
+    size: e.size,
+    importedAt: e.importedAt,
+    otherCopies: match.otherCopies,
+    sizeMismatch: match.sizeMismatch
+  }
+}
+
+/**
+ * 判重 + 询问（docs/27 §1.2 / §4.5）。
+ *
+ * 返回 `null` = 不判重，调用方走**完全原有**的落盘链路（D01 的「都不命中」分支）。
+ * 判定全部是纯函数（`matchConflict`），**不产生任何磁盘副作用**：这条保证是
+ * 「跳过时连空分类目录都不产生」的前提（§3.1）。
+ *
+ * `askConflict` 未注入时按 `keep-both` 处理：宁可多一份 `-2` 副本，也绝不静默丢弃用户的包。
+ */
+async function resolveConflict(
+  batch: ImportBatch,
+  deps: ImportDeps,
+  info: {
+    item: string
+    itemName: string
+    assetName: string
+    kind: AssetKind
+    size: number
+    zhimoId?: string | null
+  }
+): Promise<ConflictDecision | null> {
+  if (!deps.conflictContext || batch.index.size === 0) return null
+
+  const match = matchConflict(batch.index, {
+    assetName: info.assetName,
+    kind: info.kind,
+    size: info.size,
+    zhimoId: info.zhimoId,
+    dedupeKey: dedupeKeyOf(info.assetName, info.kind)
+  })
+  if (!match) return null
+
+  let resolution: ImportConflictResolution = 'keep-both'
+  if (deps.askConflict) {
+    // 等待期间的状态复用既有 `organizing` + `message`（§2.3）：不新增"等待中"状态，
+    // `ImportQueue.tsx` 直接渲染 message，用户能看到这条在等他的决定。
+    deps.emit({
+      item: info.item,
+      itemName: info.itemName,
+      status: 'organizing',
+      message: '检测到重复素材，等待你的选择…'
+    })
+    resolution = await deps.askConflict({
+      item: info.item,
+      itemName: info.itemName,
+      assetName: info.assetName,
+      kind: info.kind,
+      size: info.size,
+      reason: match.reason,
+      zhimoId: info.zhimoId ?? undefined,
+      existing: conflictExistingOf(match),
+      // 本批还没出结果的源文件数（含当前这条）：弹窗顶部「还有 N 个包正在检查」
+      remainingItems: Math.max(0, batch.total - batch.settled)
+    })
+  }
+  return { match, resolution }
+}
+
+/** 跳过的上报（D09/D20：走 `status:'skipped'` + `conflict`，不复用 rescan 的 `IgnoredReason`） */
+function emitSkipped(
+  deps: ImportDeps,
+  info: { item: string; itemName: string },
+  decision: ConflictDecision
+): void {
+  deps.emit({
+    item: info.item,
+    itemName: info.itemName,
+    status: 'skipped',
+    message: '已跳过重复素材（原文件保留在原位）',
+    conflict: {
+      reason: decision.match.reason,
+      resolution: 'skip',
+      existingName: decision.match.existing.name
+    }
+  })
+}
+
+/**
+ * `done` 事件上的处置标记（keep-both / overwrite 才有）。
+ *
+ * `degraded=true` 只表示「覆盖了，但旧版**没进**回收站」（见 `isDegradedOverwrite`）。
+ * 正常情况下**连字段都不带**（不是 `false`）：这样没走退化的事件与 0.6.9 逐字节一致，
+ * 渲染层也只需判 `=== true`。
+ */
+function conflictNote(
+  decision: ConflictDecision,
+  resolution: ImportConflictResolution,
+  degraded = false
+): NonNullable<ImportEvent['conflict']> {
+  return {
+    reason: decision.match.reason,
+    resolution,
+    existingName: decision.match.existing.name,
+    ...(degraded ? { degraded: true } : {})
+  }
+}
+
+/**
+ * `done` 事件的补充文案（§3.2.4）：覆盖档有两种情形必须**显式告诉用户**，不能静默 ——
+ * ① 旧版本没能进回收站（被 DCC 占用等）→ 已暂存为 `.idbox-old-*`；
+ * ② 走了退化分支（旧目录已不存在 / 不在库内 / kind 变了）→ 按新素材落盘。
+ */
+function doneMessage(
+  decision: ConflictDecision | null,
+  replace: ReplaceResult | null
+): string | undefined {
+  if (!decision || decision.resolution !== 'overwrite') return undefined
+  if (!replace) return '已覆盖（原目录已不存在，按新素材落盘）'
+  if (!replace.oldDirTrashed) return '已覆盖；旧版本未能移入回收站，已暂存为 .idbox-old-*'
+  return undefined
+}
+
+/**
+ * 覆盖是否走了「旧版没进回收站」的退化路径 —— `ImportEvent.conflict.degraded` 的唯一判据。
+ *
+ * 刻意复用 `doneMessage()`：**有解释文案 ⇔ 旧版没进回收站**，两者必须永远同步。
+ * 渲染层据此决定「旧版在系统回收站」这句话能不能说（说错了用户不会去清回收站）。
+ *
+ * 三种命中：`replace===null`（旧目录不存在 / kind 变 / 库外，按新素材落盘）、
+ * `!oldDirTrashed`（暂存 `.idbox-old-*`）；正常原位替换 → false。
+ */
+function isDegradedOverwrite(
+  decision: ConflictDecision | null,
+  replace: ReplaceResult | null
+): boolean {
+  return doneMessage(decision, replace) !== undefined
+}
+
+/** 覆盖目标是否满足「原位替换」的前提（§3.2.4 退化分支的判据） */
+type OverwriteVerdict = 'ok' | 'kind-changed' | 'outside-library' | 'missing-folder'
+
+async function checkOverwriteTarget(
+  deps: ImportDeps,
+  existing: ImportDedupeEntry,
+  kind: AssetKind
+): Promise<OverwriteVerdict> {
+  // kind 变了 → 四层路径的顶层大类目录必然变，原位替换无从谈起
+  if (kind !== existing.kind) return 'kind-changed'
+  // 快照脏数据 / 用户刚换过库目录：绝不对库外路径动手
+  if (!isInsideLibraryDir(deps.libraryDir, existing.folder)) {
+    deps.warn?.('import:conflict:folder-outside', { id: existing.id, folder: existing.folder })
+    return 'outside-library'
+  }
+  // 用户手工删了 / 移走了那条资产
+  if (!(await pathExists(existing.folder))) return 'missing-folder'
+  return 'ok'
+}
+
+/**
+ * 旧目录 → 系统回收站（D11：**不进**库内 `.trash`，理由见 docs/27 §3.2.2）。
+ *
+ * 未注入 `trashFolder` 时退回 `trash` npm 包（与 `disposeArchive` 的兜底同款，
+ * 只为单测/开发态保底）。**任何情况下都不 `fs.rm`**：那是永久删除，超出「覆盖」授权。
+ */
+async function trashAssetFolder(abs: string, deps: ImportDeps): Promise<void> {
+  if (deps.trashFolder) return deps.trashFolder(abs)
+  const { default: trash } = await import('trash')
+  await trash(abs)
+}
+
+/** 覆盖三步的结果 */
+interface ReplaceResult {
+  /** 旧内容是否成功进回收站 */
+  oldDirTrashed: boolean
+  /** 没进回收站时留在盘上的 `.idbox-old-*` 目录（要写进 done 事件文案） */
+  leftover: string | null
+}
+
+/**
+ * 覆盖执行器（docs/27 §3.2.4 / D13）：**挪旧 → 落新 → 销毁旧**。
+ *
+ * 为什么必须是这个顺序：目标路径被旧目录占着，`fs.rename` 无法覆盖非空目录；
+ * 而「先删旧再落新」会在落新失败时把用户的原件弄丢。
+ *
+ * 三条失败语义：
+ * - 第 1 步（挪旧）失败 → 直接抛：磁盘零改动，本条导入失败，staging 照常清理；
+ * - 第 2 步（落新）失败 → rename 回滚（旧目录回原位）后抛：**绝不出现「记录指向不存在的目录」**；
+ * - 第 3 步（销毁旧）失败 → **不回滚**（新内容已就位、数据正确），保留 `.idbox-old-*`
+ *   + 由调用方把「旧版本未能移入回收站」写进 done 事件；**绝不 `fs.rm` 兜底**。
+ *
+ * 临时名用 `.` 开头（`.idbox-old-<id>`）：`rescan` / `watcher` 天然跳过（`rescan.ts:54`、
+ * `watcher.shouldIgnoreWatchPath`），也不会出现在任何视图里。
+ */
+async function replaceAssetFolder(
+  target: string,
+  id: string,
+  deps: ImportDeps,
+  place: (target: string) => Promise<void>
+): Promise<ReplaceResult> {
+  const parent = path.dirname(target)
+  let temp = path.join(parent, `.idbox-old-${id}`)
+  // 崩溃残留兜底：同名临时目录已存在 → 加时间戳（§5.7）
+  if (await pathExists(temp)) temp = `${temp}-${Date.now()}`
+
+  // ① 挪旧（同父目录 = 同盘 O(1)）
+  await fs.rename(target, temp)
+
+  // ② 落新
+  try {
+    await place(target)
+  } catch (err) {
+    // 回滚：新内容没落成，旧目录必须回到原位，否则记录会指向不存在的目录（D13）。
+    // 先把**新内容的残骸**清掉（旧内容此时安全地躺在 temp 里，target 上只可能是本次新写的），
+    // 否则 `rename` 到非空目录在 Windows 上会失败，回滚就变成了空动作。
+    if (await pathExists(target)) {
+      await fs.rm(target, { recursive: true, force: true }).catch(() => {})
+    }
+    await fs.rename(temp, target).catch(() => {})
+    throw err
+  }
+
+  // ③ 销毁旧（失败只降级，不回滚）
+  try {
+    await trashAssetFolder(temp, deps)
+    return { oldDirTrashed: true, leftover: null }
+  } catch (err) {
+    deps.warn?.('import:conflict:trash-failed', {
+      dir: temp,
+      error: err instanceof Error ? err.message : String(err)
+    })
+    return { oldDirTrashed: false, leftover: temp }
+  }
+}
+
+/**
+ * 覆盖后的记录（docs/27 §3.2.3 / D10 / D12）：**同位替换 + 元数据 100% 继承**。
+ *
+ * | 字段 | 取值 |
+ * |---|---|
+ * | `id` / `name` / `folder` / `relFolder` | 旧值（`fresh` 里已按旧路径构造） |
+ * | `category1/2` | 旧值 —— 见下方说明 |
+ * | 收藏 / 评分 / 色标 / 标签 / 风格 / 备注 | 旧值；`note` 用 `旧 || 新`（空串不算覆盖） |
+ * | `files` / `size` / `cover` / `thumb*` / `suVersion` / `materialMeta` / `mojibake` | 新值（跟着内容走） |
+ * | `zhimoId` | `新 ?? 旧`（只增不减，封面抓取依赖它） |
+ * | `importedAt` / `updatedAt` | 新时间（覆盖后这份就是"当前的"） |
+ * | `dedupeKey` | 用**旧名**重算（name 不变 → 与旧值一致，重算只为自洽） |
+ *
+ * ⚠️ 分类为什么无条件取旧值（含「双哨兵」情形）：目标路径恒等于 `existing.folder`，
+ * 分类段就是那条路径的 `<一级>/<二级>`。若旧值是 `未分类/未分类` 而改用新包预分类，
+ * 记录会声称自己在 `家具/椅子` 上、磁盘却在 `未分类/未分类/…` —— `relFolder`、
+ * `category`、磁盘三者不一致，下一次 `rescan` 就会把分类改回去，等于白改。
+ * 「双哨兵才用新结论」的前提是允许换路径，而 D10 已裁定沿用旧路径，故此处取旧值。
+ */
+function applyOverwriteInherit(fresh: Asset, existing: ImportDedupeEntry): Asset {
+  const meta = existing.meta
+  return {
+    ...fresh,
+    id: existing.id,
+    name: existing.name,
+    favorite: meta.favorite,
+    rating: meta.rating,
+    colorTag: meta.colorTag,
+    tags: [...meta.tags],
+    styles: [...meta.styles],
+    // 空串不覆盖：HDR 的全景对齐参数写在 note 里，新包没写就必须留住旧值
+    note: meta.note || fresh.note,
+    category1: meta.category1,
+    category2: meta.category2,
+    zhimoId: fresh.zhimoId ?? existing.zhimoId,
+    dedupeKey: dedupeKeyOf(existing.name, fresh.kind)
+  }
+}
+
+async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Promise<Asset | null> {
   const st = await fs.stat(src)
   const isDir = st.isDirectory()
   const itemName = path.basename(src)
@@ -245,11 +606,11 @@ async function importOne(src: string, deps: ImportDeps): Promise<Asset | null> {
   //    加进去会让 `Displacement.exr` 被当成 albedo 贴上球（见 `shared/hdrExts.ts` 头注）。
   if (!isDir) {
     const ext = path.extname(itemName).slice(1).toLowerCase()
-    if (IMAGE_IMPORT_EXTS.has(ext)) return importMediaOne(src, st, deps, 'texture')
+    if (IMAGE_IMPORT_EXTS.has(ext)) return importMediaOne(src, st, deps, 'texture', batch)
     if (isHdrExt(ext)) {
       // kind 复用 `shared/classify.ts` 的 ext→kind 唯一映射（hdr/exr → 'hdri'），
       // 不在这里再写一张表（两处表必然漂移）。
-      return importMediaOne(src, st, deps, kindOfExt(ext))
+      return importMediaOne(src, st, deps, kindOfExt(ext), batch)
     }
   }
 
@@ -343,30 +704,110 @@ async function importOne(src: string, deps: ImportDeps): Promise<Asset | null> {
       kind
     )
 
-    // ── T06 固定四层：<大类>/<一级>/<二级>/<资产名>（06 §11.1） ────────
-    // ⚠️ 空间预检已在本函数更早处完成（P0-3），此处才允许第一次 mkdir。
-    //    预检必须严格早于任何 mkdir（含分类目录），否则"空间不足不产生半成品"契约（:163 断言）会红。
-    const cat2Dir = path.join(deps.libraryDir, folderName, category1, category2)
-    await fs.mkdir(cat2Dir, { recursive: true }) // 一次建齐两级
+    // ── 判重点（docs/27 §2.3）：解压之后、**任何 mkdir 之前** ────────────────
+    // 位置是硬约束：判定早于 `mkdir(cat2Dir)` 才能保证「跳过」连空分类目录都不产生
+    // （§3.1 / §6.1 判据 ①）。空间预检（P0-3）仍然严格更早，故不破坏
+    // 「空间不足不产生半成品」的既有契约。
+    const totalSize = files.reduce((s, f) => s + f.size, 0)
+    // 知末 ID 必须在**落盘前**算（§1.3），且用**原始资产名**（不是 finalName）：
+    // finalName 可能带 `-2` 后缀，用痕迹更干净的名字更稳，也消除「第二条同 ID 素材
+    // 因 finalName 变形而取不到 ID」的历史隐患。
+    const zhimoId = zhimoIdFromSources(
+      itemName,
+      assetName,
+      files.map((f) => f.rel)
+    )
 
-    let existing: string[] = []
-    try {
-      existing = await fs.readdir(cat2Dir)
-    } catch {
-      /* 目录刚建 */
+    const decision = await resolveConflict(batch, deps, {
+      item: src,
+      itemName,
+      assetName,
+      kind,
+      size: totalSize,
+      zhimoId
+    })
+    if (decision?.resolution === 'skip') {
+      // 跳过 = 这次导入**没发生过**：不 mkdir、不落盘、不产生 Asset，
+      // 原压缩包/原图**绝不处置**（`disposeArchive` 一次都不调用，D09/§3.1）
+      emitSkipped(deps, { item: src, itemName }, decision)
+      return null
     }
-    const finalName = uniqueName(assetName, new Set(existing))
-    const target = path.join(cat2Dir, finalName)
-    await moveDir(contentRoot, target)
+
+    // ── 落盘（三档在此分叉）─────────────────────────────────────────
+    interface Placement {
+      id: string
+      finalName: string
+      target: string
+      relFolder: string
+      /** 覆盖三步的执行结果（仅覆盖档非 null） */
+      replace: ReplaceResult | null
+      /** 覆盖档要继承元数据的那条旧记录（仅覆盖档非 null） */
+      inheritFrom: ImportDedupeEntry | null
+    }
+
+    let placement: Placement
+
+    // 覆盖：先验前提（§3.2.4）—— 旧目录在、在库内、kind 没变，才谈得上「原位替换」
+    const overwriteMatch = decision?.resolution === 'overwrite' ? decision.match.existing : null
+    const overwriteOk =
+      overwriteMatch !== null && (await checkOverwriteTarget(deps, overwriteMatch, kind)) === 'ok'
+
+    if (overwriteOk && overwriteMatch) {
+      // D10：id / 名称 / 分类 / 磁盘路径全是旧的，只换内容与派生字段
+      const target = overwriteMatch.folder
+      const relFolder =
+        overwriteMatch.relFolder || composeRelFolder(folderName, category1, category2, overwriteMatch.name)
+      const replace = await replaceAssetFolder(target, overwriteMatch.id, deps, (t) =>
+        moveDir(contentRoot, t)
+      )
+      placement = {
+        id: overwriteMatch.id,
+        finalName: overwriteMatch.name,
+        target,
+        relFolder,
+        replace,
+        inheritFrom: overwriteMatch
+      }
+    } else {
+      // ── T06 固定四层：<大类>/<一级>/<二级>/<资产名>（06 §11.1） ────────
+      // ⚠️ 空间预检已在本函数更早处完成（P0-3），此处才允许第一次 mkdir。
+      //    预检必须严格早于任何 mkdir（含分类目录），否则"空间不足不产生半成品"契约（:163 断言）会红。
+      const cat2Dir = path.join(deps.libraryDir, folderName, category1, category2)
+      await fs.mkdir(cat2Dir, { recursive: true }) // 一次建齐两级
+
+      let diskNames: string[] = []
+      try {
+        diskNames = await fs.readdir(cat2Dir)
+      } catch {
+        /* 目录刚建 */
+      }
+      // 批内台账（§5.1）：`diskNames` 只反映**此刻**的磁盘，并发 3 下必须再叠上
+      // 本批已保留的名字，否则 A、B 会同时算出 `X`，第二个 moveDir 撞上非空目录直接 error。
+      const finalName = batch.ledger.reserve(cat2Dir, assetName, diskNames)
+      const target = path.join(cat2Dir, finalName)
+      try {
+        await moveDir(contentRoot, target)
+      } catch (err) {
+        batch.ledger.release(cat2Dir, finalName) // 名字归还，避免白占
+        throw err
+      }
+      placement = {
+        // 退化覆盖（§3.2.4）：旧目录不可用 → 按新素材落盘，但**沿用旧 id** 覆盖那条陈旧记录
+        id: overwriteMatch ? overwriteMatch.id : randomUUID(),
+        finalName,
+        target,
+        relFolder: composeRelFolder(folderName, category1, category2, finalName),
+        replace: null,
+        inheritFrom: null
+      }
+    }
+
+    const { id, finalName, target, relFolder } = placement
 
     // 0.6.0 分辨率筛选：文件已在最终位置 → 给图片补宽高（只读文件头，失败静默）。
     // 必须**在推送 skp 预览图之前**做：那张图是程序生成的封面，不是用户的贴图，
     // 让它参与「±2K 贴图」判定会把模型资产误算进高清档。
     await fillImageSizes(target, files)
-
-    // ── P0-7：稳定主键，永不变更 ────────────────────────────────
-    const id = randomUUID()
-    const relFolder = composeRelFolder(folderName, category1, category2, finalName)
 
     // ── 封面优先级（P0-8 + P1-2 升级）─────────────────────────
     // ① skp 内嵌预览图（提取落盘成资产内文件，coverSource='embedded'）
@@ -447,20 +888,8 @@ async function importOne(src: string, deps: ImportDeps): Promise<Asset | null> {
       }
     }
 
-    // ── 知末商品 ID（0.6.3，用户反馈）：三来源按可信度取**第一个非空** ────────
-    // ① 源压缩包 / 源文件夹文件名 —— 最高优先：实测「现代壁灯ID_1232108421.rar」
-    //    解包后是 `attachment_1786942463670\现代壁灯\现代壁灯.skp`，包内**零 ID 痕迹**，
-    //    而压缩包稍后就会被按设置处置掉 → 必须在导入这一刻算出来落库；
-    // ② 最终资产名（`uniqueName` 之后的 finalName）；
-    // ③ 包内文件相对路径 —— `znzmo-1180221079-1.skp` 这类资产名里没有 ID 的包。
-    const zhimoId = zhimoIdFromSources(
-      itemName,
-      finalName,
-      files.map((f) => f.rel)
-    )
-
     const now = Date.now()
-    const asset: Asset = {
+    const fresh: Asset = {
       id,
       name: finalName,
       kind,
@@ -487,7 +916,7 @@ async function importOne(src: string, deps: ImportDeps): Promise<Asset | null> {
       favorite: false,
       rating: 0,
       colorTag: null,
-      // 知末商品 ID：压缩包名 / 最终资产名 / 包内文件路径三来源（见函数上方注释）
+      // 知末商品 ID（落盘**之前**就按原始资产名算好，见判重点的注释）
       zhimoId,
       // ⚠️ v0.4 缺陷修复：必须用 `uniqueName()` **之前**的 `assetName`。
       // 用 `finalName` 时第二个同名包叫「椅子-2」→ key 是 `model:椅子-2`，与
@@ -497,7 +926,14 @@ async function importOne(src: string, deps: ImportDeps): Promise<Asset | null> {
       updatedAt: now
     }
 
+    // 覆盖档：同位替换 + 元数据 100% 继承（D10/D12）
+    const asset = placement.inheritFrom
+      ? applyOverwriteInherit(fresh, placement.inheritFrom)
+      : fresh
+
     // ── P0-5 原压缩包处置（失败不阻断） ───────────────────────────
+    // ⚠️ 只有走到这里（真的落盘成功）才允许处置原包；「跳过」档在上面的判定点就 return 了，
+    //    一次都不会调到这里（D09 硬约束：跳过必须原包原封不动）。
     if (!isDir) {
       try {
         await disposeArchive(src, deps.archiveDisposal, deps.disposeArchive)
@@ -506,7 +942,18 @@ async function importOne(src: string, deps: ImportDeps): Promise<Asset | null> {
       }
     }
 
-    deps.emit({ item: src, itemName, status: 'done', asset })
+    const message = doneMessage(decision, placement.replace)
+    const conflict = decision
+      ? conflictNote(decision, decision.resolution, isDegradedOverwrite(decision, placement.replace))
+      : undefined
+    deps.emit({
+      item: src,
+      itemName,
+      status: 'done',
+      asset,
+      ...(conflict ? { conflict } : {}),
+      ...(message ? { message } : {})
+    })
     return asset
   } finally {
     unregisterStaging(staging)
@@ -543,7 +990,8 @@ async function importMediaOne(
   src: string,
   st: Awaited<ReturnType<typeof fs.stat>>,
   deps: ImportDeps,
-  kind: AssetKind
+  kind: AssetKind,
+  batch: ImportBatch
 ): Promise<Asset | null> {
   const itemName = path.basename(src)
   const isHdr = kind === 'hdri'
@@ -592,57 +1040,133 @@ async function importMediaOne(
 
   deps.emit({ item: src, itemName, status: 'organizing', message: '正在分类归档…' })
 
-  const cat2Dir = path.join(deps.libraryDir, folderName, category1, category2)
-  await fs.mkdir(cat2Dir, { recursive: true })
-
-  // 防重名 + 并发安全：mkdir（非 recursive）当作"占位锁"——EEXIST 说明
-  // 同名资产刚被并发导入占用，把该名字拉黑重取，直到占位成功。
-  // （fs.copyFile 会静默覆盖同名目标文件，绝不能让两个导入拿到同一目标。）
-  const taken = new Set<string>()
-  try {
-    for (const name of await fs.readdir(cat2Dir)) taken.add(name)
-  } catch {
-    /* 目录刚建 */
+  // ── 判重点（docs/27 §2.3）：**早于任何 mkdir**（含上面的 cat2Dir 与下面的占位目录）──
+  // 单图 / HDR 的判重口径与压缩包**完全一致**（D16）：键 = `dedupeKeyOf(资产名, 各自 kind)`
+  // + `zhimoId`，处置语义也一致。同名不同 kind 天然不判重（`dedupeKeyOf` 里 kind 是前缀，
+  // 两者的落盘大类目录本来就不同，物理上不冲突）。
+  const zhimoId = zhimoIdFromSources(itemName, assetName, [itemName])
+  const decision = await resolveConflict(batch, deps, {
+    item: src,
+    itemName,
+    assetName,
+    kind,
+    size: Number(st.size),
+    zhimoId
+  })
+  if (decision?.resolution === 'skip') {
+    // 跳过 = 源文件**绝不处置**（D09）：本函数尾部那次 `disposeArchive` 一次都不会执行
+    emitSkipped(deps, { item: src, itemName }, decision)
+    return null
   }
-  let finalName = uniqueName(assetName, taken)
-  let target = path.join(cat2Dir, finalName)
-  for (;;) {
+
+  interface MediaPlacement {
+    id: string
+    finalName: string
+    target: string
+    relFolder: string
+    replace: ReplaceResult | null
+    inheritFrom: ImportDedupeEntry | null
+  }
+
+  let placement: MediaPlacement
+  const overwriteMatch = decision?.resolution === 'overwrite' ? decision.match.existing : null
+  const overwriteOk =
+    overwriteMatch !== null && (await checkOverwriteTarget(deps, overwriteMatch, kind)) === 'ok'
+
+  if (overwriteOk && overwriteMatch) {
+    // 单图覆盖与压缩包同构（§5.2）：不是 `moveDir(contentRoot)` 而是「mkdir 旧路径 + copyFile」；
+    // 文件名用**新包的文件名**（可能是 .png 而旧的是 .jpg），`Asset.files` 随之换新，
+    // 资产名（= 目录名）保持旧值。
+    const target = overwriteMatch.folder
+    const relFolder =
+      overwriteMatch.relFolder || composeRelFolder(folderName, category1, category2, overwriteMatch.name)
+    const replace = await replaceAssetFolder(target, overwriteMatch.id, deps, async (t) => {
+      await fs.mkdir(t)
+      try {
+        await fs.copyFile(src, path.join(t, itemName))
+      } catch (err) {
+        // 复制失败：撤掉刚建的壳，再让 replaceAssetFolder 把旧目录 rename 回原位
+        await fs.rm(t, { recursive: true, force: true }).catch(() => {})
+        throw err
+      }
+    })
+    placement = {
+      id: overwriteMatch.id,
+      finalName: overwriteMatch.name,
+      target,
+      relFolder,
+      replace,
+      inheritFrom: overwriteMatch
+    }
+  } else {
+    const cat2Dir = path.join(deps.libraryDir, folderName, category1, category2)
+    await fs.mkdir(cat2Dir, { recursive: true })
+
+    // 防重名 + 并发安全：mkdir（非 recursive）当作"占位锁"——EEXIST 说明
+    // 同名资产刚被并发导入占用，把该名字拉黑重取，直到占位成功。
+    // （fs.copyFile 会静默覆盖同名目标文件，绝不能让两个导入拿到同一目标。）
+    //
+    // 台账名并入初始 `taken`（docs/27 §5.1）：`fs.readdir` 只反映此刻磁盘，
+    // 并发 3 下必须再叠上本批次已保留的名字，否则 A、B 会算出同一目标。
+    const taken = batch.ledger.namesOf(cat2Dir)
     try {
-      await fs.mkdir(target) // 非 recursive：已存在即抛 EEXIST
-      break
+      for (const name of await fs.readdir(cat2Dir)) taken.add(name)
+    } catch {
+      /* 目录刚建 */
+    }
+    let finalName = uniqueName(assetName, taken)
+    let target = path.join(cat2Dir, finalName)
+    for (;;) {
+      try {
+        await fs.mkdir(target) // 非 recursive：已存在即抛 EEXIST
+        break
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+        taken.add(finalName)
+        finalName = uniqueName(assetName, taken)
+        target = path.join(cat2Dir, finalName)
+      }
+    }
+    // 占位成功 → 立刻记进台账，让并发的兄弟任务看得见（中间没有 await，不会漏）
+    batch.ledger.claim(cat2Dir, finalName)
+
+    // ── 纳入库内：**一律先复制**，源文件留待下面按用户设置处置 ────────────
+    //
+    // ⚠️ 缺陷修复（2026-10）：旧实现无条件 `fs.rename`（跨盘退化为 复制+删源），
+    // 完全没读 `deps.archiveDisposal` —— 于是「保留原位 / 移入回收站 / 彻底删除」
+    // 三档表现完全一样，源图片一律被搬走。`rename` 更不能留作主路径：
+    // 它会把源文件直接搬走，'keep' 档的语义天然无法成立。
+    //
+    // 现在与压缩包路径（`importOne` 尾部）**完全对齐**：先复制入库，再复用同一个
+    // `disposeArchive` 处置源文件；不另写一套删除逻辑（两套实现迟早漂移）。
+    // 顺序不可颠倒：**复制成功之后**才允许触碰源文件，杜绝「源没了、库里也没有」。
+    //
+    // 不再为 'delete' 保留同卷 rename 快路径：少一条分支就少一个坑，且 rename
+    // 对 'keep'/'recycle' 都是错的，为省一次拷贝去分裂语义不划算。
+    const dest = path.join(target, itemName)
+    try {
+      await fs.copyFile(src, dest)
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-      taken.add(finalName)
-      finalName = uniqueName(assetName, taken)
-      target = path.join(cat2Dir, finalName)
+      // 复制失败 = 该条导入失败：撤掉刚才的 `mkdir` 占位目录，不留空资产壳。
+      // 此刻源文件**一次都没被写过/删过**，因此必然完好（验收点 5）。
+      await fs.rm(target, { recursive: true, force: true }).catch(() => {})
+      batch.ledger.release(cat2Dir, finalName)
+      throw err
+    }
+    placement = {
+      // 退化覆盖：沿用旧 id 覆盖那条陈旧记录（与压缩包路径同口径）
+      id: overwriteMatch ? overwriteMatch.id : randomUUID(),
+      finalName,
+      target,
+      relFolder: composeRelFolder(folderName, category1, category2, finalName),
+      replace: null,
+      inheritFrom: null
     }
   }
 
-  // ── 纳入库内：**一律先复制**，源文件留待下面按用户设置处置 ────────────
-  //
-  // ⚠️ 缺陷修复（2026-10）：旧实现无条件 `fs.rename`（跨盘退化为 复制+删源），
-  // 完全没读 `deps.archiveDisposal` —— 于是「保留原位 / 移入回收站 / 彻底删除」
-  // 三档表现完全一样，源图片一律被搬走。`rename` 更不能留作主路径：
-  // 它会把源文件直接搬走，'keep' 档的语义天然无法成立。
-  //
-  // 现在与压缩包路径（`importOne` 尾部）**完全对齐**：先复制入库，再复用同一个
-  // `disposeArchive` 处置源文件；不另写一套删除逻辑（两套实现迟早漂移）。
-  // 顺序不可颠倒：**复制成功之后**才允许触碰源文件，杜绝「源没了、库里也没有」。
-  //
-  // 不再为 'delete' 保留同卷 rename 快路径：少一条分支就少一个坑，且 rename
-  // 对 'keep'/'recycle' 都是错的，为省一次拷贝去分裂语义不划算。
+  const { id, finalName, target } = placement
+  const relFolder = placement.relFolder
   const destFile = path.join(target, itemName)
-  try {
-    await fs.copyFile(src, destFile)
-  } catch (err) {
-    // 复制失败 = 该条导入失败：撤掉刚才的 `mkdir` 占位目录，不留空资产壳。
-    // 此刻源文件**一次都没被写过/删过**，因此必然完好（验收点 5）。
-    await fs.rm(target, { recursive: true, force: true }).catch(() => {})
-    throw err
-  }
-
-  const id = randomUUID()
-  const relFolder = composeRelFolder(folderName, category1, category2, finalName)
   // HDR 不做缩略图：`.hdr` 不是图片解码器能吃的格式，传给 ensureThumb 只会白跑一次
   // 解码并留下一条 failed 足迹（UI 本来就显示类型占位）。
   const coverAbs = isHdr ? null : destFile
@@ -665,15 +1189,15 @@ async function importMediaOne(
     }
   }
 
-  // 知末商品 ID（0.6.3）：单文件路径同压缩包路径 —— 源文件名优先，其次最终资产名
-  const zhimoId = zhimoIdFromSources(itemName, finalName, [itemName])
+  // 知末商品 ID（0.6.3）：单文件路径同压缩包路径 —— 源文件名优先，其次资产名。
+  // 已在判重点按 `assetName` 算好（§1.3），这里不再用 finalName 重算。
 
   // 全景对齐参数（0.6.5）：只对 HDR 生效。名字里写的「偏移U/V、平铺N」是用户
   // 在 DCC 里的对齐设定，丢了就得回原站查 —— 顺手抄一行到 note（不结构化）。
   const note = isHdr ? panoramaNoteFromName(itemName) : ''
 
   const now = Date.now()
-  const asset: Asset = {
+  const fresh: Asset = {
     id,
     name: finalName,
     kind,
@@ -700,7 +1224,7 @@ async function importMediaOne(
     favorite: false,
     rating: 0,
     colorTag: null,
-    // 同压缩包路径：三来源（源文件名 → 最终资产名 → 包内文件名）
+    // 同压缩包路径：源文件名优先，其次资产名（判重点已算好）
     zhimoId,
     // 同压缩包路径：用 `uniqueName()` 之前的 `assetName`（见上方注释）
     dedupeKey: dedupeKeyOf(assetName, kind),
@@ -708,18 +1232,35 @@ async function importMediaOne(
     updatedAt: now
   }
 
+  // 覆盖档：同位替换 + 元数据 100% 继承（D10/D12）
+  const asset = placement.inheritFrom
+    ? applyOverwriteInherit(fresh, placement.inheritFrom)
+    : fresh
+
   // ── 源文件处置（与压缩包 P0-5 **同一个** helper，三档语义因此天然一致）──
   //   keep    → 直接 return，源文件原地不动（缺陷修复的核心验收点）
   //   recycle → trashOne / shell.trashItem 进回收站
   //   delete  → fs.rm 彻底删除
   // 处置失败只吞掉（源文件保留），绝不回滚已经完成的入库——与压缩包路径同策略。
+  // ⚠️「跳过」档在上面判重点就 return 了，**一次都走不到这里**（D09 硬约束）。
   try {
     await disposeArchive(src, deps.archiveDisposal, deps.disposeArchive)
   } catch {
     /* 处置失败 → 保留源图，不阻断导入 */
   }
 
-  deps.emit({ item: src, itemName, status: 'done', asset })
+  const message = doneMessage(decision, placement.replace)
+  const conflict = decision
+    ? conflictNote(decision, decision.resolution, isDegradedOverwrite(decision, placement.replace))
+    : undefined
+  deps.emit({
+    item: src,
+    itemName,
+    status: 'done',
+    asset,
+    ...(conflict ? { conflict } : {}),
+    ...(message ? { message } : {})
+  })
   return asset
 }
 

@@ -109,6 +109,52 @@ export function kindFilterLabel(f: KindFilter): string {
 }
 
 /**
+ * 某个大类视图里「这个筛选维度有没有意义」——**唯一能力表**。
+ *
+ * 背景（2026-10 用户反馈）：「分辨率这个功能在材质和 HDR 的界面都会失效」「材质面板的顶栏
+ * 不需要出现风格的选项，HDR 也不需要」「模型界面的顶栏也不需要显示分辨率」。
+ * 这些都不是"入口藏起来就行"的 UI 问题——入口隐藏了但筛选值仍生效时，网格会空着且
+ * 用户找不到原因（见 `sanitizeFiltersForKind`）。
+ *
+ * 口径（照抄，不要在组件里另判）：
+ * - `model`：封面是 720px 渲染图，按它筛"分辨率"没有意义 → 不给分辨率；风格主战场 → 给风格；
+ * - `texture` / `material`：贴图长边就是真实规格 → 给分辨率；材质不挂风格（`DetailPanel` 已如此）→ 不给；
+ * - `hdri`：全景宽度是硬规格 → 给分辨率；用户明确"不需要风格" → 不给；
+ * - `other`：兜底不给任何入口。
+ */
+export interface KindFilterCaps {
+  resolution: boolean
+  style: boolean
+}
+
+export const KIND_FILTER_CAPS: Record<AssetKind, KindFilterCaps> = {
+  model: { resolution: false, style: true },
+  texture: { resolution: true, style: false },
+  material: { resolution: true, style: false },
+  hdri: { resolution: true, style: false },
+  other: { resolution: false, style: false }
+}
+
+const ALL_ASSET_KINDS = Object.keys(KIND_FILTER_CAPS) as AssetKind[]
+
+/**
+ * 能力判定的**唯一入口**（组件 / store / 纯逻辑都调它）。
+ *
+ * ⚠️ 禁止在别处写 `filters.kind !== 'model'` 这类硬编码大类判断：
+ * ① 分组哨兵（materialGroup）会被漏掉；② 将来加维度 / 加大类时必然漏改；
+ * ③ `tests/filterCaps.test.ts` 有源码守卫盯着 `App.tsx`。
+ *
+ * `'all'` = 所有真实 kind 的**并集**（任一支持即 true）；`materialGroup` = 看它的成员。
+ */
+export function capsOfFilter(f: KindFilter, cap: keyof KindFilterCaps): boolean {
+  if (f === 'all') return ALL_ASSET_KINDS.some((k) => KIND_FILTER_CAPS[k][cap])
+  const kinds = kindsOfFilter(f)
+  if (!kinds) return false
+  for (const k of kinds) if (KIND_FILTER_CAPS[k]?.[cap] === true) return true
+  return false
+}
+
+/**
  * 侧栏/导航显示顺序（docs/14 §2.4 / §6.1）：`texture` 与 `material` 合并为一个
  * 「材质」节点（哨兵 `'materialGroup'`），展开后由两个 kind chip 单独筛选。
  * HDRI 仍在第 3 位、其他仍在末位。

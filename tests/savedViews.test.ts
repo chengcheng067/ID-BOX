@@ -87,7 +87,8 @@ describe('filtersFromSavedView · 补齐与校验', () => {
         colorTags: ['pink', 5],
         minBytes: Number.NaN,
         importedAfter: Number.POSITIVE_INFINITY,
-        minResolution: '8k',
+        // 2026-10 起 8K / 16K 是合法档（HDR 用），这里换一个真正越界的值
+        minResolution: '32k',
         query: 42,
         sort: 'unknown'
       })
@@ -125,10 +126,19 @@ describe('filtersFromSavedView · 补齐与校验', () => {
       )
     )
     expect(out.kind).toBe('materialGroup')
-    expect(out.styles).toEqual(['奶油风'])
+    // 2026-10 筛选域收敛：材质族不挂风格 → 存量视图里的 styles 在套用时就地清掉
+    // （这正是 `sanitizeFiltersForKind` 的职责，用户反馈「材质面板不需要风格」）
+    expect(out.styles).toEqual([])
     expect(out.colorTags).toEqual(['red', 'purple'])
     expect(out.minResolution).toBe('2k')
     expect(out.sort).toBe('su')
+  })
+
+  it('风格只在支持它的视图里还原（模型视图：保留；材质视图：清空）', () => {
+    expect(filtersFromSavedView(view({ kind: 'model', styles: ['奶油风'] })).styles).toEqual([
+      '奶油风'
+    ])
+    expect(filtersFromSavedView(view({ kind: 'hdri', styles: ['奶油风'] })).styles).toEqual([])
   })
 
   it('sort：视图字段优先；非法时退回快照里的 sort', () => {

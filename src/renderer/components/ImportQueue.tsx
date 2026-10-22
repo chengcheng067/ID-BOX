@@ -1,27 +1,30 @@
 import { useEffect, useState } from 'react'
 import { useVault } from '../store'
-import { dismissRemainingMs, spaceShortageText } from '../logic/importText'
+import {
+  dismissRemainingMs,
+  importItemDetail,
+  isTerminalStatus,
+  spaceShortageText,
+  statusClass
+} from '../logic/importText'
 import { IconAlert, IconCheck, IconClose, IconDownload } from '../icons'
-
-const STATUS_CLS: Record<string, string> = {
-  pending: 'text-muted',
-  extracting: 'text-accent',
-  organizing: 'text-accent',
-  done: 'text-success',
-  error: 'text-danger'
-}
 
 /**
  * 右下角导入进度队列。
  *
  * 2026-10 用户反馈（截图 6 条堆屏）：「条目永不消失」——旧实现只在 `imports.length === 0`
  * 时整块消失，单条 done 之后一直留着。现在的口径：
- * - `done` → 6 秒后自动移除（`autoDismissDelayMs`）；
+ * - `done` / `skipped` → 6 秒后自动移除（`autoDismissDelayMs`）；
  * - `error` → 12 秒（错误要留久一点让人看清）；
- * - pending / extracting / organizing **不消失**（队列此刻是唯一的进度反馈）；
+ * - pending / extracting / organizing **不消失**（队列此刻唯一的进度反馈）；
  * - 鼠标悬停整个队列 → 暂停倒计时，移开继续（倒计时以 `settledAt` 绝对时间戳重算，
  *   暂停期间流逝的时间会如实扣掉，不会"悬停一下又重新计 6 秒"）；
  * - 手动点 ✕ 仍立即移除；计时器在悬停切换 / 条目变化 / 组件卸载时全部清理。
+ *
+ * 2026-10 导入重复处置（docs/27 T-08）：
+ * - `skipped` 走**中性灰** + ✕ 图标（跳过不是失败，不能学 error 用红色）；
+ * - `done` 且带 `conflict` 时明细换成「已覆盖到「…」」/「已保留为「…」」。
+ *   配色 / 倒计时 / 文案三处的唯一来源是 `logic/importText.ts`（本组件只管排布）。
  */
 export function ImportQueue() {
   const imports = useVault((s) => s.imports)
@@ -94,11 +97,14 @@ export function ImportQueue() {
               key={it.item}
               className="pointer-events-auto flex items-start gap-2.5 rounded-xl border border-line bg-card px-3 py-2.5 shadow-soft"
             >
-              <span className={`mt-0.5 shrink-0 ${STATUS_CLS[it.status] ?? 'text-muted'}`}>
+              <span className={`mt-0.5 shrink-0 ${statusClass(it.status)}`}>
                 {it.status === 'done' ? (
                   <IconCheck />
                 ) : it.status === 'error' ? (
                   <IconAlert />
+                ) : it.status === 'skipped' ? (
+                  // 跳过：中性灰的 ✕（"这次没进来"），不是告警三角
+                  <IconClose />
                 ) : (
                   <span className="inline-block animate-pulse">
                     <IconDownload />
@@ -109,15 +115,7 @@ export function ImportQueue() {
                 <div className="truncate text-[13px] font-medium" title={it.itemName}>
                   {it.itemName}
                 </div>
-                <div className="truncate text-[11px] text-muted">
-                  {it.status === 'error'
-                    ? space ??
-                      it.message ??
-                      '导入失败'
-                    : it.status === 'done'
-                      ? `已归档${it.asset ? `到「${it.asset.relFolder.split('/')[0]}」` : ''}`
-                      : (it.message ?? '处理中…')}
-                </div>
+                <div className="truncate text-[11px] text-muted">{importItemDetail(it)}</div>
                 {/* P0-3：空间不足时给可行动出口——改库目录 + 重试 */}
                 {space && (
                   <div className="mt-1.5 flex gap-1.5">
@@ -130,7 +128,7 @@ export function ImportQueue() {
                   </div>
                 )}
               </div>
-              {(it.status === 'done' || it.status === 'error') && (
+              {isTerminalStatus(it.status) && (
                 <button
                   className="mt-0.5 shrink-0 text-muted hover:text-primary"
                   onClick={() => dismiss(it.item)}

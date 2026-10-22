@@ -8,6 +8,7 @@ import { DropOverlay } from './components/DropOverlay'
 import { ImportQueue } from './components/ImportQueue'
 import { SettingsDialog } from './components/SettingsDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
+import { ImportConflictDialog } from './components/ImportConflictDialog'
 import { NoticeToast } from './components/NoticeToast'
 import { CategoryPicker } from './components/CategoryPicker'
 import { RenameDialog } from './components/RenameDialog'
@@ -42,18 +43,21 @@ const HdrPreviewDialogLazy = lazy(() =>
 import { formatBytes } from '../shared/format'
 import { resolveTheme } from '../shared/theme'
 import { displayName } from '../shared/naming'
-import { kindFilterLabel } from '../shared/classify'
+import { capsOfFilter, kindFilterLabel, kindsOfFilter } from '../shared/classify'
 import { UNCLASSIFIED } from '../shared/taxonomy'
 import {
-  RESOLUTION_QUICK_OPTIONS,
   SIZE_PRESET_BYTES,
   SORT_OPTIONS,
   TIME_PRESET_LABEL,
   activeImportedRange,
   activeSizeRange,
   describeNumericFilters,
+  resolutionChipTitle,
+  resolutionOptionsFor,
+  resolutionPanelTitle,
   sizePresetLabel,
   sizePresetOf,
+  styleCountsFor,
   timePresetOf,
   timePresetRange,
   toggleColorTag,
@@ -568,29 +572,47 @@ export default function App() {
 
   // ── 风格筛选（2026-10 用户要求：入口从顶栏搬到中栏头这一排）─────────────
   /**
-   * 风格 → 资产数（一个资产可挂多个风格，各组分头计）。
-   * 口径与左栏 / 顶栏原实现完全一致：只统计**在库资产**（软删记录留在 store 里但不计入），
-   * 排序为数量降序，同数按名称（zh-CN）升序。
+   * 风格 → 资产数（纯逻辑在 `filters.ts` 的 `styleCountsFor`，组件只做 useMemo 接线）。
+   *
+   * ⚠️ 统计范围 = **当前大类视图内**（`kindsOfFilter(filters.kind)` 先过滤 `allAssets`），
+   * 不是全库。用户反馈「材质面板的顶栏不需要风格」的根因就在这里：以前拿全库计数，
+   * 材质视图里也能看到风格 chip，点进去必然 0 条（材质根本不挂风格）。
+   * 软删记录由 `styleCountsFor` 内部跳过。
    */
   const styleCounts = useMemo(() => {
-    const m = new Map<string, number>()
-    for (const a of allAssets) {
-      if (isDeletedAsset(a)) continue
-      for (const s of a.styles ?? []) m.set(s, (m.get(s) ?? 0) + 1)
-    }
-    return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-CN'))
-  }, [allAssets])
-  /** 有风格可选、或已有风格筛选在生效时，入口才渲染（避免空浮层 / 避免筛不掉） */
-  const showStyleEntry = styleCounts.length > 0 || filters.styles.length > 0
+    const kinds = kindsOfFilter(filters.kind)
+    const scoped = kinds ? allAssets.filter((a) => kinds.has(a.kind)) : allAssets
+    return styleCountsFor(scoped)
+  }, [allAssets, filters.kind])
+  /**
+   * 入口可见性**统一走能力表**（`shared/classify` 的 `capsOfFilter`）：
+   * - 分辨率：模型 / 其他视图不给（模型封面是 720px 渲染图，按它筛没有意义）；
+   * - 风格：材质族 / HDR / 其他不给，且该视图内没有可选风格、也没有筛选在生效时不给
+   *   （避免空浮层 / 避免筛不掉）。
+   * ⚠️ 不要在组件里按大类名字硬编码判断（分组哨兵会被漏掉，将来加维度也必然漏改；
+   * `tests/filterCaps.test.ts` 有源码守卫盯着）。
+   */
+  const showResolutionEntry = capsOfFilter(filters.kind, 'resolution')
+  const showStyleEntry =
+    capsOfFilter(filters.kind, 'style') && (styleCounts.length > 0 || filters.styles.length > 0)
   /** 风格是多选维度：只要有选中就算激活，chip 上带数量（与色标同规矩） */
   const styleFilterActive = filters.styles.length > 0
   /**
-   * 切到回收站视图时把风格浮层收起：该视图下入口是禁用态（面板不再渲染），
-   * 若不收状态，回到资产视图时会"凭空"弹出一个浮层。筛选状态本身不清空。
+   * 切到回收站视图、或切到**不支持风格**的大类（材质族 / HDR / 其他）时把风格浮层收起：
+   * 那些视图下入口不渲染（面板不再渲染），若不收状态，切回来时会"凭空"弹出一个浮层。
+   * 筛选值本身由 store 的 `sanitizeFiltersForKind` 清掉（两者分工不同）。
    */
   useEffect(() => {
-    if (trashMode) setStylePanel(false)
-  }, [trashMode])
+    if (trashMode || !showStyleEntry) setStylePanel(false)
+  }, [trashMode, showStyleEntry])
+  /**
+   * 切到**不支持分辨率**的大类（模型 / 其他）时把分辨率浮层收起：
+   * 入口消失、状态还开着的话，浮层会浮在一个没有触发按钮的位置上。
+   * 筛选值本身由 store 的 `sanitizeFiltersForKind` 清掉（两者分工不同）。
+   */
+  useEffect(() => {
+    if (!showResolutionEntry) setExtraPanel((p) => (p === 'resolution' ? null : p))
+  }, [showResolutionEntry])
 
   // ── 排序胶囊（自绘浮层）────────────────────────────────────────────
   /** 胶囊上显示的当前排序名；`SORT_OPTIONS` 与 `SortKey` 同源，兜底防止脏值留下空白胶囊 */
@@ -801,25 +823,30 @@ export default function App() {
                         时间
                       </button>
                       {/* 0.6.0 分辨率（与体积 / 时间同一视觉与交互族：单选、选中即收起）。
-                          判定口径是「该资产任一图片文件的长边 ≥ 2048 / 4096」，
-                          未知尺寸（旧索引 / 非 PNG-JPEG）**不进**这两档 → title 里说明。 */}
-                      <button
-                        className={`${resolutionFilterActive ? 'chip-accent' : 'chip-ghost'} shrink-0 ${
-                          trashMode ? 'cursor-not-allowed opacity-40' : ''
-                        }`}
-                        disabled={trashMode}
-                        aria-pressed={resolutionFilterActive}
-                        aria-haspopup="dialog"
-                        aria-expanded={extraPanel === 'resolution'}
-                        title={
-                          trashMode
-                            ? '回收站不支持分辨率筛选（返回资产视图后可用）'
-                            : '按贴图分辨率筛选（长边 ≥ 2048 / ≥ 4096；尺寸未知的资产不进这两档）'
-                        }
-                        onClick={toggleExtraPanel('resolution')}
-                      >
-                        分辨率
-                      </button>
+                          判定口径是「该资产任一图片文件的长边 ≥ 2048 / 4096」（HDR 视图看
+                          全景宽度，档位 4K/8K/16K），未知尺寸（旧索引 / 非 PNG-JPEG）
+                          **不进**这些档 → title 里说明。
+                          **按视图决定是否渲染**：模型 / 其他视图没有这个维度（能力表
+                          `capsOfFilter`），入口不出现；切走时 store 会把残留档位清掉。 */}
+                      {showResolutionEntry && (
+                        <button
+                          className={`${resolutionFilterActive ? 'chip-accent' : 'chip-ghost'} shrink-0 ${
+                            trashMode ? 'cursor-not-allowed opacity-40' : ''
+                          }`}
+                          disabled={trashMode}
+                          aria-pressed={resolutionFilterActive}
+                          aria-haspopup="dialog"
+                          aria-expanded={extraPanel === 'resolution'}
+                          title={
+                            trashMode
+                              ? '回收站不支持分辨率筛选（返回资产视图后可用）'
+                              : resolutionChipTitle(filters.kind)
+                          }
+                          onClick={toggleExtraPanel('resolution')}
+                        >
+                          分辨率
+                        </button>
+                      )}
                       {/* 色标（2026-10-25 反馈：从侧栏移到中栏头，与体积 / 时间同一视觉族）。
                           与前两个不同，色标是**多选**：点色点不自动收起浮层，
                           收起只走「点外部 / Esc」那条既有路径（见上面的 quickPanel effect）。
@@ -1065,12 +1092,13 @@ export default function App() {
                           aria-label={extraPanel === 'save' ? '存为智能集合' : '按分辨率筛选'}
                         >
                           <div className="px-2 pb-1 pt-1 text-[10px] text-tertiary">
-                            {extraPanel === 'save' ? '存为智能集合' : '分辨率（贴图长边）'}
+                            {extraPanel === 'save' ? '存为智能集合' : resolutionPanelTitle(filters.kind)}
                           </div>
 
-                          {/* 分辨率：与体积面板**完全同构**（单选、点完即收起、active 高亮同色） */}
+                          {/* 分辨率：与体积面板**完全同构**（单选、点完即收起、active 高亮同色）。
+                              选项表**按视图分**：材质族 2K/4K；HDR 4K/8K/16K（全景宽度）。 */}
                           {extraPanel === 'resolution' &&
-                            RESOLUTION_QUICK_OPTIONS.map((opt) => {
+                            resolutionOptionsFor(filters.kind).map((opt) => {
                               const active = filters.minResolution === opt.value
                               return (
                                 <button
@@ -1275,6 +1303,9 @@ export default function App() {
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       {/* P0-16 删除安全：二次确认弹窗 + 5 秒撤销提示条 */}
       <ConfirmDialog />
+      {/* docs/27 T-07：导入重复处置（跳过 / 覆盖 / 保留两者）。
+          `conflictAsk` 为 null 时组件自己返回 null，所以这里无条件挂载。 */}
+      <ImportConflictDialog />
       {/* T07：分类级联选择器（详情面板 / 右键菜单 / 多选批量共用） */}
       <CategoryPicker />
       {/* 0.6.0：批量重命名（模板 + 预览 + 失败回滚；只改文件夹名） */}

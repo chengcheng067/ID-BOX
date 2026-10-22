@@ -4,6 +4,7 @@ import App from './App'
 import './styles.css'
 import { installRendererLogHooks } from './logic/rendererLog'
 import { startAutoCheck } from './logic/updateState'
+import { startSizeBackfill } from './logic/sizeBackfill'
 
 // 渲染侧错误转发（2026-10 闪退取证）：把 `window.onerror` / `unhandledrejection`
 // 转给主进程落 `[renderer]` 日志 —— 渲染进程崩掉时控制台是看不到的，只有落盘才留得下。
@@ -30,3 +31,18 @@ createRoot(document.getElementById('root')!).render(
     <App />
   </React.StrictMode>
 )
+
+// 启动后**后台**补采缺失的贴图尺寸（2026-10「分辨率筛选在材质与 HDR 都失效」）。
+//
+// `w/h` 自 0.6.0 才在导入时采集，老库 950 条资产一条都没有 → 筛选看着像"坏了"。
+// `startSizeBackfill` 是**同会话自续**的驱动：每轮补 60 个 / 3 秒，轮间停 4 秒，
+// 直到 `remaining === 0`（或撞 25 轮会话上限），**不需要用户重启 16 次**；
+// 只补 texture / material / hdri（能力表里分辨率有意义的大类），读的是文件头
+// （64KB）不解码整图。这里延迟 1500ms 让首帧与首屏缩略图先跑，
+// 内部会话级 single-flight + 失败静默，绝不把启动链路的异常抛出去。
+//
+// **显式放在渲染进程入口**（同上面 `startAutoCheck` 的理由）：不要挂在某个组件的
+// 模块副作用上 —— 组件哪天被改成 `lazy()`，这里会静默失效且无人发现。
+setTimeout(() => {
+  void startSizeBackfill()
+}, 1500)

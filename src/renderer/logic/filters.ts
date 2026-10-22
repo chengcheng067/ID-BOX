@@ -5,13 +5,20 @@
  * vitest 跑在 node 环境（tsconfig.node.json 不带 DOM lib），组件本身测不了，
  * 纯函数抽出来才能进 `tests/` 覆盖（与 `src/shared/**` 同样的思路，只是归属渲染层）。
  */
-import type { Asset, AssetKind, ColorTag, ResolutionBucket, SavedView } from '../../shared/types'
+import type {
+  Asset,
+  AssetKind,
+  ColorTag,
+  ResolutionBucket as SharedResolutionBucket,
+  SavedView
+} from '../../shared/types'
 import { COLOR_TAGS, COLOR_TAG_LABEL } from '../../shared/types'
 import { formatDate } from '../../shared/format'
 import {
   KIND_FOLDER,
   KIND_LABEL,
   MATERIAL_GROUP,
+  capsOfFilter,
   kindFilterLabel,
   kindsOfFilter,
   type KindFilter,
@@ -37,6 +44,18 @@ export type LibraryView = 'assets' | 'trash'
  */
 export type { KindFilter } from '../../shared/classify'
 export type SortKey = 'recent' | 'name' | 'size' | 'su'
+
+/**
+ * 分辨率档位（**渲染层口径**，4 档）。
+ *
+ * 为什么不直接改 `shared/types.ts` 的 `ResolutionBucket`：本文件的改动边界不含 shared
+ * （另一端在并发修改），所以在这里做**向上扩展**——`'2k' | '4k'` 仍是合法子集，
+ * 类型上完全兼容；`Filters.minResolution` 用本类型。
+ *
+ * 4 档的由来：HDR 全景按**宽度**归档，用户库里 33 个 HDR 有 26 个是 16384×8192，
+ * 只给 2K/4K 永远分不开（全都命中 4K），必须补 8K / 16K。
+ */
+export type ResolutionBucket = SharedResolutionBucket | '8k' | '16k'
 
 /** 排序选项（走查 v0.2.2：排序控件从顶栏移到中栏头，见画布 `2:83` / 深 `2:361`）。
  * 放在纯逻辑层：中栏头与测试共用，避免组件里重复定义。 */
@@ -82,10 +101,14 @@ export interface Filters {
   importedAfter: number | null
   importedBefore: number | null
   /**
-   * 0.6.0 贴图分辨率档：`null` = 不限；`'2k'` = 长边 ≥ 2048；`'4k'` = 长边 ≥ 4096。
+   * 0.6.0 分辨率档：`null` = 不限；`'2k'` = 长边 ≥ 2048；`'4k'` = 4096；
+   * `'8k'` = 8192；`'16k'` = 16384（后两档只给 HDR 视图，见 `resolutionOptionsFor`）。
    *
-   * 判定口径是「该资产**任一图片文件**的长边达标」，且**未知尺寸的资产不进这两档**
+   * 判定口径是「该资产**任一图片文件**的长边达标」，且**未知尺寸的资产不进这些档**
    * （旧索引没有 `AssetFile.w/h` → 需要一次重扫才补齐，见 `assetLongEdge`）。
+   *
+   * ⚠️ 这个值**并非在所有视图里都合法**：模型 / 其他视图没有分辨率维度 →
+   * 切过去必须被 `sanitizeFiltersForKind` 清掉，否则网格空着而用户找不到原因。
    */
   minResolution: ResolutionBucket | null
   query: string
@@ -247,37 +270,86 @@ export function timePresetOf(
   return null
 }
 
-// ── 0.6.0 分辨率筛选（按贴图长边归档） ──────────────────────────────
+// ── 0.6.0 分辨率筛选（按图片长边归档；HDR 按全景宽度） ──────────────
 //
 // 口径：**该资产任一图片文件的长边**达标即命中；未知尺寸（旧索引 / 非 PNG-JPEG）
-// 一律不进这两档 —— 宁可漏掉，也不让「猜出来的分辨率」污染筛选结果。
+// 一律不进这些档 —— 宁可漏掉，也不让「猜出来的分辨率」污染筛选结果。
+//
+// 档位**按视图分表**（用户反馈：材质与 HDR 界面的分辨率都失效）：
+// - 材质族 / 全部：2K / 4K —— 贴图长边就是它的真实规格，2K/4K 是行业惯例；
+// - HDR：4K / 8K / 16K —— 全景按**宽度**归档，用户库里绝大多数是 16384×8192，
+//   用 2K/4K 永远分不开（33 个里 26 个都落 4K 档），必须换档。
 
-/** 档位 → 长边阈值（像素） */
+/** 档位 → 长边阈值（像素）。4 档全表；具体视图开放哪几档见 `resolutionBucketValuesFor` */
 export const RESOLUTION_LONG_EDGE: Record<ResolutionBucket, number> = {
   '2k': 2048,
-  '4k': 4096
+  '4k': 4096,
+  '8k': 8192,
+  '16k': 16384
 }
 
 /** 档位文案（中栏头 chip 浮层 / 空态维度摘要共用同一份，避免两套字） */
 export const RESOLUTION_LABEL: Record<ResolutionBucket, string> = {
   '2k': '2K 以上',
-  '4k': '4K 以上'
+  '4k': '4K 以上',
+  '8k': '8K 以上',
+  '16k': '16K 以上'
+}
+
+/**
+ * 该视图**开放**哪些档位（不含「不限」）。
+ *
+ * - HDR：4K / 8K / 16K（全景宽度）；
+ * - 其余（材质族 / 全部 / 模型 / 其他）：2K / 4K（保持 0.6.0 现状）。
+ *   模型 / 其他视图根本不会渲染入口（`capsOfFilter` 为 false），这里返回材质那套
+ *   只是为了让函数**全值域可用**，不给调用方留 `undefined` 分支。
+ */
+export function resolutionBucketValuesFor(kind: KindFilter): readonly ResolutionBucket[] {
+  if (kind === 'hdri') return ['4k', '8k', '16k']
+  return ['2k', '4k']
 }
 
 /**
  * 中栏头「分辨率」浮层的选项表（与 `SIZE_QUICK_OPTIONS` 完全同构：单选 + 「不限」）。
+ * **按视图分表**——材质族给 2K/4K，HDR 给 4K/8K/16K。
  * 放在纯逻辑层：组件只做渲染，测试直接断言取值。
  */
-export const RESOLUTION_QUICK_OPTIONS: { label: string; value: ResolutionBucket | null }[] = [
-  { label: '不限', value: null },
-  { label: RESOLUTION_LABEL['2k'], value: '2k' },
-  { label: RESOLUTION_LABEL['4k'], value: '4k' }
-]
+export function resolutionOptionsFor(
+  kind: KindFilter
+): { label: string; value: ResolutionBucket | null }[] {
+  return [
+    { label: '不限', value: null },
+    ...resolutionBucketValuesFor(kind).map((value) => ({ label: RESOLUTION_LABEL[value], value }))
+  ]
+}
+
+/**
+ * 兼容别名：历史上组件直接用这张表（全局一份）。
+ * 现在**委托**给 `resolutionOptionsFor('all')`，避免两套字 / 两处漂移。
+ */
+export const RESOLUTION_QUICK_OPTIONS: { label: string; value: ResolutionBucket | null }[] =
+  resolutionOptionsFor('all')
+
+/**
+ * 浮层标题 / chip 文案按视图分口径：
+ * 材质族看「贴图长边」，HDR 看「全景宽度」——写错会误导用户以为筛的是同一件事。
+ */
+export function resolutionPanelTitle(kind: KindFilter): string {
+  return kind === 'hdri' ? '分辨率（全景宽度）' : '分辨率（贴图长边）'
+}
+
+/** 分辨率 chip 的 `title`（悬停说明）。 */
+export function resolutionChipTitle(kind: KindFilter): string {
+  return kind === 'hdri'
+    ? '按全景宽度筛选（≥ 4096 / ≥ 8192 / ≥ 16384；尺寸未知的资产不进这些档）'
+    : '按贴图分辨率筛选（长边 ≥ 2048 / ≥ 4096；尺寸未知的资产不进这两档）'
+}
 
 /** 档位 → 阈值；`null`（不限）/ 非法值 → null（= 该维度不参与过滤） */
 export function resolutionMinEdge(bucket: ResolutionBucket | null | undefined): number | null {
-  if (bucket === '2k' || bucket === '4k') return RESOLUTION_LONG_EDGE[bucket]
-  return null
+  if (!bucket) return null
+  const edge = RESOLUTION_LONG_EDGE[bucket]
+  return typeof edge === 'number' ? edge : null
 }
 
 /**
@@ -305,6 +377,53 @@ export function matchesResolution(a: Asset, bucket: ResolutionBucket | null): bo
   if (minEdge === null) return true
   const edge = assetLongEdge(a)
   return edge !== null && edge >= minEdge
+}
+
+/**
+ * 切大类后的**筛选值归一化**（纯函数、不修改入参、总是返回新对象）。
+ *
+ * 为什么必须有：入口消失 ≠ 条件失效。此前的真实隐患是「材质里选了 4K → 切到模型视图，
+ * 分辨率按钮消失但 `minResolution` 仍生效」——网格空着，用户找不到原因（用户所说的
+ * "类似逻辑错误"）。同理从材质切 HDR 会残留 `'2k'`，而 HDR 表里没有这一档。
+ *
+ * 三条规则（全部走能力表 / 档位表，禁止硬编码大类）：
+ * ① 该视图不支持分辨率（`capsOfFilter(kind,'resolution') === false`）→ `minResolution = null`；
+ * ② 该视图不支持风格 → `styles = []`；
+ * ③ 支持分辨率但当前档位不在该视图的档位表里（如 HDR 的 `'2k'`）→ 归 null。
+ *
+ * 调用点只有两处：`store.setFilter`（且仅在 `patch.kind` 存在时）与
+ * `filtersFromSavedView`（存量视图可能存着非法组合）。
+ */
+export function sanitizeFiltersForKind(f: Filters): Filters {
+  const next: Filters = { ...f }
+  if (!capsOfFilter(f.kind, 'resolution')) {
+    next.minResolution = null
+  } else if (
+    next.minResolution !== null &&
+    !resolutionBucketValuesFor(f.kind).includes(next.minResolution)
+  ) {
+    next.minResolution = null
+  }
+  if (!capsOfFilter(f.kind, 'style')) next.styles = []
+  return next
+}
+
+/**
+ * 风格 → 资产数（一个资产可挂多个风格，各组分头计）。
+ *
+ * 口径：只统计**传入的这批资产**（`App` 传当前大类视图内的集合），软删记录不计；
+ * 排序为数量降序，同数按名称（zh-CN）升序。
+ *
+ * ⚠️ 必须是"当前大类视图内"而不是全库：风格入口只在模型/全部视图渲染，
+ * 若拿全库统计，材质视图会出现风格 chip、点进去必然 0 条（本次修的就是这个）。
+ */
+export function styleCountsFor(assets: readonly Asset[]): [string, number][] {
+  const m = new Map<string, number>()
+  for (const a of assets) {
+    if (isDeletedAsset(a)) continue
+    for (const s of a.styles ?? []) m.set(s, (m.get(s) ?? 0) + 1)
+  }
+  return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-CN'))
 }
 
 /** 体积条件的文字描述；不启用返回 null */
@@ -612,7 +731,10 @@ const VALID_KIND_FILTERS: ReadonlySet<string> = new Set<string>([
 /** 合法的排序值（与 `SORT_OPTIONS` 同源，避免两处漂移） */
 const VALID_SORTS: ReadonlySet<string> = new Set<string>(SORT_OPTIONS.map((o) => o.value))
 
-const VALID_RESOLUTIONS: ReadonlySet<string> = new Set<string>(['2k', '4k'])
+/** 合法分辨率档（与阈值表同源：加档只改 `RESOLUTION_LONG_EDGE` 一处） */
+const VALID_RESOLUTIONS: ReadonlySet<string> = new Set<string>(
+  Object.keys(RESOLUTION_LONG_EDGE)
+)
 
 function isPlainRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -720,5 +842,7 @@ export function filtersFromSavedView(
   } else if (typeof raw.sort === 'string' && VALID_SORTS.has(raw.sort)) {
     next.sort = raw.sort as SortKey
   }
-  return next
+  // 存量视图可能存着「大类 + 该大类不支持的维度」这种非法组合
+  // （例如 `kind: 'hdri' + minResolution: '2k'`：HDR 表里没有 2K 档）→ 套用即归一化
+  return sanitizeFiltersForKind(next)
 }

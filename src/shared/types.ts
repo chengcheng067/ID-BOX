@@ -173,7 +173,17 @@ export type CoverSource =
   | 'placeholder'
   | 'zhimo'
 
-export type ImportStatus = 'extracting' | 'organizing' | 'done' | 'error'
+/**
+ * 导入队列的单条状态（`ImportQueue.tsx` 消费）。
+ *
+ * `'skipped'`（2026-10 导入重复处置，docs/27）：用户在重复弹窗里选了「跳过」——
+ * 该条**完全不落盘、原压缩包/原图绝不处置**，所以它不是错误态（文案用中性色，
+ * 不是红色告警）。⚠️ 全仓没有 `Record<ImportStatus, _>` / 穷举 switch，
+ * 加这个值**不会触发编译报错**，三处必须手工同步：
+ * `components/ImportQueue.tsx`（STATUS_CLS / 图标 / 文案）、
+ * `logic/importText.ts`（`autoDismissDelayMs`）、`store.ts`（`settled` 判定）。
+ */
+export type ImportStatus = 'extracting' | 'organizing' | 'done' | 'error' | 'skipped'
 
 // ── 2026-10-19 用户自接模型 API 辅助分类（docs/15 §7） ────────────────────
 //
@@ -366,6 +376,153 @@ export interface ImportEvent {
   /** 空间不足时给出可行动数字（UI 显示"可用 X GB / 需要 Y GB" + 改库目录入口，P0-3） */
   needBytes?: number
   freeBytes?: number
+  /**
+   * 重复处置结果（docs/27）：
+   * - `status='skipped'` 必有；
+   * - `status='done'` 且 `resolution='overwrite'|'keep-both'` 时也有（用于 toast 文案）。
+   */
+  conflict?: {
+    reason: ImportConflictReason
+    resolution: ImportConflictResolution
+    /** 被跳过 / 被覆盖的那一份在库里的名字（toast 文案用） */
+    existingName: string
+    /**
+     * `resolution='overwrite'` 且走了**退化路径**时为 true（docs/27 §3.2）：
+     * - 旧目录已不存在 / kind 变了 / 快照 folder 在库外 → 按新素材落盘；
+     * - 旧版本未能移入系统回收站（被 DCC 占用）→ 暂存为 `.idbox-old-*`。
+     *
+     * 这两种情况下**旧版并没有进回收站**，所以批次汇总文案必须能区分，
+     * 否则会告诉用户"旧版在系统回收站"——那是假话，而且用户不会再去清回收站。
+     *
+     * ⚠️ 用**布尔字段**而不是让渲染层去嗅探 `message` 的中文子串：文案随时可改，
+     * 嗅探一断就会静默退化成"谎称已进回收站"。`message` 仍然保留（展示用）。
+     */
+    degraded?: boolean
+  }
+}
+
+// ── 2026-10 导入重复处置（docs/27） ──────────────────────────────────────
+//
+// 口径（用户原话）：「拖入的文件包内如果有内容和已经存在本地库的文件有重复，
+// 弹窗告知用户素材可能重复，让用户选择跳过、覆盖，或者二者同时存在并重命名。」
+//
+// 判重是**两级**：`zhimoId` 全等（同一件知末素材，强）> `dedupeKey` 全等（同名，弱）。
+// 不做内容哈希（D04）：改名的同款素材仍带 ID，全库哈希的成本与收益不匹配。
+
+/** 覆盖时要继承的用户元数据（渲染层出快照时带上，主进程直接写进替换后的记录） */
+export interface ImportConflictInherit {
+  favorite: boolean
+  rating: number
+  colorTag: ColorTag | null
+  tags: string[]
+  styles: string[]
+  note: string
+  /** 旧分类；双哨兵（未分类/未分类）= 用户从未指派 → 覆盖时改用新包预分类 */
+  category1: string
+  category2: string
+}
+
+/**
+ * 判重快照的一条 = 当前库视图的**极简投影**。
+ *
+ * 刻意不带 `files` / `cover` / `thumbPath`：950 条带 files 的 Asset 走结构化克隆是 MB 级，
+ * 而判重只需要「键 + 定位 + 展示 + 继承元数据」。
+ */
+export interface ImportDedupeEntry {
+  id: string
+  /** 最终资产名（可能带 -2/-3 后缀）；判重不用它，展示与覆盖定位用 */
+  name: string
+  kind: AssetKind
+  /** 为空时主进程用 `baseNameOf(name)` + kind 兜底重算 */
+  dedupeKey?: string
+  zhimoId?: string
+  /** 资产目录绝对路径；主进程执行覆盖前必须再过一次库内校验 */
+  folder: string
+  relFolder: string
+  size: number
+  importedAt: number
+  meta: ImportConflictInherit
+}
+
+/**
+ * 导入开始时的判重上下文。
+ * `index` 为空数组 = 不做重复检测（等价旧行为：静默保留两者）。
+ */
+export interface ImportConflictContext {
+  index: ImportDedupeEntry[]
+}
+
+/** 判重依据：`zhimo-id` = 同一件知末素材（强）；`same-name` = 归一化同名（弱） */
+export type ImportConflictReason = 'zhimo-id' | 'same-name'
+
+/** 三档处置（与用户需求原话一一对应） */
+export type ImportConflictResolution = 'skip' | 'overwrite' | 'keep-both'
+
+/** 库里已有的那一份（覆盖的替换目标） */
+export interface ImportConflictExisting {
+  id: string
+  name: string
+  kind: AssetKind
+  relFolder: string
+  size: number
+  importedAt: number
+  /** 同键的其它副本数（>0 = 库里本来就有多份；覆盖只动 `shown` 这一份） */
+  otherCopies: number
+  /** 体积差 > 30%（`duplicates.ts` 的 `SIZE_MISMATCH_RATIO` 同口径）→ 弹窗提示「可能不是同一套」 */
+  sizeMismatch: boolean
+}
+
+/** 弹窗里的一行 */
+export interface ImportConflictItem {
+  /** 本批次内的稳定序号（1 起），答复用它回填 */
+  seq: number
+  /** 源文件绝对路径 */
+  item: string
+  /** 源文件名（展示） */
+  itemName: string
+  /** 将落库的资产名（原始名，未加 -2） */
+  assetName: string
+  kind: AssetKind
+  /** 新包解压后的总字节 */
+  size: number
+  reason: ImportConflictReason
+  zhimoId?: string
+  existing: ImportConflictExisting
+}
+
+/** 主进程 → 渲染进程：一次询问（整批聚合，一次导入只问一次） */
+export interface ImportConflictAsk {
+  requestId: string
+  /** 默认档（主进程超时兜底用 `'skip'`；弹窗据此预选） */
+  batchDefault: ImportConflictResolution
+  items: ImportConflictItem[]
+  /** 本批还没出结果的源文件数（>0 → 弹窗提示「其余按上方处理」） */
+  remainingItems: number
+}
+
+/** 渲染进程 → 主进程：一次答复 */
+export interface ImportConflictAnswer {
+  requestId: string
+  /** 用户选的批次默认档；未列出的条目 + 之后才发现的冲突都用它 */
+  batchDefault: ImportConflictResolution
+  /** 逐条指定（可缺省；缺省项用 `batchDefault`） */
+  overrides?: Array<{ seq: number; resolution: ImportConflictResolution }>
+  /** true = 用户按 Esc / 点「全部取消」；主进程等同超时（全跳过） */
+  cancelled?: boolean
+}
+
+/**
+ * 主进程 → 渲染进程：**这次询问已作废**（只有 `requestId`）。
+ *
+ * 为什么必须有这条下行：120s 超时是主进程**单方面**结束的——它自己 `resolve(null)` 走「全跳过」，
+ * 但渲染层的 `conflictAsk` 仍然非 null，弹窗继续挂在屏幕上。用户此时再点任何按钮，
+ * `requestId` 已经不在 `pendingAsks` 里 → 主进程按「过期答复」幂等丢弃（这是对的，不能影响下一批），
+ * 于是表现为：**弹窗关不掉、点了也没任何反馈**（QA 实测 DEF-19-1）。
+ *
+ * 所以超时必须显式告诉渲染层「这条作废、把它关掉」，而不是让渲染层去猜。
+ */
+export interface ImportConflictExpired {
+  requestId: string
 }
 
 export interface Settings {
