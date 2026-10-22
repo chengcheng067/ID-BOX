@@ -192,7 +192,7 @@ describe('守卫 ②：一次要删超过一半（且 >10 条）→ 中止', () 
 })
 
 describe('守卫 ③：真删前写完整记录快照，只留 5 份', () => {
-  it('正常 rescan（匹配率正常）行为不变：只 bulkPut，不删不备份', async () => {
+  it('正常 rescan（匹配率正常）行为不变：只 bulkPut，不删除；但会写一份**改库前快照**', async () => {
     const locals = [fixture(), fixture(), fixture()]
     useVault.setState({ assets: locals })
     modvault.rescan.mockResolvedValue({ assets: locals.map(scannedOf), ignored: [] })
@@ -203,7 +203,10 @@ describe('守卫 ③：真删前写完整记录快照，只留 5 份', () => {
     expect(bulkPutCalls).toHaveLength(1)
     expect(bulkPutCalls[0]!.map((a) => a.id)).toEqual(locals.map((a) => a.id))
     expect(fakeAssets.bulkDelete).not.toHaveBeenCalled()
-    expect(fakeBackups.put).not.toHaveBeenCalled()
+    // 安全网 ④：写入前把"将被覆盖的原记录"整份存快照（本次事故的教训）
+    expect(backupPuts.map((b) => b.id.startsWith('rescan-pre-'))).toEqual([true])
+    // 「恢复上次重扫前索引」只认删除备份，快照不参与计数（否则按钮会失效）
+    expect(useVault.getState().rescanBackupCount).toBe(0)
   })
 
   it('小规模删除（2 个里删 1 个）照常执行，但删除前把**完整 records**写进 backups', async () => {
@@ -215,8 +218,13 @@ describe('守卫 ③：真删前写完整记录快照，只留 5 份', () => {
     const outcome = await useVault.getState().rescan()
 
     expect(outcome).toEqual({ aborted: null, scanned: 1, removed: 1 })
-    expect(fakeBackups.put).toHaveBeenCalledTimes(1)
-    const saved = backupPuts[0]!
+    // 两份凭证：① 改库前快照（rescan-pre-*，含 keep 的原记录）② 删除备份（rescan-*）
+    const deletionBackups = backupPuts.filter((b) => !b.id.startsWith('rescan-pre-'))
+    const preSnapshots = backupPuts.filter((b) => b.id.startsWith('rescan-pre-'))
+    expect(deletionBackups).toHaveLength(1)
+    expect(preSnapshots).toHaveLength(1)
+
+    const saved = deletionBackups[0]!
     expect(saved.id.startsWith('rescan-')).toBe(true)
     expect(typeof saved.at).toBe('number')
     const records = JSON.parse(saved.json) as Asset[]
@@ -227,12 +235,16 @@ describe('守卫 ③：真删前写完整记录快照，只留 5 份', () => {
     expect(records[0]!.note).toBe('别丢我')
     expect(records[0]!.styles).toEqual(['侘寂'])
     expect(records[0]!.folder).toBe(gone.folder)
+    // 快照只含"会被覆盖"的 keep，不含将被删除的 gone
+    const pre = JSON.parse(preSnapshots[0]!.json) as Asset[]
+    expect(pre.map((r) => r.id)).toEqual([keep.id])
     // 备份发生在删除之前（同一次调用内，且删除只用 id 列表）
     expect(bulkDeleteCalls[0]).toEqual([gone.id])
+    // 计数只算删除备份（快照不算「可恢复的删除记录」）
     expect(useVault.getState().rescanBackupCount).toBe(1)
   })
 
-  it('备份只保留最近 5 条（第 6 次删除会把最旧的清掉）', async () => {
+  it('备份只保留最近 5 条（第 6 次删除会把最旧的清掉；两个家族各留 5 条）', async () => {
     let now = 1_700_000_000_000
     vi.spyOn(Date, 'now').mockImplementation(() => now++)
 
@@ -244,11 +256,17 @@ describe('守卫 ③：真删前写完整记录快照，只留 5 份', () => {
       await useVault.getState().rescan()
     }
 
-    expect(backupPuts).toHaveLength(6)
-    expect(backupStore.size).toBe(5)
+    const deletionIds = backupPuts.filter((b) => !b.id.startsWith('rescan-pre-')).map((b) => b.id)
+    const preIds = backupPuts.filter((b) => b.id.startsWith('rescan-pre-')).map((b) => b.id)
+    expect(deletionIds).toHaveLength(6)
+    expect(preIds).toHaveLength(6)
+    expect([...backupStore.keys()].filter((id) => !id.startsWith('rescan-pre-'))).toHaveLength(5)
+    expect([...backupStore.keys()].filter((id) => id.startsWith('rescan-pre-'))).toHaveLength(5)
     // 最旧的那条被删
-    expect(backupStore.has(backupPuts[0]!.id)).toBe(false)
-    expect(backupStore.has(backupPuts[5]!.id)).toBe(true)
+    expect(backupStore.has(deletionIds[0]!)).toBe(false)
+    expect(backupStore.has(deletionIds[5]!)).toBe(true)
+    expect(backupStore.has(preIds[0]!)).toBe(false)
+    expect(backupStore.has(preIds[5]!)).toBe(true)
     expect(fakeBackups.bulkDelete).toHaveBeenCalled()
   })
 })

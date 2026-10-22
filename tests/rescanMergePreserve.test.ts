@@ -450,3 +450,81 @@ describe('事故复现：一次 rescan 之后用户调好的东西全在', () =>
     expect(merged.favorite).toBe(false)
   })
 })
+
+// ── ⑧ 改库前快照（`rescan-pre-*`）：本次事故最直接的教训 ─────────────────
+//
+// 事故当时 `db.backups` 里只有 `rescan-*`（仅存**被删**记录）与 `reclass-*`，
+// 没有任何"被改写之前的原记录"→ 被 rescan 抹掉的 favorite/rating/styles 无处可退。
+
+describe('rescan 改库前快照 rescan-pre-*', () => {
+  it('bulkPut 之前把"将被覆盖的原记录"整份存进 backups（字段是原值，可回退）', async () => {
+    const local = localAsset()
+    await mergeOnce(local, scannedAsset())
+
+    const snapshots = [...backupStore.values()].filter((b) => b.id.startsWith('rescan-pre-'))
+    expect(snapshots).toHaveLength(1)
+    const snap = snapshots[0]!
+    expect(snap.id).toMatch(/^rescan-pre-\d+$/)
+    expect(typeof snap.at).toBe('number')
+    // 存的是**原记录**：被覆盖的字段都还在
+    const records = JSON.parse(snap.json) as Asset[]
+    expect(records).toHaveLength(1)
+    expect(records[0]!.id).toBe('local-uuid')
+    expect(records[0]!.favorite).toBe(true)
+    expect(records[0]!.styles).toEqual(['现代', '侘寂'])
+    expect(records[0]!.renderParams).toEqual({
+      roughness: 1.4,
+      bump: 0.7,
+      uv: 3.1,
+      light: 1,
+      metal: 0,
+      alpha: 1
+    })
+    expect(records[0]!.updatedAt).toBe(LOCAL_UPDATED_AT)
+
+    // 顺序：先落快照，再 bulkPut（快照必须早于覆盖）
+    const putOrder = fakeBackups.put.mock.invocationCallOrder[0]!
+    const bulkPutOrder = fakeAssets.bulkPut.mock.invocationCallOrder[0]!
+    expect(putOrder).toBeLessThan(bulkPutOrder)
+  })
+
+  it('新记录（本地没有对应 folder）不进快照；一条都没有 → 不写空备份', async () => {
+    useVault.setState({ assets: [] })
+    modvault.rescan.mockResolvedValue({
+      assets: [scannedAsset({ folder: 'E:\\Lib\\模型\\未分类\\未分类\\全新', deletedAt: undefined, trashRel: undefined })],
+      ignored: []
+    })
+
+    await useVault.getState().rescan()
+
+    expect(fakeBackups.put).not.toHaveBeenCalled()
+    expect([...backupStore.keys()].filter((id) => id.startsWith('rescan-pre-'))).toEqual([])
+  })
+
+  it('快照不干扰「恢复上次重扫前索引」：没有删除备份时仍然提示"没有可恢复的重扫备份"', async () => {
+    await mergeOnce(localAsset(), scannedAsset())
+
+    const restored = await useVault.getState().restoreLastRescanBackup()
+
+    expect(restored).toBe(0)
+    expect(useVault.getState().notice).toContain('没有可恢复的重扫备份')
+    // 快照不会因恢复流程被消费掉（它是取证/回退凭证，不是删除还原凭证）
+    expect([...backupStore.keys()].some((id) => id.startsWith('rescan-pre-'))).toBe(true)
+  })
+
+  it('只保留最近 5 份快照（与删除备份同一保留口径）', async () => {
+    let now = 1_800_000_000_000
+    vi.spyOn(Date, 'now').mockImplementation(() => now++)
+    try {
+      for (let i = 0; i < 6; i += 1) {
+        await mergeOnce(localAsset(), scannedAsset())
+      }
+
+      const ids = [...backupStore.keys()].filter((id) => id.startsWith('rescan-pre-'))
+      expect(ids).toHaveLength(5)
+      expect(fakeBackups.bulkDelete).toHaveBeenCalled()
+    } finally {
+      vi.restoreAllMocks()
+    }
+  })
+})

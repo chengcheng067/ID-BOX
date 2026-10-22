@@ -1357,11 +1357,24 @@ async function applyZhimoStyle(id: string, style: string | null | undefined): Pr
 // 匹配不到 → bulkDelete 全库。tags / note / styles / importedAt / source
 // **只存在于索引里**，磁盘没有副本 → 删了就永久没了。
 // 三层防御：① 空扫描中止；② 批量删除超过一半中止；③ 真删前落完整记录快照。
+// 第四层（2026-10 事故后补）：④ 覆盖前把"将被改写的原记录"另存 `rescan-pre-*` 快照
+// —— ③ 只保"被删的"，而这次事故丢的是"还在库里、字段被改写的"。
 
-/** 取 `rescan-*` 备份，按时间降序（最新在前） */
+/**
+ * 取 `rescan-*` 备份，按时间降序（最新在前）。
+ *
+ * **排除 `rescan-pre-*`**：那是"重扫覆盖前快照"（见 `backupRescanPreSnapshot`），
+ * 语义是"记录被改动之前的样子"，不是"被删记录的还原凭证"。若混进来，
+ * 「恢复上次重扫前索引」会取到它 —— 而那些记录都还在索引里 → 恢复 0 条、按钮形同失效。
+ */
 async function listRescanBackups(): Promise<IndexBackup[]> {
   const all = await db.backups.toArray()
-  return all.filter((b) => typeof b.id === 'string' && b.id.startsWith('rescan-')).sort((a, b) => b.at - a.at)
+  return all
+    .filter(
+      (b) =>
+        typeof b.id === 'string' && b.id.startsWith('rescan-') && !b.id.startsWith('rescan-pre-')
+    )
+    .sort((a, b) => b.at - a.at)
 }
 
 /**
@@ -1375,6 +1388,35 @@ async function backupRescanDeletions(records: Asset[]): Promise<void> {
   const at = Date.now()
   await db.backups.put({ id: `rescan-${at}`, at, json: JSON.stringify(records) })
   const list = await listRescanBackups()
+  const stale = list.slice(RESCAN_BACKUP_KEEP)
+  if (stale.length > 0) await db.backups.bulkDelete(stale.map((b) => b.id))
+}
+
+/** 取 `rescan-pre-*`（重扫覆盖前快照），按时间降序（最新在前） */
+async function listRescanPreBackups(): Promise<IndexBackup[]> {
+  const all = await db.backups.toArray()
+  return all
+    .filter((b) => typeof b.id === 'string' && b.id.startsWith('rescan-pre-'))
+    .sort((a, b) => b.at - a.at)
+}
+
+/**
+ * 重扫**改库之前**把"将被覆盖的本地原记录"整份存进 `db.backups`（`rescan-pre-<ts>`）。
+ *
+ * 为什么必须有这条：2026-10 的事故里，`rescan` 把 127 条记录的
+ * `favorite / rating / colorTag / styles / renderParams` 覆盖掉，而 `db.backups`
+ * 里当时**只有** `rescan-*`（仅存被删记录）与 `reclass-*` —— 没有任何"被改之前"
+ * 的快照，那批用户数据再也捞不回来。有了这条，同类损伤可以按 json 回退/比对。
+ *
+ * - 只存**能按 folder 对上本地记录**的原记录（新导入的扫描记录没有"被覆盖"的过去）；
+ * - 与删除备份同构：`{ id, at, json }`，json 是原记录数组；
+ * - 数量为 0 不写（不制造空备份）；保留期与删除备份同一口径 `RESCAN_BACKUP_KEEP`。
+ */
+async function backupRescanPreSnapshot(records: Asset[]): Promise<void> {
+  if (records.length === 0) return
+  const at = Date.now()
+  await db.backups.put({ id: `rescan-pre-${at}`, at, json: JSON.stringify(records) })
+  const list = await listRescanPreBackups()
   const stale = list.slice(RESCAN_BACKUP_KEEP)
   if (stale.length > 0) await db.backups.bulkDelete(stale.map((b) => b.id))
 }
@@ -2651,11 +2693,15 @@ export const useVault = create<VaultState>((set, get) => ({
     for (const a of trashedRecords) localByFolder.delete(a.folder)
 
     const merged: Asset[] = []
+    /** 即将被合并结果覆盖的**本地原记录**（新记录不算）→ 改库前落一份快照 */
+    const overwrittenRecords: Asset[] = []
     const goneIds: string[] = []
     for (const s of scanned) {
       const local = localByFolder.get(s.folder)
       if (local) {
         localByFolder.delete(s.folder)
+        // 改库前快照的收集点：这条记录**即将被合并结果覆盖**，先留一份原样副本
+        overwrittenRecords.push(local)
         // ── 合并方向：**以 local 为底，只覆盖磁盘权威字段** ──────────────
         //
         // 反向（`{...s, 挑几个本地字段补}`）是一个真实的丢数据事故：`rescan.ts`
@@ -2747,6 +2793,13 @@ export const useVault = create<VaultState>((set, get) => ({
       await backupRescanDeletions(goneRecords)
       await db.assets.bulkDelete(goneIds)
     }
+    // ── 安全网 ④：覆盖之前先把"将被改写的那批原记录"整份快照（`rescan-pre-*`） ──
+    // 顺序刻意放在 `bulkPut` 之前、删除之后：删除有自己的备份（③），这里只负责
+    // "仍在库里、但字段即将被重扫改写"的那些记录（本次事故的真正受害者）。
+    await backupRescanPreSnapshot(overwrittenRecords).catch(() => {
+      // 快照失败不该阻断重扫本身（磁盘真相仍要同步）；失败了宁可少一份凭证，
+      // 也不要让用户卡在"重扫永远失败"上。
+    })
     await db.assets.bulkPut(merged)
     const rescanBackupCount = (await listRescanBackups()).length
     // 文件视图看着的资产可能在重扫中消失（目录被删 / 被重建换 UUID）→ 退回网格
