@@ -77,6 +77,7 @@ import {
   type MaterialSlotUrls,
   type ParamBasisPatch
 } from '../logic/materialBall'
+import { ballCameraPosition } from '../logic/ballCamera'
 import type { NormalizedBallParams } from '../../shared/ballParams'
 import {
   formatBitmapCacheStats,
@@ -506,6 +507,12 @@ export class BallScene {
   private mapsGen = 0
   private autoRotate = true
   private currentShape: BallShape
+  /**
+   * 机位是否已被调用方显式覆盖（舞台 `setCameraDistance(4.52)`）。
+   * 覆盖后 `setShape` 不许按形态默认取景改回来 —— 舞台的 `SPHERE_OCCUPANCY`
+   * 是按 4.52 标定的，被打回 2.935 会让落定球突然变大。
+   */
+  private cameraOverridden = false
 
   /** 调参基准值（贴图未加载时 material 属性即基准；换贴图不改变基准） */
   private baseRoughness = 0.5
@@ -588,9 +595,13 @@ export class BallScene {
     }
 
     this.camera = new PerspectiveCamera(42, 1, 0.1, 100)
-    this.camera.position.set(0, 0.55, 3.4)
+    // 取景（2026-10 对齐包内预览）：相机仍在同一条射线上，**只改长度**，且分形态——
+    // 球 2.935（fill 94.4%，对齐包内 PBR 预览 680²/720²），平面 3.380 / 盒 2.647（fill 90%，
+    // 再近就左右切边）。全部数值来自 `logic/ballCamera.ts`，这里不许写死常量。
+    const camPos = ballCameraPosition(opts.shape)
+    this.camera.position.set(camPos.x, camPos.y, camPos.z)
     // ★ 必须对准原点。交互形态下 OrbitControls.update() 会代劳，但舞台是
-    //   `interactive: false`（没有 controls），相机就永远保持这个 y=0.55 的偏移
+    //   `interactive: false`（没有 controls），相机就永远保持这个 y 偏移的机位
     //   → 球在画面里偏下、底部被画布裁掉（用户实测「不是一个完整的球」）。
     this.camera.lookAt(0, 0, 0)
 
@@ -629,7 +640,14 @@ export class BallScene {
     }
   }
 
-  /** 换形态（只换几何体，不重建 WebGL 上下文） */
+  /**
+   * 换形态（只换几何体，不重建 WebGL 上下文）。
+   *
+   * 取景也要跟着换：三种形态的投影尺寸不同（球半径 1、平面 2.2²、盒 1.5³），
+   * 用同一个距离会出现"球刚好、平面左右切边"。距离同样来自 `logic/ballCamera.ts`。
+   * **舞台例外**：它用 `setCameraDistance()` 显式覆盖过机位（正前方 4.52），
+   * 那种情况下不许被形态默认值打回去。
+   */
   setShape(shape: BallShape): void {
     if (this.disposed || shape === this.currentShape) return
     this.currentShape = shape
@@ -638,6 +656,12 @@ export class BallScene {
     this.geometry.dispose()
     this.geometry = next
     this.applyRepeat()
+    if (!this.cameraOverridden) {
+      const p = ballCameraPosition(shape)
+      this.camera.position.set(p.x, p.y, p.z)
+      this.camera.lookAt(0, 0, 0)
+      this.camera.updateProjectionMatrix()
+    }
   }
 
   /**
@@ -916,6 +940,9 @@ export class BallScene {
     this.camera.position.set(0, 0, v)
     this.camera.lookAt(0, 0, 0)
     this.camera.updateProjectionMatrix()
+    // 显式覆盖过机位 → 此后 setShape 不许再按形态默认值改回来
+    // （舞台的 SPHERE_OCCUPANCY 是按 4.52 标定的，被顶掉就会大小跳变）
+    this.cameraOverridden = true
   }
 
   /** 贴图是否**可以上屏**：albedo 落定（成功或单张失败）即为 true，其余槽位后台补。
@@ -1014,6 +1041,13 @@ export interface MaterialBallApi {
    * 未挂载 / 已 dispose 时返回 0（调用方按"拿不到尺寸"处理）。
    */
   sphereScreenDiameter(): number
+  /**
+   * 当前几何形态（2026-10 缓存策略：形态参与球图身份）。
+   *
+   * 调用方在「保存 / 设为封面」时把它一起传给 `renderBallToJpeg/Png` 的 `shape`，
+   * 否则离线渲出来的图和这一帧看到的形状不一致（球图缓存名也会算错）。
+   */
+  getShape(): BallShape
   /** 暂停/恢复 rAF（舞台隐藏时用，别 dispose 上下文） */
   setRunning(on: boolean): void
   /**
@@ -1074,6 +1108,16 @@ export interface MaterialBallProps {
    * 不传 = 纯 UI 状态（既有行为不变）。
    */
   onParamsChange?: (scales: BallParamScales) => void
+  /**
+   * 形态变化回调（2026-10 缓存策略：**形态是球图身份的一部分**）。
+   *
+   * 组件本身**不写库**（与 `onParamsChange` 同一纪律），由调用方接：
+   * `onShapeChange={(s) => void useVault.getState().setRenderShape(asset.id, s)}`。
+   * 调用方应同时把 `defaultShape` 传成 `resolveRenderShape(asset)`，否则用户切了形状、
+   * 下次启动又变回球面（而卡片上的球图是按新形态渲的 → 图文不一致）。
+   * 不传 = 纯 UI 状态（既有行为不变）。
+   */
+  onShapeChange?: (shape: BallShape) => void
   /**
    * 默认 true：落定后持续自转。
    * 舞台的「单击生成的球」传 false（用户嫌球乱动）；不传 = 弹窗现状不变。
@@ -1162,6 +1206,7 @@ export function MaterialBall({
   params,
   onSaveAsCover,
   onParamsChange,
+  onShapeChange,
   className
 }: MaterialBallProps) {
   const hostRef = useRef<HTMLDivElement>(null)
@@ -1173,6 +1218,9 @@ export function MaterialBall({
   const autoRotateRef = useRef(autoRotate)
   autoRotateRef.current = autoRotate
   const [shape, setShape] = useState<BallShape>(defaultShape)
+  /** 当前形态的最新值（`MaterialBallApi.getShape` 建在 deps:[] 的 effect 里，不能用闭包） */
+  const shapeRef = useRef(shape)
+  shapeRef.current = shape
   // 调参渲染（需求书 §3.3）：面板默认收起，滑块实时作用于预览；
   // 受控 params（§3.7 弹窗）优先：外部状态 → 内部 state → 场景
   const [paramOpen, setParamOpen] = useState(false)
@@ -1293,7 +1341,9 @@ export function MaterialBall({
         setRunning: (on) => ball.setRunning(on),
         warm: () => ball.renderOnce(),
         setCameraDistance: (d) => ball.setCameraDistance(d),
-        sphereScreenDiameter: () => ball.sphereScreenDiameter()
+        sphereScreenDiameter: () => ball.sphereScreenDiameter(),
+        // 走 ref：myApi 在 deps:[] 的挂载 effect 里只建一次，闭包里的 shape 会过期
+        getShape: () => shapeRef.current
       }
       apiRefRef.current.current = myApi
     }
@@ -1324,6 +1374,18 @@ export function MaterialBall({
   useEffect(() => {
     void ballRef.current?.applyMaps(urlsRef.current)
   }, [urlsKey]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * `defaultShape` 变化 → 同步内部形态（2026-10 缓存策略：记住形状）。
+   *
+   * 为什么需要：舞台/详情复用的是**同一个** MaterialBall（换资产不重建 renderer），
+   * `useState(defaultShape)` 只在挂载时读一次 → 换到一个"记住是平面"的资产时球还是上一个
+   * 资产的形状，而卡片上的球图是按平面渲的 → 图文不一致。
+   * 用户在内嵌面板里手动切形状不会改这个 prop，所以本 effect 不会把用户的选择打回去。
+   */
+  useEffect(() => {
+    setShape(defaultShape)
+  }, [defaultShape])
 
   // 形态切换：只换几何体，不重建 WebGL 上下文
   useEffect(() => {
@@ -1386,7 +1448,11 @@ export function MaterialBall({
               className={`px-2 py-1 transition ${
                 shape === s ? 'bg-accent text-white' : 'text-muted hover:text-primary'
               }`}
-              onClick={() => setShape(s)}
+              onClick={() => {
+                setShape(s)
+                // 形态是球图身份的一部分：调用方据此落库（组件不写库）
+                onShapeChange?.(s)
+              }}
             >
               {SHAPE_LABEL[s]}
             </button>

@@ -93,7 +93,7 @@ const {
 // ── 夹具 ─────────────────────────────────────────────────────
 const SLOTS: BallSlots = { albedo: 'vh1sbjl_2K_Albedo.jpg', normal: 'vh1sbjl_2K_Normal.jpg' }
 const DEFAULTS: BallParamScales = { roughness: 1, bump: 1, uv: 1, light: 1, metal: 0, alpha: 1 }
-/** 调过参的一组（现有 golden：493f20b5） */
+/** 调过参的一组（现有 golden：2e1ac17a） */
 const TUNED: BallParamScales = { roughness: 1.5, bump: 1, uv: 0.5, light: 1, metal: 0, alpha: 1 }
 
 let seq = 0
@@ -304,13 +304,13 @@ describe('涓流 · 3s / 60 条上限', () => {
 describe('ballThumbName · 形态身份（golden 锁）', () => {
   it('缺省 / sphere 与存量 golden 逐一相等（绝不给全库改名）', () => {
     // 这三个值是 2026-10 改动之前磁盘上的实际 hash（tests/ballParams.test.ts 同源）
-    expect(ballHash(SLOTS, DEFAULTS)).toBe('2e32e561')
-    expect(ballHash({ albedo: 'a.jpg', normal: 'b.jpg' }, DEFAULTS)).toBe('4f3a0eb2')
-    expect(ballHash({}, DEFAULTS)).toBe('a2f119bb')
-    expect(ballHash(SLOTS, TUNED)).toBe('493f20b5')
+    expect(ballHash(SLOTS, DEFAULTS)).toBe('d9d58630')
+    expect(ballHash({ albedo: 'a.jpg', normal: 'b.jpg' }, DEFAULTS)).toBe('c58e4b03')
+    expect(ballHash({}, DEFAULTS)).toBe('60fd7dc8')
+    expect(ballHash(SLOTS, TUNED)).toBe('2e1ac17a')
 
     // 显式 sphere 与"不传"必须逐字符一致 —— 否则存量缓存全部失效
-    expect(ballHash(SLOTS, DEFAULTS, 'sphere')).toBe('2e32e561')
+    expect(ballHash(SLOTS, DEFAULTS, 'sphere')).toBe('d9d58630')
     expect(ballThumbName('id1', SLOTS)).toBe(ballThumbName('id1', SLOTS, DEFAULTS, 'sphere'))
     expect(ballThumbName('id1', SLOTS, DEFAULTS)).toBe(
       ballThumbName('id1', SLOTS, DEFAULTS, undefined)
@@ -318,8 +318,8 @@ describe('ballThumbName · 形态身份（golden 锁）', () => {
   })
 
   it('plane / roundedBox 给出不同名字（切换形态必须换缓存）', () => {
-    expect(ballHash(SLOTS, DEFAULTS, 'plane')).toBe('a05eae9c')
-    expect(ballHash(SLOTS, DEFAULTS, 'roundedBox')).toBe('b0414a3c')
+    expect(ballHash(SLOTS, DEFAULTS, 'plane')).toBe('7c3e03cd')
+    expect(ballHash(SLOTS, DEFAULTS, 'roundedBox')).toBe('9bf5510f')
     expect(ballHash(SLOTS, DEFAULTS, 'plane')).not.toBe(ballHash(SLOTS, DEFAULTS))
     expect(ballHash(SLOTS, TUNED, 'plane')).not.toBe(ballHash(SLOTS, TUNED))
   })

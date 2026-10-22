@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useVault } from '../store'
-import { resolveRenderParams, type NormalizedBallParams } from '../../shared/ballParams'
+import { resolveRenderParams, resolveRenderShape, type NormalizedBallParams } from '../../shared/ballParams'
 import { displayName } from '../../shared/naming'
 import { IconClose } from '../icons'
 import type { Asset } from '../../shared/types'
@@ -214,10 +214,14 @@ export function CustomRenderDialog({
 
       if (plan.writeCover) {
         const { renderBallToJpeg, blobToBase64, paperColor } = await import('./MaterialBall')
+        // 形态必须跟着"用户正看着的那颗球"（2026-10 缓存策略）：用户看到平面却渲出球，
+        // 封面就和预览不一致。`getShape()` 拿的是场景当前形态；API 还没就绪时回落到资产记忆值。
+        const shape = ballApiRef.current?.getShape() ?? resolveRenderShape(asset)
         // v0.2.1 增补 1：背景走主题化 paperColor()（读 --render-canvas-bg），不再硬编码近黑
         const blob = await renderBallToJpeg(asset.relFolder, slots, {
           size: 480,
           params: scales,
+          shape,
           background: paperColor()
         })
         const base64 = await blobToBase64(blob)
@@ -301,6 +305,11 @@ export function CustomRenderDialog({
                     slots={slots}
                     showShapeSwitch={false}
                     enableParamPanel={false}
+                    // 形态是球图身份的一部分（2026-10 缓存策略）：卡片上的球图按
+                    // `resolveRenderShape(asset)` 渲，弹窗这颗必须同形态，否则图文不一致。
+                    // 当前资产永远是 'sphere'（全仓没有形态 UI），这两行先让契约闭环。
+                    defaultShape={resolveRenderShape(asset)}
+                    onShapeChange={(s) => void useVault.getState().setRenderShape(asset.id, s)}
                     params={scales}
                     apiRef={ballApiRef}
                     className="!bg-transparent"

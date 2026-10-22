@@ -19,7 +19,7 @@
  */
 import { useEffect, useRef } from 'react'
 import type { Asset } from '../../shared/types'
-import { resolveRenderParams } from '../../shared/ballParams'
+import { resolveRenderParams, resolveRenderShape } from '../../shared/ballParams'
 import { effectiveMaterialSlots, type MaterialSlots } from '../logic/materialBall'
 import { currentMotionProfile } from '../logic/motionProfile'
 import type { StagePhase } from '../logic/ballStage'
@@ -667,6 +667,9 @@ export function MaterialStage({
         // 交接一致性：舞台球与弹窗球必须用**同一套参数**（弹窗读 resolveRenderParams），
         // 否则飞回来的那颗会在半路"换一个样子"。
         params={resolveRenderParams(shown)}
+        // 形态同理（2026-10 缓存策略：形态参与球图身份）：卡片上那张球图是按
+        // `resolveRenderShape(asset)` 渲的，舞台球不改的话会和卡片图文不一致。
+        defaultShape={resolveRenderShape(shown)}
         // 落定后必须转：用户实测「球在上面并不会转」——之前这里写死 false，
         // 舞台又不跑 OrbitControls 的自动旋转，等于把球冻住了。
         autoRotate={phase === 'active'}

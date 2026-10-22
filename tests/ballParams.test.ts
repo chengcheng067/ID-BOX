@@ -161,30 +161,30 @@ describe('shared/ballParams · 规范化（docs/12 §3.1，先 clamp 再 round2�
 })
 
 describe('shared/ballParams · golden 锁（docs/12 §3.3 实测值，防 hash 输入格式漂移）', () => {
-  it('第一组槽位 → 2e32e561（方案 B + RENDER_REV=3）', () => {
-    expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe('2e32e561')
-    expect(ballThumbName(ID, SLOTS)).toBe(`${ID}-2e32e561.png`)
+  it('第一组槽位 → d9d58630（方案 B + RENDER_REV=4）', () => {
+    expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe('d9d58630')
+    expect(ballThumbName(ID, SLOTS)).toBe(`${ID}-d9d58630.png`)
   })
 
-  it("['a.jpg','b.jpg'] → 4f3a0eb2", () => {
-    expect(ballHash({ albedo: 'a.jpg', normal: 'b.jpg' }, DEFAULT_PARAM_SCALES)).toBe('4f3a0eb2')
+  it("['a.jpg','b.jpg'] → c58e4b03", () => {
+    expect(ballHash({ albedo: 'a.jpg', normal: 'b.jpg' }, DEFAULT_PARAM_SCALES)).toBe('c58e4b03')
   })
 
-  it('空 slots → a2f119bb（RENDER_REV 前缀 + FNV-1a）', () => {
-    expect(ballHash({}, DEFAULT_PARAM_SCALES)).toBe('a2f119bb')
+  it('空 slots → 60fd7dc8（RENDER_REV 前缀 + FNV-1a）', () => {
+    expect(ballHash({}, DEFAULT_PARAM_SCALES)).toBe('60fd7dc8')
     expect(fnv1a('')).toBe('811c9dc5')
   })
 
   it("第一组 + '1.00,1.00,1.00' → c2dbee32（方案 A 形态，仅作为 golden 记录）", () => {
-    // 方案 B 下默认参数不贡献 hash，所以 ballHash 仍是 2e32e561；
+    // 方案 B 下默认参数不贡献 hash，所以 ballHash 仍是 d9d58630；
     // 这里锁的是「若无条件贡献会算出什么」——防止有人把方案 B 改成方案 A 而无人察觉。
     expect(fnv1a(BASE + '\n' + paramsKey(DEFAULT_PARAM_SCALES))).toBe('c2dbee32')
     expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).not.toBe('c2dbee32')
   })
 
-  it("第一组 + '1.50,1.00,0.50' → 493f20b5（参数变化 + RENDER_REV → 名字变）", () => {
+  it("第一组 + '1.50,1.00,0.50' → 2e1ac17a（参数变化 + RENDER_REV → 名字变）", () => {
     expect(fnv1a(BASE + '\n' + paramsKey({ roughness: 1.5, bump: 1, uv: 0.5 }))).toBe('340ed45f')
-    expect(ballHash(SLOTS, { roughness: 1.5, bump: 1, uv: 0.5 })).toBe('493f20b5')
+    expect(ballHash(SLOTS, { roughness: 1.5, bump: 1, uv: 0.5 })).toBe('2e1ac17a')
   })
 
   it('hash 输入必须带 \\n 分隔符（无分隔符会算出 4c25a542，与 golden 不符）', () => {
@@ -340,9 +340,9 @@ describe('shared/ballParams · 0.6.9 新增三参数（light / metal / alpha）'
     expect(isDefaultParams({ roughness: 1, bump: 1, uv: 1, light: Number.NaN })).toBe(true)
   })
 
-  it('★RENDER_REV 固定为 3 且无条件进 hash 前缀（UV 补偿 + Neutral 换了成像 → 旧图必须作废）', () => {
+  it('★RENDER_REV 固定为 4 且无条件进 hash 前缀（取景 79%→94.4% 换了成像 → 旧图必须作废）', () => {
     // 这个数字只许往上加：改回 2 会让用户继续看到磁盘上那张 ACES + 长砖的旧图
-    expect(RENDER_REV).toBe(3)
+    expect(RENDER_REV).toBe(4)
     expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe(fnv1a(`rev${RENDER_REV}\n` + BASE))
     // 参数没变、只有修订号变 → 名字必须不同（否则"作废旧缓存"这件事根本没发生）
     expect(fnv1a('rev2\n' + BASE)).not.toBe(fnv1a('rev3\n' + BASE))
