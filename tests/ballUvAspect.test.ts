@@ -121,7 +121,8 @@ describe('源码守卫 · 球面渲染的成像口径（防顺手改回去）', 
       'utf-8'
     )
     expect(LOGIC).toContain('target.metalness = values.metal')
-    expect(LOGIC).toContain('target.transparent = values.alpha < 1')
+    expect(LOGIC).toContain('const nextTransparent = values.alpha < 1')
+    expect(LOGIC).toContain('target.transparent = nextTransparent')
     expect(LOGIC).toContain('target.opacity = values.alpha')
   })
 

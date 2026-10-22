@@ -474,6 +474,14 @@ export interface ParamMaterialTarget {
   metalness: number
   transparent: boolean
   opacity: number
+  /**
+   * 材质版本闸门（three 的 `Material` 有；单测桩可以不给）。
+   *
+   * ⚠️ three 里它是**只有 setter 的访问器**（`Material.js` 的 `set needsUpdate`，
+   * 内部只做 `version++`），**读出来永远是 `undefined`** —— 所以调用方不要写
+   * `if (target.needsUpdate !== undefined)` 这种守卫，直接赋值即可。
+   */
+  needsUpdate?: boolean
 }
 
 /**
@@ -483,14 +491,53 @@ export interface ParamMaterialTarget {
  * 走既有的快速路径）；`alpha < 1` 才开。球是**单个物体**、默认 `side: FrontSide`
  * （背面不画），所以半透明时不存在"正面/背面谁先画"的自排序问题，
  * `depthWrite` 保持默认 true 即可，不需要额外处理。
+ *
+ * ★ `transparent` **翻转时必须重编译**（0.7.0 用户报"透明度滑块首次拖动没反应"的根因）：
+ * three 把 `opaque = transparent === false && blending === NormalBlending &&
+ * alphaToCoverage === false` 编进 **shader define**（`#define OPAQUE`），而
+ * `opaque_fragment.glsl.js` 在 `OPAQUE` 下强制 `diffuseColor.a = 1.0` ——
+ * 不重编译的话 `opacity` 这个 uniform 写了也被丢弃，拖动完全看不见变化
+ * （"保存后重开又正常"，是因为新材质在首次编译前就带上了 `transparent=true`）。
+ *
+ * ★ 但**只在翻转时**置 `needsUpdate`：它会导致整条管线重编译（几百毫秒级），
+ * 每次拖滑块都置会明显卡顿；`0.5 → 0.7` 这类同侧调整只改 `opacity` uniform，不需要。
+ * `metalness` 同理（普通 uniform），不要顺手加。
  */
 export function applyMaterialParams(target: ParamMaterialTarget, values: MaterialParamValues): void {
   target.roughness = values.roughness
   target.normalScale.set(values.normalScale, values.normalScale)
   target.displacementScale = values.displacementScale
   target.metalness = values.metal
-  target.transparent = values.alpha < 1
+  const nextTransparent = values.alpha < 1
+  if (target.transparent !== nextTransparent) {
+    target.transparent = nextTransparent
+    target.needsUpdate = true // 翻转 → OPAQUE define 变化 → 必须重编译（见上）
+  }
   target.opacity = values.alpha
+}
+
+/**
+ * 「自定义渲染」弹窗的两个出口（0.7.0 用户要求拆成两个按钮）。
+ *
+ * 用户原话：「把这里的「保存」和「设为封面」分成两个按钮，因为既有的 PBR 的材质是不需要
+ * 我们的球成为封面的」。所以两条路径**都必须**持久化六个参数（那是这次调参的成果），
+ * 区别只有一个：要不要离屏渲一帧覆盖封面。
+ *
+ * 抽成纯函数是为了让"保存不碰封面"这件事可以被单测钉住（组件层测不动）。
+ */
+export type RenderAction = 'params' | 'cover'
+
+export interface RenderActionPlan {
+  /** true = 离屏渲一帧 → 写封面文件 → `coverSource='manual'`；false = 只记参数 */
+  writeCover: boolean
+  /** 成功后的 notice 文案（两条路径刻意不同，用户要能分清刚才做了什么） */
+  notice: string
+}
+
+export function renderActionPlan(action: RenderAction): RenderActionPlan {
+  return action === 'cover'
+    ? { writeCover: true, notice: '已保存自定义渲染并设为封面' }
+    : { writeCover: false, notice: '已保存渲染参数' }
 }
 
 /**

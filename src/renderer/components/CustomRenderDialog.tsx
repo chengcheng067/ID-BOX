@@ -5,6 +5,7 @@ import { displayName } from '../../shared/naming'
 import { IconClose } from '../icons'
 import type { Asset } from '../../shared/types'
 import type { MaterialSlots } from '../logic/materialBall'
+import { renderActionPlan, type RenderAction } from '../logic/materialBall'
 import { stageController } from '../logic/stageController'
 import type { MaterialBallApi } from './MaterialBall'
 
@@ -35,8 +36,9 @@ const MaterialBall = lazy(() =>
  *   反光强度（roughness 倍率）、凹凸强度（normal/displacement 倍率）0-2、
  *   金属度（metalness 绝对值 0-1）、透明度（0.1-1）、UV 大小（平铺倍率 0.1-4）；
  *   拖动即时重渲；保存时六参数一并生效；
- * - 底部：`保存 · 设为封面` 实心 accent 通栏钮 → 离屏渲染一帧存 JPG →
- *   `asset:setCoverImage` 落盘 + `setCover`（coverSource='manual'，能力既有）。
+ * - 底部：**两个**出口（0.7.0 用户拍板拆分）：主按钮「保存」只持久化六个参数、不碰封面；
+ *   次按钮「设为封面」另外离屏渲一帧存 JPG → `asset:setCoverImage` 落盘 +
+ *   `setCover`（coverSource='manual'，能力既有）。分流的判据见 `renderActionPlan`。
  *
  * 入口：DetailPanel 预览区「自定义渲染」按钮。
  * 选型说明：MaterialBall 的**内嵌调参面板保留**（组件级能力，其他调用方仍可用），
@@ -55,7 +57,12 @@ export function CustomRenderDialog({
   // （即时重渲预览需要），只是不再从 DEFAULT 起步，否则网格与弹窗显示不一致。
   // 类型用规范化形态：六参数全部就位，滑块才是受控的（历史参数只有三个字段）。
   const [scales, setScales] = useState<NormalizedBallParams>(() => resolveRenderParams(asset))
-  const [saving, setSaving] = useState(false)
+  /**
+   * 正在执行哪个出口（0.7.0 拆成两个按钮后必须区分）：
+   * `null` = 空闲；`'params'` → 保存中…；`'cover'` → 渲染中…。
+   * 两个按钮在任一动作进行中都要禁用，避免"保存"和"设为封面"并发写同一份参数。
+   */
+  const [busy, setBusy] = useState<RenderAction | null>(null)
   const renderable = useMemo(() => !!slots.albedo, [slots])
 
   // 防抖落库（§5.1）：滑块停下 400ms 才写库 + 入队重渲。
@@ -185,37 +192,61 @@ export function CustomRenderDialog({
 
   if (!renderable) return null
 
-  /** 保存：当前参数离屏渲一帧 JPG → 写进资产文件夹 → coverSource='manual'（§3.7） */
-  const save = async () => {
-    if (saving) return
-    setSaving(true)
+  /**
+   * 两个出口共用一条主干（0.7.0）：先**强制**落库六个参数，再按 `renderActionPlan`
+   * 决定要不要渲封面。
+   *
+   * - `'params'`（保存）：只记参数 → 关闭弹窗 → `已保存渲染参数`。
+   *   **绝不动封面、绝不动 coverSource** —— 用户原话「既有的 PBR 材质不需要我们的球成为封面」；
+   * - `'cover'`（设为封面）：离屏渲一帧 JPG → 写进资产文件夹 → `coverSource='manual'`
+   *   → 原文案 → 球回家。
+   *
+   * 为什么先显式 `persistRenderParams` 而不是等 400ms 防抖：用户可能拖完滑块立刻点按钮，
+   * 防抖窗口还没到就关了弹窗，参数就丢了。`persistRenderParams` 内部按 `paramsKey`
+   * 去重（无变化直接 return），所以这次强制落库是幂等的、不会重复写库。
+   */
+  const runAction = async (action: RenderAction) => {
+    if (busy) return
+    const plan = renderActionPlan(action)
+    setBusy(action)
     try {
-      const { renderBallToJpeg, blobToBase64, paperColor } = await import('./MaterialBall')
-      // v0.2.1 增补 1：背景走主题化 paperColor()（读 --render-canvas-bg），不再硬编码近黑
-      const blob = await renderBallToJpeg(asset.relFolder, slots, {
-        size: 480,
-        params: scales,
-        background: paperColor()
-      })
-      const base64 = await blobToBase64(blob)
-      if (!base64) throw new Error('离屏渲染读帧失败')
-      const res = await window.modvault.setCoverImage({
-        assetId: asset.id,
-        folder: asset.folder,
-        source: 'clipboard',
-        data: base64
-      })
-      if (!res) throw new Error('封面写盘失败')
-      // 后半程复用既有 setCover：coverSource='manual' + RA3 缩略图重生
-      await useVault.getState().setCover(asset.id, res.rel)
-      useVault.setState({ notice: '已保存自定义渲染并设为封面' })
-      // 保存成功后同样走"球回家"，不要直接卸载弹窗（否则球会凭空消失）
+      await useVault.getState().persistRenderParams(asset.id, scales)
+
+      if (plan.writeCover) {
+        const { renderBallToJpeg, blobToBase64, paperColor } = await import('./MaterialBall')
+        // v0.2.1 增补 1：背景走主题化 paperColor()（读 --render-canvas-bg），不再硬编码近黑
+        const blob = await renderBallToJpeg(asset.relFolder, slots, {
+          size: 480,
+          params: scales,
+          background: paperColor()
+        })
+        const base64 = await blobToBase64(blob)
+        if (!base64) throw new Error('离屏渲染读帧失败')
+        const res = await window.modvault.setCoverImage({
+          assetId: asset.id,
+          folder: asset.folder,
+          source: 'clipboard',
+          data: base64
+        })
+        if (!res) throw new Error('封面写盘失败')
+        // 后半程复用既有 setCover：coverSource='manual' + RA3 缩略图重生
+        await useVault.getState().setCover(asset.id, res.rel)
+      }
+
+      useVault.setState({ notice: plan.notice })
+      // 两条路径都走"球回家"，不要直接卸载弹窗（否则球会凭空消失）
       beginClose()
     } catch (err) {
-      console.warn('[CustomRenderDialog] 保存失败：', err)
-      useVault.setState({ notice: '保存失败：渲染或写盘未成功，请重试' })
+      console.warn(`[CustomRenderDialog] ${action === 'cover' ? '设为封面' : '保存'}失败：`, err)
+      // 两条路径各自的失败文案：说清楚是哪一步没成，别共用一句
+      useVault.setState({
+        notice:
+          action === 'cover'
+            ? '封面保存失败：渲染或写盘未成功，请重试'
+            : '保存失败：参数未能写入，请重试'
+      })
     } finally {
-      setSaving(false)
+      setBusy(null)
     }
   }
 
@@ -389,14 +420,29 @@ export function CustomRenderDialog({
             </div>
 
             <div className="mt-3 shrink-0">
-              {/* §3.7：保存 · 设为封面（实心 accent 通栏钮） */}
-              <button className="btn-solid w-full !h-10 !text-[13px]" disabled={saving} onClick={() => void save()}>
-                {saving ? '渲染中…' : '保存 · 设为封面'}
-              </button>
-              {/* 2026-10-21 走查 P2⑤：这里原来写的是「离屏渲染一帧 JPG · coverSource=manual（§3.3）」
-                  —— 全是实现细节与需求书章节号，用户读不懂也不需要读。改成说人话：会发生什么、能不能反悔。 */}
+              {/* 0.7.0 用户拍板：拆成两个出口。
+                  主按钮 = 保存（只记参数，不碰封面）；次按钮 = 设为封面（渲一帧覆盖封面）。
+                  用户原话：「既有的 PBR 的材质是不需要我们的球成为封面的」。 */}
+              <div className="flex items-center gap-2">
+                <button
+                  className="btn-solid !h-10 flex-1 !text-[13px]"
+                  disabled={busy !== null}
+                  onClick={() => void runAction('params')}
+                >
+                  {busy === 'params' ? '保存中…' : '保存'}
+                </button>
+                {/* 次按钮走既有 `.btn`（border-line + bg-card，无自造色值），高度与主按钮一致 */}
+                <button
+                  className="btn !h-10 shrink-0 !text-[13px] disabled:opacity-40"
+                  disabled={busy !== null}
+                  onClick={() => void runAction('cover')}
+                >
+                  {busy === 'cover' ? '渲染中…' : '设为封面'}
+                </button>
+              </div>
+              {/* 两句说明各自的后果，别让用户猜哪个会把球变成封面 */}
               <div className="mt-2 text-[11px] text-muted">
-                保存后会把当前这一帧存成封面，之后可随时在这里或详情面板换回
+                保存只记住这六个参数，不影响封面 · 设为封面会把当前这一帧存成封面图
               </div>
             </div>
           </div>
