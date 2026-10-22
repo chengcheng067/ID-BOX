@@ -12,7 +12,7 @@
  *
  * 任何一次同类损伤都能自愈，不需要迁移标记（谓词在修复完成后自然为假 = 天然幂等）。
  *
- * ## 四条硬纪律（改这里之前先读）
+ * ## 五条硬纪律（改这里之前先读）
  *
  * ① **有图的绝不碰**：只处理 `!thumbPath || thumbStatus !== 'ready'` 的记录。
  *    已经能显示的记录一旦被改写，就是拿"能看"换"可能更好"，毫无必要。
@@ -23,6 +23,19 @@
  *    用旧快照覆盖回去（与 `sizeBackfill` 同一条纪律）。
  * ④ **改动前先快照**：原记录整条塞进 `db.backups`（id `rescue-<ts>`），与
  *    `backupRescanDeletions` 同构，天然可回退。
+ *
+ * ⑤ **本模块禁止调用 `ballThumbName` / `ballHash`，禁止把 rev 纳入任何判据**
+ *    （team-lead 2026-10 裁定，理由照抄，别改）：
+ *    救援要回答的只有一个是非——「这条记录现在没图，盘上有没有一个**属于这个 id**
+ *    的缩略图文件？」这只需要 `<id>-<8hex>.(png|jpg)` 的形状校验 + **id 前缀逐字符
+ *    相等**，与 rev、slots、params 全都无关。
+ *    一旦引入"期望名比对"，救援就变成"渲染器版本的马前卒"：以后每升一次 rev
+ *    （`RENDER_REV` 3→4 就是这么一次），救援都会把**健康记录**判成不健康 → 正好
+ *    产生它本该避免的反效果。所以从设计上断掉。
+ *    挂回来的图是旧 rev 的，`ballThumbIsFresh` 必然 false → **惰性升级**会在它被看见
+ *    时重渲一次。**这个"不自洽"是特征，不是缺陷**：先让用户立刻有图，再悄悄换成新观感。
+ *    ⇒ 也不要为了"更严格"而新增 `ballHashAtRev` 之类的历史 rev 入口：那种入口迟早
+ *    会被某处误用来**回写文件名**。`shared/ballParams.ts` 永远只有一个真源 `RENDER_REV`。
  *
  * ## 为什么"最新那个候选"就够
  *
@@ -70,6 +83,21 @@ export interface ThumbRescuePlanItem {
 export interface PlanThumbRescueOptions {
   /** 覆盖上限（默认 {@link THUMB_RESCUE_LIMIT}） */
   limit?: number
+  /**
+   * **显式偏好**：`assetId → 期望文件名`，命中时**绕过 mtime 规则**（也绕过"已有图就不碰"）。
+   *
+   * 只服务于"最新 ≠ 正确"的个案：`5e4c3050-…` 的 id 下同时有
+   * `…-e94039c0.png`（UV 3.10，02:00）与 `…-7933daa4.png`（默认 UV，02:05 更晚），
+   * 纯按最新会挑到错的那张。
+   *
+   * 两条边界：
+   * ① 期望文件**必须真的在该 id 的候选列表里**（以 `thumb:list` 的结果为准），
+   *    不在就回落到 mtime 规则——绝不凭空造一个不存在的名字；
+   * ② 命中偏好时**允许替换已有 `thumbPath`**：这是唯一会改写"看起来已有图"的
+   *    记录的口子，因此只能由**静态的一次性表**驱动（`RESCUE_PREFER`），
+   *    不允许从运行时数据自动推导。
+   */
+  prefer?: Readonly<Record<string, string>>
 }
 
 /**
@@ -114,17 +142,37 @@ export function planThumbRescue(
 
   const plan: ThumbRescuePlanItem[] = []
   const seen = new Set<string>()
+  const prefer = opts.prefer ?? {}
   for (const asset of assets) {
     if (plan.length >= limit) break
     const id = typeof asset?.id === 'string' ? asset.id : ''
     if (id.length === 0) continue
     if (seen.has(id)) continue
-    // ① 已有可用缩略图 → 绝不碰
-    if (asset.thumbPath && asset.thumbStatus === 'ready') continue
-    // ② 软删记录不救援
+    // ② 软删记录不救援（偏好也不能越过这条）
     if (typeof asset.deletedAt === 'number') continue
     const list = byId.get(id)
     if (!list || list.length === 0) continue
+
+    // ① 显式偏好：文件真的在盘上就优先于一切（含"已有图"那道门，见选项注释）
+    const preferredName = prefer[id]
+    if (preferredName) {
+      const hit = list.find((f) => f.name === preferredName)
+      if (hit) {
+        seen.add(id)
+        plan.push({
+          assetId: id,
+          thumbPath: hit.name,
+          mtimeMs: hit.mtimeMs,
+          candidates: list.length
+        })
+        continue
+      }
+      // 偏好文件不在本次列举结果里（被手动删了 / IPC 只回了部分）→ 回落 mtime 规则
+    }
+
+    // ③ 已有可用缩略图 → 绝不碰
+    if (asset.thumbPath && asset.thumbStatus === 'ready') continue
+
     const best = [...list].sort(compareCandidates)[0]
     if (!best) continue
     seen.add(id)
