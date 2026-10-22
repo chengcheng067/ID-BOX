@@ -12,6 +12,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   RENDER_PARAMS_RESTORE,
+  RESCUE_PREFER,
   THUMB_RESCUE_LIMIT,
   THUMB_RESCUE_SNAPSHOT_PREFIX,
   applyThumbRescue,
@@ -111,7 +112,7 @@ describe('planThumbRescue · 匹配规则', () => {
     expect(plan[0]!.thumbPath).toBe(`${ID_A}-00ff00ff.png`)
   })
 
-  it('`manual` 封面 → 一律跳过（哪怕盘上是球图候选）', () => {
+  it('`manual` 封面且**不在静态表** → 一律跳过（哪怕盘上是球图候选）', () => {
     const plan = planThumbRescue(
       [needRescue({ coverSource: 'manual' })],
       [file(ID_A, '00ff00ff', 'png')]
@@ -119,7 +120,7 @@ describe('planThumbRescue · 匹配规则', () => {
     expect(plan).toEqual([])
   })
 
-  it('`named` 封面 → 一律跳过（哪怕盘上是封面候选）', () => {
+  it('`named` 封面且**不在静态表** → 一律跳过（哪怕盘上是封面候选）', () => {
     const plan = planThumbRescue(
       [needRescue({ coverSource: 'named' })],
       [file(ID_A, '00ff00ff', 'jpg')]
@@ -141,6 +142,72 @@ describe('planThumbRescue · 匹配规则', () => {
     const files = assets.map((a) => file(a.id, 'abcdef01'))
     expect(planThumbRescue(assets, files, { limit: 2 })).toHaveLength(2)
     expect(THUMB_RESCUE_LIMIT).toBeGreaterThan(2)
+  })
+})
+
+describe('planThumbRescue · prefer（静态表点名的唯一例外）', () => {
+  const TARGET = '5e4c3050-e057-4681-a70a-cb277890c309'
+  const PREFERRED = `${TARGET}-e94039c0.png`
+  const NEWER = `${TARGET}-7933daa4.png`
+
+  it('prefer 优先于 mtime（目标 id 下 7933 更晚，正确的那张是 e940）', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, coverSource: 'manual', thumbStatus: 'none' }],
+      [file(TARGET, '7933daa4', 'png', 5000), file(TARGET, 'e94039c0', 'png', 1000)]
+    )
+    // 不传 prefer 时：manual → 跳过（产品不变量）
+    expect(plan).toEqual([])
+    // 传 prefer（= 静态表点名）→ 例外生效
+    const withPrefer = planThumbRescue(
+      [{ id: TARGET, coverSource: 'manual', thumbStatus: 'none' }],
+      [file(TARGET, '7933daa4', 'png', 5000), file(TARGET, 'e94039c0', 'png', 1000)],
+      { prefer: { [TARGET]: PREFERRED } }
+    )
+    expect(withPrefer).toHaveLength(1)
+    expect(withPrefer[0]!.thumbPath).toBe(PREFERRED)
+    expect(withPrefer[0]!.candidates).toBe(2)
+  })
+
+  it('prefer **允许替换已有 thumbPath**（唯一例外；否则用户永远看到默认 UV 那张）', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, coverSource: 'manual', thumbPath: NEWER, thumbStatus: 'ready' }],
+      [file(TARGET, '7933daa4', 'png', 5000), file(TARGET, 'e94039c0', 'png', 1000)],
+      { prefer: { [TARGET]: PREFERRED } }
+    )
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.thumbPath).toBe(PREFERRED)
+  })
+
+  it('prefer 文件不在盘上 → 回落常规规则（manual 因此仍被跳过，绝不凭空造名字）', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, coverSource: 'manual', thumbStatus: 'none' }],
+      [file(TARGET, '7933daa4', 'png', 5000)],
+      { prefer: { [TARGET]: PREFERRED } }
+    )
+    expect(plan).toEqual([])
+  })
+
+  it('软删记录：prefer 也不能越过', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, coverSource: 'manual', thumbStatus: 'none', deletedAt: 1 }],
+      [file(TARGET, 'e94039c0', 'png', 1000)],
+      { prefer: { [TARGET]: PREFERRED } }
+    )
+    expect(plan).toEqual([])
+  })
+
+  it('例外是**窄**的：同一条盘上候选，别的 manual id 照样跳过', () => {
+    const plan = planThumbRescue(
+      [{ id: ID_A, coverSource: 'manual', thumbStatus: 'none' }],
+      [file(ID_A, '00ff00ff', 'png')],
+      { prefer: { [TARGET]: PREFERRED } }
+    )
+    expect(plan).toEqual([])
+  })
+
+  it('RESCUE_PREFER 与表项同源（只含点名的那一个 id）', () => {
+    expect(RESCUE_PREFER[TARGET]).toBe(PREFERRED)
+    expect(Object.keys(RESCUE_PREFER)).toEqual([TARGET])
   })
 })
 

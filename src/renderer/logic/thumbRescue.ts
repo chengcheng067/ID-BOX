@@ -44,6 +44,13 @@
  *    修掉的 bug。这类记录交回既有 `ensureMissingThumbs`（它按当前封面 salt 生成，
  *    结果与 `manual` 语义一致），成本一条 IPC/资产。
  *
+ *    **唯一例外**：静态救援表 `RENDER_PARAMS_RESTORE.preferThumb` 点名要恢复的那一条
+ *    （`prefer` 命中）。它不是"按来源猜"，而是"事故复盘后写死的一个文件名"——
+ *    目标资产 `5e4c3050-…` 是 `manual`，球图管线永远轮不到它；事故后补齐流程又把它
+ *    渲成了**默认 UV** 的 `…-7933daa4.png`。不 pin 的话，用户刚被恢复的 UV=3.10
+ *    与屏幕上的图**不一致**（"我调的又变回去了"）。pin 住是"UV 对、贴图错"，
+ *    好过"UV 和贴图都错"；真正的重渲要破例让 manual 资产进球图管线，本版不做。
+ *
  * ## 为什么"最新那个候选"就够
  *
  * 同一 id 的多个缓存文件只可能来自"同一资产的不同 cover salt / 不同参数"。
@@ -95,6 +102,21 @@ export interface ThumbRescuePlanItem {
 export interface PlanThumbRescueOptions {
   /** 覆盖上限（默认 {@link THUMB_RESCUE_LIMIT}） */
   limit?: number
+  /**
+   * **显式偏好**：`assetId → 期望文件名`，命中时**优先于 mtime 规则**，
+   * 并且**是"已有图就不碰"与"manual/named 一律跳过"这两道门的唯一例外**。
+   *
+   * 存在的理由（事故复盘，别删）：目标资产 `5e4c3050-…` 是 `manual` 封面，
+   * 球图管线永远轮不到它；事故后补齐流程又把它渲成了**默认 UV** 的
+   * `…-7933daa4.png`（mtime 更晚）。不 pin 的话，刚恢复的 UV=3.10 与屏幕上的图
+   * 不一致（用户会觉得"我调的又变回去了"）。
+   *
+   * 两条边界：
+   * ① 期望文件**必须真的在该 id 的候选列表里**（以 `thumb:list` 的结果为准），
+   *    不在就回落到常规规则——绝不凭空造一个不存在的名字；
+   * ② 只能由**静态的一次性表**驱动（`RESCUE_PREFER`），不允许从运行时数据推导。
+   */
+  prefer?: Readonly<Record<string, string>>
 }
 
 /**
@@ -140,20 +162,38 @@ export function planThumbRescue(
 
   const plan: ThumbRescuePlanItem[] = []
   const seen = new Set<string>()
+  const prefer = opts.prefer ?? {}
   for (const asset of assets) {
     if (plan.length >= limit) break
     const id = typeof asset?.id === 'string' ? asset.id : ''
     if (id.length === 0) continue
     if (seen.has(id)) continue
-    // ① 软删记录不救援
+    // ① 软删记录不救援（偏好也不能越过这条）
     if (typeof asset.deletedAt === 'number') continue
-    // ② `manual` / `named` 一律跳过（文件头 ⑥）：按产品不变量，这类资产显示封面。
-    //    即使盘上候选看起来像球图也不碰——把它挂回去就等于亲手制造"卡片显示球、
-    //    按设计该显示封面"的旧 bug。交给 `ensureMissingThumbs` 按封面 salt 生成。
-    if (asset.coverSource === 'manual' || asset.coverSource === 'named') continue
     const list = byId.get(id)
     if (!list || list.length === 0) continue
-    // ③ 已有可用缩略图 → 绝不碰
+
+    // ② 显式偏好（静态表点名）：优先于 mtime，也是下面两道门的唯一例外
+    const preferredName = prefer[id]
+    if (preferredName) {
+      const hit = list.find((f) => f.name === preferredName)
+      if (hit) {
+        seen.add(id)
+        plan.push({
+          assetId: id,
+          thumbPath: hit.name,
+          mtimeMs: hit.mtimeMs,
+          candidates: list.length
+        })
+        continue
+      }
+      // 偏好文件不在本次列举结果里（被手动删了 / IPC 只回了部分）→ 回落常规规则
+    }
+
+    // ③ `manual` / `named` → 跳过（文件头 ⑥）：按产品不变量，这类资产显示封面
+    if (asset.coverSource === 'manual' || asset.coverSource === 'named') continue
+
+    // ④ 已有可用缩略图 → 绝不碰
     if (asset.thumbPath && asset.thumbStatus === 'ready') continue
 
     const best = [...list].sort(compareCandidates)[0]
@@ -264,11 +304,12 @@ export async function applyThumbRescue(
  * 并已用文件名反算验证（**固定槽位 + 硬编码 rev=3 的字符串 fixture**，见测试）：
  * `fnv1a('rev3\n<槽位>\n1.00,1.00,3.10')` **恰好等于**盘上那张 `…-e94039c0.png`。
  *
- * ⚠️ **只写 `renderParams`，不写 `thumbPath`**（team-lead 2026-10 裁定）：
- * 那张 `e94039c0` 是用 `*.cover.jpg`（商品预览图）当 albedo 渲出来的**错图**，
- * 而该资产是 `manual` 封面 → 球图管线永远轮不到它（`ballThumbTarget` 为 null）。
- * 一旦把它 pin 住，用户会**永久**看到错图的球，albedo 修复对这个资产永远不生效。
- * 参数是用户创作的东西，必须救；错的像素不该救。
+ * ✅ **同时 pin 缩略图**（`preferThumb`，team-lead 2026-10 最终裁定）：
+ * 该资产是 `manual` 封面 → 球图管线永远轮不到它（`ballThumbTarget` 为 null），
+ * 而事故后补齐流程按**默认 UV** 渲出了 `…-7933daa4.png`（mtime 更晚）。
+ * 只恢复参数不 pin 图的话，屏幕上的球仍是默认 UV —— 用户会觉得"我调的又变回去了"。
+ * 三种选择里 pin 是当下最优：UV 对、贴图错（e94039c0 是把 `*.cover.jpg` 当 albedo
+ * 渲的）好过 UV 与贴图都错。真正的重渲需要破例让 manual 资产进球图管线，本版不做。
  *
  * ⚠️ 只存**部分字段**：事故时用户只动过 UV，其余全部是默认值。
  * 写入前用 {@link restoreParamsFor} 补齐成完整结构（六个字段全就位），
@@ -280,13 +321,37 @@ export async function applyThumbRescue(
 export const RENDER_PARAMS_RESTORE: ReadonlyArray<{
   id: string
   params: Partial<BallParamScales>
+  /**
+   * 该记录应挂的**确切**缩略图文件名（一次性纠正"最新 ≠ 正确"，也是
+   * `manual` / `named` 跳过规则的唯一例外）。
+   *
+   * 目标资产 id 下有两个球图：`…-e94039c0.png`（UV 3.10）与 `…-7933daa4.png`
+   * （默认 UV，mtime 更晚——事故后补齐流程又渲了一张）。纯 mtime 规则会挑到后者，
+   * 于是"刚恢复的 UV=3.10"与屏幕上的图不一致。文件不存在时自动回落常规规则。
+   */
+  preferThumb?: string
 }> = [
   // 新中式复古仿古砖（UV=3.10，其余默认）
   {
     id: '5e4c3050-e057-4681-a70a-cb277890c309',
-    params: { uv: 3.1 }
+    params: { uv: 3.1 },
+    preferThumb: '5e4c3050-e057-4681-a70a-cb277890c309-e94039c0.png'
   }
 ]
+
+/**
+ * `planThumbRescue` 的 `prefer` 入参：由 `RENDER_PARAMS_RESTORE` 的 `preferThumb` 汇总。
+ *
+ * 只包含**显式偏好**的条目（当前 1 条）。刻意从表里算而不是手写第二份，
+ * 避免表与偏好两处漂移。
+ */
+export const RESCUE_PREFER: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(
+    RENDER_PARAMS_RESTORE.filter(
+      (e) => typeof e.preferThumb === 'string' && e.preferThumb.length > 0
+    ).map((e) => [e.id, e.preferThumb as string])
+  )
+)
 
 /** 把"部分参数"补齐成完整结构（缺省项取 `DEFAULT_PARAM_SCALES`，再整体规范化） */
 export function restoreParamsFor(entry: { params: Partial<BallParamScales> }): NormalizedBallParams {

@@ -170,35 +170,54 @@ afterEach(() => {
 
 describe('init · 救援接线', () => {
   it('被抹掉 thumbPath 的资产：init 后挂回，且**先于** ensureMissingThumbs（不再被封面缩略图抢走）', async () => {
-    rows = [asset({ thumbStatus: 'none', thumbPath: undefined })]
+    // 用非目标 id：目标 id 会命中 prefer 例外，测不出"按 mtime 通用规则挂回"
+    const OTHER = '99999999-8888-4777-8666-555544443333'
+    rows = [
+      asset({
+        id: OTHER,
+        name: '混凝土',
+        folder: 'E:\\ModVault\\Library\\材质\\未分类\\未分类\\混凝土',
+        relFolder: '材质/未分类/未分类/混凝土',
+        cover: '混凝土.cover.jpg',
+        files: [{ rel: '混凝土.cover.jpg', name: '混凝土.cover.jpg', ext: 'jpg', size: 10, kind: 'texture' }],
+        dedupeKey: 'material:混凝土',
+        thumbStatus: 'none',
+        thumbPath: undefined
+      })
+    ]
+    modvault.listThumbs.mockImplementation(async () => [
+      { name: `${OTHER}-11111111.png`, size: 100, mtimeMs: 1000 },
+      { name: `${OTHER}-22222222.jpg`, size: 100, mtimeMs: 5000 } // 最新
+    ])
 
     await useVault.getState().init()
 
     const after = useVault.getState().assets[0]!
-    expect(after.thumbPath).toBe(NEWER) // 通用规则：同 id 多候选取 mtime 最大（不认 rev）
+    expect(after.thumbPath).toBe(`${OTHER}-22222222.jpg`) // 通用规则：取 mtime 最大（不认 rev）
     expect(after.thumbStatus).toBe('ready')
     // 写库走的是定向 modify（不是整对象 put），且只碰这两个字段
     const rescueWrite = modifyCalls.find((c) => c.changed.includes('thumbPath'))
     expect(rescueWrite).toBeTruthy()
-    expect(rescueWrite!.id).toBe(ID)
+    expect(rescueWrite!.id).toBe(OTHER)
     expect(rescueWrite!.changed.sort()).toEqual(['thumbPath', 'thumbStatus'])
     // 快照：rescue-<ts>，json 是原记录
     const snapshot = [...backups.values()].find((b) => b.id.startsWith('rescue-'))
     expect(snapshot).toBeTruthy()
-    expect((JSON.parse(snapshot!.json) as Array<{ id: string }>)[0]!.id).toBe(ID)
+    expect((JSON.parse(snapshot!.json) as Array<{ id: string }>)[0]!.id).toBe(OTHER)
     // 顺序证据：救援把它变成 ready 之后，封面缩略图分支就不会再看它
     expect(modvault.ensureThumb).not.toHaveBeenCalled()
+    modvault.listThumbs.mockImplementation(async () => disk)
   })
 
-  it('事故参数：只在 renderParams 为空时补齐成完整六字段；**不写 thumbPath**（manual 封面 → 不 pin 错图）', async () => {
-    // 真实记录就是 manual 封面 + `…-7933daa4.png`（默认 UV，错图）。按裁定：参数救、
-    // 缩略图不救（球图管线永远轮不到它，pin 住 = 把错图永久冻结）。
+  it('事故参数：renderParams 补齐六字段；目标资产经 prefer 从 `…-7933daa4` 换回 `…-e94039c0`', async () => {
+    // 真实记录：manual 封面 + `…-7933daa4.png`（默认 UV，mtime 更晚）。
+    // manual 本应跳过救援，但它在静态表里被点名 → prefer 例外生效。
     rows = [asset({ coverSource: 'manual', thumbPath: NEWER, thumbStatus: 'ready' })]
 
     await useVault.getState().init()
 
     const after = useVault.getState().assets[0]!
-    expect(after.thumbPath).toBe(NEWER) // 一个字都没动
+    expect(after.thumbPath).toBe(GOOD)
     expect(after.renderParams).toEqual({
       roughness: 1,
       bump: 1,
@@ -209,21 +228,37 @@ describe('init · 救援接线', () => {
     })
   })
 
-  it('`manual` / `named` 不进救援：不写库、不写快照（交回 ensureMissingThumbs 按封面 salt 生成）', async () => {
+  it('`manual` / `named`（不在静态表里）不进救援：不写库、不写快照', async () => {
+    // ⚠️ 必须用**另一个 id**：用目标 id 会命中 prefer 例外，测不出"跳过"
+    const OTHER = '99999999-8888-4777-8666-555544443333'
     for (const coverSource of ['manual', 'named'] as const) {
-      rows = [asset({ coverSource, thumbStatus: 'none', thumbPath: undefined })]
+      rows = [
+        asset({
+          id: OTHER,
+          name: '混凝土',
+          folder: 'E:\\ModVault\\Library\\材质\\未分类\\未分类\\混凝土',
+          relFolder: '材质/未分类/未分类/混凝土',
+          cover: '混凝土.cover.jpg',
+          files: [{ rel: '混凝土.cover.jpg', name: '混凝土.cover.jpg', ext: 'jpg', size: 10, kind: 'texture' }],
+          dedupeKey: 'material:混凝土',
+          coverSource,
+          thumbStatus: 'none',
+          thumbPath: undefined
+        })
+      ]
       backups.clear()
       modifyCalls.length = 0
+      modvault.listThumbs.mockImplementation(async () => [
+        { name: `${OTHER}-00ff00ff.png`, size: 4096, mtimeMs: 9000 } // 盘上有球图候选也不碰
+      ])
 
       await useVault.getState().init()
 
       const after = useVault.getState().assets[0]!
-      expect(after.thumbPath).toBeUndefined() // 救援没碰它
-      expect(backups.size).toBe(0) // 也没写快照
-      // 注意：这里**不断言** ensureThumb —— 那是 ensureMissingThumbs 的实现细节，
-      // 且 `thumbAttempted` 是模块级集合（同一文件内第二次会跳过）。
-      // "跳过救援"的判定已在 `tests/thumbRescue.test.ts` 的纯函数用例里逐一钉住。
+      expect(after.thumbPath).toBeUndefined()
+      expect(backups.size).toBe(0)
     }
+    modvault.listThumbs.mockImplementation(async () => disk)
   })
 
   it('用户已经调过参数 → 一个字节都不覆盖（救援只填空）', async () => {
