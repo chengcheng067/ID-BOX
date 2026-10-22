@@ -8,14 +8,17 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-007AFF)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F)
-![Version](https://img.shields.io/badge/version-0.6.8-4B5563)
-![Tests](https://img.shields.io/badge/tests-1791%20passed-30A46C)
+![Version](https://img.shields.io/badge/version-0.7.4-4B5563)
+![Tests](https://img.shields.io/badge/tests-2248%20passed-30A46C)
 ![Status](https://img.shields.io/badge/status-Preview-7A5AF8)
 
 </div>
 
 > **当前是 Preview 测试版**（顶栏 `ID BOX` 右边那颗紫色胶囊就是它）。功能在快速迭代，
 > 数据结构可能随版本调整；遇到问题请用「设置 → 诊断 → 导出日志」，日志里有足够定位的信息。
+>
+> 0.7.x 已经做过一轮数据修复：重扫不再覆盖你改过的字段，并且覆盖前先落一份快照。
+> 所以调好的材质球参数，不会因为一次重扫被抹掉。
 
 ---
 
@@ -37,7 +40,7 @@
   <img src="docs/screenshots/main-dark.png" width="49%" alt="主界面 · 深色" />
 </div>
 
-> 以上为 **0.6.8 实际运行截图**（1440×900，本地真实素材库）。深色是作者的日常主题。
+> 以上为**实际运行截图**（1440×900，本地真实素材库）。深色是作者的日常主题。
 
 ---
 
@@ -111,7 +114,7 @@
 | 本地库 | Dexie（IndexedDB） |
 | 3D | three.js（材质球、HDR 环境光、PMREM） |
 | 构建 | electron-vite + electron-builder |
-| 测试 | Vitest（纯逻辑层 + 源码守卫，**1791 条**） |
+| 测试 | Vitest（纯逻辑层 + 源码守卫，**2248 条**） |
 
 设计原则：**本地优先**。素材、缩略图、索引全在本机，删除软件不删你的文件。
 
@@ -126,7 +129,7 @@ npm install
 
 npm run dev       # 开发（HMR）
 npm run build     # 编译到 out/
-npm run test      # 1791 条测试
+npm run test      # 2248 条测试
 npm run typecheck:node && npm run typecheck:web
 ```
 
@@ -143,20 +146,21 @@ npx electron-builder --win nsis -c.directories.output=release
 
 ### 品牌资源
 
-应用图标、顶栏 Logo、关于页二维码由 `scripts/build-app-icon.cjs` 一次从 `resources/brand/` 生成：
+应用图标、顶栏 Logo、关于页二维码由 `scripts/build-app-icon.cjs` 从 `resources/brand/` 一次性生成：
 
 ```bash
 npm run brand
 ```
 
-> ⚠️ 仓库里的 `src/renderer/assets/brand/contact-qr.png` 是**占位图**（浅灰叉）。
-> 真实微信二维码属于个人信息，不进公开仓库。
-> 要换成你自己的：把图存成 `resources/brand/contact-wechat.local.jpg` → `npm run brand`，
-> 产物会覆盖占位图；源图不存在时脚本会跳过、保留占位图，不会报错。
+> 仓库里的 `src/renderer/assets/brand/contact-qr.png` 是**占位图**（浅灰叉，扫不出内容），
+> 真实二维码不在公开仓库里。正式发布版的图标 / Logo / 二维码由作者在本地私有品牌资源中生成，
+> 不随仓库分发——所以你 clone 下来自己构建，拿到的是占位图，这是**预期行为**，不是 bug。
 >
-> **注意**：`contact-qr.png` 是被 git 跟踪的文件，所以在自己机器上跑过 `npm run brand` 之后，
-> 提交前请还原占位图——`git checkout -- src/renderer/assets/brand/contact-qr.png`。
-> 否则你的个人二维码会跟着 commit 进公开仓库。
+> 脚本语义就这一句：从 `resources/brand/` 一次性生成图标 / Logo / 二维码；源图缺失时跳过对应产物、
+> 保留占位图，不报错。
+>
+> **二维码与打赏码是作者的身份标识。请勿替换成他人的二维码后分发本软件，也不要替换后改名发布。**
+> 如果你 fork 只是为了自己用，正确做法是**删掉「设置 → 关于」里的二维码 / 打赏区域**，而不是换成你自己的。
 
 ---
 
@@ -169,7 +173,7 @@ src/
 ├─ renderer/      React UI：组件 / 逻辑（纯函数，可单测）/ 样式 token
 └─ shared/        主进程与渲染层共用：类型、分类词表、自动分类、命名与别名规则
 
-docs/             26 篇工程文档（PRD、架构、分类体系、变更设计、测试报告、性能诊断…）
+docs/             27 篇工程文档（PRD、架构、分类体系、变更设计、测试报告、性能诊断…）
 tests/            Vitest 用例（纯逻辑 + 源码守卫）
 build/            应用图标
 resources/        打包资源（品牌素材、拖拽图标）
@@ -216,6 +220,48 @@ resources/        打包资源（品牌素材、拖拽图标）
 | [`docs/25`](docs/25-待办-用户反馈.md) | 用户反馈台账（每条含原话、根因、验收口径） |
 | [`docs/26`](docs/26-性能诊断-材质球切换.md) | 材质球卡顿的量化诊断（瓶颈在解码，不在 GPU） |
 | [`docs/08`](docs/08-测试报告.md) | 测试报告与各轮验收结论 |
+
+---
+
+## 未来功能展望
+
+> **以下都是方向，不是承诺**；优先级会随实际使用反馈调整，未完成的功能不会写进发布说明。
+
+**渐变贴图的透明度按灰度映射**
+
+现在的透明度判定偏二值，柔和的半透明边缘容易被压成硬边。作者的原话是「渐变的透明不该是非黑即白，
+要识别灰度」，并且要配一个「反转灰度」开关——哪里透明交给用户抉择，而不是由默认值替用户决定。
+这条已记录、**明确推迟**：它改的是贴图管线的语义，会让已经在库里调好的球得到不同结果，
+得和缓存键、封面一致性一起想清楚，不适合塞进一个小版本。
+
+**材质球形态可选（球 / 平面 / 圆角盒）**
+
+渲染与缓存已支持三种形态，也参与球图命名，但**地基已有、入口未做**。之所以先不放按钮：
+形态一换，卡片封面、缓存键、拖出行为都要重新对齐，等设计与交互定稿再放出来，
+比先给一个半成品开关更省事。
+
+**封面与调参统一**
+
+现状是「手动封面优先」：设过封面的资产，卡片就固定显示那张图，之后再调参数卡片不会自己变，
+要点两次才更新。将来想区分「自己渲的球」和「用户挑的图」，让前者跟着参数走、后者保持不变。
+这个区分的前提是封面能可靠地记住来源，所以排在数据层稳定之后。
+
+**材质球切换性能**
+
+`docs/26` 已经量化过：瓶颈在**贴图解码**，不在 GPU。下一步做解码池 / 预热，
+而不是继续加渲染特效——特效只会让解码压力更大，方向是反的。
+
+**更多格式与平台**
+
+目前只解析 png / jpg / hdr / exr 的尺寸，webp / tif 还不认；也只支持 Windows
+（拖出、回收站、文件关联都用了平台能力）。跨平台不是不愿意做，是这三件事在 macOS / Linux
+上都要另写一套，成本远高于它现在能带来的收益。
+
+**分类词表继续补抄**
+
+词表纪律不变：只从站方原始抄录补，不自创；缺的类目先补抄录，再进代码。
+先抄后写看起来慢，但能避免「为了分得准自己发明类目」——短期好看，长期会把
+「和网站上归在同一处」这条最值钱的线索弄断。
 
 ---
 
