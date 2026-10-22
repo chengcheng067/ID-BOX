@@ -313,6 +313,18 @@ export interface Asset {
    */
   renderParams?: BallParamScales
   /**
+   * 材质球**几何形态**（2026-10 缓存策略）：用户在「自定义渲染」里切过 plane /
+   * roundedBox 后必须记住，否则下次启动又渲回球面 —— 而卡片上写的就是"材质球"，
+   * 形态一旦不入库，切换就只是一次性的视觉烟花。
+   *
+   * **缺省 = `'sphere'`**，与本次改动前的所有存量记录完全兼容（渲染结果、缓存名
+   * 都不变：`ballThumbName` 只在非球面时才把形态拼进 hash 输入，见
+   * `shared/ballParams.ts: ballThumbName`）。
+   *
+   * 非索引字段（不参与筛选）——与 `renderParams` 同处理，不需要升 Dexie 版本。
+   */
+  renderShape?: BallRenderShape
+  /**
    * 软删时间戳（C 线「最近删除」）。`undefined` = 未删除。
    *
    * **Dexie v5 建索引**（`deletedAt`）；迁移老记录时**不要补 0 / null**——
@@ -813,6 +825,21 @@ export interface BallSlots {
   displacement?: string
 }
 
+/**
+ * 材质球几何形态（**shared 里的规范定义**）。
+ *
+ * 与 `renderer/components/MaterialBall.tsx` 的 `BallShape` 逐字同形（结构类型兼容，
+ * 互相可直接赋值）；放 shared 是因为 `Asset.renderShape` 与 IPC 载荷
+ * `SaveBallThumbPayload.shape` 都要用它，而 main 层不能 import renderer 的类型。
+ *
+ * 为什么形态要进球图的**身份**（hash）：同一个材质、同一个参数，球面与平面的成像
+ * 完全不同。若形态不参与 hash，用户切换形态后缓存名不变 → 网格永远显示旧形态那张图。
+ *
+ * ⚠️ 只有**非球面**才贡献 hash（`'sphere'` 与缺省逐字符一致），否则本次改动会让
+ * 全库存量球图凭空改名 → 又一次全量重渲（正是本次要消灭的行为）。
+ */
+export type BallRenderShape = 'sphere' | 'plane' | 'roundedBox'
+
 /** `thumb:saveBall` 入参 */
 export interface SaveBallThumbPayload {
   /** 资产稳定 id（缓存文件名 `<id>-<槽位hash>.png` 的一部分） */
@@ -825,6 +852,13 @@ export interface SaveBallThumbPayload {
    * 传 undefined = 默认参数（与不传等价，既有调用不受影响）。
    */
   params?: BallParamScales
+  /**
+   * 几何形态（参与 hash，但同样**只在非球面时**）。传 undefined = `'sphere'`。
+   *
+   * 主进程必须用**同一个** `ballThumbName` 算文件名（不许在 main 复制一份 hash 逻辑），
+   * 因此形态必须随载荷过来：渲染层渲的是 plane，落盘名字就必须带 plane。
+   */
+  shape?: BallRenderShape
   /**
    * 离屏渲染出的 **PNG base64**（透明背景，不含 `data:` 前缀）。
    * 透明是关键：卡片 `bg-canvas` 透出来 → 深浅主题同一个缓存文件都正确。

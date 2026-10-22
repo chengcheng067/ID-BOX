@@ -61,7 +61,10 @@ export const IPC = {
   /** 把剪贴板/本地图片写进资产文件夹并返回 rel 路径（main 侧校验 magic bytes/大小/路径） */
   setCoverImage: 'asset:setCoverImage',
   // ── 2026-10：材质球离屏渲染图落盘（任务 6） ──────────────────────
-  /** 渲染出的材质球 JPEG 写进 thumbs 目录；文件名与既有缩略图同格式，返回缓存文件名 */
+  /**
+   * 渲染出的材质球**透明 PNG** 写进 thumbs 目录；文件名与既有缩略图同格式，返回缓存文件名。
+   * 载荷含 `params` / `shape`：两者都参与 hash（shape 只在非球面时），必须由渲染层传来。
+   */
   saveBallThumb: 'thumb:saveBall',
   /**
    * 尺寸**回填**（2026-10「分辨率筛选失效」）：`(folder, rels)` → `ProbedImageSize[]`。

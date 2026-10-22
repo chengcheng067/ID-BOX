@@ -20,7 +20,7 @@
  * 就是一块亮白方块）。透明 PNG 让卡片的 `bg-canvas` 透出来，于是
  * **深浅两个主题共用同一个缓存文件都正确**，缓存与主题彻底解耦。
  */
-import type { Asset, BallSlots } from './types'
+import type { Asset, BallRenderShape, BallSlots } from './types'
 import { PBR_SLOT_ORDER } from './pbrSlots'
 
 /**
@@ -178,6 +178,22 @@ export function resolveRenderParams(asset: Asset): NormalizedBallParams {
 }
 
 /**
+ * 读回某资产的形态：缺省 / 脏值一律回落到 `'sphere'`（= 本次改动前的唯一形态）。
+ *
+ * 与 `resolveRenderParams` 同一纪律：**读时兜底、不回填**。不回填的理由是
+ * 「存量记录没有这个字段」与「用户明确选了球面」在渲染上等价，写库只是噪音；
+ * 也因此不需要 Dexie 迁移。
+ *
+ * 全仓（store 的四处口径、主进程落盘名、测试）都必须走这里，
+ * 不许各自写 `asset.renderShape ?? 'sphere'`——历史上"四处口径不同源"就是缓存 bug 的根因。
+ */
+export function resolveRenderShape(asset: Asset): BallRenderShape {
+  const s = asset.renderShape
+  if (s === 'plane' || s === 'roundedBox' || s === 'sphere') return s
+  return 'sphere'
+}
+
+/**
  * FNV-1a 32bit → 8 位小写十六进制。
  *
  * 与 `shared/thumb.ts` 的 `thumbSalt` 同算法同格式：这样球图缓存文件名
@@ -211,29 +227,28 @@ export function ballSlotsRelPaths(slots: BallSlots): string[] {
 }
 
 /**
- * 球图缓存 hash：`slots 集合` +（非默认时）`参数串`。
- *
- * **方案 B（用户拍板，硬约束）**：`isDefaultParams(params)` 时 hash 输入不追加参数串
- * —— 现有磁盘缓存全部保留，只有真调过参的材质才重渲。这不是兼容 hack，而是
- * 「hash 输入的最短表示」：默认参数不改变渲染结果（`ballParams.test.ts` 已锁死
- * 「1 倍时三个 effective* 恒等于基准」这条回归）。
- *
- * golden 锁（docs/12 §3.3，实测值，写进测试防漂移）：
- * - `['vh1sbjl_2K_Albedo.jpg','vh1sbjl_2K_Normal.jpg']` → `7694126f`
- * - `['a.jpg','b.jpg']` → `8f3f48d0`
- * - `[]` → `811c9dc5`
- * - 第一组 + `1.00,1.00,1.00`（方案 A 形态）→ `c2dbee32`
- * - 第一组 + `1.50,1.00,0.50` → `340ed45f`
- */
-/**
  * 渲染修订号（缓存失效闸门，docs/12 §3.3）。
  *
- * 规则：**只要球的观感变了就 +1**。历史：
+ * ## 纪律（2026-10 缓存策略修订，**请严格遵守**）
+ *
+ * **只在"成像公式"变更时 +1**：色调映射、相机（fov/距离/朝向）、UV 补偿、
+ * 几何（球的细分/半径/形变）、光照口径（环境光/HDR/强度基准）——这些会改变
+ * **同一输入的像素输出**，旧缓存与新渲染不是一张图，必须让它失效。
+ *
+ * **功能开发一律不 +1**：加按钮、加字段、改布局、改筛选、改文案、加 IPC 通道、
+ * 改 store 逻辑——这些都**不改变成像**，+1 只会让全库缓存白白作废。
+ *
+ * **每次 +1 之前必须确认**：`store.ts` 的惰性升级（`noteVisibleAssets` /
+ * `ensureMissingBallThumbs` / 3s trickle）已生效。因为 +1 会让**全库**球图名字
+ * 过期——没有惰性升级时，+1 就等于"下次启动全量重渲"（用户明确否掉的行为：
+ * 素材多时启动压力极大）。
+ *
+ * ## 历史
  * - 2：环境光照全进程共享 + 贴图降采样 + 单图合成法线；
- * - 3（本轮）：**ACES → Neutral 色调映射** + **球面 UV 等距补偿**（u 方向 repeat ×2）
+ * - 3：**ACES → Neutral 色调映射** + **球面 UV 等距补偿**（u 方向 repeat ×2）
  *   + 环境光强度参数化。这三件事都改变成像，但**参数可以完全没变**（默认参数
  *   资产照样变样）——不加这个修订号，用户会一直看到磁盘上那张旧渲染图。
- *   因此本轮的 +1 会让**所有旧球图缓存一次性作废**（`regenThumbSweep` 会清掉旧的），
+ *   本轮的 +1 会让所有旧球图缓存一次性作废（`regenThumbSweep` 会清掉旧的），
  *   这是有意为之，不是副作用。
  *
  * 它只进 hash 输入的**前缀**，不参与任何计算、不进参数串 —— 用户调过的参数不会错位
@@ -242,10 +257,46 @@ export function ballSlotsRelPaths(slots: BallSlots): string[] {
  */
 export const RENDER_REV = 3
 
-export function ballHash(slots: BallSlots, params: BallParamScales): string {
+/**
+ * 形态的 hash 输入片段：**球面与缺省一律空串**。
+ *
+ * 为什么不能让 `'sphere'` 也拼进去：那会给全库存量球图凭空改名（hash 输入多两个
+ * 字符 → 全部落到新名字）→ 升级后首次启动全量重渲，正是本次改动要消灭的行为。
+ * 非球面才拼，于是"存量资产（无该字段）+ 球面"共享同一批缓存，只有真正切过形态的
+ * 资产才需要一张新图。`tests/ballLazyUpgrade.test.ts` 用 golden 值钉死这条。
+ */
+function shapeHashKey(shape?: BallRenderShape): string {
+  return !shape || shape === 'sphere' ? '' : '/' + shape
+}
+
+/**
+ * 球图缓存 hash：`slots 集合` +（非默认时）`参数串` +（非球面时）`形态`。
+ *
+ * **方案 B（用户拍板，硬约束）**：`isDefaultParams(params)` 时 hash 输入不追加参数串
+ * —— 现有磁盘缓存全部保留，只有真调过参的材质才重渲。这不是兼容 hack，而是
+ * 「hash 输入的最短表示」：默认参数不改变渲染结果（`ballParams.test.ts` 已锁死
+ * 「1 倍时三个 effective* 恒等于基准」这条回归）。
+ *
+ * **形态同理（2026-10 缓存策略）**：`'sphere'` / 缺省不追加——存量球图的名字逐字符
+ * 不变；只有 plane / roundedBox 才换名（同一材质换了形态，成像必然不同）。
+ *
+ * golden 锁（docs/12 §3.3，实测值，写进测试防漂移）：
+ * - `['vh1sbjl_2K_Albedo.jpg','vh1sbjl_2K_Normal.jpg']` → `7694126f`
+ * - `['a.jpg','b.jpg']` → `8f3f48d0`
+ * - `[]` → `811c9dc5`
+ * - 第一组 + `1.00,1.00,1.00`（方案 A 形态）→ `c2dbee32`
+ * - 第一组 + `1.50,1.00,0.50` → `340ed45f`
+ * - 第一组 + `'sphere'` → `7694126f`（**与不传形态完全一致**，见 shapeHashKey）
+ * - 第一组 + `'plane'` → 另一串（由 `tests/ballLazyUpgrade.test.ts` 钉住）
+ */
+export function ballHash(
+  slots: BallSlots,
+  params: BallParamScales,
+  shape?: BallRenderShape
+): string {
   const base = ballSlotsRelPaths(slots).join('\n')
   const key = isDefaultParams(params) ? '' : '\n' + paramsKey(params)
-  return fnv1a('rev' + RENDER_REV + '\n' + base + key)
+  return fnv1a('rev' + RENDER_REV + '\n' + base + key + shapeHashKey(shape))
 }
 
 /**
@@ -254,6 +305,7 @@ export function ballHash(slots: BallSlots, params: BallParamScales): string {
  * slots 由 rel 路径**集合**算出：换任何一张贴图（增删改路径）→ hash 变 →
  * 缓存自然失效；集合内容不变则名字不变（顺序无关）。参数同理（规范化后相等
  * → 同一个名字，防缓存膨胀）。第三参可选：不传 = 默认参数（既有 2 参调用合法）。
+ * 第四参 `shape` 可选：不传 / `'sphere'` 与既有名字**逐字符一致**，非球面才换名。
  *
  * 扩展名是 `.png`（透明背景）：卡片封面容器是 `bg-canvas`，透明像素透出卡片
  * 自身的画布色 → **深浅主题同一个缓存文件都正确**，无需按主题分缓存、也无需
@@ -263,7 +315,8 @@ export function ballHash(slots: BallSlots, params: BallParamScales): string {
 export function ballThumbName(
   assetId: string,
   slots: BallSlots,
-  params?: BallParamScales
+  params?: BallParamScales,
+  shape?: BallRenderShape
 ): string {
-  return `${assetId}-${ballHash(slots ?? {}, normalizeParams(params))}.png`
+  return `${assetId}-${ballHash(slots ?? {}, normalizeParams(params), shape)}.png`
 }

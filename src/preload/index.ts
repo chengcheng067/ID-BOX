@@ -263,6 +263,9 @@ const api = {
    * （`<assetId>-<槽位hash>.png`，与既有缩略图同格式，故 delete/prune/stats 自动生效）。
    * 透明背景 → 卡片 `bg-canvas` 透出来，深浅主题共用同一个缓存文件。
    * 网格因此只读 `vault://thumb/<name>`，**永不开 WebGL**。失败返回 null。
+   *
+   * 载荷里的 `params` / `shape` 都参与文件 hash（`shape` 只在非球面时），
+   * 由渲染层传**实际渲染的那一份**——主进程复用 shared 的 `ballThumbName`，不另算一套。
    */
   saveBallThumb: (payload: SaveBallThumbPayload): Promise<string | null> =>
     ipcRenderer.invoke(IPC.saveBallThumb, payload),

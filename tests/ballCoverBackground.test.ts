@@ -120,7 +120,10 @@ describe('源码守卫：口径不许被改回去', () => {
       path.join(process.cwd(), 'src/renderer/store.ts'),
       'utf-8'
     )
-    expect(store).toContain('mod.renderBallToPng(asset.relFolder, slots, { params })')
+    // 2026-10 缓存策略：选项里多了 shape（形态参与球图身份），但**格式仍是 PNG**。
+    // 断言用主谓部分 + 选项内容分开写，避免"多一个合法选项就红"。
+    expect(store).toContain('mod.renderBallToPng(asset.relFolder, slots, { params, shape })')
+    expect(store).toContain('const shape = resolveRenderShape(asset)')
     // 球图管线里不许出现 JPEG 渲染（那会把背景色烤进像素）
     const ballSection = store.slice(store.indexOf('async function renderBallThumbFor('))
     expect(ballSection.slice(0, ballSection.indexOf('\n}\n'))).not.toContain('renderBallToJpeg')

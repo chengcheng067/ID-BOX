@@ -4,6 +4,7 @@ import { db, type IndexBackup } from './db'
 import type {
   Asset,
   AssetFile,
+  BallRenderShape,
   ColorTag,
   CoverSource,
   FetchZhimoCoverResult,
@@ -43,15 +44,13 @@ import {
   groupAssignUndo,
   type AssignUndoRecord
 } from './logic/dragAssign'
+import { effectiveMaterialSlots, hasMaterialSlots } from './logic/materialBall'
 import {
   ballThumbName,
-  effectiveMaterialSlots,
-  hasMaterialSlots
-} from './logic/materialBall'
-import {
   normalizeParams,
   paramsKey,
   resolveRenderParams,
+  resolveRenderShape,
   type BallParamScales
 } from '../shared/ballParams'
 import { withAssetCoverLock } from './logic/coverLock'
@@ -275,6 +274,53 @@ const ballQueue: string[] = []
 
 /** 队列运行标志（重入保护） */
 let ballQueueRunning = false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 球图**缓存升级策略**（2026-10，用户反馈：不许每次更新就全量重渲）
+//
+// 三档优先级，全部共用下面那份「过期候选」惰性索引，**没有一处遍历全库**：
+// ① 首屏缺图（`thumbPath` 空 / 非 ready）→ `ensureMissingBallThumbs()` 一次性补齐，
+//    只有这一类会在启动时入队；
+// ② 用户滚到哪就升哪（`noteVisibleAssets`）——名字过期但**文件还在**的球图，
+//    等卡片真的出现在屏幕上才重渲，上限 `VISIBLE_UPGRADE_MAX` 条/次；
+// ③ 兜底涓流（3s 一条，本次会话最多 `STALE_TRICKLE_SESSION_MAX` 条）——
+//    覆盖「用户不再滚动」的库，让它自己慢慢收敛，不抢首屏。
+//
+// 硬不变量（改这里之前先读）：升级期间卡片**始终显示旧球图**（先建新、再删旧，
+// 见 `renderBallThumbFor`）；`renderParams` / `renderShape` 一个字节都不动；
+// 没升完不影响下次启动（`thumbPath` 仍是旧名 → 仍在过期候选里 → 继续）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 单次可见性上报最多入队几条（一次滚动渲染出几十张卡，不能一口气全排上） */
+export const VISIBLE_UPGRADE_MAX = 6
+
+/** 涓流间隔（渲染进程用 `setTimeout` 自续，不用 `setInterval`：不会在 dispose 后泄漏） */
+export const STALE_TRICKLE_INTERVAL_MS = 3000
+
+/** 涓流本次会话的总产出上限（60 条 ≈ 3 分钟，之后交给「看到才升」这条主路径） */
+export const STALE_TRICKLE_SESSION_MAX = 60
+
+/** 涓流定时器句柄；`null` = 链已停 */
+let staleTrickleTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 本次会话已由涓流入队的条数（跨 init / rescan 保留 = 真正的"每会话"上限） */
+let staleTrickleProduced = 0
+
+/**
+ * 过期候选索引的**缓存源**：`assets` 数组引用变了才重建（见 `upgradeCandidates`）。
+ *
+ * 为什么要缓存：`noteVisibleAssets` 每次滚动都会调用；如果每次都 `filter` 全库，
+ * 1 万条资产滚一下就是几十万次比较，纯属白烧（这正是本文件其它地方
+ * `useVisibleAssets` 用 memo 的同一条理由）。
+ */
+let upgradeIndexSource: Asset[] | null = null
+
+/** 过期候选（**名字过期但文件还在**的球图），与上面的源引用配对使用 */
+let upgradeIndex: Array<{ id: string; want: string }> = []
+
+/** `assetId → Asset` 惰性索引（同上：只在 `assets` 引用变化时重建） */
+let assetIndexSource: Asset[] | null = null
+let assetIndexById = new Map<string, Asset>()
 
 /** 启动自动迁移的规模上限：≤ 此数自动搬，> 此数改设置页手动触发（03 §4.4） */
 export const AUTO_MIGRATE_LIMIT = 50
@@ -988,6 +1034,14 @@ interface VaultState {
    * `thumbStatus !== 'ready'`）会把该资产抢进封面缩略图分支，球图丢失。
    */
   persistRenderParams: (assetId: string, scales: BallParamScales) => Promise<void>
+  /**
+   * 记住材质球的几何形态（`'sphere'` / `'plane'` / `'roundedBox'`）。
+   *
+   * 形态参与球图 hash（只在非球面时），换形态 = 换期望缓存名 → 走与调参相同的
+   * 「先建新、再删旧」链路。与 `persistRenderParams` 一样**不改** `thumbStatus`
+   * （否则会被封面缩略图分支抢走，§4.3）。传非法值一律按 `'sphere'` 处理。
+   */
+  setRenderShape: (assetId: string, shape: BallRenderShape) => Promise<void>
 }
 
 function upsert(list: Asset[], asset: Asset): Asset[] {
@@ -3375,17 +3429,43 @@ export const useVault = create<VaultState>((set, get) => ({
 
     // 旧 thumbPath 只有「确实是球图」才登记待删——封面 salt（官方渲染图 / 手动封面）
     // 不是球图，删它会连带删掉封面缓存（§4.1 场景 ①②）。
-    const oldSlots = ballSlotsOf(asset)
+    // 用 `wantedBallName`（而非就地拼 hash）保证与判新鲜 / 落盘同一口径。
     const oldName = asset.thumbPath
-    if (
-      oldName &&
-      oldSlots &&
-      oldName === ballThumbName(asset.id, oldSlots, resolveRenderParams(asset))
-    ) {
+    if (oldName && oldName === wantedBallName(asset)) {
       ballStaleNames.set(asset.id, oldName)
     }
 
     const updated: Asset = { ...asset, renderParams: normalized, updatedAt: Date.now() }
+    commitAsset(set, updated)
+    enqueueBallThumb(updated)
+  },
+
+  /**
+   * 记住材质球的**几何形态**（2026-10 缓存策略：形态是球图身份的一部分）。
+   *
+   * 与 `persistRenderParams` 完全同构，理由也一样：
+   * ① 形态参与 hash → 换形态 = 换期望名，旧图登记到 `ballStaleNames` 后按
+   *    「先建新、再删旧」替换（升级期间卡片仍显示旧图，不闪灰格）；
+   * ② 全程**不**改 `thumbStatus`（§4.3 竞态：置非 ready 会被封面缩略图分支抢走）；
+   * ③ 与已存形态相同直接 return（防无意义写库 / 重渲）。
+   *
+   * `'sphere'` 与 `undefined` 等价（`resolveRenderShape` 的口径），所以"切回球面"
+   * 会删掉字段值语义上的差异吗？不会：这里写的是显式 `'sphere'`，两者 hash 相同，
+   * 因此**不触发**任何重渲（`ballThumbIsFresh` 仍是 true）——这是刻意的。
+   */
+  async setRenderShape(assetId, shape) {
+    const asset = get().assets.find((a) => a.id === assetId)
+    if (!asset) return
+    const normalized: BallRenderShape =
+      shape === 'plane' || shape === 'roundedBox' ? shape : 'sphere'
+    if (resolveRenderShape(asset) === normalized) return
+
+    const oldName = asset.thumbPath
+    if (oldName && oldName === wantedBallName(asset)) {
+      ballStaleNames.set(asset.id, oldName)
+    }
+
+    const updated: Asset = { ...asset, renderShape: normalized, updatedAt: Date.now() }
     commitAsset(set, updated)
     enqueueBallThumb(updated)
   }
@@ -3488,6 +3568,31 @@ function ballSlotsOf(asset: Asset): ReturnType<typeof effectiveMaterialSlots> | 
 }
 
 /**
+ * 这个资产的球图**应该**叫什么名字（只算名字，不管"该不该有球图"）。
+ *
+ * ⚠️ **全仓唯一口径**（2026-10 缓存策略）：`ballThumbTarget`、`ballThumbIsFresh`、
+ * `enqueueBallThumb`、`isStaleBallThumb`、`renderBallThumbFor`（落盘时传给
+ * `saveBallThumb` 的参数）、以及 `persistRenderParams` 的旧名登记，全部走这里。
+ *
+ * 历史上这里曾出现"四处各自拼 hash"的不一致（渲染用默认参数、判新鲜用当前参数、
+ * 落盘用另一套扩展名）→ 结果是"渲染结果与文件名不符"→ 每次启动全库重渲。
+ * 名字的构成只有三样东西：槽位集合、非默认参数、非球面形态，三者都由 shared
+ * 的 `ballThumbName` 一条路径算出来。
+ *
+ * @returns 需要渲球时的期望缓存名；`null` = 连槽位都不成立（素球，不该有球图）
+ */
+export function wantedBallName(asset: Asset): string | null {
+  const slots = ballSlotsOf(asset)
+  if (!slots) return null
+  return ballThumbName(
+    asset.id,
+    slots,
+    resolveRenderParams(asset),
+    resolveRenderShape(asset)
+  )
+}
+
+/**
  * 这个资产的「球图**应该**叫什么」——`null` = 它不该有球图（网格走封面 / 类型占位）。
  *
  * 三道门必须与**入队侧**（`enqueueBallThumb`）和**渲染侧**（`renderBallThumbFor`）
@@ -3508,14 +3613,13 @@ function ballSlotsOf(asset: Asset): ReturnType<typeof effectiveMaterialSlots> | 
 export function ballThumbTarget(asset: Asset): { name: string } | null {
   if (asset.kind !== 'material' && asset.kind !== 'texture') return null
   if (asset.cover && (asset.coverSource === 'named' || asset.coverSource === 'manual')) return null
-  const slots = ballSlotsOf(asset)
-  if (!slots) return null
-  return { name: ballThumbName(asset.id, slots, resolveRenderParams(asset)) }
+  const name = wantedBallName(asset)
+  return name ? { name } : null
 }
 
 /**
- * 球图缓存是否已经是"当前槽位 + 当前参数"的成品（换贴图 / 调参 → hash 变 →
- * 名字变 → 视为未命中）。
+ * 球图缓存是否已经是"当前槽位 + 当前参数 + 当前形态"的成品（换贴图 / 调参 /
+ * 换形态 → hash 变 → 名字变 → 视为未命中）。
  *
  * ⚠️ 导出仅供 `tests/ballCache.test.ts`（docs/12 §6.4）直测——运行时调用路径不变。
  *
@@ -3524,36 +3628,34 @@ export function ballThumbTarget(asset: Asset): { name: string } | null {
  * 方案 B 下未调参资产的 hash 输入与既有磁盘缓存一致 → 这条判断对历史缓存仍为 true。
  */
 export function ballThumbIsFresh(asset: Asset): boolean {
-  const slots = ballSlotsOf(asset)
-  if (!slots) return false
-  return (
-    !!asset.thumbPath &&
-    asset.thumbPath === ballThumbName(asset.id, slots, resolveRenderParams(asset))
-  )
+  const want = wantedBallName(asset)
+  return !!asset.thumbPath && asset.thumbPath === want
 }
 
-/** 材质类资产入队（导入完成 / 首次点开 / init 与 rescan 后的全量补齐都走这里） */
-function enqueueBallThumb(asset: Asset): void {
-  // DEF-08（QA 第 2 轮严重缺陷）：模型资产**永不渲球**。
-  // 模型资产即使附带 PBR 贴图（如 .skp + Textures/wood_{Diffuse,Normal}.jpg）也不渲——
-  // 否则球图会顶掉刚提取出来的 SKP 内嵌预览（封面又变回看不见模型）。
+/**
+ * 材质类资产入队（导入完成 / 首次点开 / 补缺 / 可见升级 / 涓流都走这里）。
+ *
+ * @returns 是否**真的**入队（调用方据此计数：可见升级的 6 条上限、涓流的 60 条上限）
+ */
+function enqueueBallThumb(asset: Asset): boolean {
+  // 入队闸门 = `ballThumbTarget`（**唯一口径**）：模型资产永不渲球（DEF-08）；
+  // 官方渲染图（`'named'`）/ 用户手动封面（`'manual'`）优先，球图不许顶掉；
+  // 没有 albedo 槽位的素球不渲。三条门与判新鲜 / 渲染 / 清理侧共用同一份实现，
+  // 所以"缩略图指向一张永远不会被渲出来的球图"这类历史 bug 不会再出现。
   //
-  // 2026-10-21 用户反馈：**「贴图」类也要渲球**。原先这里只放 `material`，导致贴图资产的
-  // 卡片只能沿用资产目录里的 `*.cover.jpg`（用户当年手动保存的旧封面，旧版相机渲的歪球），
-  // 而旧封面的缓存键不含渲染器版本、永远刷不掉，同一屏里两种观感永远统一不了。
-  // 现在贴图与材质预设走同一条球图管线；`coverSource === 'named'`（包内自带官方预览）仍由
-  // `renderBallThumbFor` 提前返回，官方图优先的口径不变。
-  if (asset.kind !== 'material' && asset.kind !== 'texture') return
-  const slots = ballSlotsOf(asset)
-  if (!slots) return
-  if (ballThumbIsFresh(asset)) return // 缓存命中，网格直接读
-  const want = ballThumbName(asset.id, slots, resolveRenderParams(asset))
-  if (ballAttempted.get(asset.id) === want) return // 同一期望名只试一次（DEF-09）
-  if (ballQueue.length >= BALL_THUMB_BATCH) return
-  if (ballQueue.includes(asset.id)) return
+  // 2026-10-21 用户反馈：**「贴图」类也要渲球**——这一点由 `ballThumbTarget` 的
+  // kind 判定（material | texture）承担，这里不再自己写一遍。
+  if (ballThumbTarget(asset) === null) return false
+  const want = wantedBallName(asset)
+  if (!want) return false
+  if (asset.thumbPath === want) return false // 缓存命中，网格直接读
+  if (ballAttempted.get(asset.id) === want) return false // 同一期望名只试一次（DEF-09）
+  if (ballQueue.length >= BALL_THUMB_BATCH) return false
+  if (ballQueue.includes(asset.id)) return false
   ballAttempted.set(asset.id, want)
   ballQueue.push(asset.id)
   void runBallQueue()
+  return true
 }
 
 /** Blob → base64（不含 data: 前缀），给 `thumb:saveBall` 过 IPC 用 */
@@ -3585,20 +3687,24 @@ async function renderBallThumbFor(asset: Asset): Promise<void> {
   const slots = ballSlotsOf(asset)
   if (!slots) return
   const params = resolveRenderParams(asset)
+  // 形态必须与"期望文件名"同源：渲的是 plane，落盘名就必须带 plane，
+  // 否则 `ballThumbIsFresh` 永远 false → 每次启动都判过期（缓存永不自愈）。
+  const shape = resolveRenderShape(asset)
   try {
     // 动态 import：three.js 只在真有材质球要渲时才加载，不拖慢首屏
     const mod = await import('./components/MaterialBall')
     // ⚠️ 既有 bug（docs/12 §0 补充发现）：这里此前不传 params → 落盘的图永远是默认参数，
     // 而 hash（文件名）用的是调参后的值 → 「渲染结果与文件名不符」。必须补 params。
+    // 同一个坑在 2026-10 又出现在 shape 上（永远渲球面、名字却按形态算）—— 一并补上。
     //
     // 2026-10 深色主题修复：球图走**透明 PNG**（renderBallToPng）——卡片封面容器是
     // `bg-canvas`，透明像素透出卡片自身的画布色，因此同一个缓存文件在深浅主题下都正确。
     // 若用 JPEG，背景色会被烤进像素（浅色主题渲过的白底图切深色后就是一块白方块）。
-    const blob = await mod.renderBallToPng(asset.relFolder, slots, { params })
+    const blob = await mod.renderBallToPng(asset.relFolder, slots, { params, shape })
     const base64 = await blobToBase64(blob)
     if (!base64) return
     const name = await window.modvault
-      .saveBallThumb({ assetId: asset.id, slots, params, base64 })
+      .saveBallThumb({ assetId: asset.id, slots, params, shape, base64 })
       .catch(() => null)
     if (!name) return
     const current = useVault.getState().assets.find((a) => a.id === asset.id)
@@ -3672,10 +3778,192 @@ function yieldToIdle(): Promise<void> {
   })
 }
 
-/** init / rescan 后的全量补齐（与 ensureMissingThumbs 同思路：只补缺的，封顶） */
-async function ensureMissingBallThumbs(): Promise<void> {
+/** `assetId → Asset` 惰性索引：`assets` 引用一变就重建（不在每次滚动时 O(n) 扫全库） */
+function cachedAssetIndex(): Map<string, Asset> {
   const assets = useVault.getState().assets
-  for (const a of assets) enqueueBallThumb(a)
+  if (assetIndexSource !== assets) {
+    assetIndexSource = assets
+    const next = new Map<string, Asset>()
+    for (const a of assets) next.set(a.id, a)
+    assetIndexById = next
+  }
+  return assetIndexById
+}
+
+/**
+ * 「名字过期但**文件还在**」的候选（惰性升级的对象）——三条入口共用的唯一视图。
+ *
+ * 判据刻意要求 `thumbStatus === 'ready'`：这类资产的旧图**确实在磁盘上**，
+ * 所以升级过程中卡片一直有图可看（本策略的核心不变量）。
+ * `thumbStatus !== 'ready'` / 无 `thumbPath` 的属于"根本没图"，由
+ * `ensureMissingBallThumbs` 在启动时补，两者**互斥不重叠**。
+ *
+ * 索引只在 `assets` 数组引用变化时重建：`commitAsset` 每次都会换引用，
+ * 升级完一条自然从候选里消失；滚动 / 悬停不会触发任何全库扫描。
+ */
+function upgradeCandidates(): Array<{ id: string; want: string }> {
+  const assets = useVault.getState().assets
+  if (upgradeIndexSource === assets) return upgradeIndex
+  upgradeIndexSource = assets
+  const next: Array<{ id: string; want: string }> = []
+  for (const a of assets) {
+    if (!a.thumbPath || a.thumbStatus !== 'ready') continue
+    // 与入队侧同一道门（`ballThumbTarget`）：手动封面 / 官方图 / 模型资产不是候选，
+    // 否则涓流会永远挑到它们（`enqueueBallThumb` 拒收 → 计数不增 → 空转到天荒地老）。
+    const target = ballThumbTarget(a)
+    if (!target || target.name === a.thumbPath) continue
+    next.push({ id: a.id, want: target.name })
+  }
+  upgradeIndex = next
+  return upgradeIndex
+}
+
+/** 从过期候选里挑一条**本会话没试过**的（涓流用；返回 null = 已全部尝试完） */
+function pickStaleCandidate(): Asset | null {
+  const byId = cachedAssetIndex()
+  for (const c of upgradeCandidates()) {
+    if (ballQueue.includes(c.id)) continue
+    if (ballAttempted.get(c.id) === c.want) continue // 试过（成功会换名，失败也记名）
+    const asset = byId.get(c.id)
+    if (asset) return asset
+  }
+  return null
+}
+
+/**
+ * 停止涓流（导出仅供测试 / 会话收尾；重复调用幂等）。
+ *
+ * 停掉定时器后**不重置** `staleTrickleProduced`：那样会让"每会话 60 条"的上限失效。
+ * 重置由 `resetBallLazyUpgradeForTests` 单独负责。
+ */
+export function stopStaleTrickle(): void {
+  if (staleTrickleTimer !== null) {
+    clearTimeout(staleTrickleTimer)
+    staleTrickleTimer = null
+  }
+}
+
+/** 安排下一次涓流（幂等：已有定时器就不重复排） */
+function scheduleStaleTrickle(): void {
+  if (staleTrickleTimer !== null) return
+  if (staleTrickleProduced >= STALE_TRICKLE_SESSION_MAX) return
+  const handle = setTimeout(runStaleTrickleTick, STALE_TRICKLE_INTERVAL_MS)
+  // node（单测环境）里定时器有 unref：不拖住进程退出；浏览器没有这个字段，可选调用。
+  ;(handle as unknown as { unref?: () => void }).unref?.()
+  staleTrickleTimer = handle
+}
+
+/**
+ * 涓流：每 3s 从"名字过期且未尝试过"里挑**1 条**升级，本次会话产满 60 条就停。
+ *
+ * 三道闸：
+ * ① 只在 `ballQueue` **空**时入队（用户滚动触发的可见升级永远优先，涓流不抢）；
+ * ② `staleTrickleProduced` 只统计**真的入了队**的（找不到候选 / 已被闸门挡下都不计）；
+ * ③ 找不到候选就**让链自然停**（不在空库上空转）；下次 `init` / `rescan` 会重新排。
+ */
+function runStaleTrickleTick(): void {
+  staleTrickleTimer = null
+  if (staleTrickleProduced >= STALE_TRICKLE_SESSION_MAX) return
+  if (ballQueue.length > 0) {
+    scheduleStaleTrickle() // 让路：等队列清空后的那一拍再做
+    return
+  }
+  const next = pickStaleCandidate()
+  if (!next) return // 收敛完毕（或全部尝试过）→ 停链
+  if (enqueueBallThumb(next)) staleTrickleProduced += 1
+  scheduleStaleTrickle()
+}
+
+/**
+ * **启动 / 重扫**的球图入口：只补「屏幕上根本没图可看」的资产。
+ *
+ * 与改造前的区别（本次核心）：以前是 `for (const a of assets) enqueueBallThumb(a)`
+ * ——遍历全库、把**所有名字过期**的资产一次性排进队列。RENDER_REV +1 或换相机
+ * 之后，1 万条资产的库启动就要渲 1 万张球图（用户明确否掉："每一次更新软件都会
+ * 全部重新渲染一次我的材质…刚刚启动的压力会非常非常的大"）。
+ *
+ * 现在只处理两类"真的有洞"的记录：
+ * - 没有 `thumbPath`（新导入 / 索引迁移 / 缓存被清）；
+ * - `thumbStatus !== 'ready'`（上次没渲成）。
+ * 名字过期但**文件还在**的资产 **不入队** —— 交给 `noteVisibleAssets`（看到才升）
+ * 与涓流（3s 一条）慢慢收敛；期间卡片一直显示旧球图，绝不出现灰格 / 白球。
+ *
+ * `BALL_THUMB_BATCH` 仍由 `enqueueBallThumb` 封顶；`ballAttempted` 保证同一期望名
+ * 只试一次（断网 / 无 GPU 时不会反复重试）。
+ *
+ * ⚠️ 导出仅供 `tests/ballLazyUpgrade.test.ts` 断言"过期资产不入队"。
+ */
+export async function ensureMissingBallThumbs(): Promise<void> {
+  const assets = useVault.getState().assets
+  for (const a of assets) {
+    if (a.thumbPath && a.thumbStatus === 'ready') continue // 有图：即便名字过期也等"被看见"
+    enqueueBallThumb(a)
+  }
+  // 缺图补齐之后，把"慢慢收敛"的兜底链条挂上（幂等：已有定时器不会重复排）。
+  scheduleStaleTrickle()
+}
+
+/**
+ * **可见性上报**：AssetGrid 把这一帧真正渲染出来的卡片 id 报上来，
+ * 这里只为「需要球图 + 名字过期」的资产入队升级（每次最多 `VISIBLE_UPGRADE_MAX` 条）。
+ *
+ * 为什么是这条设计：用户看到的卡片才值得渲。RENDER_REV +1 让全库名字过期时，
+ * 首屏只渲当前那几屏；滚动到哪升到哪，升级完的图**立刻**在卡片上出现。
+ *
+ * 排序与去重：
+ * - 入队顺序 = 传入 id 顺序（= 屏幕上从上到下的顺序，先升用户正在看的）；
+ * - 已在队列里 / 本会话已试过同一期望名的跳过（不挤占这 6 个名额）；
+ * - 每次调用独立计数，滚动节流不必由调用方负责（多报几次也不会雪崩：
+ *   第一次入队的 6 条在队列里，后续调用会因为 `ballQueue.includes` 全部跳过）。
+ *
+ * 传入的 id 找不到（刚被删）静默跳过——这是渲染层与状态的正常竞态。
+ */
+export function noteVisibleAssets(ids: readonly string[]): void {
+  if (!ids || ids.length === 0) return
+  const byId = cachedAssetIndex()
+  let queued = 0
+  for (const id of ids) {
+    if (queued >= VISIBLE_UPGRADE_MAX) break
+    const asset = byId.get(id)
+    if (!asset) continue
+    const want = wantedBallName(asset)
+    if (!want) continue
+    if (asset.thumbPath === want) continue // 已是成品
+    if (enqueueBallThumb(asset)) queued += 1
+  }
+}
+
+/**
+ * 重置惰性升级的会话状态（**仅供单测**；运行时没有任何调用点）。
+ *
+ * 需要它的理由：`staleTrickleProduced` 是"每会话"语义的模块级计数器，
+ * 而 vitest 同一个文件里多次 `init` 共用同一个模块实例——不重置就无法断言
+ * "首次 60 条、之后停"与"重入幂等"。
+ */
+export function resetBallLazyUpgradeForTests(): void {
+  stopStaleTrickle()
+  staleTrickleProduced = 0
+  upgradeIndexSource = null
+  upgradeIndex = []
+  assetIndexSource = null
+  assetIndexById = new Map()
+  ballQueue.length = 0
+  ballQueueRunning = false
+  ballAttempted.clear()
+}
+
+/**
+ * 只看不动的快照（**仅供单测**）：队列里排了谁、本会话尝试过谁。
+ *
+ * 为什么需要它：入队是**同步**的，渲染是异步的（动态 import + IPC + yield）。
+ * 用"渲染被调用了几次"来断言入队，会被计时器和队列消费顺序带偏；
+ * `attempted` 在入队那一刻写入、且只在成功/失败后保留，是唯一稳定的观测面。
+ */
+export function ballQueueSnapshotForTests(): {
+  queued: string[]
+  attempted: Array<[string, string]>
+} {
+  return { queued: [...ballQueue], attempted: [...ballAttempted.entries()] }
 }
 
 /**
@@ -3694,9 +3982,8 @@ async function ensureMissingBallThumbs(): Promise<void> {
 export function isStaleBallThumb(asset: Asset): boolean {
   if (!asset.cover || asset.thumbStatus !== 'ready' || !asset.thumbPath) return false
   if (ballThumbTarget(asset) !== null) return false
-  const slots = ballSlotsOf(asset)
-  if (!slots) return false
-  return asset.thumbPath === ballThumbName(asset.id, slots, resolveRenderParams(asset))
+  // 名字口径统一走 `wantedBallName`（含形态）——四处分头拼 hash 是历史 bug 根源。
+  return asset.thumbPath === wantedBallName(asset)
 }
 
 /** 每次启动最多修几条（正常只会有个位数，封顶防病态库把启动拖慢） */

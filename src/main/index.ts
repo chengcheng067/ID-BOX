@@ -1229,8 +1229,9 @@ ipcMain.handle(
  * 材质球离屏渲染图落盘（2026-10，任务 6）。
  *
  * 渲染进程 `renderBallToPng`（three.js 离屏渲一帧，**透明背景 PNG**）产出 Blob →
- * base64 → 这里写进 thumbs 目录，文件名 `ballThumbName(assetId, slots)`（与既有缩略图
- * 同格式，delete/prune/stats 自动覆盖）。网格只读 `vault://thumb/<name>`，**永不开 WebGL**。
+ * base64 → 这里写进 thumbs 目录，文件名 `ballThumbName(assetId, slots, params, shape)`
+ * （与既有缩略图同格式，delete/prune/stats 自动覆盖）。网格只读 `vault://thumb/<name>`，
+ * **永不开 WebGL**。
  *
  * 为什么是 PNG：透明背景让卡片 `bg-canvas` 透出来，深浅两个主题共用同一个缓存文件
  * 都正确（JPEG 无 alpha 通道，只能把纸色烤进像素 → 深色主题下是亮白方块）。
@@ -1244,14 +1245,16 @@ ipcMain.handle(IPC.saveBallThumb, async (_e, payload: SaveBallThumbPayload) => {
   try {
     const buf = Buffer.from(payload.base64, 'base64')
     if (buf.length > MAX_BALL_IMAGE_BYTES) return null
-    // params 是第 5 参（第 4 参 thumbsRoot 保持默认值）——`saveBallThumbBytes` 内部会
-    // `normalizeParams` 后再进 hash，与渲染进程同一口径（docs/12 §3.4）。
+    // params 是第 5 参、shape 是第 6 参（第 4 参 thumbsRoot 保持默认值）——
+    // `saveBallThumbBytes` 内部会 `normalizeParams` 后再进 hash，与渲染进程同一口径
+    // （docs/12 §3.4）。shape 只影响非球面的名字，存量球面缓存名不受影响。
     return await saveBallThumbBytes(
       payload.assetId,
       payload.slots ?? {},
       buf,
       thumbsDir(),
-      payload.params
+      payload.params,
+      payload.shape
     )
   } catch (err) {
     console.error('[idbox] thumb:saveBall 写盘失败：', payload.assetId, err)

@@ -3,7 +3,7 @@ import path from 'node:path'
 import { thumbsDir } from './paths'
 import { ballThumbName, normalizeParams, type BallParamScales } from '../shared/ballParams'
 import { isWithinRoot } from '../shared/vault'
-import type { BallSlots } from '../shared/types'
+import type { BallRenderShape, BallSlots } from '../shared/types'
 
 /**
  * 材质球离屏渲染图的落盘（2026-10，任务 6）——**不 import electron，可单测**
@@ -40,13 +40,18 @@ export const MAX_BALL_IMAGE_BASE64_LEN = Math.ceil((MAX_BALL_IMAGE_BYTES * 4) / 
  *
  * `params` 可选：不传 / 传默认值（1,1,1）→ 参数不贡献 hash（方案 B），
  * 与既有磁盘缓存的名字完全一致；只有真调过参的才会算出不同的名字。
+ *
+ * `shape` 可选：不传 / `'sphere'` → 形态不贡献 hash（与存量球图同名）；
+ * 只有 plane / roundedBox 才换名。**必须与渲染层同口径**，所以这里只是转发，
+ * 绝不再拼一遍字符串（主进程复制 hash 逻辑是历史 bug 的来源）。
  */
 export function ballThumbFileName(
   assetId: string,
   slots: BallSlots,
-  params?: BallParamScales
+  params?: BallParamScales,
+  shape?: BallRenderShape
 ): string {
-  return ballThumbName(assetId, slots, params)
+  return ballThumbName(assetId, slots, params, shape)
 }
 
 /** 纯函数：assetId 是否合法（非空、不含路径分隔符，防止被用来拼出越界文件名） */
@@ -79,13 +84,21 @@ export async function saveBallThumbBytes(
    *  是 4 参调用，把 params 插在它前面会把目录当参数用（既有断言不得改，docs/12 §6.1）。 */
   thumbsRoot: string = thumbsDir(),
   /** 调参倍率（docs/12 §3.4）；参与 hash 前必须 `normalizeParams` —— 与渲染进程同一口径 */
-  params?: BallParamScales
+  params?: BallParamScales,
+  /**
+   * 几何形态（第 6 参，**只在非球面时**参与 hash）。
+   *
+   * 加在末尾是为了不动既有 4/5 参调用（`saveBallThumbBytes(ID, SLOTS, bytes, dir)`）。
+   * 与 `params` 同理：必须由**渲染层传来实际渲的那一个**，主进程不猜 ——
+   * 猜错就是"渲染结果与文件名不符"，下次启动仍判过期、无限重渲。
+   */
+  shape?: BallRenderShape
 ): Promise<string | null> {
   if (!isValidBallAssetId(assetId)) return null
   if (!bytes || bytes.length === 0 || bytes.length > MAX_BALL_IMAGE_BYTES) return null
 
   const dir = path.resolve(thumbsRoot)
-  const name = ballThumbFileName(assetId.trim(), slots ?? {}, normalizeParams(params))
+  const name = ballThumbFileName(assetId.trim(), slots ?? {}, normalizeParams(params), shape)
   const abs = path.resolve(path.join(dir, name))
   if (!isWithinRoot(dir, abs, path.sep)) return null
 

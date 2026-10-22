@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useVault, useVisibleAssets } from '../store'
+import { useVault, useVisibleAssets, noteVisibleAssets } from '../store'
 import { KIND_LABEL } from '../../shared/classify'
 import { formatBytes, formatDate, thumbVaultUrl, vaultUrl } from '../../shared/format'
 import {
@@ -1655,6 +1655,41 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
     ? shownGroups.flatMap((g) => g.assets.map((x) => x.id))
     : assets.map((a) => a.id)
   visibleOrderRef.current = visibleOrder
+
+  /**
+   * **可见性上报**（2026-10 缓存策略）：把这一帧真正渲染出来的卡片报给 store。
+   *
+   * 用途只有一个：球图"名字过期但文件还在"的资产，等它真的出现在屏幕上才重渲
+   * （`noteVisibleAssets`，每次最多 6 条）。启动因此不再全量重渲；用户滚到哪升到哪，
+   * 升级期间卡片始终显示旧球图。
+   *
+   * 三条实现约束：
+   * - 只报**当前窗口切片**（不是全部 `assets`）：虚拟滚动的意义就在这里；
+   *   重复视图不虚拟化，取前 40 条足够（store 侧每次最多入队 6 条）。
+   * - 依赖用**指纹串**而不是数组：`assets.slice()` 每次 render 都是新数组，直接当
+   *   依赖会让 effect 每帧都跑。指纹里带上 `thumbPath`：一批（6 张）升完之后
+   *   `thumbPath` 变了 → 指纹变 → 再报一次 → 屏幕上的下一批接着升，
+   *   于是"当前这一屏"会以 6 张为一批收敛完，而不是干等 3s 涓流。
+   * - 必须放在**任何 early return 之前**（React hooks 顺序不能随渲染分支变化）。
+   */
+  const visibleBallReport = (() => {
+    if (dupOnly) {
+      return shownGroups.flatMap((g) => g.assets).slice(0, 40)
+    }
+    if (view === 'list') {
+      return assets.slice(listWin.startIndex, listWin.endIndex + 1)
+    }
+    const start = gridWin.startRow * gridMetrics.columns
+    const end = Math.min(assets.length - 1, (gridWin.endRow + 1) * gridMetrics.columns - 1)
+    return assets.slice(start, end + 1)
+  })()
+  const visibleBallReportKey = visibleBallReport
+    .map((a) => `${a.id}\u0001${a.thumbPath ?? ''}\u0001${a.renderShape ?? 'sphere'}`)
+    .join('\u0000')
+  useEffect(() => {
+    if (visibleBallReport.length === 0) return
+    noteVisibleAssets(visibleBallReport.map((a) => a.id))
+  }, [visibleBallReportKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /** 退出重复视图并恢复整个库（空态里的「清空筛选 / 返回全部」共用） */
   const leaveDupView = () => {
