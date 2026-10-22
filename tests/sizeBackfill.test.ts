@@ -1,8 +1,10 @@
 /**
  * 尺寸回填调度（`renderer/logic/sizeBackfill.ts`）—— 全部用**假 deps**。
  *
- * 硬化三条边界：① 不加载 Dexie / store / electron（deps 注入后默认实现永不求值）；
- * ② 写库只动 `files[i].w/h`（`updatedAt` 等逐字段不变）；③ 单飞 + 预算 + 环形轮转。
+ * 硬化四条边界：① 不加载 Dexie / store / electron（deps 注入后默认实现永不求值）；
+ * ② 写库走**定向 patch**（只动 `files[i].w/h`，`updatedAt` 等逐字段不变）；
+ * ③ **不覆盖并发写入**：探测期间别处改了 `thumbPath` / `renderParams`，patch 之后
+ *    库里仍是新值（快照整对象 `put` 会把这些改动回滚掉）；④ 单飞 + 预算 + 环形轮转。
  */
 
 import { describe, expect, it, vi } from 'vitest'
@@ -19,7 +21,8 @@ import {
   startSizeBackfill,
   withProbedSizes,
   type SizeBackfillDeps,
-  type SizeBackfillLogEvent
+  type SizeBackfillLogEvent,
+  type SizePatch
 } from '../src/renderer/logic/sizeBackfill'
 import { PROBE_SIZES_MAX } from '../src/main/probeSizes'
 import type { Asset, AssetFile } from '../src/shared/types'
@@ -66,13 +69,71 @@ function candidateAsset(id: string): Asset {
   return asset(id, [file('albedo.jpg', 'jpg'), file('model.skp', 'skp')])
 }
 
-/** 统一收集 put 调用 */
-function collector(): { put: (a: Asset) => Promise<void>; puted: Asset[] } {
-  const puted: Asset[] = []
+/** 统一收集 patch 调用（默认返回"确实改了"，让 patched 计数可断言） */
+function collector(): {
+  patch: (id: string, patches: SizePatch[]) => Promise<boolean>
+  calls: Array<{ id: string; patches: SizePatch[] }>
+} {
+  const calls: Array<{ id: string; patches: SizePatch[] }> = []
   return {
-    puted,
-    put: async (a: Asset) => {
-      puted.push(a)
+    calls,
+    patch: async (id: string, patches: SizePatch[]) => {
+      calls.push({ id, patches: patches.map((p) => ({ ...p })) })
+      return true
+    }
+  }
+}
+
+/**
+ * 内存版「库 + Dexie modify 语义」：`patchSizes` 像真实实现一样**读库里当下的记录**
+ * 只改 `files[i].w/h`，其余字段（thumbPath / renderParams / updatedAt…）原样保留。
+ */
+function fakeLibrary(initial: Asset[]): {
+  deps: SizeBackfillDeps
+  patchCalls: Array<{ id: string; patches: SizePatch[] }>
+  get: (id: string) => Asset | undefined
+  /** 模拟"别处（球图渲染器 commitAsset）"在探测期间写库 */
+  write: (id: string, patch: Partial<Asset>) => void
+  refreshed: Asset[][]
+} {
+  const rows = new Map<string, Asset>(initial.map((a) => [a.id, a]))
+  const patchCalls: Array<{ id: string; patches: SizePatch[] }> = []
+  const refreshed: Asset[][] = []
+
+  const deps: SizeBackfillDeps = {
+    listAssets: async () => [...rows.values()],
+    patchSizes: async (id: string, patches: SizePatch[]) => {
+      patchCalls.push({ id, patches: patches.map((p) => ({ ...p })) })
+      const current = rows.get(id)
+      if (!current) return false
+      let changed = false
+      const files = current.files.map((file) => {
+        const hit = patches.find((p) => p.rel === file.rel)
+        if (!hit) return file
+        if (file.w === hit.w && file.h === hit.h) return file
+        changed = true
+        return { ...file, w: hit.w, h: hit.h }
+      })
+      if (changed) rows.set(id, { ...current, files })
+      return changed
+    },
+    readAsset: async (id: string) => rows.get(id),
+    probe: async (_folder, rels) => rels.map((rel) => ({ rel, w: 2048, h: 2048 })),
+    refreshAssets: (updated) => {
+      refreshed.push(updated)
+    },
+    log: () => {},
+    now: () => FIXED_NOW
+  }
+
+  return {
+    deps,
+    patchCalls,
+    refreshed,
+    get: (id: string) => rows.get(id),
+    write: (id: string, patch: Partial<Asset>) => {
+      const current = rows.get(id)
+      if (current) rows.set(id, { ...current, ...patch })
     }
   }
 }
@@ -167,12 +228,12 @@ describe('withProbedSizes —— 只 patch 目标字段', () => {
 })
 
 describe('runSizeBackfill —— 预算 / 轮转 / 单飞', () => {
-  it('probe 返回空数组 → 不 put、不抛异常、remaining 计数正确', async () => {
-    const { put, puted } = collector()
+  it('probe 返回空数组 → 不 patch、不抛异常、remaining 计数正确', async () => {
+    const { patch, calls } = collector()
     const probe = vi.fn(async () => [])
     const summary = await runSizeBackfill({
       listAssets: async () => [candidateAsset('a'), candidateAsset('b')],
-      putAsset: put,
+      patchSizes: patch,
       probe,
       refreshAssets: () => {},
       log: () => {},
@@ -186,7 +247,7 @@ describe('runSizeBackfill —— 预算 / 轮转 / 单飞', () => {
       elapsedMs: 0
     })
     expect(probe).toHaveBeenCalledTimes(2)
-    expect(puted).toHaveLength(0)
+    expect(calls).toHaveLength(0)
   })
 
   it('预算：100 个候选 + maxAssets=60 → 只 probe 60 个，remaining=40', async () => {
@@ -194,7 +255,7 @@ describe('runSizeBackfill —— 预算 / 轮转 / 单飞', () => {
     const probe = vi.fn(async () => [])
     const summary = await runSizeBackfill({
       listAssets: async () => assets,
-      putAsset: async () => {},
+      patchSizes: async () => false,
       probe,
       refreshAssets: () => {},
       log: () => {},
@@ -212,7 +273,7 @@ describe('runSizeBackfill —— 预算 / 轮转 / 单飞', () => {
     let ticks = 0
     const summary = await runSizeBackfill({
       listAssets: async () => assets,
-      putAsset: async () => {},
+      patchSizes: async () => false,
       probe: async () => [],
       refreshAssets: () => {},
       log: () => {},
@@ -248,10 +309,10 @@ describe('runSizeBackfill —— 预算 / 轮转 / 单飞', () => {
       await gate
       return [{ rel: 'albedo.jpg', w: 2048, h: 2048 }]
     })
-    const { put, puted } = collector()
+    const { patch, calls } = collector()
     const deps = {
       listAssets: async () => [candidateAsset('single')],
-      putAsset: put,
+      patchSizes: patch,
       probe,
       refreshAssets: () => {},
       log: () => {},
@@ -268,15 +329,16 @@ describe('runSizeBackfill —— 预算 / 轮转 / 单飞', () => {
     const summary = await first
     expect(summary?.patched).toBe(1)
     expect(probe).toHaveBeenCalledTimes(1)
-    expect(puted).toHaveLength(1)
-    expect(puted[0]!.files[0].w).toBe(2048)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.id).toBe('single')
+    expect(calls[0]!.patches).toEqual([{ rel: 'albedo.jpg', w: 2048, h: 2048 }])
   })
 
   it('写库与刷新都失败也不抛（写库失败 → 不计数、不刷新）', async () => {
     const refresh = vi.fn(() => {})
     const summary = await runSizeBackfill({
       listAssets: async () => [candidateAsset('boom')],
-      putAsset: async () => {
+      patchSizes: async () => {
         throw new Error('quota')
       },
       probe: async () => [{ rel: 'albedo.jpg', w: 1024, h: 1024 }],
@@ -287,6 +349,53 @@ describe('runSizeBackfill —— 预算 / 轮转 / 单飞', () => {
 
     expect(summary).toEqual({ scanned: 1, patched: 0, remaining: 0, elapsedMs: 0 })
     expect(refresh).not.toHaveBeenCalled()
+  })
+
+  it('patch 返回 false（值本来就相同）→ 不计数、不刷新', async () => {
+    const refresh = vi.fn(() => {})
+    const summary = await runSizeBackfill({
+      listAssets: async () => [candidateAsset('noop')],
+      patchSizes: async () => false,
+      probe: async () => [{ rel: 'albedo.jpg', w: 1024, h: 1024 }],
+      refreshAssets: refresh,
+      log: () => {},
+      now: () => FIXED_NOW
+    })
+
+    expect(summary).toEqual({ scanned: 1, patched: 0, remaining: 0, elapsedMs: 0 })
+    expect(refresh).not.toHaveBeenCalled()
+  })
+
+  it('★ 探测期间该资产被别处改了 thumbPath / renderParams → patch 之后库里仍是新值', async () => {
+    const before = candidateAsset('concurrent')
+    const lib = fakeLibrary([before])
+    // 探测期间球图渲染器 commitAsset：写进新的缩略图与调参
+    const probe = vi.fn(async (_folder: string, rels: string[]) => {
+      lib.write('concurrent', {
+        thumbPath: 'e94039c0.jpg',
+        thumbStatus: 'ready',
+        renderParams: { roughness: 1.4, bump: 0.7, uv: 3.1 },
+        updatedAt: 1_700_000_999_000
+      })
+      return rels.map((rel) => ({ rel, w: 4096, h: 4096 }))
+    })
+
+    const summary = await runSizeBackfill({ ...lib.deps, probe })
+
+    expect(summary?.patched).toBe(1)
+    const row = lib.get('concurrent')!
+    // 尺寸补上了
+    expect(row.files[0]!.w).toBe(4096)
+    expect(row.files[0]!.h).toBe(4096)
+    // ★ 并发写入一点没被回滚（旧实现整对象 put 会把这三项顶回快照值）
+    expect(row.thumbPath).toBe('e94039c0.jpg')
+    expect(row.thumbStatus).toBe('ready')
+    expect(row.renderParams).toEqual({ roughness: 1.4, bump: 0.7, uv: 3.1 })
+    expect(row.updatedAt).toBe(1_700_000_999_000)
+    // 内存刷新用的是"写库后的最新记录"，不是轮次快照
+    expect(lib.refreshed).toHaveLength(1)
+    expect(lib.refreshed[0]![0]!.thumbPath).toBe('e94039c0.jpg')
+    expect(lib.refreshed[0]![0]!.renderParams).toEqual({ roughness: 1.4, bump: 0.7, uv: 3.1 })
   })
 
   it('整体失败（读库抛错）→ 返回零摘要，绝不把异常抛给启动链路', async () => {
@@ -340,26 +449,38 @@ describe('候选判定 —— 只补能力表里 resolution=true 的大类', () 
 
 // ── 会话驱动：一轮补不完自己接着跑 ──────────────────────────────────────
 
-/** 内存假 db：put 会真的改掉 rows，下一轮 listAssets 才能看到"已补完" */
+/** 内存假 db：patch 会真的改掉 rows（只改 w/h），下一轮 listAssets 才能看到"已补完" */
 function fakeDb(
   initial: Asset[],
   opts: { probeDelay?: () => Promise<void> } = {}
 ): {
   deps: SizeBackfillDeps
-  puted: Asset[]
+  patched: SizePatch[]
   logs: SizeBackfillLogEvent[]
   probeCalls: () => number
 } {
   let rows = initial
-  const puted: Asset[] = []
+  const patchedCalls: SizePatch[] = []
   const logs: SizeBackfillLogEvent[] = []
   let probes = 0
   const deps: SizeBackfillDeps = {
     listAssets: async () => rows,
-    putAsset: async (a) => {
-      puted.push(a)
-      rows = rows.map((x) => (x.id === a.id ? a : x))
+    patchSizes: async (id, patches) => {
+      patchedCalls.push(...patches)
+      let rowChanged = false
+      rows = rows.map((row) => {
+        if (row.id !== id) return row
+        const files = row.files.map((file) => {
+          const hit = patches.find((p) => p.rel === file.rel)
+          if (!hit) return file
+          rowChanged = true
+          return { ...file, w: hit.w, h: hit.h }
+        })
+        return { ...row, files }
+      })
+      return rowChanged
     },
+    readAsset: async (id) => rows.find((row) => row.id === id),
     probe: async (_folder, rels) => {
       probes += 1
       if (opts.probeDelay) await opts.probeDelay()
@@ -369,7 +490,7 @@ function fakeDb(
     log: (ev) => logs.push(ev),
     now: () => FIXED_NOW
   }
-  return { deps, puted, logs, probeCalls: () => probes }
+  return { deps, patched: patchedCalls, logs, probeCalls: () => probes }
 }
 
 /** 推进 fake timer（每轮间隔一次），足够跑完一整条会话链 */
@@ -396,7 +517,7 @@ describe('startSizeBackfill —— 同会话自续', () => {
         elapsedMs: 0
       })
       expect(db.probeCalls()).toBe(150)
-      expect(db.puted).toHaveLength(150)
+      expect(db.patched).toHaveLength(150)
 
       // 完成日志：累计 patched + 总耗时
       const done = db.logs.find((e) => e.message === '[sizeBackfill] 全部补完')
@@ -422,7 +543,7 @@ describe('startSizeBackfill —— 同会话自续', () => {
       const assets = Array.from({ length: 2000 }, (_, i) => candidateAsset(`cap-${i}`))
       const running = startSizeBackfill({
         listAssets: async () => assets,
-        putAsset: async () => {},
+        patchSizes: async () => false,
         probe: async () => {
           probes += 1
           return []

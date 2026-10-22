@@ -26,8 +26,11 @@
  * 3. **轮转**：起点取 `now % 候选总数`（环形），坏资产不会永远堵在前面；
  * 4. **预算**：单轮最多 60 个资产 / 3 秒 / 每个资产最多 200 条 rel（主进程上限）；
  *    一轮补不完就在同会话内**每 4 秒接着跑**（最多 25 轮），不必等用户重启；
- * 5. **写库只动 `files[i].w/h`**：整对象 `put`，其余字段（尤其 `updatedAt`）原样保留
- *    —— 动 `updatedAt` 会牵动排序与缩略图判定；
+ * 5. **写库只动 `files[i].w/h`**，而且必须是 **Dexie 定向 `modify`**（读库里**当下**的
+ *    记录），**不是整对象 `put`**：本轮的 `asset` 是轮次起点的快照，同一时刻球图渲染器
+ *    正在 `commitAsset` 写 `thumbPath` / `renderParams` —— 拿快照整对象覆盖回去就是
+ *    丢更新（2026-10 真机取证：参数被抹的次要嫌疑通道）。`updatedAt` 同理一律不碰：
+ *    动它会牵动排序与缩略图判定；
  * 6. **刷新只刷内存态**：按 id 窄替换 `assets`，不重置筛选 / 选中 / 滚动位置，
  *    失败也不影响已落库的尺寸（Dexie 才是事实）；
  * 7. **single-flight**：同一时刻只跑一轮；会话驱动也只有一条。
@@ -156,29 +159,78 @@ export function missingSizeRels(asset: Asset): string[] {
 }
 
 /**
- * 把探测结果**只**写进 `files[i].w/h`（返回新对象，不改入参）。
+ * 一条尺寸补丁 = 「这个 rel 的宽高应该是多少」。
  *
- * - 其余字段（`name` / `id` / `updatedAt` / `thumbPath` / `files` 里其它属性）逐个原样保留；
- * - 一条都没匹配上 / 值本来就相同 → 返回 `null`（调用方据此**不 put**，避免无意义写放大）。
+ * 与 `ProbedImageSize` 同形（结构类型兼容），单独起名是为了让**写库接口**只承诺
+ * "要改哪些文件"，而不是"探测返回了什么"（前者是写库契约，后者是实现细节）。
  */
-export function withProbedSizes(asset: Asset, probed: ProbedImageSize[]): Asset | null {
-  if (!Array.isArray(probed) || probed.length === 0) return null
+export interface SizePatch {
+  /** 相对资产文件夹的路径（与 `AssetFile.rel` 同一口径） */
+  rel: string
+  /** 宽（像素，必须 > 0） */
+  w: number
+  /** 高（像素，必须 > 0） */
+  h: number
+}
+
+/** 把探测结果收敛成"只包含**真正需要改**的条目"的补丁列表（纯函数）。 */
+export function sizePatches(asset: Asset, probed: ProbedImageSize[]): SizePatch[] {
+  if (!Array.isArray(probed) || probed.length === 0) return []
   const byRel = new Map<string, ProbedImageSize>()
   for (const p of probed) {
     if (p && typeof p.rel === 'string' && p.w > 0 && p.h > 0) byRel.set(p.rel, p)
   }
-  if (byRel.size === 0) return null
+  if (byRel.size === 0) return []
+
+  const files = Array.isArray(asset?.files) ? asset.files : []
+  const patches: SizePatch[] = []
+  for (const file of files) {
+    const hit = byRel.get(file.rel)
+    if (!hit) continue
+    if (file.w === hit.w && file.h === hit.h) continue
+    patches.push({ rel: file.rel, w: hit.w, h: hit.h })
+  }
+  return patches
+}
+
+/**
+ * 把补丁应用到**内存对象**（返回新对象，不改入参）。
+ *
+ * ⚠️ 只用于"写库成功之后刷新内存态"的兜底路径 —— **绝不能**拿它的结果去整对象写库
+ * （那正是丢更新的通道）。写库一律走 `patchSizes` 的定向 `modify`。
+ */
+export function applySizePatches(asset: Asset, patches: SizePatch[]): Asset {
+  if (!Array.isArray(patches) || patches.length === 0) return asset
+  const byRel = new Map<string, SizePatch>()
+  for (const p of patches) {
+    if (p && typeof p.rel === 'string' && p.w > 0 && p.h > 0) byRel.set(p.rel, p)
+  }
+  if (byRel.size === 0) return asset
 
   let changed = false
-  const files = asset.files.map((file) => {
+  const files = (Array.isArray(asset?.files) ? asset.files : []).map((file) => {
     const hit = byRel.get(file.rel)
     if (!hit) return file
     if (file.w === hit.w && file.h === hit.h) return file
     changed = true
     return { ...file, w: hit.w, h: hit.h }
   })
-  if (!changed) return null
+  if (!changed) return asset
   return { ...asset, files }
+}
+
+/**
+ * 把探测结果**只**写进 `files[i].w/h`（返回新对象，不改入参）。
+ *
+ * - 其余字段（`name` / `id` / `updatedAt` / `thumbPath` / `files` 里其它属性）逐个原样保留；
+ * - 一条都没匹配上 / 值本来就相同 → 返回 `null`（调用方据此**不写库**，避免无意义写放大）。
+ *
+ * 纯函数保留给单测 / 内存态兜底；**落库不再用它整对象 `put`**（见 `SizePatch`）。
+ */
+export function withProbedSizes(asset: Asset, probed: ProbedImageSize[]): Asset | null {
+  const patches = sizePatches(asset, probed)
+  if (patches.length === 0) return null
+  return applySizePatches(asset, patches)
 }
 
 // ── 执行器（依赖可注入；下面两个 default 实现只在真实运行时才求值） ──────
@@ -206,7 +258,21 @@ export type SizeBackfillLogger = (ev: SizeBackfillLogEvent) => void
 /** 依赖注入面：单测全部替换成内存实现，因此不加载 Dexie / store / electron */
 export interface SizeBackfillDeps {
   listAssets?: () => Promise<Asset[]>
-  putAsset?: (asset: Asset) => Promise<void>
+  /**
+   * **定向写库**：只改 `patches` 里这些 rel 的 `w/h`。
+   *
+   * 默认实现是 Dexie 的 `.where('id').equals(id).modify(...)` —— 读的是**库里当下**
+   * 的记录，而不是本轮快照，所以并发写入（球图 `thumbPath` / `renderParams`）不会被回滚。
+   *
+   * @returns true = 真的改了至少一条（值本来就相同 → false，调用方不刷新内存态）
+   */
+  patchSizes?: (assetId: string, patches: SizePatch[]) => Promise<boolean>
+  /**
+   * 写库成功后取回该条记录（默认 `db.assets.get()`）。
+   * 拿它刷新内存态，避免用轮次快照把内存里刚被别处更新过的字段顶回去。
+   * 失败 / 查不到 → 调用方退回"快照 + 补丁"的写法（仅内存，不落库）。
+   */
+  readAsset?: (assetId: string) => Promise<Asset | undefined>
   probe?: (folder: string, rels: string[]) => Promise<ProbedImageSize[]>
   /** 写库后刷新内存态（默认按 id 窄替换 `useVault.assets`） */
   refreshAssets?: (updated: Asset[]) => void | Promise<void>
@@ -247,7 +313,8 @@ export async function runSizeBackfill(
     total = plan.total
 
     const probe = deps.probe ?? defaultProbe
-    const putAsset = deps.putAsset ?? defaultPutAsset
+    const patchSizes = deps.patchSizes ?? defaultPatchSizes
+    const readAsset = deps.readAsset ?? defaultReadAsset
     const updatedAssets: Asset[] = []
 
     for (const asset of plan.queue) {
@@ -263,16 +330,31 @@ export async function runSizeBackfill(
       } catch {
         /* 静默：这一条读不出就跳过，不占预算 */
       }
-      const updated = withProbedSizes(asset, probed)
-      if (!updated) continue
+      // 只算"真正要改的条目"；没有可写的就不碰库（天然幂等，避免写放大）
+      const patches = sizePatches(asset, probed)
+      if (patches.length === 0) continue
 
+      // ★ 定向写库：Dexie `modify` 只动 files[i].w/h，读的是库里当下的记录。
+      //   本轮 `asset` 只是快照 —— 整对象 put 会把并发写入的 thumbPath /
+      //   renderParams 回滚成旧值（丢更新）。
+      let changed = false
       try {
-        await putAsset(updated)
+        changed = await patchSizes(asset.id, patches)
       } catch {
         continue // 写库失败：不改内存态，下一轮重试
       }
+      if (!changed) continue
       patched += 1
-      updatedAssets.push(updated)
+
+      // 内存态刷新用**写库后的最新记录**（而不是快照 + 补丁），保证界面不会短暂
+      // 回退掉别处刚写进去的字段；读不到才退回"快照 + 补丁"（这一步不落库）。
+      let latest: Asset | undefined
+      try {
+        latest = await readAsset(asset.id)
+      } catch {
+        latest = undefined
+      }
+      updatedAssets.push(latest ?? applySizePatches(asset, patches))
     }
 
     const summary: SizeBackfillSummary = {
@@ -429,9 +511,57 @@ async function defaultListAssets(): Promise<Asset[]> {
   return db.assets.toArray()
 }
 
-async function defaultPutAsset(asset: Asset): Promise<void> {
+/**
+ * 默认定向写库：Dexie 事务内 `.where('id').equals(id).modify(...)`。
+ *
+ * 关键点：
+ * - `modify` 的回调拿到的是**库里当下的记录**（Dexie 会读出、深拷贝、回调、再写回），
+ *   所以并发写进去的 `thumbPath` / `renderParams` / `updatedAt` 原样保留；
+ * - 只碰 `files[i]` 的 `w`/`h`，其余属性一个不动；
+ * - 返回是否真的发生变化（值本来就相同 → false，调用方跳过内存刷新）。
+ */
+async function defaultPatchSizes(assetId: string, patches: SizePatch[]): Promise<boolean> {
+  if (typeof assetId !== 'string' || assetId === '') return false
+  if (!Array.isArray(patches) || patches.length === 0) return false
+
+  const byRel = new Map<string, SizePatch>()
+  for (const p of patches) {
+    if (p && typeof p.rel === 'string' && p.w > 0 && p.h > 0) byRel.set(p.rel, p)
+  }
+  if (byRel.size === 0) return false
+
   const { db } = await import('../db')
-  await db.assets.put(asset)
+  let changed = false
+  await db.assets
+    .where('id')
+    .equals(assetId)
+    .modify((rec: Asset) => {
+      if (!rec || !Array.isArray(rec.files)) return
+      let touched = false
+      const files = rec.files.map((file) => {
+        if (!file) return file
+        const hit = byRel.get(file.rel)
+        if (!hit) return file
+        if (file.w === hit.w && file.h === hit.h) return file
+        touched = true
+        // 只替换这一个条目（浅拷贝保留 name/ext/size/kind 等）
+        return { ...file, w: hit.w, h: hit.h }
+      })
+      if (!touched) return
+      // 顶层属性赋值（而不是原地改数组元素）：Dexie 的 `modify` 一定会把这次
+      // 顶层变更写回，语义最稳；其余字段（thumbPath / renderParams / updatedAt…）
+      // 一个都没碰。
+      rec.files = files
+      changed = true
+    })
+  return changed
+}
+
+/** 默认读取单条记录（刷新内存态用；拿不到就是 undefined，调用方自行兜底） */
+async function defaultReadAsset(assetId: string): Promise<Asset | undefined> {
+  if (typeof assetId !== 'string' || assetId === '') return undefined
+  const { db } = await import('../db')
+  return db.assets.get(assetId)
 }
 
 function defaultProbe(folder: string, rels: string[]): Promise<ProbedImageSize[]> {

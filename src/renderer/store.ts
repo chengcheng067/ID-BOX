@@ -2656,10 +2656,20 @@ export const useVault = create<VaultState>((set, get) => ({
       const local = localByFolder.get(s.folder)
       if (local) {
         localByFolder.delete(s.folder)
-        // 主进程 rescan 会把 thumbPath 置空；本地已有缩略图且封面未变时沿用缓存文件
-        //（缩略图文件名 = id + cover salt，封面没变就仍然有效，无需重新生成）
-        const keepThumb =
-          local.thumbStatus === 'ready' && !!local.thumbPath && !!local.cover && local.cover === s.cover
+        // ── 合并方向：**以 local 为底，只覆盖磁盘权威字段** ──────────────
+        //
+        // 反向（`{...s, 挑几个本地字段补}`）是一个真实的丢数据事故：`rescan.ts`
+        // 产出的 `s` 里用户字段全是占位默认值（favorite:false / rating:0 /
+        // colorTag:null / styles:[] / tags:[] / note:'' / source:''），而且
+        // **完全没有** `renderParams` / `renderShape`。于是每次「重新扫描库」
+        // 都把用户调好的材质球参数、收藏、评分、色标、风格整片打回默认
+        // （2026-10 真机取证：一次 rescan 覆盖 143 条中的 127 条）。
+        //
+        // 白名单式"再补几个字段"治不了根 —— 新字段一加就又漏一次。所以这里翻过来：
+        // 任何在 `Asset` 上新增的字段默认**天然保留本地值**，只有下面显式列出的
+        // 磁盘权威字段才被 `s` 覆盖。`tests/rescanMergePreserve.test.ts` 逐键枚举
+        // `Asset` 的每个字段并要求归入「磁盘权威 / 本地保留」之一，加字段忘了归类就红。
+
         // 手动封面 / 知末封面都是"用户显式指定或抓来的"，rescan 不得覆盖
         //（仅当文件仍在 index 的文件清单里时保留；文件被删了就如实回落到扫描值）。
         // ⚠️ 漏掉 'zhimo' 会让抓到的封面在下次「重新扫描库」时被 SKP 内嵌灰图打回
@@ -2668,21 +2678,47 @@ export const useVault = create<VaultState>((set, get) => ({
           (local.coverSource === 'manual' || local.coverSource === 'zhimo') &&
           !!local.cover &&
           s.files.some((f) => f.rel === local.cover)
+
+        // 缩略图：本地已生成就**原样保留**。
+        //
+        // 旧实现额外要求 `local.cover === s.cover`，封面一被重扫改动就整片清空
+        // `thumbPath` 并写 `thumbStatus: 'none'`（真机上 37 条的图文件明明还在盘上，
+        // 索引里却被抹成 null）。封面真的变了的情况交给 `regenThumbSweep()` /
+        // 惰性升级机制（`708caf3`）处理 —— 那里会按新的 cover salt 重算并覆盖。
+        const keepThumb = local.thumbStatus === 'ready' && !!local.thumbPath
+
         merged.push({
-          ...s,
-          id: local.id,
-          tags: local.tags,
-          note: local.note,
-          source: local.source || s.source,
-          importedAt: local.importedAt,
+          ...local,
+          // ── 磁盘权威（重扫真正该更新的字段） ────────────────────────
+          kind: s.kind,
+          name: s.name,
+          folder: s.folder,
+          relFolder: s.relFolder,
+          files: s.files,
+          size: s.size,
+          suVersion: s.suVersion,
+          suMajor: s.suMajor,
           // 分类以磁盘目录名为准（rescan 的权威语义），本地记录不覆盖
+          category1: s.category1,
+          category2: s.category2,
+          dedupeKey: s.dedupeKey,
+          // 材质包元数据只在扫描**真有值**时覆盖（json 读失败 / 被删 → 保留已知值）
+          materialMeta: s.materialMeta ?? local.materialMeta,
+          // ── 条件覆盖：默认取磁盘值，本地在明确条件下优先 ─────────────
           cover: keepStickyCover ? local.cover : s.cover,
           coverSource: keepStickyCover ? local.coverSource : s.coverSource,
-          thumbPath: keepThumb ? local.thumbPath : undefined,
+          thumbPath: keepThumb ? local.thumbPath : s.thumbPath,
           thumbStatus: keepThumb ? 'ready' : s.thumbStatus,
           // 知末 ID（0.6.3）：本地记录已有值就**原样保留** —— 导入时从压缩包名解析出的 ID
           // 是磁盘上再也找不回来的信息（包已处置）；只有本地为空时才用磁盘扫描值兜底。
-          zhimoId: local.zhimoId || s.zhimoId
+          zhimoId: local.zhimoId || s.zhimoId,
+          // ── 本地保留（显式写出，表达"这里刻意不取磁盘值"） ───────────
+          // 重扫不是用户编辑：`updatedAt` 必须留着，否则「最近修改」排序被整库顶到当下。
+          updatedAt: local.updatedAt,
+          importedAt: local.importedAt
+          // 其余（id / source / tags / note / favorite / rating / colorTag /
+          // styles / renderParams / renderShape / mojibake / deletedAt / trashRel /
+          // aliasOverride）由 `...local` 原样带过来。
         })
       } else {
         merged.push(s)
