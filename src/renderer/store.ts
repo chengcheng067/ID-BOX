@@ -64,6 +64,12 @@ import {
 import { resolveZhimoStyle } from './logic/zhimoStyle'
 import { buildDedupeSnapshot } from './logic/importConflict'
 import {
+  applyThumbRescue,
+  planRenderParamsRestore,
+  planThumbRescue,
+  RESCUE_PREFER
+} from './logic/thumbRescue'
+import {
   isTerminalStatus,
   overwriteSummaryText,
   skippedSummaryText
@@ -1513,6 +1519,99 @@ async function bootstrapMigrations(): Promise<void> {
   await maybeAutoMigrate()
 }
 
+/**
+ * **一次性数据救援**（2026-10-23 rescan 事故）：把被抹掉的 `thumbPath` 按盘上真实
+ * 文件挂回，并恢复被抹掉的事故参数。规格见 `logic/thumbRescue.ts` 头部注释。
+ *
+ * ## 为什么必须在 init 的这个位置、并且 await
+ *
+ * ```
+ * db.assets.toArray() → set({ assets }) → ★ 这里 ★ → repairStaleBallThumbs()
+ *   → ensureMissingThumbs() → ensureMissingBallThumbs()
+ * ```
+ *
+ * 三个补齐队列的候选判据都是「`thumbStatus !== 'ready'`」。救援晚一步，记录就会先被
+ * `ensureMissingThumbs` 抓去按**封面 salt** 生成一张封面缩略图并写成 `ready`
+ * ——球图再也挂不回去（用户丢的还是那张调过 UV 的图）。
+ *
+ * ## 四条硬纪律
+ *
+ * ① **空跑零成本**：`listThumbs` 失败 / 返回空 / 计划为空 → 直接返回，不写快照、不打日志；
+ * ② **失败静默**：整个函数包在 try/catch 里。救援是"额外的好事"，绝不能让 init 打不开；
+ * ③ **只写目标字段**：`thumbPath` / `thumbStatus` 与 `renderParams`，用 `.modify()`
+ *    定向更新（不整对象 put），并发写入的别的字段原样保留；
+ * ④ **不清理孤儿**：这里**绝不**调用 `pruneThumbs`（传部分清单就是批量删盘），
+ *    清孤儿是独立的、可预演的另一步。
+ *
+ * 幂等：计划由"当前状态 + 盘上文件"算出；修完之后谓词自然为假，下次启动零动作。
+ */
+async function rescueDamagedIndex(assets: Asset[]): Promise<void> {
+  try {
+    const files = await window.modvault.listThumbs().catch(() => [])
+    const thumbPlan =
+      files.length > 0 ? planThumbRescue(assets, files, { prefer: RESCUE_PREFER }) : []
+    const paramsPlan = planRenderParamsRestore(assets)
+    // ① 空跑保护：正常库每次启动都走到这里，必须零副作用
+    if (thumbPlan.length === 0 && paramsPlan.length === 0) return
+
+    const touched = new Set<string>()
+
+    // ② 缩略图：先快照（applyThumbRescue 内部做）→ 逐条定向写
+    if (thumbPlan.length > 0) {
+      await applyThumbRescue(thumbPlan, {
+        loadAssets: async (ids) => {
+          const rows = await db.assets.bulkGet([...ids])
+          return rows
+            .filter((a): a is Asset => !!a)
+            .map((a) => ({
+              id: a.id,
+              thumbPath: a.thumbPath,
+              thumbStatus: a.thumbStatus,
+              deletedAt: a.deletedAt
+            }))
+        },
+        saveSnapshot: async (snapshot) => {
+          await db.backups.put(snapshot)
+        },
+        updateThumb: async (assetId, thumbPath) => {
+          await db.assets
+            .where('id')
+            .equals(assetId)
+            .modify((a: Asset) => {
+              a.thumbPath = thumbPath
+              a.thumbStatus = 'ready'
+            })
+        }
+      })
+      for (const item of thumbPlan) touched.add(item.assetId)
+    }
+
+    // ③ 事故参数：只在**当前为空**时写（用户事后新调的值优先级最高）。
+    //    这里不写快照：写入是"填空"，不覆盖任何既有用户数据，回退只需删字段。
+    //    也不动 `updatedAt`——救援不是用户编辑（与 backfillZhimoIds 同一纪律）。
+    for (const item of paramsPlan) {
+      await db.assets
+        .where('id')
+        .equals(item.assetId)
+        .modify((a: Asset) => {
+          if (a.renderParams && Object.keys(a.renderParams).length > 0) return
+          a.renderParams = item.params
+        })
+      touched.add(item.assetId)
+    }
+
+    // ④ 内存态**按 id 窄替换**（不要整体替换 `assets`：那会让正在进行的选中/滚动错位）
+    if (touched.size === 0) return
+    const rows = await db.assets.bulkGet([...touched])
+    const byId = new Map<string, Asset>()
+    for (const row of rows) if (row) byId.set(row.id, row)
+    if (byId.size === 0) return
+    useVault.setState((s) => ({ assets: s.assets.map((a) => byId.get(a.id) ?? a) }))
+  } catch {
+    // ② 救援失败一律静默：绝不能让"修数据的版本"打不开
+  }
+}
+
 export const useVault = create<VaultState>((set, get) => ({
   assets: [],
   filters: { ...DEFAULT_FILTERS },
@@ -1548,6 +1647,11 @@ export const useVault = create<VaultState>((set, get) => ({
       db.assets.toArray()
     ])
     set({ settings, assets, ready: true })
+
+    // 一次性数据救援（2026-10-23 rescan 事故）：**必须 await 且必须在三个补齐队列之前**。
+    // 晚一步，`ensureMissingThumbs` 会先按封面 salt 生成封面缩略图并写成 ready，
+    // 被抹掉的球图就再也挂不回去了（详见 `rescueDamagedIndex` 的注释）。
+    await rescueDamagedIndex(assets)
 
     // 知末 ID 一次性回填（0.6.3）：老索引记录没有 `zhimoId` → 从资产名/包内文件补算。
     // 纯幂等：算不出就不写库，已回填过的记录下次启动直接跳过。失败不影响启动（catch 吞掉）。

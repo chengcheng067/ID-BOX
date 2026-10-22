@@ -292,10 +292,36 @@ export async function applyThumbRescue(
 export const RENDER_PARAMS_RESTORE: ReadonlyArray<{
   id: string
   params: Partial<BallParamScales>
+  /**
+   * 该记录应挂的**确切**缩略图文件名（一次性纠正"最新 ≠ 正确"）。
+   *
+   * 目标资产 id 下有两个球图：`…-e94039c0.png`（UV 3.10，正确）与
+   * `…-7933daa4.png`（默认 UV，mtime 更晚——事故后补齐流程又渲了一张）。
+   * 纯 mtime 规则会挑到后者，所以这里写死前者。文件不存在时自动回落 mtime 规则。
+   */
+  preferThumb?: string
 }> = [
   // 新中式复古仿古砖（UV=3.10，其余默认）
-  { id: '5e4c3050-e057-4681-a70a-cb277890c309', params: { uv: 3.1 } }
+  {
+    id: '5e4c3050-e057-4681-a70a-cb277890c309',
+    params: { uv: 3.1 },
+    preferThumb: '5e4c3050-e057-4681-a70a-cb277890c309-e94039c0.png'
+  }
 ]
+
+/**
+ * `planThumbRescue` 的 `prefer` 入参：由 `RENDER_PARAMS_RESTORE` 的 `preferThumb` 汇总。
+ *
+ * 只包含**显式偏好**的条目（当前 1 条）。刻意做成"从表里算"而不是手写第二份，
+ * 避免表与偏好两处漂移。
+ */
+export const RESCUE_PREFER: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(
+    RENDER_PARAMS_RESTORE.filter((e) => typeof e.preferThumb === 'string' && e.preferThumb.length > 0).map(
+      (e) => [e.id, e.preferThumb as string]
+    )
+  )
+)
 
 /** 把"部分参数"补齐成完整结构（缺省项取 `DEFAULT_PARAM_SCALES`，再整体规范化） */
 export function restoreParamsFor(entry: { params: Partial<BallParamScales> }): NormalizedBallParams {

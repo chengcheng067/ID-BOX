@@ -12,6 +12,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   RENDER_PARAMS_RESTORE,
+  RESCUE_PREFER,
   THUMB_RESCUE_LIMIT,
   THUMB_RESCUE_SNAPSHOT_PREFIX,
   applyThumbRescue,
@@ -111,6 +112,69 @@ describe('planThumbRescue · 匹配规则', () => {
     const files = assets.map((a) => file(a.id, 'abcdef01'))
     expect(planThumbRescue(assets, files, { limit: 2 })).toHaveLength(2)
     expect(THUMB_RESCUE_LIMIT).toBeGreaterThan(2)
+  })
+})
+
+describe('planThumbRescue · prefer（显式偏好优先于 mtime）', () => {
+  const TARGET = '5e4c3050-e057-4681-a70a-cb277890c309'
+  const PREFERED = `${TARGET}-e94039c0.png`
+  const NEWER = `${TARGET}-7933daa4.png`
+
+  it('偏好文件优先，即便它不是最新的那个（事故现场：7900 比 e940 晚 5 分钟）', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, thumbStatus: 'none' }],
+      [
+        file(TARGET, '7933daa4', 'png', 5000), // 更晚
+        file(TARGET, 'e94039c0', 'png', 1000) // 正确
+      ],
+      { prefer: { [TARGET]: PREFERED } }
+    )
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.thumbPath).toBe(PREFERED)
+    expect(plan[0]!.candidates).toBe(2)
+  })
+
+  it('偏好**允许替换已有 thumbPath**（唯一例外；否则用户永远看到默认 UV 那张）', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, thumbPath: NEWER, thumbStatus: 'ready' }],
+      [file(TARGET, '7933daa4', 'png', 5000), file(TARGET, 'e94039c0', 'png', 1000)],
+      { prefer: { [TARGET]: PREFERED } }
+    )
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.thumbPath).toBe(PREFERED)
+  })
+
+  it('偏好文件不在盘上 → 回落 mtime 规则（绝不凭空造名字）', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, thumbStatus: 'none' }],
+      [file(TARGET, '7933daa4', 'png', 5000)],
+      { prefer: { [TARGET]: PREFERED } }
+    )
+    expect(plan).toHaveLength(1)
+    expect(plan[0]!.thumbPath).toBe(NEWER)
+  })
+
+  it('偏好文件不在盘上且记录已有可用图 → 不产出', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, thumbPath: NEWER, thumbStatus: 'ready' }],
+      [file(TARGET, '7933daa4', 'png', 5000)],
+      { prefer: { [TARGET]: PREFERED } }
+    )
+    expect(plan).toEqual([])
+  })
+
+  it('软删记录：偏好也不能越过', () => {
+    const plan = planThumbRescue(
+      [{ id: TARGET, thumbStatus: 'none', deletedAt: 1 }],
+      [file(TARGET, 'e94039c0', 'png', 1000)],
+      { prefer: { [TARGET]: PREFERED } }
+    )
+    expect(plan).toEqual([])
+  })
+
+  it('RESCUE_PREFER 与表项同源（写死的那一个文件名）', () => {
+    expect(RESCUE_PREFER[TARGET]).toBe(PREFERED)
+    expect(Object.keys(RESCUE_PREFER)).toEqual([TARGET])
   })
 })
 
