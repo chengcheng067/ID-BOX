@@ -373,3 +373,77 @@ describe('renderBallThumbFor · 升级失败保留旧图', () => {
     expect(after.renderParams).toEqual(before.renderParams)
   })
 })
+
+// ── ⑥ 形态**写入口**契约（`store.setRenderShape`） ───────────────
+//
+// 为什么现在就锁：MaterialBall 侧的接缝（`onShapeChange` / `defaultShape` /
+// `getShape`）已备好，但 `CustomRenderDialog` 里当前**没有形态 UI**
+// （`showShapeSwitch={false}`），所以 `renderShape` 还不会产生用户可见变化。
+// 一旦 UI 接线，写入口的行为必须已经是钉死的——否则"切了形态、下次启动又变回球面"
+// 会以最低成本回归。这组测试只走 store 的真实代码路径，不依赖任何 UI。
+describe('store.setRenderShape · 形态写入口契约', () => {
+  /** 轮询等待条件（球图渲染是异步的：动态 import + IPC + yield） */
+  async function waitFor(cond: () => boolean, ms = 3000): Promise<boolean> {
+    const t0 = Date.now()
+    while (Date.now() - t0 < ms) {
+      if (cond()) return true
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    return cond()
+  }
+
+  it('切到 plane：写库带 renderShape，旧 thumbPath / thumbStatus / renderParams 一律不动', async () => {
+    const a = ballAsset({ renderParams: TUNED })
+    a.thumbPath = ballThumbName(a.id, SLOTS, TUNED) // 球面成品
+    a.thumbStatus = 'ready'
+    useVault.setState({ assets: [a], selectedId: null })
+
+    await useVault.getState().setRenderShape(a.id, 'plane')
+
+    // 写库：只多一个 renderShape
+    const written = fakeTable.put.mock.calls.at(-1)![0] as Asset
+    expect(written.renderShape).toBe('plane')
+    // 升级期间卡片继续显示**旧球面图**（先建新、再删旧），绝不置灰
+    expect(written.thumbPath).toBe(a.thumbPath)
+    expect(written.thumbStatus).toBe('ready')
+    // 用户调好的参数一个字节都不许动
+    expect(written.renderParams).toEqual(TUNED)
+
+    // 渲染完成后才换成 plane 名，并删掉旧球面图
+    const planeName = ballThumbName(a.id, SLOTS, TUNED, 'plane')
+    expect(
+      await waitFor(() => useVault.getState().assets[0]!.thumbPath === planeName)
+    ).toBe(true)
+    expect(modvault.deleteOneThumb).toHaveBeenCalledWith(a.id, a.thumbPath)
+  })
+
+  it('相同形态重复调用 → 不写库、不入队（幂等门）', async () => {
+    const a = ballAsset()
+    a.thumbPath = ballThumbName(a.id, SLOTS)
+    a.thumbStatus = 'ready'
+    useVault.setState({ assets: [a], selectedId: null })
+
+    await useVault.getState().setRenderShape(a.id, 'sphere') // 缺省 = sphere → 无变化
+    await useVault.getState().setRenderShape(a.id, 'plane')
+    fakeTable.put.mockClear()
+    const attemptedBefore = attemptedIds().length
+
+    await useVault.getState().setRenderShape(a.id, 'plane') // 再切同一个
+
+    expect(fakeTable.put).not.toHaveBeenCalled()
+    expect(attemptedIds().length).toBe(attemptedBefore)
+  })
+
+  it('非法形态值一律按 sphere 处理（不把脏值写进 hash）', async () => {
+    const a = ballAsset({ renderShape: 'plane' })
+    a.thumbPath = ballThumbName(a.id, SLOTS, undefined, 'plane')
+    a.thumbStatus = 'ready'
+    useVault.setState({ assets: [a], selectedId: null })
+
+    // @ts-expect-error 故意传脏值，验证运行时兜底
+    await useVault.getState().setRenderShape(a.id, 'cylinder')
+
+    const written = fakeTable.put.mock.calls.at(-1)![0] as Asset
+    expect(written.renderShape).toBe('sphere')
+  })
+})
