@@ -5,6 +5,7 @@ import type {
   Asset,
   AssetFile,
   ColorTag,
+  CoverSource,
   FetchZhimoCoverResult,
   ImportConflictAnswer,
   ImportConflictAsk,
@@ -1110,13 +1111,18 @@ async function patchAssets(ids: string[], patch: MarkPatch): Promise<boolean> {
  */
 async function regenThumbSweep(
   id: string,
-  coverAbs: string
+  coverAbs: string,
+  nextCoverSource?: CoverSource
 ): Promise<{ thumbPath?: string; thumbStatus: ThumbStatus }> {
   const first = await window.modvault.ensureThumb(id, coverAbs).catch(() => null)
   if (!first) return { thumbStatus: 'none' }
 
   const asset = useVault.getState().assets.find((a) => a.id === id)
-  const ball = asset ? ballThumbTarget(asset) : null
+  // ⚠️ `nextCoverSource` 是**必须先有**的入参：`commitCover` 的时序是"先重算缩略图、
+  // 最后才写 coverSource"，若这里读库里那份旧记录，用户刚点的「更换封面」会被判成
+  // "仍该保球图" → 换了封面卡片还显示球（2026-10-23 用户的真实症状）。
+  // 所以调用方要把**即将落库的来源**传进来，判定用"未来态"而不是"现状"。
+  const ball = asset ? ballThumbTarget(nextCoverSource ? { ...asset, coverSource: nextCoverSource } : asset) : null
 
   // A：球图资产 —— 精确删「上一张封面缩略图」，球图一个字节都不碰。
   if (asset && ball) {
@@ -1206,7 +1212,7 @@ async function commitCover(
   //      **内容一变就换名** → 渲染层的 `vault://thumb/<名>` URL 跟着变，
   //      原地覆盖同名封面（如 HDR 预览「拍照」）也能立刻刷新，不再需要重启。
   //      失败退化为 'none'（网格走类型占位）。
-  const thumb = await regenThumbSweep(id, assetFileAbs(asset.folder, rel))
+  const thumb = await regenThumbSweep(id, assetFileAbs(asset.folder, rel), source)
 
   // 缩略图生成期间资产可能被删 / 被 rescan 替换 → 以**最新**记录为底
   const latest = useVault.getState().assets.find((a) => a.id === id) ?? asset
@@ -1456,6 +1462,8 @@ export const useVault = create<VaultState>((set, get) => ({
 
     // 清理孤儿缩略图缓存（索引里已不存在的 id），失败静默
     window.modvault.pruneThumbs(assets.map((a) => a.id)).catch(() => 0)
+    // 修「封面已被用户指定、缩略图却还是旧球图」的存量记录（2026-10-23 反馈，幂等、封顶 40 条）
+    void repairStaleBallThumbs()
     // 启动后后台补齐缺缩略图的资产（v1 迁移 / rescan 后 thumbStatus 都是 none）
     void ensureMissingThumbs()
     // 材质类资产补材质球图（后台串行队列，2026-10 任务 6）
@@ -3488,12 +3496,18 @@ function ballSlotsOf(asset: Asset): ReturnType<typeof effectiveMaterialSlots> | 
  * ② `coverSource === 'named'`（包内自带官方渲染图）优先官方图，不渲球；
  * ③ 没有 albedo 槽位 → 素球无信息量，不渲（`ballSlotsOf` 的两道门）。
  *
+ * ⚠️ **`'manual'` 也必须排除**（2026-10-23 用户反馈修）：用户在「更换封面」里亲手选了
+ * 某张图当封面，卡片就必须显示那张——不能被球图顶掉。之前的实现只排除 `'named'`，
+ * 于是"选了包内 preview 图当封面、卡片仍是球"（`regenThumbSweep` 走球图分支、
+ * 保留 `asset.thumbPath === ball.name`，封面缩略图根本没被生成）。
+ * 判据是"用户是否明确指定过封面"，不是"封面好不好看"。
+ *
  * 供 `regenThumbSweep` 判定「能不能保住球图」：球图适用的资产在换封面 / 改名 / 分类
  * 迁移时都必须**保留**透明球图，不能被封面缩略图顶掉（2026-10 回归修复）。
  */
-function ballThumbTarget(asset: Asset): { name: string } | null {
+export function ballThumbTarget(asset: Asset): { name: string } | null {
   if (asset.kind !== 'material' && asset.kind !== 'texture') return null
-  if (asset.coverSource === 'named' && asset.cover) return null
+  if (asset.cover && (asset.coverSource === 'named' || asset.coverSource === 'manual')) return null
   const slots = ballSlotsOf(asset)
   if (!slots) return null
   return { name: ballThumbName(asset.id, slots, resolveRenderParams(asset)) }
@@ -3662,6 +3676,64 @@ function yieldToIdle(): Promise<void> {
 async function ensureMissingBallThumbs(): Promise<void> {
   const assets = useVault.getState().assets
   for (const a of assets) enqueueBallThumb(a)
+}
+
+/**
+ * 缩略图是否**仍然指向一张"已经不该用"的球图**（2026-10-23 用户反馈）。
+ *
+ * 场景：用户在「更换封面」里亲手选了某张图（`coverSource='manual'`），
+ * 但库里存的 `thumbPath` 还是旧的球图名 → 卡片继续显示球。
+ * 判据（三条同时成立才算）：
+ * ① 有封面且缩略图已就绪；
+ * ② `ballThumbTarget()` 现在返回 null（用户指定过封面 / 官方预览 / 非材质类）；
+ * ③ `thumbPath` **恰好等于**该资产当前的球图名（精确比对，不能用前缀猜——
+ *    封面缩略图也是 `<id>-<hash>.png`，前缀一致）。
+ *
+ * 导出仅供测试与 `repairStaleBallThumbs()` 使用。
+ */
+export function isStaleBallThumb(asset: Asset): boolean {
+  if (!asset.cover || asset.thumbStatus !== 'ready' || !asset.thumbPath) return false
+  if (ballThumbTarget(asset) !== null) return false
+  const slots = ballSlotsOf(asset)
+  if (!slots) return false
+  return asset.thumbPath === ballThumbName(asset.id, slots, resolveRenderParams(asset))
+}
+
+/** 每次启动最多修几条（正常只会有个位数，封顶防病态库把启动拖慢） */
+const REPAIR_THUMB_BATCH = 40
+const ballRepairAttempted = new Set<string>()
+
+/**
+ * 修「封面已被用户指定、缩略图却还是旧球图」的存量记录（只跑一次/启动，幂等）。
+ *
+ * 为什么需要它：`ballThumbTarget()` 的修复只影响**以后**的 `setCover`；
+ * 用户库里已经存着"球图名"的记录不会自己变，重开还是看到球——等于没修。
+ *
+ * 走 `regenThumbSweep` 而不是 `ensureThumb`：前者会先清掉该资产的旧缩略图
+ * （这里球图已不该用，通配删是安全的），保证磁盘上不留孤儿文件。
+ */
+export async function repairStaleBallThumbs(): Promise<number> {
+  const pending = useVault
+    .getState()
+    .assets.filter((a) => isStaleBallThumb(a) && !ballRepairAttempted.has(a.id))
+    .slice(0, REPAIR_THUMB_BATCH)
+  let repaired = 0
+  for (const a of pending) {
+    ballRepairAttempted.add(a.id)
+    // 等待期间可能被删 / 被重新设封面 → 复核一次
+    const current = useVault.getState().assets.find((x) => x.id === a.id)
+    if (!current || !current.cover || !isStaleBallThumb(current)) continue
+    const coverAbs = assetFileAbs(current.folder, current.cover)
+    const next = await regenThumbSweep(current.id, coverAbs).catch(() => null)
+    if (!next) continue
+    const latest = useVault.getState().assets.find((x) => x.id === a.id)
+    if (!latest) continue
+    const updated: Asset = { ...latest, thumbPath: next.thumbPath, thumbStatus: next.thumbStatus }
+    void db.assets.put(updated)
+    useVault.setState({ assets: useVault.getState().assets.map((x) => (x.id === updated.id ? updated : x)) })
+    repaired += 1
+  }
+  return repaired
 }
 
 /**

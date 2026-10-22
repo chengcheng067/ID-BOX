@@ -192,8 +192,15 @@ afterEach(async () => {
   useVault.setState({ assets: [], selectedId: null })
 })
 
-describe('保存封面不能把透明球图顶成「有底的封面缩略图」', () => {
-  it('球图 fresh 时保存封面 → 球图文件仍在、thumbPath 仍是球图名、零通配删', async () => {
+describe('封面与球图的优先级（2026-10-23 契约变更）', () => {
+  it('手动保存封面 → 球图**让位**给封面缩略图（旧契约"球图不许被顶掉"已作废）', async () => {
+    // 契约演进说明（勿删这段历史）：
+    // · 0.6.9 的原始缺陷是「通配删把球图删了、补回来的是封面 JPEG」，当时的修法是
+    //   "球图 fresh 时保存封面 → 仍保留球图"；
+    // · 2026-10-23 用户反馈「我在更换封面里选了包内 preview 图，卡片还是球」——
+    //   说明那条修法**过度**了：用户显式指定封面时，球图必须让位。
+    //   现在的判据在 `ballThumbTarget()`（`coverSource='manual'` 不再渲球），
+    //   并且 `commitCover` 会把**即将落库的来源**传给 `regenThumbSweep`（否则判定读到旧值）。
     const coverThumb = `${ID}-8cd965b3.jpg`
     modvault.ensureThumb.mockResolvedValue(coverThumb)
     await writeThumb(BALL, 'ball-png')
@@ -208,21 +215,21 @@ describe('保存封面不能把透明球图顶成「有底的封面缩略图」'
     expect(ok).toBe(true)
 
     const saved = putCalls.at(-1)!
-    // ① 卡片继续指向透明 PNG（修复前这里会变成 <id>-8cd965b3.jpg）
-    expect(saved.thumbPath).toBe(BALL)
+    // ① 卡片改指封面缩略图（用户看得见自己选的那张）
+    expect(saved.thumbPath).toBe(coverThumb)
     expect(saved.thumbStatus).toBe('ready')
-    // ② 球图**没被删**：旧实现 deleteThumb(id) 会把它一起删掉（回归根因）
-    expect(await exists(path.join(thumbsRoot, BALL))).toBe(true)
-    // ③ 球图适用时绝不允许按 id 通配删
-    expect(modvault.deleteThumb).not.toHaveBeenCalled()
-    // ④ 已经是 fresh → 不需重渲（零额外 WebGL 开销）
+    // ② 该资产已无球图要保 → 走通配删（清掉旧球图文件，不留垃圾）
+    expect(modvault.deleteThumb).toHaveBeenCalledWith(ID)
+    // ③ 没有"当前缩略图仍是球图"这回事了
+    expect(saved.thumbPath).not.toBe(BALL)
+    // ④ 不触发额外的球图重渲
     expect(renderMock).not.toHaveBeenCalled()
-    // 封面本身照常落库（「保存为封面」功能不受影响）
+    // ⑤ 封面本身照常落库
     expect(saved.cover).toBe('albedo.cover.jpg')
     expect(saved.coverSource).toBe('manual')
   })
 
-  it('旧状态是封面缩略图占位 → 保存一次封面后**自动补渲**球图（不用重启）', async () => {
+  it('手动指定封面后 → 缩略图换成封面缩略图、**不再**补渲球图（2026-10-23 新契约）', async () => {
     const oldCoverThumb = `${ID}-deadbeef.jpg`
     const newCoverThumb = `${ID}-8cd965b3.jpg`
     modvault.ensureThumb.mockResolvedValue(newCoverThumb)
@@ -240,19 +247,21 @@ describe('保存封面不能把透明球图顶成「有底的封面缩略图」'
     })
     expect(ok).toBe(true)
 
-    // 入队重渲（异步）→ 最终 thumbPath 回到透明球图
-    expect(await waitFor(() => useVault.getState().assets[0]?.thumbPath === BALL)).toBe(true)
+    // ★ 契约变更（2026-10-23 用户反馈「换了封面卡片还是球」）：`setCoverFromImage` 写的是
+    // `coverSource='manual'` → `ballThumbTarget()` 返回 null → **不该再渲球**，
+    // 缩略图必须是封面缩略图。此前这里断言"回到球图"，正是那条 bug 的另一种表现。
+    await waitFor(() => useVault.getState().assets[0]?.thumbPath === newCoverThumb)
+    expect(useVault.getState().assets[0]?.thumbPath).toBe(newCoverThumb)
     expect(useVault.getState().assets[0]?.thumbStatus).toBe('ready')
-    expect(await exists(path.join(thumbsRoot, BALL))).toBe(true)
-    expect(renderMock).toHaveBeenCalledTimes(1)
-    // 旧封面缩略图被**精确**删掉（不留垃圾），新封面缩略图保留在磁盘上（下次兜底用）
-    expect(await exists(path.join(thumbsRoot, oldCoverThumb))).toBe(false)
+    expect(renderMock).not.toHaveBeenCalled()
+    // 新封面缩略图留在磁盘上（旧的那张由通配删负责，桩不落盘所以这里不断言文件）
     expect(await exists(path.join(thumbsRoot, newCoverThumb))).toBe(true)
-    // 全程没有通配删
-    expect(modvault.deleteThumb).not.toHaveBeenCalled()
+    // 非球图资产走**通配删**（与模型同一条分支：该资产已经没有球图要保）
+    expect(modvault.deleteThumb).toHaveBeenCalledWith(ID)
+    expect(modvault.deleteOneThumb).not.toHaveBeenCalled()
   })
 
-  it('封面缩略图生成失败 → 不删旧球图（不彻底丢图）', async () => {
+  it('手动封面 + 封面缩略图生成失败 → 退化为占位，**绝不**把 thumbPath 留在球图上', async () => {
     modvault.ensureThumb.mockResolvedValue(null)
     await writeThumb(BALL, 'ball-png')
 
@@ -260,13 +269,14 @@ describe('保存封面不能把透明球图顶成「有底的封面缩略图」'
     useVault.setState({ assets: [a], selectedId: a.id })
     await useVault.getState().setCoverFromImage(a.id, { source: 'clipboard', data: 'x' })
 
-    // 不删任何旧文件：既没有通配删，也没有精确删
+    const after = useVault.getState().assets[0]
+    // 生成失败发生在任何删除之前 → 不动磁盘（旧球图文件成为孤儿，由 pruneThumbs 回收）
     expect(modvault.deleteThumb).not.toHaveBeenCalled()
     expect(modvault.deleteOneThumb).not.toHaveBeenCalled()
     expect(await exists(path.join(thumbsRoot, BALL))).toBe(true)
-    // 球图仍是当前缩略图（`regenThumbSweep` 见 thumbPath 就是球图 → 原样返回）
-    expect(await waitFor(() => useVault.getState().assets[0]?.thumbPath === BALL)).toBe(true)
-    expect(useVault.getState().assets[0]?.thumbStatus).toBe('ready')
+    // ★ 关键：不能再宣称"当前缩略图是球图"——那正是用户投诉的现象（换了封面还显示球）
+    expect(after?.thumbPath).not.toBe(BALL)
+    expect(after?.thumbStatus).not.toBe('ready')
   })
 
   it('模型资产（不该有球图）照旧走通配删 —— 守卫不是无差别跳过', async () => {

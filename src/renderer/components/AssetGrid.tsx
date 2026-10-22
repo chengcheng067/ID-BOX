@@ -42,6 +42,9 @@ import {
 import { computeRowWindow } from '../logic/virtualWindow'
 import { useScrollViewport, useVirtualWindow } from '../hooks/useVirtualWindow'
 import { AssetContextMenu } from './AssetContextMenu'
+import { FileContextMenu } from './FileContextMenu'
+import { EmptyAreaContextMenu } from './EmptyAreaContextMenu'
+import { MENU_TARGET_SELECTOR } from '../logic/contextMenu'
 import { PurgeConfirmDialog } from './PurgeConfirmDialog'
 import {
   IconBox,
@@ -59,7 +62,7 @@ import {
 } from '../icons'
 import { COLOR_TAG_LABEL } from '../../shared/types'
 import type { Asset, AssetKind, GridDensity } from '../../shared/types'
-import type { CSSProperties, DragEvent, MouseEvent, SVGProps } from 'react'
+import type { CSSProperties, DragEvent, MouseEvent, RefObject, SVGProps } from 'react'
 
 /**
  * 密度三档 → 网格 `minmax` 下限（反馈 6b，docs/15 §6b：大 240 / 中 184 / 小 132）。
@@ -642,6 +645,97 @@ function openFileRow(row: FileRow): void {
 }
 
 /**
+ * 「回到顶部」按钮的出现阈值（px）：约一屏多一点。低于它说明"一屏就看完了"，
+ * 顶栏/侧栏就在上方，按钮只是遮挡。
+ */
+const BACK_TO_TOP_THRESHOLD = 600
+
+/**
+ * 「快速回到顶部」浮起按钮（用户 2026-10-13："在素材库里面再增加一个快速回顶部的功能"）。
+ *
+ * ## 为什么不会跟着内容滚走
+ * 它**不是**滚动容器的子元素，而是挂在容器**父层**（`position: relative` 的那一层）上的
+ * `absolute bottom-5 right-5` 按钮。滚动的是容器内部的 `scrollTop`，按钮的包含块是外层
+ * 盒子 → 容器滚多远都不影响它的位置。（也正因为不在容器里，容器 `overflow: auto` 的
+ * 裁剪范围不含它。）
+ *
+ * ## 为什么直接对容器 `scrollTo` 就够（虚拟滚动下也一样）
+ * 虚拟滚动改的是"渲染哪一段行"，容器本身始终是那个真实 DOM，`scrollTop` 是浏览器管的。
+ * 平滑滚动会**连续发出 scroll 事件** → 既有的 `onScroll`（`scrollMemo` 记录 + rAF 合并的
+ * `viewport.onScroll`）会照常跟着跑，虚拟窗口自然一路更新，恢复逻辑也不会抢：
+ * 那条 effect 只在"容器重建 / 视口高度变化"时执行，且判据是
+ * `|scrollTop - scrollMemo| > 1`，平滑滚动期间两者同步递减 → 差恒为 0。
+ *
+ * ## 参数口径
+ * - 阈值 600px（见 `BACK_TO_TOP_THRESHOLD`）；过渡 180ms，只动 `opacity` + `translateY(4px)`；
+ * - 隐藏时 `pointer-events: none`（不可见却可点是最糟的形态）；
+ * - 键盘可达：原生 `<button>`，Tab 到 + Enter 即可，不做焦点陷阱。
+ */
+function BackToTop({
+  containerRef,
+  hidden = false,
+  attachKey
+}: {
+  /** 当前视图的滚动容器（网格 / 列表 / 文件视图各一个） */
+  containerRef: RefObject<HTMLDivElement>
+  /** 被上层覆盖时（例如文件视图展开）直接不渲染，避免两个按钮叠着 */
+  hidden?: boolean
+  /**
+   * 容器**换节点**的重订阅信号。
+   *
+   * ⚠️ 不能省：网格容器在「切视图 / 进出文件视图 / 切重复视图」时会被**销毁重建**，
+   * 而 `ref` 对象身份不变 → effect 不会重跑 → 监听还挂在已卸载的旧节点上
+   * （表现为：按钮点不动，或该出现时不出现）。传一个能代表"挂载点换了"的字符串即可。
+   */
+  attachKey?: unknown
+}) {
+  const [visible, setVisible] = useState(false)
+
+  useEffect(() => {
+    if (hidden) return
+    const el = containerRef.current
+    if (!el) return
+    const sync = (): void => setVisible(el.scrollTop > BACK_TO_TOP_THRESHOLD)
+    // 挂载时先同步一次：从文件视图返回 / 切视图时容器可能已经不在顶部
+    sync()
+    el.addEventListener('scroll', sync, { passive: true })
+    return () => el.removeEventListener('scroll', sync)
+  }, [containerRef, hidden, attachKey])
+
+  if (hidden) return null
+
+  return (
+    <button
+      type="button"
+      aria-label="回到顶部"
+      title="回到顶部（滚动超过一屏时出现）"
+      onClick={() => {
+        // 不用 `window.scrollTo`：滚动的是中栏容器，不是文档
+        containerRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+      }}
+      className={`absolute bottom-5 right-5 z-30 flex h-9 w-9 items-center justify-center rounded-full border border-line bg-card/90 text-secondary shadow-modal transition-[opacity,transform] duration-[180ms] ease-out hover:bg-elevated hover:text-primary ${
+        visible ? 'opacity-100' : 'pointer-events-none translate-y-1 opacity-0'
+      }`}
+    >
+      {/* chevron-up：16px / 1.8 描边（与菜单、侧栏同一套线性风格） */}
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M6 14.5L12 8.5l6 6" />
+      </svg>
+    </button>
+  )
+}
+
+/**
  * 中栏「软件内文件夹浏览器」（docs/15 §6c，用户反馈：所有 UI 由我们控）。
  *
  * - 双击行 / 卡片 = 用系统默认程序打开**该文件**（不是打开资源管理器）；
@@ -663,6 +757,15 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
   const openHdrPreview = useVault((s) => s.openHdrPreview)
   // 文件网格复用资产网格的密度档位（大 / 中 / 小），两处列宽口径一致
   const gridDensity = useVault((s) => s.settings?.gridDensity ?? 'medium')
+  /**
+   * 本视图自己的两个右键菜单（**不借用网格那套 state**）：
+   * 文件视图是盖在网格之上的独立层，网格的 `menu` 打开时会被退场动画 / inert 影响，
+   * 而且文件菜单作用的是"某一行"，与资产菜单的作用集合（`ids`）不是一回事。
+   */
+  const [fileMenu, setFileMenu] = useState<{ x: number; y: number; row: FileRow } | null>(null)
+  const [emptyMenu, setEmptyMenu] = useState<{ x: number; y: number } | null>(null)
+  /** 当前文件视图的滚动容器（grid / list 二选一，同一时刻只有一个在 DOM 里） */
+  const fileScrollRef = useRef<HTMLDivElement>(null)
   const rows = buildFileRows(asset)
 
   useEffect(() => {
@@ -680,7 +783,14 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
   if (rows.length === 0) {
     return (
       // 空态也走同一个入场动画（整体一条，不 stagger）——否则"进入后什么都没有"会闪一下
-      <div className="folder-anim-item flex flex-1 flex-col items-center justify-center gap-3 text-muted">
+      <div
+        // 本轮：**空态容器本身**也要能右键（用户口径"所有界面的空界面右键都要有刷新"）
+        onContextMenu={(e) => {
+          e.preventDefault()
+          setEmptyMenu({ x: e.clientX, y: e.clientY })
+        }}
+        className="folder-anim-item flex flex-1 flex-col items-center justify-center gap-3 text-muted"
+      >
         {/* 图标规格 A：与其它空态同规格（40px、单色 currentColor） */}
         <IconEmptyLibrary className="text-tertiary" />
         <p className="text-sm">这个资产文件夹里没有可列出的文件</p>
@@ -690,6 +800,13 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
         <button className="btn" onClick={closeFolderView} title="返回资产列表（Esc）">
           返回资产列表
         </button>
+        {emptyMenu && (
+          <EmptyAreaContextMenu
+            x={emptyMenu.x}
+            y={emptyMenu.y}
+            onClose={() => setEmptyMenu(null)}
+          />
+        )}
       </div>
     )
   }
@@ -735,6 +852,23 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
       : `${row.absPath}\n双击用系统默认程序打开`
 
   /**
+   * 文件行 / 文件卡的右键（本轮新增）：弹**文件菜单**（不是资产菜单 —— 文件不是资产，
+   * 这里能做的只有打开 / 定位 / 设为封面 / 复制）。
+   *
+   * `data-file-row="1"` 同时是外层滚动容器判"这是空白处吗"的依据
+   * （`MENU_TARGET_SELECTOR` 里逐字引用这个属性名），两者必须一起改。
+   * `stopPropagation` 保证只弹一层：否则文件菜单 + 空白处菜单会同时出现。
+   */
+  const rowMenuProps = (row: FileRow) => ({
+    'data-file-row': '1',
+    onContextMenu: (e: MouseEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      setFileMenu({ x: e.clientX, y: e.clientY, row })
+    }
+  })
+
+  /**
    * 文件行双击（0.6.5）：
    * - **HDRI 资产里的 `.hdr` 文件** → 进 HDR 预览（与网格双击 / 详情面板按钮同一个
    *   `openHdrPreview` 入口，绝不在这里再开一份弹窗 state）；
@@ -762,6 +896,7 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
           <div
             key={row.rel}
             {...fileDragProps(row)}
+            {...rowMenuProps(row)}
             onDoubleClick={() => openRow(row)}
             title={fileTitle(row)}
             // Win8 磁贴入场：`folder-anim-item` 由外层 `.folder-stage` 的
@@ -790,6 +925,7 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
           key={row.rel}
           data-file-card
           {...fileDragProps(row)}
+          {...rowMenuProps(row)}
           onDoubleClick={() => openRow(row)}
           title={fileTitle(row)}
           style={folderStaggerStyle(i)}
@@ -820,16 +956,56 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
     </div>
   )
 
+  /**
+   * 文件视图的**空白处**右键（容器级）。
+   *
+   * 判定口径与网格一致：事件目标落在文件行 / 文件卡里 → 是行自己的菜单，这里不接管；
+   * 其余（行与行之间的缝隙、下方留白）→ 弹空白处菜单（刷新 / 清除筛选）。
+   */
+  const emptyAreaProps = {
+    onContextMenu: (e: MouseEvent) => {
+      const target = e.target as Element | null
+      if (target?.closest(MENU_TARGET_SELECTOR)) return
+      e.preventDefault()
+      setEmptyMenu({ x: e.clientX, y: e.clientY })
+    }
+  }
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div
+      // 空白处右键挂在**最外层**：滚动容器、行间缝隙、顶部说明条、下方留白都算"空白"
+      // （挂在两个滚动容器上会漏掉说明条；两处都挂又会同一次右键跑两遍）
+      {...emptyAreaProps}
+      // `relative`：给「回到顶部」按钮当包含块（它在滚动容器**外面**，才不会跟着内容滚走）
+      className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+    >
       <div className="shrink-0 px-5 pt-1 text-[11px] text-muted">
         双击文件用系统默认程序打开 · 拖拽文件可拖出到建模软件 · Esc 返回
       </div>
       {/* 形态严格跟随顶栏 view：grid = 卡片网格（与资产网格同密度），list = 行表格 */}
       {view === 'grid' ? (
-        <div className="flex-1 overflow-auto px-5 pb-4 pt-4">{gridBody}</div>
+        <div ref={fileScrollRef} className="flex-1 overflow-auto px-5 pb-4 pt-4">
+          {gridBody}
+        </div>
       ) : (
-        <div className="flex-1 overflow-auto px-4 py-3">{listBody}</div>
+        <div ref={fileScrollRef} className="flex-1 overflow-auto px-4 py-3">
+          {listBody}
+        </div>
+      )}
+      {/* `key={view}`：grid ↔ list 换的是另一个 DOM 节点（ref 对象身份不变），
+          必须重挂一次才能重新绑 scroll 监听 */}
+      <BackToTop key={view} containerRef={fileScrollRef} />
+      {fileMenu && (
+        <FileContextMenu
+          x={fileMenu.x}
+          y={fileMenu.y}
+          assetId={asset.id}
+          row={fileMenu.row}
+          onClose={() => setFileMenu(null)}
+        />
+      )}
+      {emptyMenu && (
+        <EmptyAreaContextMenu x={emptyMenu.x} y={emptyMenu.y} onClose={() => setEmptyMenu(null)} />
       )}
     </div>
   )
@@ -893,6 +1069,12 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
   /** 0.6.0 批量重命名：只做批量（单选走详情面板的单条改名，不在本功能范围） */
   const openRenameDialog = useVault((s) => s.openRenameDialog)
   const [menu, setMenu] = useState<{ x: number; y: number; ids: string[] } | null>(null)
+  /**
+   * 空白处右键（刷新 / 清除筛选）。与 `menu`（资产卡片的菜单）**分开存**：
+   * 两者互斥且作用对象完全不同（一组 id vs 当前视图），塞进一个 state 只会让
+   * 渲染分支互相覆盖。声明位置必须在所有早退之前（下方多处空态要用）。
+   */
+  const [emptyMenu, setEmptyMenu] = useState<{ x: number; y: number } | null>(null)
 
   // ── 文件视图（双击进入）的**进出场动画**载体 ────────────────────────────────
   //
@@ -1480,6 +1662,30 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
     setFilter(DEFAULT_FILTERS)
   }
 
+  /**
+   * **空白处右键**（本轮需求：「所有界面的空界面右键都增加刷新按钮」）。
+   *
+   * 判定：事件目标落在卡片 / 文件行内 → 那是它们自己的菜单，这里直接放弃
+   * （卡片上的 `onContextMenu` 已经 `preventDefault`，但**不** `stopPropagation` ——
+   * 它有拖拽/框选等冒泡依赖，所以豁免必须放在容器这侧做）。
+   *
+   * 覆盖范围：网格容器、列表容器、三个空态容器、文件视图的滚动容器（各自展开用途）。
+   * 滚动条上的右键也算空白（Chromium 里滚动条在容器内，但不在任何卡片上）。
+   */
+  const onEmptyContextMenu = (e: MouseEvent) => {
+    const target = e.target as Element | null
+    if (target?.closest(MENU_TARGET_SELECTOR)) return
+    e.preventDefault()
+    // 与卡片菜单互斥：右键空白处时把上一张卡片的菜单收掉，避免两层浮层叠着
+    setMenu(null)
+    setEmptyMenu({ x: e.clientX, y: e.clientY })
+  }
+
+  /** 空态也要能右键（三处空态共用一个渲染口） */
+  const emptyAreaMenu = emptyMenu ? (
+    <EmptyAreaContextMenu x={emptyMenu.x} y={emptyMenu.y} onClose={() => setEmptyMenu(null)} />
+  ) : null
+
   // 用户反馈第 5 条：库里仍有资产、只是筛选结果为 0 → 这里必须显示「没有匹配的资产」，
   // 绝不能被 App 的全局空态（拖包 CTA）盖掉。生效维度提取在 filters.ts 的纯函数里，组件只渲染。
   //
@@ -1489,19 +1695,26 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
     // C 线：回收站空态与「筛选结果为 0」是两件事，文案必须分开（否则用户会去清筛选）
     if (trashMode) {
       return (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted">
+        <div
+          onContextMenu={onEmptyContextMenu}
+          className="flex flex-1 flex-col items-center justify-center gap-3 text-muted"
+        >
           <IconTrash width={40} height={40} className="text-tertiary" />
           <p className="text-sm">回收站是空的</p>
           <p className="max-w-md text-center text-[12px] leading-relaxed">
             删除的资产会先放进这里，保留期内随时可以还原；到期后自动彻底删除。
           </p>
+          {emptyAreaMenu}
         </div>
       )
     }
     const dims = activeFilterDimensions(filters)
     const hasDupDim = dupOnly
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted">
+      <div
+        onContextMenu={onEmptyContextMenu}
+        className="flex flex-1 flex-col items-center justify-center gap-3 text-muted"
+      >
         {/* 图标规格 A：筛选结果为 0 的空态图形（40px、单色 currentColor） */}
         <IconEmptyFilter className="text-tertiary" />
         <p className="text-sm">没有匹配的资产</p>
@@ -1515,6 +1728,7 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
             清空筛选
           </button>
         )}
+        {emptyAreaMenu}
       </div>
     )
   }
@@ -1523,7 +1737,10 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
   // （同上：文件视图盖在网格之上，不能被这个空态替换掉）
   if (dupOnly && shownGroups.length === 0 && !folderStageOn) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted">
+      <div
+        onContextMenu={onEmptyContextMenu}
+        className="flex flex-1 flex-col items-center justify-center gap-3 text-muted"
+      >
         <IconEmptyFilter className="text-tertiary" />
         <p className="text-sm">没有发现重复资产</p>
         <p className="max-w-md text-center text-[12px] leading-relaxed">
@@ -1532,6 +1749,7 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
         <button className="btn" onClick={leaveDupView} title="退出重复视图，恢复显示整个库">
           返回全部资产
         </button>
+        {emptyAreaMenu}
       </div>
     )
   }
@@ -1554,6 +1772,8 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
     // 回收站里不弹资产菜单：菜单项是「指派分类 / 删除」，对已删资产都是错的
     // （再删一次会拿旧 folder 去软删，主进程只会报失败）。还原 / 彻底删除在详情面板与浮出条上。
     if (trashMode) return
+    // 与空白处菜单互斥（同一次右键不该留两层）
+    setEmptyMenu(null)
     setMenu({ x: e.clientX, y: e.clientY, ids: contextMenuIds(a) })
   }
 
@@ -1770,7 +1990,9 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
     return (
       <tr
         key={a.id}
-        data-asset-card
+        // `="1"` 是给"空白处右键"与框选共用的**值**（选择器在 logic/contextMenu.ts，
+        // 两边必须逐字一致；只写布尔属性在 HTML 里是空串，选择器要写 `[data-asset-card]` 才对得上）
+        data-asset-card="1"
         // 框选命中靠这个属性把 DOM 矩形映射回 assetId（见 snapshotCardBoxes）
         data-asset-id={a.id}
         {...dragProps(a)}
@@ -1858,6 +2080,8 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
       }}
       // 框选只能在**空白处**起手（卡片/控件上的 mousedown 由 startMarquee 内部排除）
       onMouseDown={startMarquee}
+      // 空白处右键 = 刷新 / 清除筛选（卡片由自身的 onContextMenu 拦截，见 onEmptyContextMenu）
+      onContextMenu={onEmptyContextMenu}
       // `relative`：框选矩形是滚动容器的绝对定位子元素（内容坐标系，随内容滚动 + 被容器裁剪）
       className="relative flex-1 overflow-auto px-4 py-3"
     >
@@ -1943,7 +2167,7 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
         key={a.id}
         role="button"
         tabIndex={0}
-        data-asset-card
+        data-asset-card="1"
         // 框选命中靠这个属性把 DOM 矩形映射回 assetId（见 snapshotCardBoxes）
         data-asset-id={a.id}
         {...dragProps(a)}
@@ -2115,6 +2339,8 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
       }}
       // 框选只能在**空白处**起手（卡片/控件上的 mousedown 由 startMarquee 内部排除）
       onMouseDown={startMarquee}
+      // 空白处右键 = 刷新 / 清除筛选（同上：卡片自身会先拦截）
+      onContextMenu={onEmptyContextMenu}
       // `relative`：框选矩形是本容器的绝对定位子元素（内容坐标系，随内容滚动 + 被容器裁剪）
       className="relative flex-1 overflow-auto px-5 pt-5 pb-4"
     >
@@ -2163,6 +2389,16 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       {view === 'list' ? list : grid}
+
+      {/* 「回到顶部」：挂在**这一层**（`relative`）而不是滚动容器里 —— 容器滚多远，
+          按钮都钉在中栏右下角。`containerRef` 跟着当前视图换（grid ↔ list 是不同的
+          DOM 节点，ref 对象身份不变时需要这里的入参变化来触发重绑）。
+          文件视图展开时它让位（文件视图自己有一个，见 FolderFileList）。 */}
+      <BackToTop
+        containerRef={view === 'list' ? listRef : gridRef}
+        hidden={folderStageOn}
+        attachKey={scrollMountKey}
+      />
 
       {/* ── 文件视图（进入）：盖在网格之上 ──────────────────────────────────
        * 网格**不卸载**，留在下面 → 交叉淡入的 130ms 里用户看到的是"网格 → 文件列表"，
@@ -2266,6 +2502,8 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
       )}
 
       {menu && <AssetContextMenu x={menu.x} y={menu.y} ids={menu.ids} onClose={() => setMenu(null)} />}
+      {/* 空白处右键（所有视图共用；文件视图内部另有一份，见 FolderFileList） */}
+      {emptyAreaMenu}
       {purgeIds && <PurgeConfirmDialog ids={purgeIds} onClose={() => setPurgeIds(null)} />}
     </div>
   )
