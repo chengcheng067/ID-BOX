@@ -82,12 +82,15 @@ describe('记住形状 · CustomRenderDialog 的契约闭环', () => {
     )
   })
 
-  it('★「设为封面」渲 JPG 必须带场景当前形态（否则封面与预览不一致）', () => {
-    const at = DIALOG.indexOf('renderBallToJpeg(asset.relFolder, slots, {')
+  it('★「设为封面」渲图（透明 PNG）必须带场景当前形态（否则封面与预览不一致）', () => {
+    const at = DIALOG.indexOf('renderBallToPng(asset.relFolder, slots, {')
     expect(at).toBeGreaterThan(-1)
     const body = DIALOG.slice(at, at + 260)
     expect(DIALOG).toContain('ballApiRef.current?.getShape() ?? resolveRenderShape(asset)')
-    expect(body).toContain('shape,')
+    // 选项里必须有 shape（最后一个选项，可能没有尾逗号）
+    expect(body).toMatch(/shape\s*,?\s*\}\)/)
+    // 2026-10-23：封面一律透明 PNG（用户拍板），不许接回 JPEG
+    expect(DIALOG).not.toContain('renderBallToJpeg(')
   })
 
   it('形态按钮对用户仍不可见（本批只让类型闭环，不加 UI）', () => {

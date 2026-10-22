@@ -104,10 +104,9 @@ const PLANE_REPEAT = 2
  * 离屏 JPG 背景色（v0.2.1 增补 1，覆盖 §3.7）：**主题化**，读 `--render-canvas-bg`
  * ——浅色 `#FFFFFF` / 深色 `#1C1C1E`。
  *
- * ⚠️ 只给**「保存为封面」**这条路径用（`renderBallToJpeg` / CustomRenderDialog 预览）：
- * 封面是落进资产目录的不透明成品图，必须有背景色。**球图缩略图不走这里**——
- * 那是透明 PNG（`renderBallToPng`），背景由卡片 `bg-canvas` 提供。
- * 导出供 `CustomRenderDialog` 复用，两处共用同一口径。
+ * ⚠️ 2026-10-23 起**封面不再走 JPEG**（用户拍板：封面一律透明 PNG）。这个色现在只服务
+ * `renderBallToJpeg`（带底输出的遗留能力）。**球图缩略图与封面都不走这里**——
+ * 它们都是透明 PNG（`renderBallToPng`），背景由卡片 `bg-canvas` 提供。
  */
 export function paperColor(): string {
   if (typeof document === 'undefined') return '#ffffff'
@@ -1414,12 +1413,18 @@ export function MaterialBall({
     ballRef.current?.applyMotionProfile(profile)
   }, [profile])
 
-  /** 「保存为封面」：当前参数离屏渲一帧 → Blob 交给调用方落盘（需求书 §3.3） */
+  /**
+   * 「保存为封面」：当前参数离屏渲一帧 → Blob 交给调用方落盘（需求书 §3.3）。
+   *
+   * 2026-10-23 用户拍板：**封面一律透明 PNG**（"不需要是 JPG"）。
+   * 卡片走封面缩略图时会透出 `bg-canvas`，方底/黑边从根上消失；
+   * `renderBallToJpeg` 已不再用于封面，别接回来（有源码守卫）。
+   */
   const saveCover = async () => {
     if (!onSaveAsCover || saving) return
     setSaving(true)
     try {
-      const blob = await renderBallToJpeg(relFolder, slots, {
+      const blob = await renderBallToPng(relFolder, slots, {
         shape,
         size: 480,
         params: scales
@@ -1688,11 +1693,11 @@ async function renderBallBlob(
 /**
  * 离屏渲染一帧材质球 → **JPEG** Blob（不透明、纸色背景）。
  *
- * 用途：**「保存为封面」**（`CustomRenderDialog.save()` / `MaterialBall.saveCover()`）
- * ——封面落在资产目录里、用户在文件管理器里也能看到，必须是不透明图（透明 PNG 在
- * 白色背景的看图器里会变成"没有背景的球"）。**行为与签名与改造前完全一致**。
+ * ⚠️ **已不再用于封面**（2026-10-23 用户拍板：封面一律透明 PNG，见
+ * `renderBallToPng`）。保留导出只因为它是"带底输出"的唯一实现（给外部看图 /
+ * 导出场景用）；**别把它接回封面路径**——不透明的底会在卡片上变成一块方色块。
  *
- * 球图缩略图**不要**用这个，用 `renderBallToPng`（透明背景，缓存与主题无关）。
+ * 球图缩略图与封面**都不要**用这个，用 `renderBallToPng`（透明背景）。
  */
 export async function renderBallToJpeg(
   relFolder: string,
@@ -1703,7 +1708,10 @@ export async function renderBallToJpeg(
 }
 
 /**
- * 离屏渲染一帧材质球 → **透明背景 PNG** Blob（球图缩略图专用）。
+ * 离屏渲染一帧材质球 → **透明背景 PNG** Blob。
+ *
+ * 两个用途：**球图缩略图** + **「保存为封面」**（2026-10-23 用户拍板：封面也走透明 PNG，
+ * 这样 `manual` 封面 → 缩略图（`toPNG()` 保 alpha）→ 卡片透出画布色，不会出现方底）。
  *
  * 为什么必须透明：网格卡片的封面容器自带 `bg-canvas`（浅色 #FFFFFF / 深色 #1C1C1E）。
  * 透明像素会透出卡片自身的画布色，于是**同一个缓存文件在深浅两个主题下都正确**

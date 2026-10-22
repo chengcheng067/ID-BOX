@@ -213,16 +213,18 @@ export function CustomRenderDialog({
       await useVault.getState().persistRenderParams(asset.id, scales)
 
       if (plan.writeCover) {
-        const { renderBallToJpeg, blobToBase64, paperColor } = await import('./MaterialBall')
+        const { renderBallToPng, blobToBase64 } = await import('./MaterialBall')
         // 形态必须跟着"用户正看着的那颗球"（2026-10 缓存策略）：用户看到平面却渲出球，
         // 封面就和预览不一致。`getShape()` 拿的是场景当前形态；API 还没就绪时回落到资产记忆值。
         const shape = ballApiRef.current?.getShape() ?? resolveRenderShape(asset)
-        // v0.2.1 增补 1：背景走主题化 paperColor()（读 --render-canvas-bg），不再硬编码近黑
-        const blob = await renderBallToJpeg(asset.relFolder, slots, {
+        // 2026-10-23 用户拍板：**封面文件用透明 PNG**（"不需要是 JPG"）。
+        // 这样 `manual` 封面 → 缩略图（`toPNG()` 保 alpha）→ 卡片透出画布色，
+        // 「保存封面后出现一块方底」从根上消失，也不需要为渲图单开一个 coverSource。
+        // ⚠️ 不要再传 `background`：PNG 分支恒为透明（见 resolveBallBackground）。
+        const blob = await renderBallToPng(asset.relFolder, slots, {
           size: 480,
           params: scales,
-          shape,
-          background: paperColor()
+          shape
         })
         const base64 = await blobToBase64(blob)
         if (!base64) throw new Error('离屏渲染读帧失败')
