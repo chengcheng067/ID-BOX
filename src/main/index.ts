@@ -53,7 +53,7 @@ import {
 import { findSevenZip, thumbsDir } from './paths'
 import { fetchLatestRelease } from './updateCheck'
 import { freeBytesOf } from './disk'
-import { deleteThumb, deleteOneThumb, ensureThumb, clearThumbs, pruneThumbs, thumbStats } from './thumb'
+import { deleteThumb, deleteOneThumb, ensureThumb, clearThumbs, listThumbFiles, pruneThumbs, thumbStats } from './thumb'
 import { MAX_COVER_IMAGE_BYTES, writeCoverImageInto } from './coverImage'
 import {
   refreshZhimoCoverInto,
@@ -1172,6 +1172,17 @@ ipcMain.handle(IPC.thumbPrune, (_e, liveIds: string[]) => pruneThumbs(liveIds ??
 ipcMain.handle(IPC.thumbClear, () => clearThumbs())
 
 ipcMain.handle(IPC.thumbStats, () => thumbStats())
+
+/**
+ * **只读**列出缩略图缓存文件（2026-10 数据救援）。
+ *
+ * 用途：rescan 曾把 `thumbPath` 抹空而图片还在盘上——渲染层需要"盘上有什么"
+ * 才能按 `<id>-<8hex>` 精确挂回（通用修复，取代硬编码对照表）。
+ *
+ * 安全边界：只读 `thumbsDir`，只回 `name/size/mtimeMs`，**不提供删除能力**；
+ * 越界/解析失败/stat 失败的条目在 `listThumbFiles` 内静默跳过。
+ */
+ipcMain.handle(IPC.thumbList, () => listThumbFiles())
 
 /**
  * HDR 预览准备（0.6.5）：流式解码 + 盒式降采样 + 落缓存。

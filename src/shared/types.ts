@@ -866,6 +866,25 @@ export interface SaveBallThumbPayload {
   base64: string
 }
 
+/**
+ * 缩略图缓存目录里的一**个文件**（`thumb:list` 的返回值，2026-10 数据救援）。
+ *
+ * 只读快照：`name` 是纯文件名（`<id>-<8hex>.(jpg|png)`），不含目录。
+ * 提供 `size` / `mtimeMs` 是因为救援要「同一 id 多个候选时取最新」——
+ * 主进程已经 stat 过一遍，渲染层不必再为每个文件额外发一次 IPC。
+ *
+ * ⚠️ 刻意**不**提供路径 / 删除能力：这条通道只用于"盘上有什么"，
+ * 清理仍然只能走 `thumbDelete` / `thumbDeleteOne` / `thumbPrune`（各自有校验）。
+ */
+export interface ThumbFileEntry {
+  /** 纯文件名（相对 thumbs 目录） */
+  name: string
+  /** 字节数 */
+  size: number
+  /** 最后修改时间（毫秒时间戳） */
+  mtimeMs: number
+}
+
 // ── T08：rescan 忽略上报（RA6，06 §11.2） ──────────────────────────
 
 /** 结构符合性上报的原因 */

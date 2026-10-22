@@ -41,6 +41,17 @@ export const IPC = {
   thumbClear: 'thumb:clear',
   /** T04 追加：缓存数量 / 占用，设置面板显示用 */
   thumbStats: 'thumb:stats',
+  /**
+   * **只读**列出缩略图缓存目录里的文件（2026-10 数据救援）：
+   * 返回 `ThumbFileEntry[]`（name / size / mtimeMs）。
+   *
+   * 存在的理由：rescan 曾把 `thumbPath` 抹成空，而图片文件还在盘上——
+   * 通用修复需要知道"盘上到底有哪些 `<id>-<8hex>`"，否则只能靠硬编码对照表。
+   *
+   * ⚠️ 本通道**只读**：不提供任何删除能力（清理仍走 thumb:delete / thumb:deleteOne / thumb:prune）。
+   * 尤其**不要**用 `thumb:prune` 当探测——它会把不在 liveIds 里的文件全部删掉。
+   */
+  thumbList: 'thumb:list',
   diskFree: 'disk:free',
   indexBackup: 'index:backup',
   // ── T06 新增（分类体系，06 v1.0.2 §12.1） ──────────────────────

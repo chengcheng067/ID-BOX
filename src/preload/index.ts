@@ -34,6 +34,7 @@ import type {
   SetCoverImagePayload,
   SetCoverImageResult,
   Settings,
+  ThumbFileEntry,
   TrashPurgeItem,
   TrashPurgeResult,
   TrashRestoreItem,
@@ -154,6 +155,13 @@ const api = {
     ipcRenderer.invoke(IPC.thumbDeleteOne, id, name),
   /** 清理孤儿缓存，返回删掉的数量 */
   pruneThumbs: (liveIds: string[]): Promise<number> => ipcRenderer.invoke(IPC.thumbPrune, liveIds),
+  /**
+   * **只读**列出缩略图缓存目录里的文件（`name` / `size` / `mtimeMs`）。
+   *
+   * 只给"盘上有什么"，**没有任何删除能力**；用于把被 rescan 抹掉的 `thumbPath`
+   * 按 `<id>-<8hex>` 精确挂回。⚠️ 不要用 `pruneThumbs` 做探测（它会删文件）。
+   */
+  listThumbs: (): Promise<ThumbFileEntry[]> => ipcRenderer.invoke(IPC.thumbList),
   /** 清空缩略图缓存，返回清掉的数量 */
   clearThumbs: (): Promise<number> => ipcRenderer.invoke(IPC.thumbClear),
   /** 缓存统计：设置面板显示「当前缓存数量 / 占用」 */

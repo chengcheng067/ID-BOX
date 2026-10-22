@@ -15,6 +15,7 @@ import {
 } from '../shared/thumb'
 import { extOf } from '../shared/format'
 import { isWithinRoot } from '../shared/vault'
+import type { ThumbFileEntry } from '../shared/types'
 
 export { thumbsDir }
 
@@ -199,6 +200,38 @@ export async function thumbStats(): Promise<ThumbStats> {
 /** 缓存数量（便捷包装） */
 export async function thumbCount(): Promise<number> {
   return (await thumbStats()).count
+}
+
+/**
+ * **只读**列出缩略图缓存文件（2026-10 数据救援，`thumb:list`）。
+ *
+ * 为什么需要它：rescan 曾把 `thumbPath` 抹空，而图片文件还在盘上；通用修复必须
+ * 知道"盘上到底有哪些 `<id>-<8hex>` 文件，各自多大、多新"，否则只能硬编码对照表。
+ *
+ * 纪律：
+ * - **只读**，绝不删任何东西（清理仍走 `deleteThumb` / `deleteOneThumb` / `pruneThumbs`）；
+ * - 只返回**能解析成缩略图名**的文件（`parseThumbFileName`），其它杂项一律忽略；
+ * - `stat` 失败（被杀毒锁住 / 刚被删）的条目**静默跳过**，不让一个坏文件打断整批；
+ * - 目录不存在时返回空数组（首次运行 / 用户手动清过缓存）。
+ *
+ * `mtimeMs` 是救援"同 id 多候选取最新"的判据，因此在 main 侧一次 stat 完，
+ * 避免渲染层为每个文件再发一轮 IPC。
+ */
+export async function listThumbFiles(): Promise<ThumbFileEntry[]> {
+  try {
+    const dir = await ensureThumbsDir()
+    const names = await fs.readdir(dir)
+    const out: ThumbFileEntry[] = []
+    for (const name of names) {
+      if (!parseThumbFileName(name)) continue
+      const st = await fs.stat(path.join(dir, name)).catch(() => null)
+      if (!st || !st.isFile()) continue
+      out.push({ name, size: st.size, mtimeMs: st.mtimeMs })
+    }
+    return out
+  } catch {
+    return []
+  }
 }
 
 /** 缓存占用字节数（便捷包装） */
