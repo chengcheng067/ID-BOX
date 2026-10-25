@@ -85,6 +85,20 @@ describe('四份手写 Esc 已删除', () => {
     // App 的全局 decideEsc → close-settings（qa-real076 真机缺陷 0.7.6-ESC-01）
     expect(src).toContain('useEscLayer(onClose, !!settings)')
   })
+
+  it('别名输入框在回滚后把 Esc 按死在本地（不依赖"层栈非空"这条前提）', () => {
+    const src = read('components/SettingsDialog.tsx')
+    const at = src.indexOf('revertingRef.current = true')
+    expect(at).toBeGreaterThan(-1)
+    // 回滚分支内必须有 stopPropagation，且必须在 blur() 之前调
+    // （blur 同步派发，会把 React 合成事件提前收尾）
+    const branch = src.slice(at, at + 600)
+    const stopAt = branch.indexOf('e.stopPropagation()')
+    const blurAt = branch.indexOf('e.currentTarget.blur()')
+    expect(stopAt).toBeGreaterThan(-1)
+    expect(blurAt).toBeGreaterThan(-1)
+    expect(stopAt).toBeLessThan(blurAt)
+  })
 })
 
 describe('自绘 dialog-scrim 一律要进层栈（0.7.6-ESC-01 的结构性守卫）', () => {

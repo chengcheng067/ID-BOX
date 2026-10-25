@@ -362,10 +362,17 @@ function AliasRow({
           // 这里的 Esc 语义是「回滚这条别名的草稿」，**不是**关弹窗：
           // 草稿只在失焦时才保存，按 Esc 走人等于放弃修改 —— 若让 `Modal` 吃掉 Esc，
           // 用户本想撤回一格输入，结果整个设置弹窗被关掉。
-          // `data-esc-own` 让 `Modal` 的捕获阶段监听对这一格放行（见 Modal.tsx 同名注释）。
+          // `data-esc-own` 让 Esc 层的捕获监听（useEscLayer，见 logic/escLayer.ts）
+          // 对这一格放行；这里的 stopPropagation 再把它拦在 App 的全局 Esc 之前。
           if (e.key === 'Escape') {
             revertingRef.current = true
             setDraft(record.name)
+            // 回滚做完后把按键按死在输入框这一层（0.7.6-ESC-01 的第三道保险）：
+            // `useEscLayer` 见到 `data-esc-own` 只会**放行**（它绝不能 stop，否则这一格
+            // 的草稿回滚就收不到按键了），放行之后事件会继续冒泡到 App 的 window 冒泡监听。
+            // 本层 stop 之后，App 连 `decideEsc` 都不会进 —— 不依赖"层栈非空"这个前提。
+            // 必须在 blur() 之前调：blur 是同步派发的，会把 React 合成事件提前收尾。
+            e.stopPropagation()
             e.currentTarget.blur()
           }
         }}

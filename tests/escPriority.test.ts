@@ -59,6 +59,14 @@ describe('decideEsc：栈顶优先', () => {
     expect(decideEsc(ctx)).toBe('none')
   })
 
+  it('设置弹窗作为一层在场时：App 不动，更不许清选中（0.7.6-ESC-01）', () => {
+    // 设置页是自绘外壳，它必须自己 useEscLayer 进栈（见 modalEsc 守卫）；
+    // 一旦进栈，这里就只能返回 'none' —— 否则「别名输入框按 Esc」会连带关窗。
+    expect(decideEsc({ ...IDLE, modalOpen: true, settingsOpen: true, hasSelection: true })).toBe(
+      'none'
+    )
+  })
+
   it('分类选择器 / 设置弹窗各有独立动作（Modal 未挂载的窗口期也不清选中）', () => {
     expect(decideEsc({ ...IDLE, categoryPickerOpen: true, hasSelection: true })).toBe(
       'close-category-picker'
