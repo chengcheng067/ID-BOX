@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
-import { isTopEscLayer, popEscLayer, pushEscLayer } from '../logic/escLayer'
+import { escOwnedByControl, isTopEscLayer, popEscLayer, pushEscLayer } from '../logic/escLayer'
 import { IconClose } from '../icons'
 
 interface ModalProps {
@@ -34,23 +34,6 @@ interface ModalProps {
    * 用户看不见它会以为导入卡死。仅该弹窗传 `z-[60]`。
    */
   zClass?: string
-}
-
-/**
- * 事件目标是否声明了「Esc 归我」（`data-esc-own`）。
- *
- * 为什么需要：`Modal` 的 Esc 监听挂在 `window` **捕获**阶段，早于任何输入框自己的
- * `onKeyDown`（React 的合成事件在冒泡阶段才跑）。设置 · 别名表格里的输入框要把 Esc
- * 解释成「回滚这条草稿」，而不是「关掉整个设置弹窗」——用属性把它标出来，
- * `Modal` 见到就让路（不 stop、不关），按键继续传给控件自己的处理函数。
- *
- * 用 DOM 属性而不是 prop：标记点在深层输入框上，层层传 prop 会污染组件树；
- * 而且这是「控件级临时语义」，只在获得焦点的那一个控件上成立。
- */
-function escOwnedByControl(target: EventTarget | null): boolean {
-  const el = target as Element | null
-  if (!el || typeof el.closest !== 'function') return false
-  return el.closest('[data-esc-own]') !== null
 }
 
 /**

@@ -45,8 +45,15 @@ describe('Modal：唯一的 Esc 入口（捕获阶段）', () => {
   })
 
   it('输入框可以用 data-esc-own 保留自己的 Esc 语义（别名草稿回滚）', () => {
-    expect(src).toContain('data-esc-own')
     expect(src).toContain('escOwnedByControl(e.target)')
+  })
+
+  it('data-esc-own 的判定在共享层（Modal 与 useEscLayer 都认，少一处就回到真机缺陷）', () => {
+    const layer = read('logic/escLayer.ts')
+    expect(layer).toContain('export function escOwnedByControl')
+    expect(layer).toContain("closest('[data-esc-own]')")
+    // useEscLayer 内部也必须放行：自绘弹窗里的输入框只经过这一条路径
+    expect(layer).toContain('if (escOwnedByControl(e.target)) return')
   })
 })
 
@@ -74,7 +81,33 @@ describe('四份手写 Esc 已删除', () => {
     expect(src).toContain('data-esc-own')
     // blur 是同步派发的：回滚必须靠标记跳过 commit，否则 Esc 反而会把编辑存下去
     expect(src).toContain('revertingRef.current = true')
+    // 设置页是**自绘** dialog-scrim（不走 Modal）：必须自己占一层，否则 Esc 会落到
+    // App 的全局 decideEsc → close-settings（qa-real076 真机缺陷 0.7.6-ESC-01）
+    expect(src).toContain('useEscLayer(onClose, !!settings)')
   })
+})
+
+describe('自绘 dialog-scrim 一律要进层栈（0.7.6-ESC-01 的结构性守卫）', () => {
+  // 这条守卫针对的是真机那条缺陷的成因：设置页自绘外壳不在栈里 → hasEscLayer() 为 false
+  // → App 的全局 Esc 把它关掉，`data-esc-own` 也轮不到生效。
+  // 以后再有新的自绘弹窗，忘了 useEscLayer 会在测试里直接红。
+  const dir = new URL('../src/renderer/components/', import.meta.url)
+  const files = fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith('.tsx') && f !== 'Modal.tsx')
+    .filter((f) => fs.readFileSync(new URL(f, dir), 'utf-8').includes('dialog-scrim'))
+
+  it('至少扫到 HdrPreview / CustomRender / Settings 三个自绘弹窗', () => {
+    expect(files.length).toBeGreaterThanOrEqual(3)
+    expect(files).toContain('SettingsDialog.tsx')
+  })
+
+  for (const file of files) {
+    it(`${file} 自绘外壳也调 useEscLayer`, () => {
+      const src = fs.readFileSync(new URL(file, dir), 'utf-8')
+      expect(src).toContain('useEscLayer(')
+    })
+  }
 })
 
 describe('全部 Modal 使用者都白拿 Esc', () => {

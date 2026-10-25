@@ -30,6 +30,7 @@ import {
   useUpdateState
 } from '../logic/updateState'
 import { Modal } from './Modal'
+import { useEscLayer } from '../logic/escLayer'
 import { IconCheck, IconRefresh } from '../icons'
 import { UNCLASSIFIED } from '../../shared/taxonomy'
 // 品牌资源（2026-10 用户要求「图标 logo 换一下」「关于页做上打赏和反馈」）：
@@ -875,6 +876,20 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const refreshLogStat = () => {
     void window.modvault.logStats().then(setLogStat).catch(() => undefined)
   }
+
+  /**
+   * Esc 关闭（0.7.6 T-ESC 真机返工）。
+   *
+   * 本弹窗外壳是**自绘** `dialog-scrim`（见下面 return，不走 `Modal`），所以必须自己占一层。
+   * 少了这一步的后果（qa-real076 真机复现）：`hasEscLayer()` 为 false → Esc 落到 App 的
+   * 全局 `decideEsc` → `settingsOpen` 命中 `'close-settings'`；而别名输入框的
+   * `data-esc-own` 只被 `Modal` 认，自绘外壳这条支路根本没经过它 → 「草稿回滚了、
+   * 弹窗也被关掉」。
+   *
+   * 现在两层保障同时成立：本层在栈里（App 不动作）+ `useEscLayer` 认 `data-esc-own`
+   * （输入框那一格按 Esc 只回滚草稿，不关弹窗）。
+   */
+  useEscLayer(onClose, !!settings)
 
   if (!settings) return null
 

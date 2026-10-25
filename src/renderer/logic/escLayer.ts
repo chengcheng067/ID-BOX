@@ -48,6 +48,24 @@ export function resetEscLayers(): void {
 }
 
 /**
+ * 事件目标是否声明了「Esc 归我」（`data-esc-own`）。
+ *
+ * 为什么需要：Esc 监听挂在 `window` **捕获**阶段，早于任何输入框自己的 `onKeyDown`
+ * （React 的合成事件在冒泡阶段才跑）。设置 · 别名表格里的输入框要把 Esc 解释成
+ * 「回滚这条草稿」而不是「关掉整个弹窗」——用属性把它标出来，消费方见到就让路
+ * （不 stop、不关），按键继续传给控件自己的处理函数。
+ *
+ * 两个消费方**都必须**调它：`Modal`（含 `Modal` 外壳的弹窗）与 `useEscLayer`
+ * （自绘 `dialog-scrim` 的弹窗）。少一处就会出现 0.7.6 真机那条缺陷：
+ * 设置页是自绘外壳，只有 `Modal` 认这个标记 → 输入框回滚了、弹窗同时被 App 关掉。
+ */
+export function escOwnedByControl(target: EventTarget | null): boolean {
+  const el = target as Element | null
+  if (!el || typeof el.closest !== 'function') return false
+  return el.closest('[data-esc-own]') !== null
+}
+
+/**
  * 给「不是 `Modal` 的第二层」用的 Esc 监听（分类浮层 / 自绘弹窗）。
  *
  * 监听挂在 `window` 捕获阶段，与 `Modal` 同阶段；只有自己是栈顶时才 stop + 回调。
@@ -64,6 +82,10 @@ export function useEscLayer(handler: () => void, active: boolean): void {
     const onKey = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
       if (!isTopEscLayer(token)) return
+      // 输入框声明了「Esc 归我」→ 不吃、不关，让控件自己回滚草稿。
+      // 这里**不能** stopPropagation：按键要继续传给控件的 React onKeyDown；
+      // 之后即使再冒泡到 App 的全局 Esc，也会因 `hasEscLayer()` 为真而不动作。
+      if (escOwnedByControl(e.target)) return
       // 吃掉这次按键：否则 App 的全局 Esc（冒泡阶段）会顺手清掉选中 / 关掉下层视图
       e.stopPropagation()
       handlerRef.current()
