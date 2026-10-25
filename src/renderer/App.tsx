@@ -17,6 +17,9 @@ import { canStage, stageController } from './logic/stageController'
 import { setMotionQuality } from './logic/motionProfile'
 import { decideEsc } from './logic/escPriority'
 import { hasEscLayer } from './logic/escLayer'
+// DEF-19-3：库目录漂移体检。与设置页的警示条**共用同一个纯函数** ——
+// 两处各写一套"路径在不在库内 / 缺不缺尺寸"的判据，迟早会给出两个数字。
+import { planLibraryDrift, resolutionDriftHint } from './logic/libraryDrift'
 
 /**
  * 舞台落点尺寸（2026-10-21 用户拍板：球放**标题下方居中**，不再放顶栏。
@@ -580,6 +583,27 @@ export default function App() {
   const setDupOnly = useVault((s) => s.setDupOnly)
   /** 设置里关掉色标入口时，中栏头这个 chip 不渲染（settings 未加载 → 按默认显示） */
   const showColorTagsEntry = useVault((s) => s.settings?.showColorTags !== false)
+  /**
+   * DEF-19-3：库目录漂移体检（只给分辨率浮层做就近提示用）。
+   *
+   * 用**全库 assets**（上面 `activeAssetCount` / `empty` 判据用的那一个，不是已筛选的
+   * `assets`）：要回答的是"索引里有多少条路径已经不在当前库目录下"，与当前筛选无关；
+   * 空库目录时纯函数返回全 0（不误报）。
+   */
+  const settingsLibraryDir = useVault((s) => s.settings?.libraryDir ?? '')
+  const libraryDrift = useMemo(
+    () => planLibraryDrift(allAssets, settingsLibraryDir),
+    [allAssets, settingsLibraryDir]
+  )
+  /**
+   * 浮层那行小字的内容（`null` = 不渲染）。裁决在纯函数里，单测可直接证明
+   * 「选了档位 + 可见结果为 0 + 有路径漂移 → 提示出现」，组件这里不重复判条件。
+   */
+  const resolutionHint = resolutionDriftHint(libraryDrift, {
+    minResolution: filters.minResolution,
+    visibleCount: assets.length,
+    inTrash: libraryView === 'trash'
+  })
 
   // ── 搜索也是导航（与侧栏 `navTo` 同一条语义，2026-10 用户反馈第二个 bug）──
   // 文件视图打开时中栏被 `folderAsset` 分支占住，顶栏搜索框敲字只改 `filters.query`，
@@ -1165,6 +1189,22 @@ export default function App() {
                                 </button>
                               )
                             })}
+
+                          {/*
+                            DEF-19-3 就近提示：选了分辨率档位、当前列表却是空的，而索引里
+                            还有一批资产的 folder 不在当前库目录下（主进程 probeSizes 会
+                            return []，尺寸永远补不上）—— 这时"筛不到"很可能不是没货，
+                            而是那批资产的尺寸没采到。只加一行小字，**不加按钮**：
+                            浮层的交互（单选 / 不限）保持原样，解释留在设置页那条警示里。
+
+                            判条件全在 `resolutionDriftHint()` 里（`useVisibleAssets()` 的
+                            长度直接传进去，不另算一套筛选 —— 两份判据必然漂移）。
+                          */}
+                          {extraPanel === 'resolution' && resolutionHint !== null && (
+                            <div className="mt-0.5 border-t border-line/60 px-2 pb-0.5 pt-1 text-[10px] leading-relaxed text-tertiary">
+                              {resolutionHint}
+                            </div>
+                          )}
 
                           {/* 存为集合：极简行内输入（回车保存 / Esc 取消）。
                               失败原因就地显示在输入框下方，不打断到全局 notice。 */}

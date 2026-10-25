@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVault } from '../store'
 import { DISPOSAL_LABEL, SEVEN_ZIP_DOWNLOAD_URL } from '../../shared/types'
 import type { AiClassifySettings, AliasRecord, ArchiveDisposal, MotionQuality } from '../../shared/types'
@@ -18,6 +18,10 @@ import {
   type AliasSuggestion
 } from '../logic/aliasIndex'
 import { RETENTION_OPTIONS } from '../logic/trashView'
+// DEF-19-3：库目录被改过 / 搬过之后，老资产的 folder 不在新根下 → 主进程的
+// probeSizes 守卫会一律拒绝（这是对的），但"整库尺寸补不上"必须在界面上有解释。
+// 判据是纯函数，和分辨率浮层的就近提示**共用同一份**（两套判据必然漂移）。
+import { planLibraryDrift, libraryDriftWarning } from '../logic/libraryDrift'
 // 自动检查更新（2026-10 用户需求）：状态机单独一个模块 —— `store.ts` 正被并发改动，
 // 更新检查只是「一个只读结论 + 一个进行中标志」，放进全局 store 只会扩大冲突面。
 import {
@@ -103,12 +107,30 @@ function Toggle({
   )
 }
 
-function Row({ title, desc, children }: { title: string; desc?: string; children?: React.ReactNode }) {
+/**
+ * 设置页的一行：左侧「标题 + 说明（+ 可选警示条）」，右侧操作区。
+ *
+ * `notice` 是为 DEF-19-3 加的：库目录那一行需要在说明**下方**插一条可行动的警示
+ * （索引路径与当前库目录不一致），而不是塞进 `desc` 里 —— `desc` 是常驻灰字，
+ * 警示条要能一眼看出来。其余行不传 = 与原来逐像素一致。
+ */
+function Row({
+  title,
+  desc,
+  notice,
+  children
+}: {
+  title: string
+  desc?: string
+  notice?: React.ReactNode
+  children?: React.ReactNode
+}) {
   return (
     <div className="flex items-start justify-between gap-4 border-b border-line/70 py-3 last:border-0">
       <div className="min-w-0">
         <div className="text-[13px] font-medium">{title}</div>
         {desc && <div className="mt-0.5 text-[11px] leading-relaxed text-muted">{desc}</div>}
+        {notice}
       </div>
       <div className="shrink-0 pt-0.5">{children}</div>
     </div>
@@ -680,6 +702,23 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const settings = useVault((s) => s.settings)
   const saveSettings = useVault((s) => s.saveSettings)
   const rescan = useVault((s) => s.rescan)
+  /**
+   * DEF-19-3：库目录漂移体检（只读派生数据）。
+   *
+   * 必须用**全库 assets**（不是 `useVisibleAssets()`）：分辨率浮层那边已经按筛选裁过，
+   * 而这里要回答的是"索引里有多少条路径已经不在当前库目录下"，与筛选无关。
+   * 纯函数，`assets` / `libraryDir` 不变就不会重算。
+   */
+  const allAssets = useVault((s) => s.assets)
+  const libraryDrift = useMemo(
+    () => planLibraryDrift(allAssets, settings?.libraryDir ?? ''),
+    [allAssets, settings?.libraryDir]
+  )
+  /**
+   * 警示条内容（`null` = 整块不渲染）。文案与"何时显示"都在纯函数里裁决，
+   * 单测能直接证明「folder 旧根 + libraryDir 新根 → 提示出现」。
+   */
+  const driftWarning = libraryDriftWarning(libraryDrift)
   const [tab, setTab] = useState<SettingsTab>('appearance')
   const [version, setVersion] = useState('')
   // 自动检查更新（关于页）：结论 + 进行中标志都来自 logic/updateState.ts 的模块级 store。
@@ -1557,7 +1596,29 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   const libraryTab = (
     <div>
-      <Row title="库目录" desc="所有模型/贴图的归档位置。更改后点「导入」页的「重新扫描」即可索引新目录。">
+      <Row
+        title="库目录"
+        desc="所有模型/贴图的归档位置。更改后点「导入」页的「重新扫描」即可索引新目录。"
+        notice={
+          /*
+           * DEF-19-3：索引路径与当前库目录不一致时的**可行动**提示。
+           *
+           * 为什么必须提示：`probeSizes` 的越界守卫会让老资产的尺寸回填全部返回空
+           * （`scanned:N, patched:0`），分辨率筛选于是永远筛不到它们，而日志里只有一行
+           * WARN —— 用户看不到日志，只会觉得"筛选坏了"。
+           *
+           * 只给只读入口，**绝不**放一个"点了就重建索引"的按钮：重建会丢标签/备注/风格，
+           * 必须先看「检查索引与磁盘」的结果再决定（那也是这里唯一的行动指向）。
+           * outsideCount === 0 时 `driftWarning` 为 null → 整块不渲染（零视觉噪音）。
+           */
+          driftWarning ? (
+            <div className="mt-1.5 rounded-lg border border-danger/40 bg-danger-tint px-2.5 py-2 text-[11px] leading-relaxed text-danger">
+              <div className="font-medium">{driftWarning.title}</div>
+              <div className="mt-1">{driftWarning.body}</div>
+            </div>
+          ) : null
+        }
+      >
         <div className="flex items-center gap-2">
           <code className="max-w-[220px] truncate rounded-md bg-canvas px-2 py-1 text-[11px] text-secondary">{settings.libraryDir}</code>
           <button
