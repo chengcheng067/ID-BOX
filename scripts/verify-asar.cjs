@@ -75,6 +75,11 @@ check('renderer: 灰度透明参数 alphaFromMap', rendererAll, 'alphaFromMap')
 check('renderer: Esc 输入框放行标记 data-esc-own', rendererAll, 'data-esc-own')
 check('renderer: 库目录漂移提示文案', rendererAll, '的索引路径不在当前库目录内')
 
+// ── 0.7.7 ──
+// 备份前缀与清理日志前缀都是字符串字面量，压缩不会动它们。
+check('renderer: 重复记录清理备份 dup-clean-', rendererAll, 'dup-clean-')
+check('renderer: 缩略图存在性自愈日志', rendererAll, '[recordHygiene]')
+
 const qr = find(/contact-qr.*\.png$/)
 console.log('contact-qr in bundle:', qr.join(',') || '(none)')
 if (qr.length) {
