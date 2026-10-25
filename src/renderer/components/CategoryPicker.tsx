@@ -4,6 +4,7 @@ import { useVault } from '../store'
 import { KIND_LABEL, kindFolder } from '../../shared/classify'
 import { UNCLASSIFIED } from '../../shared/taxonomy'
 import { level1OptionsFor, level2OptionsFor } from '../logic/category'
+import { useEscLayer } from '../logic/escLayer'
 import { Modal } from './Modal'
 
 /**
@@ -107,8 +108,9 @@ export function CategoryPicker() {
   /**
    * 分类浮层的关闭路径：点浮层外 / Esc / 窗口 resize。
    *
-   * - Esc 用**捕获阶段 + stopPropagation**：同一次 Esc 不能再被全局快捷键消费
-   *   （弹窗里一次按键关两层是最烦人的那种交互）。
+   * - Esc 交给 `useEscLayer`（`logic/escLayer.ts`）：浮层是弹窗里的**第二层**，
+   *   展开期间压在 `Modal` 之上 —— Esc 先收起浮层，再按一次才关整个弹窗。
+   *   0.7.6 T-ESC 之前这里手写了一份捕获阶段监听，与另外三个组件重复；现在统一走栈。
    * - resize 必须关：浮层是 `fixed`、坐标在打开那一刻按按钮矩形写死 → 尺寸一变就错位。
    */
   useEffect(() => {
@@ -118,21 +120,17 @@ export function CategoryPicker() {
       if (root && e.target instanceof Node && root.contains(e.target)) return
       setOpenField(null)
     }
-    const onKeyDown = (e: KeyboardEvent): void => {
-      if (e.key !== 'Escape') return
-      e.stopPropagation()
-      setOpenField(null)
-    }
     const onResize = (): void => setOpenField(null)
     window.addEventListener('mousedown', onPointerDown)
-    window.addEventListener('keydown', onKeyDown, true)
     window.addEventListener('resize', onResize)
     return () => {
       window.removeEventListener('mousedown', onPointerDown)
-      window.removeEventListener('keydown', onKeyDown, true)
       window.removeEventListener('resize', onResize)
     }
   }, [openField])
+
+  /** Esc：只在浮层展开期间占一层，收起浮层（不关弹窗） */
+  useEscLayer(() => setOpenField(null), openField !== null)
 
   if (!pickerIds || targets.length === 0 || !kind) return null
 
@@ -217,7 +215,7 @@ export function CategoryPicker() {
   /**
    * 一级浮层的键盘操作（挂在触发件 + 浮层共同的容器上，事件从当前焦点元素冒泡上来）：
    * ↑/↓ 移动高亮（循环，未展开时展开），Enter 选中高亮项。
-   * Esc 由上面的 window 捕获监听处理（这里不重复，避免一次按键关两层）。
+   * Esc 由 `useEscLayer` 统一处理（这里不重复，避免一次按键关两层）。
    */
   const onLevel1KeyDown = (e: ReactKeyboardEvent<HTMLDivElement>): void => {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {

@@ -41,10 +41,15 @@ import type { ImportConflictResolution } from '../../shared/types'
  *                                  [全部取消]  [确定]
  * ```
  *
- * 三个**必须自己补**的行为（`Modal.tsx` 不提供，docs/27 T-07 验收判据）：
- * ① Esc → `cancelled:true`（`Modal` 不处理 keydown）；
- * ② 点遮罩**不关闭**（`dismissOnScrim={false}`）—— 遮罩误触 = 静默全跳过；
- * ③ ✕ 关闭 = 等同 `cancelled`。
+ * 三条关闭口径（0.7.6 T-ESC 统一后）：
+ * ① Esc **不关闭、也不等于跳过**（`dismissOnEsc={false}`）—— 本弹窗的「关闭」在这个
+ *    上下文里只有一个含义：整批按「跳过」（`cancelled:true`），而「跳过」是用户对每个
+ *    重复项做出的**处置决定**，不能由一个顺手的按键代劳。这与它关掉 `dismissOnScrim`
+ *    的理由是同一个（docs/27 T-07：遮罩误触 = 静默全跳过），两处口径现在一致。
+ *    注意 `false` 的语义是「吃掉但不关」：仍然占一层，按键不会落到 App 的全局 Esc 上去
+ *    清空选中 / 关掉底下的视图。
+ * ② 点遮罩**不关闭**（`dismissOnScrim={false}`）。
+ * ③ ✕ 关闭 = 等同 `cancelled`（显式动作，保留）。
  *
  * 没做焦点陷阱（项目无先例，`ConfirmDialog` 也没有）：靠原生 `<button>` 的 Tab/Enter 可达。
  * 层级用 `z-[60]` 压在其它弹窗之上（§5.4：导入等待答复最长 120s，被盖住会像卡死）。
@@ -69,20 +74,6 @@ export function ImportConflictDialog() {
     void answerConflict(buildConflictAnswer(ask, state, cancelled))
   }
 
-  useEffect(() => {
-    if (!ask) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
-      // 捕获阶段吃掉这次按键：否则 App 的全局 Esc 会顺手关掉底下的设置 / 文件视图 / 清空选择
-      e.preventDefault()
-      e.stopPropagation()
-      submit(true)
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-    // `submit` 闭包依赖 ask + state，故两者进依赖：任一变化都重新挂（代价可忽略）
-  }, [ask, state, answerConflict])
-
   if (!ask) return null
 
   const remaining = remainingItemsText(ask.remainingItems, ask.items.length)
@@ -93,6 +84,7 @@ export function ImportConflictDialog() {
       onClose={() => submit(true)}
       width="max-w-2xl"
       dismissOnScrim={false}
+      dismissOnEsc={false}
       zClass="z-[60]"
     >
       {remaining && <p className="mb-3 text-[12px] text-muted">{remaining}</p>}

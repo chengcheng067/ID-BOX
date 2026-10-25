@@ -3,6 +3,7 @@ import { useVault } from '../store'
 import { resolveRenderParams, resolveRenderShape, type NormalizedBallParams } from '../../shared/ballParams'
 import { displayName } from '../../shared/naming'
 import { IconClose } from '../icons'
+import { useEscLayer } from '../logic/escLayer'
 import type { Asset } from '../../shared/types'
 import type { MaterialSlots } from '../logic/materialBall'
 import { renderActionPlan, type RenderAction } from '../logic/materialBall'
@@ -189,6 +190,13 @@ export function CustomRenderDialog({
       onClose()
     }, 120)
   }
+
+  /**
+   * Esc 关闭（0.7.6 T-ESC）：本弹窗是自绘 `dialog-scrim`、不走 `Modal`，
+   * 所以显式占一层。走 `beginClose` 而不是 `onClose`：交接过的球要先飞回顶栏，
+   * 与点遮罩 / 点 ✕ 完全同一条关闭路径（否则 Esc 会让球凭空消失）。
+   */
+  useEscLayer(beginClose, renderable)
 
   if (!renderable) return null
 

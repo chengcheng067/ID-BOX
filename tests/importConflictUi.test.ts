@@ -976,12 +976,16 @@ describe('源码守卫：组件接线', () => {
     expect(s).toContain('if (hovered || imports.length === 0) return')
   })
 
-  it('弹窗：遮罩不关闭 + Esc 在捕获阶段映射 cancelled + 挂在 App 上', () => {
+  it('弹窗：遮罩不关闭 + Esc 也不等同于「跳过」（0.7.6 T-ESC 裁定）', () => {
     const dialog = read('components/ImportConflictDialog.tsx')
     expect(dialog).toContain('dismissOnScrim={false}')
-    expect(dialog).toContain("if (e.key !== 'Escape') return")
+    // Esc 曾经 = submit(true) ≡ 整批按「跳过」，与关掉 dismissOnScrim 的理由自相矛盾。
+    // 现在两处口径一致：都不许"顺手"把整批按跳过，取消导入只能点界面按钮。
+    expect(dialog).toContain('dismissOnEsc={false}')
     expect(dialog).toContain('submit(true)')
-    expect(dialog).toContain("window.addEventListener('keydown', onKey, true)")
+    // 不再自己接 Esc（统一由 Modal 内置，见 tests/modalEsc.test.ts）
+    expect(dialog).not.toContain("e.key !== 'Escape'")
+    expect(dialog).not.toContain("addEventListener('keydown'")
     // 提交走 store 的唯一入口，不直接调 IPC
     expect(dialog).toContain('answerConflict(')
     expect(dialog).not.toContain('window.modvault.answerImportConflict')
@@ -994,6 +998,8 @@ describe('源码守卫：组件接线', () => {
     const s = read('components/Modal.tsx')
     expect(s).toContain('dismissOnScrim = true')
     expect(s).toContain('dismissOnScrim ? onClose : undefined')
+    // 新增的 Esc 开关同样默认 true：除导入重复处置外，其它弹窗零改动就获得 Esc
+    expect(s).toContain('dismissOnEsc = true')
   })
 
   it('store：importPaths 传 ctx + skipped 计入 settled + 订阅幂等入口', () => {

@@ -15,6 +15,8 @@ import { RenameDialog } from './components/RenameDialog'
 import { ColorTagPicker } from './components/MarkControls'
 import { canStage, stageController } from './logic/stageController'
 import { setMotionQuality } from './logic/motionProfile'
+import { decideEsc } from './logic/escPriority'
+import { hasEscLayer } from './logic/escLayer'
 
 /**
  * 舞台落点尺寸（2026-10-21 用户拍板：球放**标题下方居中**，不再放顶栏。
@@ -436,22 +438,54 @@ export default function App() {
       const typing = tag === 'INPUT' || tag === 'TEXTAREA'
       if (e.key === 'Escape') {
         const st = useVault.getState()
-        // HDR 预览自己吃 Esc（见 HdrPreviewDialog）；这里先让路，
-        // 否则一次按键会「关掉预览 + 顺手关掉底下的文件视图 / 清空选择」。
-        if (st.hdrPreviewAssetId) return
-        // 删除确认中先关确认框（= 撤销）
-        if (st.pendingDelete) {
-          undoDelete()
-          return
+        /*
+         * 「Esc 该谁吃」全部收口到纯函数（logic/escPriority.ts），这里只做 dispatch。
+         *
+         * 修的是 0.7.5 及以前的连带缺陷：原来尾部**无条件** `select(null)` +
+         * `setSettingsOpen(false)`，前面只对 HDR 预览 / 删除确认 / 文件视图让路。于是
+         * 开着「批量重命名」按 Esc 会先清空选中（右侧面板卸载、`renameIds` 还在 → 弹窗悬空）；
+         * 封面选择器 / 彻底删除确认那种组件局部弹窗更是靠"选中被清 → 组件卸载"顺带关掉的，
+         * 附带"重开还得重新选"的副作用。
+         *
+         * 那两类局部弹窗（DetailPanel 的 `coverPickerOpen`、AssetGrid / DetailPanel 的
+         * `purgeIds`）不进输入：它们都由 `Modal` 承载，Esc 在捕获阶段就被 `Modal` 吃掉并
+         * `stopPropagation`，本监听（冒泡阶段）根本收不到；`modalOpen` 是同一件事的显式
+         * 兜底 —— 即使事件阶段语义有出入，也不会一次按键关两层。
+         */
+        const action = decideEsc({
+          modalOpen: hasEscLayer(),
+          hdrPreviewOpen: !!st.hdrPreviewAssetId,
+          pendingDelete: !!st.pendingDelete,
+          renameOpen: !!st.renameIds,
+          categoryPickerOpen: !!st.categoryPickerIds,
+          settingsOpen,
+          folderViewOpen: !!st.folderViewAssetId,
+          hasSelection: !!selectedId || selectedIds.length > 0
+        })
+        switch (action) {
+          case 'undo-delete':
+            undoDelete()
+            break
+          case 'close-rename':
+            st.closeRenameDialog()
+            break
+          case 'close-category-picker':
+            st.closeCategoryPicker()
+            break
+          case 'close-settings':
+            setSettingsOpen(false)
+            break
+          case 'close-folder-view':
+            closeFolderView()
+            break
+          case 'clear-selection':
+            select(null)
+            break
+          default:
+            // 'none'：弹窗 / HDR 预览自己处理这次 Esc（或没有任何可关的东西）
+            break
         }
-        // 软件内文件视图：Esc 退回原网格 / 列表（不顺手清掉选择，退出后选中态还在）。
-        // 弹窗（设置 / 分类选择器）在场时让它们先吃 Esc，避免一次按键关两层。
-        if (st.folderViewAssetId && !st.categoryPickerIds && !settingsOpen) {
-          closeFolderView()
-          return
-        }
-        select(null)
-        setSettingsOpen(false)
+        return
       }
       // P0-16：Delete/Backspace 只触发 requestDelete（二次确认 + 5 秒撤销），
       // 不再有「按键直接删」的路径；支持 Ctrl 多选后的批量删除。

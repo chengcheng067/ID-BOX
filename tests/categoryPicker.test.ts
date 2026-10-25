@@ -121,12 +121,14 @@ describe('分类浮层：三条关闭路径', () => {
     expect(src).toContain("window.removeEventListener('mousedown', onPointerDown)")
   })
 
-  it('Esc 用捕获阶段 + stopPropagation（不让同一次 Esc 又被全局快捷键消费）', () => {
+  it('Esc 交给 useEscLayer：只收起浮层（不关弹窗、不让按键落到全局快捷键）', () => {
     const src = codeOf(read(PICKER))
-    expect(src).toContain("if (e.key !== 'Escape') return")
-    expect(src).toContain('e.stopPropagation()')
-    expect(src).toContain("window.addEventListener('keydown', onKeyDown, true)")
-    expect(src).toContain("window.removeEventListener('keydown', onKeyDown, true)")
+    // 0.7.6 T-ESC：浮层是弹窗里的第二层，压栈后栈顶优先 —— 先收浮层，再按才关弹窗
+    expect(src).toContain("import { useEscLayer } from '../logic/escLayer'")
+    expect(src).toContain('useEscLayer(() => setOpenField(null), openField !== null)')
+    // 不再自己手写 keydown（那四份重复实现已收敛进 Modal / escLayer）
+    expect(src).not.toContain("'Escape'")
+    expect(src).not.toContain("addEventListener('keydown'")
   })
 
   it('窗口 resize 关闭（fixed 坐标在打开时写死，尺寸一变必错位）', () => {

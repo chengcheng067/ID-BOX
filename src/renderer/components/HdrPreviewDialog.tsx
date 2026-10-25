@@ -58,6 +58,7 @@ import { formatBytes } from '../../shared/format'
 import { assetFileAbs } from '../logic/assetPath'
 import { coverImageInputOf } from '../logic/coverImage'
 import { useVault } from '../store'
+import { useEscLayer } from '../logic/escLayer'
 import { IconClose, IconImage } from '../icons'
 import type { Asset, AssetFile } from '../../shared/types'
 
@@ -543,14 +544,16 @@ export function HdrPreviewDialog({ asset, onClose }: HdrPreviewDialogProps) {
     }
   }, [])
 
-  // Esc 关闭（与其它弹窗一致）
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  /**
+   * Esc 关闭（0.7.6 T-ESC）。
+   *
+   * 本弹窗是自绘 `dialog-scrim`、不走 `Modal`，但同样占一层：`useEscLayer` 挂在
+   * **捕获阶段**且只在栈顶时消费按键 —— 这样"后开的先吃"对预览也成立
+   * （预览开着时导入重复处置弹出来，Esc 先答重复处置；反过来说预览最后才关）。
+   * 以前这里是一条冒泡阶段的 window 监听，靠 App 里对 `hdrPreviewAssetId` 让路来避免
+   * 一次按键关两层；现在由栈统一表达，App 那一支只作为兜底。
+   */
+  useEscLayer(onClose, true)
 
   // ── 准备阶段：订阅进度 → prepareHdr → 拿到 hdr:// URL ───────────────
   useEffect(() => {

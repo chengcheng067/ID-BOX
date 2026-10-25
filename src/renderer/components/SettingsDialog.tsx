@@ -284,12 +284,25 @@ function AliasRow({
   onDelete: () => void
 }) {
   const [draft, setDraft] = useState(record.name)
+  /**
+   * Esc 回滚的「别保存」标记。
+   *
+   * blur 是**同步派发**的：先 `setDraft(record.name)` 再 `blur()` 时，`commit` 这次
+   * 仍然闭包着编辑后的 `draft` → 会把用户刚想撤回的值存下去。所以回滚必须靠标记，
+   * 而不是靠"改完 state 再失焦"（原始写法实际上把 Esc 变成了保存）。
+   */
+  const revertingRef = useRef(false)
   // 外部改动（导入 / 采纳建议 / 删除同名项）要跟随；依赖 record.name 而不是整对象，避免无谓刷新
   useEffect(() => {
     setDraft(record.name)
   }, [record.id, record.name])
 
   const commit = () => {
+    if (revertingRef.current) {
+      revertingRef.current = false
+      setDraft(record.name)
+      return
+    }
     const next = draft.trim()
     if (!next || next === record.name) {
       setDraft(record.name)
@@ -323,11 +336,17 @@ function AliasRow({
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === 'Enter') e.currentTarget.blur()
+          // 这里的 Esc 语义是「回滚这条别名的草稿」，**不是**关弹窗：
+          // 草稿只在失焦时才保存，按 Esc 走人等于放弃修改 —— 若让 `Modal` 吃掉 Esc，
+          // 用户本想撤回一格输入，结果整个设置弹窗被关掉。
+          // `data-esc-own` 让 `Modal` 的捕获阶段监听对这一格放行（见 Modal.tsx 同名注释）。
           if (e.key === 'Escape') {
+            revertingRef.current = true
             setDraft(record.name)
             e.currentTarget.blur()
           }
         }}
+        data-esc-own
         title="显示名：失焦即保存；只改界面显示，磁盘文件名不动"
       />
       <button

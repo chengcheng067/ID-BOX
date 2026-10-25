@@ -11,8 +11,9 @@
  * - **不改删除链路**：每列底部「保留这份」只是回调 `onKeep(id)`，真正的
  *   二次确认 + 5 秒撤销仍在 store 的 `requestDelete`；
  * - 差异判定是纯函数 `compareFields()`（logic/duplicates.ts），组件只负责摆位置。
+ * - Esc 由 `Modal` 统一处理（0.7.6 T-ESC）：本组件此前自己挂了一份捕获阶段监听，
+ *   与 `CategoryPicker` / `SettingsDialog` / `ImportConflictDialog` 三处逐字符重复，已删。
  */
-import { useEffect } from 'react'
 import { KIND_LABEL } from '../../shared/classify'
 import { thumbVaultUrl } from '../../shared/format'
 import { compareFields } from '../logic/duplicates'
@@ -72,24 +73,6 @@ export function DuplicateCompareDialog({
   const columns = [asset, ...copies].filter((a) => a && !a.deletedAt)
   // 「有才显示」的字段（SU 版本）全空时整行不渲染
   const fields = compareFields(columns).filter((f) => f.values.some((v) => v !== ''))
-
-  /**
-   * Esc 关闭。
-   *
-   * `Modal` 外壳**不带** Esc（它只有遮罩点击关闭），App 的全局 Esc 又只认
-   * `pendingDelete` / 文件视图这些 store 状态，不知道本地弹窗 → 不自己接一手的话，
-   * 按 Esc 会「弹窗不动、底下的选中被清掉」。
-   * 捕获阶段 + `stopPropagation`：与 App 里浮层同一套写法，避免一次按键关两层。
-   */
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key !== 'Escape') return
-      e.stopPropagation()
-      onClose()
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
 
   return (
     <Modal title={`重复副本对比（${columns.length} 份）`} onClose={onClose} width="max-w-5xl">
