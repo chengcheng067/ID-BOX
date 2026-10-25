@@ -275,12 +275,30 @@ function isSketchUpAsset(asset: Asset): boolean {
  * `logic/aliasIndex.resolveAssetDisplayName`）：本组件不读设置，保持纯展示。
  */
 function Cover({ asset, name }: { asset: Asset; name: string }) {
-  if (asset.thumbStatus === 'ready' && asset.thumbPath) {
+  // 缩略图 URL（`ready` + 有 `thumbPath` 才算有图；否则走下面的占位分支）
+  const src =
+    asset.thumbStatus === 'ready' && asset.thumbPath ? thumbVaultUrl(asset.thumbPath) : null
+  /**
+   * 记录**哪一个 `src`** 加载失败（不是布尔值）。
+   *
+   * 为什么按 src 记而不是 `useState(false)` + `useEffect` 复位：换成字符串之后，
+   * `src` 一变（用户换封面 / 补齐队列重生成了新文件）比较自然为假 → 自动重试，
+   * 不需要一次额外的 effect，也不会在首帧闪一下占位图标。
+   *
+   * 为什么必须有兜底（T-PRUNE ⑤，0.7.7）：缓存文件可能被外部删掉（清理工具 /
+   * 0.7.6 的 prune 误删 / 手动清缓存），`<img>` 加载失败时只剩一块空白 + alt 文本；
+   * 卡片左上角又是类型 chip，用户很容易把"黑块"当成"这个资产本来就没图"。
+   * 回落到与"没有缩略图"完全相同的类型占位（含 SU 品牌图标），信息一致、不误导。
+   */
+  const [brokenSrc, setBrokenSrc] = useState<string | null>(null)
+
+  if (src && brokenSrc !== src) {
     return (
       <img
-        src={thumbVaultUrl(asset.thumbPath)}
+        src={src}
         alt={name}
         loading="lazy"
+        onError={() => setBrokenSrc(src)}
         // `object-contain`（不是 `object-cover`）：封面框统一 4:3 后，1:1 的球图
         // 若按 cover 会被上下切掉约 1/4；contain 保证「整张图都看得见」，
         // 方图左右剩下的空白由这一层的 `bg-canvas` 呈现（画布色当"卡纸边"）。

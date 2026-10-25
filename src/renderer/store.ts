@@ -33,6 +33,7 @@ import {
 } from './logic/filters'
 import { dedupeIds, pruneToVisible, selectRangeIds } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
+import { planDuplicateCleanup, planThumbPresenceRepair } from './logic/recordHygiene'
 import { assetFileAbs } from './logic/assetPath'
 import { DELETE_GRACE_MS, toDeleteTargets, type DeleteTarget } from './logic/deleteFlow'
 import { isLegacyLayout, planLegacyMoves, categoriesOf } from './logic/category'
@@ -1427,6 +1428,191 @@ async function backupRescanPreSnapshot(records: Asset[]): Promise<void> {
   if (stale.length > 0) await db.backups.bulkDelete(stale.map((b) => b.id))
 }
 
+// ── 索引记录卫生：重复记录清理前备份（T-PRUNE，0.7.7） ─────────────────
+//
+// 与「重扫删除备份」同构，但**刻意用独立前缀** `dup-clean-`：
+//
+// - `listRescanBackups()` 的过滤条件是 `id.startsWith('rescan-')`，
+//   `dup-clean-` 天然**不在**里面 → 设置页的「可恢复的重扫备份」条数
+//   （`refreshRescanBackupCount`）不会被这类备份污染；「恢复上次重扫前索引」
+//   也不会误取到它（它存的是 `{dropped, rewritten}` 对象，不是 `Asset[]`）。
+// - 这就是"显式排除"：**不要**为了让计数变好看把它塞进 rescan 家族，
+//   否则那两个按钮的语义会一起被搞坏（一个按 `Asset[]` 解析，一个用来撤销删除）。
+//
+// 不做成"可一键恢复"的入口：清理是幂等的，被丢弃的记录整条存在这里，
+// 需要时从 `db.backups` 手工取即可（本版不给 UI 加按钮，避免多一条误操作路径）。
+
+/** `db.backups` 里「重复索引记录清理」快照的 id 前缀 */
+export const DUP_CLEAN_BACKUP_PREFIX = 'dup-clean-'
+
+/** 这类快照的保留条数（清理幂等，正常只有一条；留几份只为可回退） */
+export const DUP_CLEAN_BACKUP_KEEP = 3
+
+/** `dup-clean-*` 快照的 json 形状（对象，不是数组 —— 见上面的说明） */
+interface DupCleanSnapshot {
+  /** 被丢弃的**原始**记录（完整字段，原样） */
+  dropped: Asset[]
+  /** 幸存者被改写**之前**的原记录（完整字段，原样） */
+  rewritten: Asset[]
+}
+
+/** 取 `dup-clean-*` 备份，按时间降序（最新在前） */
+async function listDupCleanBackups(): Promise<IndexBackup[]> {
+  const all = await db.backups.toArray()
+  return all
+    .filter((b) => typeof b.id === 'string' && b.id.startsWith(DUP_CLEAN_BACKUP_PREFIX))
+    .sort((a, b) => b.at - a.at)
+}
+
+/**
+ * 清理重复记录**之前**把原样记录写进 `db.backups`（`dup-clean-<ts>`）。
+ *
+ * 顺序不可颠倒：先备份、再 put / bulkDelete。备份失败 → 调用方直接放弃本次清理
+ * （`cleanupDuplicateRecords` 里 put 在 await 之后），宁可留着重复记录，
+ * 也不能在没有还原凭证的情况下删掉用户数据。
+ */
+async function backupDupCleanup(dropped: Asset[], rewritten: Asset[]): Promise<void> {
+  if (dropped.length === 0) return
+  const at = Date.now()
+  const snapshot: DupCleanSnapshot = { dropped, rewritten }
+  await db.backups.put({
+    id: `${DUP_CLEAN_BACKUP_PREFIX}${at}`,
+    at,
+    json: JSON.stringify(snapshot)
+  })
+  const list = await listDupCleanBackups()
+  const stale = list.slice(DUP_CLEAN_BACKUP_KEEP)
+  if (stale.length > 0) await db.backups.bulkDelete(stale.map((b) => b.id))
+}
+
+/**
+ * init 里的「同 folder 重复索引记录」清理（T-PRUNE 治本档 C 的存量迁移）。
+ *
+ * ## 为什么必须在 `rescueDamagedIndex()` **之前**
+ *
+ * 后面所有步骤（救援 / 缩略图存在性修复 / 补齐队列）都以"索引记录"为准。
+ * 重复记录先收掉，后面的判断才不会对着 12 份必然被删的副本做无用功
+ * （其中 11 份的缩略图文件根本不存在，救援也无从下手）。
+ *
+ * ## 行为
+ *
+ * - 计划为空（正常库）→ 直接返回同一个数组，**零日志、零 DB 写**；
+ * - 有重复 → 先写 `dup-clean-<ts>` 快照，再 `put(merged)` + `bulkDelete(dropIds)`；
+ *   全程**只动索引行，绝不碰磁盘上的资产文件夹**（目录由用户与导入流程管理）；
+ * - 内存态同步收掉被丢弃的记录、替换幸存者，并返回新数组供后续步骤使用；
+ * - 一条 toast，**不弹窗**：用户不需要为一次数据卫生操作做任何决定。
+ *
+ * ## 为什么整段包 try/catch
+ *
+ * 这是启动路径。清理是"额外的好事"，任何一步失败（Dexie 配额 / 短暂锁表 / 备份写不进）
+ * 都必须让 init 继续 —— 修数据的版本绝不能因为修数据本身打不开。
+ * 失败时返回**原始**数组（后续步骤看到的就是未清理的库，行为退回 0.7.6）。
+ */
+async function cleanupDuplicateRecords(assets: Asset[]): Promise<Asset[]> {
+  try {
+    const plan = planDuplicateCleanup(assets)
+    if (plan.length === 0) return assets
+
+    const byId = new Map(assets.map((a) => [a.id, a]))
+    const dropped: Asset[] = []
+    const rewritten: Asset[] = []
+    for (const group of plan) {
+      const keeperBefore = byId.get(group.keepId)
+      if (keeperBefore) rewritten.push(keeperBefore)
+      for (const id of group.dropIds) {
+        const rec = byId.get(id)
+        if (rec) dropped.push(rec)
+      }
+    }
+
+    // ① 先备份（失败即放弃本次清理，见 backupDupCleanup 注释）
+    await backupDupCleanup(dropped, rewritten)
+
+    // ② 再写幸存者 + 删多余索引行（只删索引行，不动磁盘目录）
+    for (const group of plan) {
+      await db.assets.put(group.merged)
+    }
+    const dropIds = plan.flatMap((g) => g.dropIds)
+    if (dropIds.length > 0) await db.assets.bulkDelete(dropIds)
+
+    // ③ 内存态：删掉被丢弃的、替换幸存者（保持原顺序，选中/滚动不错位）
+    const dropSet = new Set(dropIds)
+    const mergedById = new Map(plan.map((g) => [g.keepId, g.merged]))
+    const next = assets
+      .filter((a) => !dropSet.has(a.id))
+      .map((a) => mergedById.get(a.id) ?? a)
+    useVault.setState({ assets: next })
+
+    console.info(
+      `[recordHygiene] 合并 ${plan.length} 组重复索引，删除 ${dropIds.length} 条（原始记录已备份 dup-clean-*）`
+    )
+    enqueueNotice(`已合并 ${dropIds.length} 条重复索引记录（原始记录已备份）`)
+    return next
+  } catch (err) {
+    console.info('[recordHygiene] 重复记录清理跳过：', err instanceof Error ? err.message : err)
+    return assets
+  }
+}
+
+/**
+ * init 里的「缩略图索引指向不存在的文件」修复（T-PRUNE 自愈档 B 的存量迁移）。
+ *
+ * ## 为什么在 `rescueDamagedIndex()` **之后**、`ensureMissingThumbs()` **之前**
+ *
+ * - 救援先跑：它能把"盘上其实有图、只是 `thumbPath` 被抹掉"的记录挂回去。
+ *   若本函数先跑，它会把这类记录判成缺图 → 救援被自己触发的重置挡住。
+ * - 补齐队列后跑：本函数把记录置成 `none`，正是队列的候选判据，随后照常重生
+ *   （封面缩略图 / 材质球图各有自己的队列）。
+ *
+ * ## 定向写，不整对象 put
+ *
+ * `.where('id').equals(id).modify()` 只删 `thumbPath`、写 `thumbStatus`。
+ * 整对象 `put` 会拿旧快照把并发写入的字段（尺寸回填 / 分类 / 封面）盖回去
+ * —— 这是仓库既有纪律（见 `thumbRescue` / `sizeBackfill`）。
+ *
+ * ## 静默
+ *
+ * 用户不需要知道"有几条索引撒谎了"，只需看到卡片自己恢复。只留一条 `console.info`。
+ */
+async function repairThumbPresence(): Promise<void> {
+  try {
+    const assets = useVault.getState().assets
+    // 必须 catch：`listThumbs` 失败返回空数组，而空名单本身会被 plan 整体跳过
+    const files = await window.modvault.listThumbs().catch(() => [])
+    const plan = planThumbPresenceRepair(
+      assets,
+      files.map((f) => f.name)
+    )
+    if (plan.length === 0) return
+
+    for (const item of plan) {
+      await db.assets
+        .where('id')
+        .equals(item.id)
+        .modify((a: Asset) => {
+          delete a.thumbPath
+          a.thumbStatus = 'none'
+        })
+      // 本会话可能已经尝试过为它生成过图（init 重复调用 / HMR）→ 解除一次性封锁，
+      // 否则补齐队列会跳过它，卡片永远不恢复。
+      thumbAttempted.delete(item.id)
+    }
+
+    const ids = new Set(plan.map((p) => p.id))
+    useVault.setState((s) => ({
+      assets: s.assets.map((a) => {
+        if (!ids.has(a.id)) return a
+        const next: Asset = { ...a, thumbStatus: 'none' as ThumbStatus }
+        delete next.thumbPath
+        return next
+      })
+    }))
+    console.info(`[recordHygiene] ${plan.length} 条缩略图索引指向不存在的文件，已置为 none 交给补齐队列`)
+  } catch {
+    // 失败静默：修数据不能阻塞启动；下次启动会重新计算（幂等）
+  }
+}
+
 // ── 重跑自动分类：移动前备份（v1.0.13） ─────────────────────────────
 
 /** 取 `reclass-*` 备份，按时间降序（最新在前） */
@@ -1648,10 +1834,22 @@ export const useVault = create<VaultState>((set, get) => ({
     ])
     set({ settings, assets, ready: true })
 
+    // ── ① 索引记录卫生：同 folder 重复记录先收掉（T-PRUNE 治本档 C 的存量迁移） ──
+    // 必须在救援之前：后面每一步都以"索引记录"为准，12 份必然被删的副本先出局，
+    // 救援 / 存在性修复 / 补齐队列才不会对着它们做无用功。
+    // 正常库（无重复）→ 原样返回、零日志、零 DB 写。
+    // 返回的 `cleaned` 是**清理后**的列表，后续步骤必须用它，不能再用上面那份快照。
+    const cleaned = await cleanupDuplicateRecords(assets)
+
     // 一次性数据救援（2026-10-23 rescan 事故）：**必须 await 且必须在三个补齐队列之前**。
     // 晚一步，`ensureMissingThumbs` 会先按封面 salt 生成封面缩略图并写成 ready，
     // 被抹掉的球图就再也挂不回去了（详见 `rescueDamagedIndex` 的注释）。
-    await rescueDamagedIndex(assets)
+    await rescueDamagedIndex(cleaned)
+
+    // ── ② 缩略图存在性修复（T-PRUNE 自愈档 B）──────────────────────────────
+    // 顺序：救援之后（先让它把盘上真实存在的图挂回去）、补齐队列之前（置成 none
+    // 正好是队列的候选判据）。静默执行：用户只需要看到卡片自己恢复。
+    await repairThumbPresence()
 
     // 知末 ID 一次性回填（0.6.3）：老索引记录没有 `zhimoId` → 从资产名/包内文件补算。
     // 纯幂等：算不出就不写库，已回填过的记录下次启动直接跳过。失败不影响启动（catch 吞掉）。
@@ -1661,7 +1859,7 @@ export const useVault = create<VaultState>((set, get) => ({
     void get().refreshRescanBackupCount()
 
     // 清理孤儿缩略图缓存（索引里已不存在的 id），失败静默
-    window.modvault.pruneThumbs(assets.map((a) => a.id)).catch(() => 0)
+    window.modvault.pruneThumbs(cleaned.map((a) => a.id)).catch(() => 0)
     // 修「封面已被用户指定、缩略图却还是旧球图」的存量记录（2026-10-23 反馈，幂等、封顶 40 条）
     void repairStaleBallThumbs()
     // 启动后后台补齐缺缩略图的资产（v1 迁移 / rescan 后 thumbStatus 都是 none）
@@ -2786,15 +2984,61 @@ export const useVault = create<VaultState>((set, get) => ({
 
     // rescan 主进程侧生成**新 UUID**，所以合并键必须用 `folder`（绝对路径），
     // 不能用 id —— 否则每次 rescan 都全量重建、tags/note 全丢（P0-17 / R9）。
-    const localByFolder = new Map(localAssets.map((a) => [a.folder, a]))
-
-    // ── C 线「最近删除」：软删记录保活 ──────────────────────────────
-    // main 的 rescan **明确跳过 `.trash`**（isLibraryTrashName），软删资产的目录
-    // 永远不会出现在 scanned 里。若按普通记录走，任何一次重扫都会把它们判成
-    // "磁盘已删除" → 写备份 + 清出索引 → 回收站凭空消失、用户再也还原不了。
-    // 因此：先摘出来（不参与 gone 判定），合并完再原样放回 merged。
+    //
+    // ── T-PRUNE ③：软删记录**不进 Map**（0.7.6「每次刷新 +1 条」的根因）──────
+    //
+    // 旧实现：先无条件 `new Map(localAssets.map(a => [a.folder, a]))`，再
+    // `for (const a of trashedRecords) localByFolder.delete(a.folder)`。
+    // 问题：软删记录的 `folder` 字段**不变**（目录搬进了 `<库根>/.trash/`，索引里
+    // 保留的还是原路径），所以它和"同位置的活记录"必然撞同一个 key —— 那一行
+    // `delete(a.folder)` 会把**活记录**的键一起删掉。本次 rescan 于是认不出它 →
+    // 主进程给一个新 UUID → 每条记录每次刷新 +1（真机 13→15，DB 174→177）。
+    //
+    // 现在反过来：软删记录从头到尾**不参与建 Map**，也就不需要（更不能）按 folder 删键。
+    // `trashedRecords` 仍然在合并完 `merged.push(...)` 原样放回索引。
     const trashedRecords = localAssets.filter((a) => isDeletedAsset(a))
-    for (const a of trashedRecords) localByFolder.delete(a.folder)
+    const liveLocal = localAssets.filter((a) => !isDeletedAsset(a))
+    // 补充（C 线「最近删除」的原始理由，仍然成立）：main 的 rescan **明确跳过 `.trash`**
+    // （isLibraryTrashName），软删资产的目录永远不会出现在 `scanned` 里。若把它们按普通
+    // 记录走，任何一次重扫都会判成"磁盘已删除"→ 写备份 + 清出索引 → 回收站凭空消失、
+    // 用户再也还原不了。所以它们既不进 Map、也不参与 gone 判定，合并完原样放回 `merged`。
+
+    // ── 同 folder 的多条**活**记录：显式取舍，绝不悬空 ─────────────────
+    //
+    // 理论上 init 的 `cleanupDuplicateRecords` 已经把存量收干净，但 rescan 期间
+    // 并发导入 / 上一版遗留仍可能造出新的冲突。这里复用**同一套**优先级结论
+    // （`planDuplicateCleanup`：有缩略图 > 用户字段多 > updatedAt > id 字典序），
+    // 并把被丢弃的记录放进 `dupDropIds` → 与 gone 记录一起**先备份再删**。
+    // 不做 `Map` 的静默覆盖：那正是 0.7.6 让 12 份副本悬空（不在 merged、不在
+    // goneIds、永不被更新也不被删除）的机制。
+    //
+    // 只删索引行；磁盘上同 folder 只有一个目录，不需要（也不能）动。
+    const dupPlan = planDuplicateCleanup(liveLocal)
+    const dupDropIds: string[] = []
+    const dupDropRecords: Asset[] = []
+    const dupDropSet = new Set<string>()
+    const dupMergedById = new Map<string, Asset>()
+    const liveById = new Map(liveLocal.map((a) => [a.id, a]))
+    for (const group of dupPlan) {
+      // 幸存者带上"只补空"的合并结果（别条的用户字段不能随记录一起消失）
+      dupMergedById.set(group.keepId, group.merged)
+      for (const id of group.dropIds) {
+        dupDropSet.add(id)
+        dupDropIds.push(id)
+        const rec = liveById.get(id)
+        if (rec) dupDropRecords.push(rec)
+      }
+    }
+    const liveCollapsed = liveLocal
+      .filter((a) => !dupDropSet.has(a.id))
+      .map((a) => dupMergedById.get(a.id) ?? a)
+    if (dupDropIds.length > 0) {
+      console.info(
+        `[recordHygiene] rescan 期间发现 ${dupPlan.length} 组同 folder 重复记录，合并 ${dupDropIds.length} 条`
+      )
+    }
+
+    const localByFolder = new Map(liveCollapsed.map((a) => [a.folder, a]))
 
     const merged: Asset[] = []
     /** 即将被合并结果覆盖的**本地原记录**（新记录不算）→ 改库前落一份快照 */
@@ -2885,6 +3129,11 @@ export const useVault = create<VaultState>((set, get) => ({
     // ── 安全守卫 ②：一次要删掉超过一半（且数量显著）→ 中止 ────────────
     // 覆盖"切到一个只有几个文件的新目录"：scanned 不为 0，但大部分旧记录要被删。
     // 阈值取 gone > 10 是为了不干扰小库的正常删除（如 2 个里删 1 个）。
+    //
+    // ⚠️ 分子分母都**不含** `dupDropIds`：那是"索引内部去重"（数据全部来自索引本身、
+    // 已落 `rescan-*` 备份、可还原），不是"磁盘说这些资产没了"。若把它算进来，
+    // 一个只由重复记录构成的库（真机：33 个文件夹 / 69 条记录）在清理前永远过不了
+    // 这个阈值 → 永远无法自愈。真正危险的是 `goneIds`（磁盘侧消失），守卫只盯它。
     if (!force && goneIds.length > 10 && goneIds.length / localAssets.length > 0.5) {
       set({
         notice: `重扫已中止：本次扫描将删除 ${goneIds.length}/${localAssets.length} 个资产（超过一半），索引未改动。请确认库目录是否正确；若确认要清空，请到「设置 → 导入 → 强制重扫」。`
@@ -2893,9 +3142,15 @@ export const useVault = create<VaultState>((set, get) => ({
     }
 
     // ── 安全网 ③：真删之前先把**完整记录**写进 backups（tags/note/styles 只在这里有副本） ──
-    if (goneIds.length > 0) {
-      await backupRescanDeletions(goneRecords)
-      await db.assets.bulkDelete(goneIds)
+    // 两类删除共用一次备份（同构、同保留期）：
+    // - `goneRecords`：磁盘上已经不存在的（原语义）；
+    // - `dupDropRecords`：本次 rescan 因同 folder 重复被合并掉的（内容会并进幸存者，
+    //   但**原样快照**才是唯一可精确回退的东西）。
+    const deleteIds = [...goneIds, ...dupDropIds]
+    const deleteRecords = [...goneRecords, ...dupDropRecords]
+    if (deleteIds.length > 0) {
+      await backupRescanDeletions(deleteRecords)
+      await db.assets.bulkDelete(deleteIds)
     }
     // ── 安全网 ④：覆盖之前先把"将被改写的那批原记录"整份快照（`rescan-pre-*`） ──
     // 顺序刻意放在 `bulkPut` 之前、删除之后：删除有自己的备份（③），这里只负责
@@ -2913,7 +3168,33 @@ export const useVault = create<VaultState>((set, get) => ({
       rescanBackupCount,
       folderViewAssetId: viewedId && merged.some((a) => a.id === viewedId) ? viewedId : null
     })
-    window.modvault.pruneThumbs(merged.map((a) => a.id)).catch(() => 0)
+    // ── T-PRUNE ④：prune 白名单必须是**库里写入后的真实 id 集合** ──────────
+    //
+    // 旧实现传的是 `merged`（本次 rescan 的合并结果）当白名单 —— 那是 0.7.6 真机
+    // 误删 36 张缩略图的根因：任何**没参与本次合并**的记录（历史悬空记录、
+    // rescan 期间并发导入的新记录）都不在 `merged` 里 → 它们的缩略图被判成孤儿
+    // → `thumbPrune` 直接从磁盘删文件。文件没了，索引却还写着 `ready`，
+    // 于是"每次启动一大批预览图不出现"。
+    //
+    // 为什么 `db.assets.toArray()` 才是权威：写库已经完成（上面 `bulkPut` + 删除），
+    // 此刻表里的 id 集合**就是**"这些缩略图还有人认领"的完整答案 —— 包括本次没被
+    // 合并、但在库里活着的记录，以及并发写入的新记录。`merged ∪ localAssets`
+    // 便宜一点，但漏掉并发导入的记录，需要靠"没人这时导入"这种假设，不采用。
+    //
+    // 读表失败 / 空库 → **一次也不 prune**：传部分清单就是批量删盘，而空白名单会删掉
+    // 全部缓存。没有孤儿可清是小事，删错文件是事故。
+    let idsAfter: string[] | null = null
+    try {
+      idsAfter = (await db.assets.toArray()).map((a) => a.id)
+    } catch {
+      // 读表失败（含运行在无 IndexedDB 的环境里）：保持 null = 本次不清孤儿
+      idsAfter = null
+    }
+    if (idsAfter && idsAfter.length > 0) {
+      window.modvault.pruneThumbs(idsAfter).catch(() => 0)
+    } else {
+      console.info('[recordHygiene] 跳过缩略图孤儿清理：读表失败或库为空（不冒删盘风险）')
+    }
     // rescan 会把新/变更资产的 thumbStatus 重置为 none → 后台补齐（封顶 ENSURE_THUMB_BATCH）
     void ensureMissingThumbs()
     // 同上：材质球缓存也可能失效（贴图换了 → hash 变）→ 重新入队
