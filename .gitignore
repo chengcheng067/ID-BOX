@@ -29,3 +29,7 @@ docs/idbox-ui-package-v0.2.zip
 #   要换成本机真实码 → resources/brand/contact-wechat.local.jpg 后跑 npm run brand）
 resources/brand/contact-wechat.jpg
 resources/brand/*.local.*
+
+# 真机验收证据（本地产物，不入库：34MB 截图 + 临时 CDP 脚本）
+docs/screenshots/0.7.6/
+qa-v076-tmp/
