@@ -486,9 +486,12 @@ describe('源码守卫：最近删除的界面接线', () => {
     // 结果是除「最近删除」外全点不动（用户原话：「没有办法通过直接去点侧边栏的任何一个按键退出」）。
     // 现在回收站只是"当前视图"，不再锁死其它筛选 —— 这条守卫要**反向**钉住。
     expect(src).not.toContain('pointer-events-none opacity-40')
-    // 统一出口：每条导航的 onClick 都得先退出回收站再应用筛选
+    // 统一出口：每条导航的 onClick 都经过 `navTo`，它在**退出回收站之前**还负责
+    // 先 `closeFolderView()`（2026-10 第二个 bug：文件视图里点侧栏中栏不动）。
+    // 因此 `exitTrash()` 的直接调用收口成 1 处（`navTo` 内），判据改为数 `navTo(`。
     expect(src).toContain('const exitTrash = (): void =>')
-    expect((src.match(/exitTrash\(\)/g) ?? []).length).toBeGreaterThanOrEqual(8)
+    expect(src).toContain('const navTo = (action: () => void): void =>')
+    expect((src.match(/navTo\(/g) ?? []).length).toBeGreaterThanOrEqual(8)
     // 「最近删除」自身仍是唯一的进出开关，语义不能跟着改
     expect(src).toContain("setLibraryView(trashMode ? 'assets' : 'trash')")
   })

@@ -546,6 +546,19 @@ export default function App() {
   const setDupOnly = useVault((s) => s.setDupOnly)
   /** 设置里关掉色标入口时，中栏头这个 chip 不渲染（settings 未加载 → 按默认显示） */
   const showColorTagsEntry = useVault((s) => s.settings?.showColorTags !== false)
+
+  // ── 搜索也是导航（与侧栏 `navTo` 同一条语义，2026-10 用户反馈第二个 bug）──
+  // 文件视图打开时中栏被 `folderAsset` 分支占住，顶栏搜索框敲字只改 `filters.query`，
+  // 画布不动。这里只在**搜索词变化**时判断（依赖数组只有 query）：
+  // · 进入文件视图时不会触发 —— 否则「先搜索、再双击结果进文件列表」会被立刻弹出来；
+  // · 首次敲字（query 变非空）时关一次；关完后 `folderViewAssetId` 已是 null，
+  //   后面每敲一个字都直接跳过，不会反复 close（也不需要每敲一下都写 store）。
+  const searchQuery = filters.query
+  useEffect(() => {
+    if (searchQuery.trim().length === 0) return
+    const st = useVault.getState()
+    if (st.folderViewAssetId) st.closeFolderView()
+  }, [searchQuery])
   // 大类筛选可能是分组哨兵（materialGroup）→ 显示名统一走 kindFilterLabel
   const headerTitle =
     libraryView === 'trash'

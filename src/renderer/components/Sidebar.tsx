@@ -45,6 +45,19 @@ function scopeOf(node: NavNode | null): AssetKind | readonly AssetKind[] {
 }
 
 /**
+ * 「导航收口」的**纯函数内核**（导出仅为可单测，生产只经 `navTo` 使用）。
+ *
+ * 先离开文件视图，再执行导航动作；**顺序不可颠倒**——反过来会先按旧筛选渲染一帧，
+ * 中栏短暂出现"筛选已经变了、却还盖着文件列表"的错帧。
+ *
+ * 两个依赖都用参数注入（而不是在这里直接摸 store），node 环境就能用调用数组断言顺序。
+ */
+export function runNavAction(closeFolderView: () => void, action: () => void): void {
+  closeFolderView()
+  action()
+}
+
+/**
  * 左栏库导航（UI 设计规范 v0.2 §3.2，宽 216，底 --bg-sidebar）。
  *
  * 分组：全部 → 分类（模型/贴图/HDRI/材质预设/其他）→ 整理（收藏/色标/重复资产，
@@ -73,6 +86,8 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   // C 线「最近删除」：视图切换 + 软删计数
   const libraryView = useVault((s) => s.libraryView)
   const setLibraryView = useVault((s) => s.setLibraryView)
+  // 软件内文件视图（docs/15 §6c）：进入后中栏由 `folderAsset` 分支接管（优先于网格）
+  const closeFolderView = useVault((s) => s.closeFolderView)
   // 0.6.0 智能集合：保存的筛选视图（settings.savedViews，纯虚拟层）
   // 选择器只取数组本身（不写 `?? []`，否则每次返回新引用），空值在外面兜底。
   const savedViewsOrNull = useVault((s) => s.settings?.savedViews)
@@ -108,7 +123,7 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const trashMode = libraryView === 'trash'
 
   /**
-   * 退出回收站，回到资产视图（左栏**每一个**筛选入口点击时都先走这一步）。
+   * 退出回收站，回到资产视图（左栏**每一个**筛选入口点击时都先走这一步，由 `navTo` 统一调用）。
    *
    * 为什么只在确实是 trash 时才写 store：`setLibraryView` 会顺带清空选择 / 文件视图，
    * 资产视图里无谓地调一次会打断用户正在做的事情。
@@ -116,6 +131,31 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
    */
   const exitTrash = (): void => {
     if (libraryView !== 'assets') setLibraryView('assets')
+  }
+
+  /**
+   * 2026-10 用户反馈（第二个 bug）：文件视图打开时，点左栏任何导航项只改了筛选 / 视图，
+   * 中栏却仍被 `folderAsset` 分支盖住（`App.tsx` 里文件视图优先于网格）——
+   * 用户看到的是「侧栏高亮变了、计数也变了，中心画布纹丝不动」。
+   *
+   * 收口：**所有**"会把中栏换成另一批资产"的入口统一走 `navTo`：
+   * ① 先 `closeFolderView()`（中栏立刻回到网格 / 列表，`folderAsset` 变 null）；
+   * ② 再 `exitTrash()`（既有逻辑：回收站是视图不是锁定态）；
+   * ③ 最后执行筛选 / 视图变更。
+   *
+   * `closeFolderView` 本身就是幂等（`set({ folderViewAssetId: null })`），不必先判断是否打开；
+   * 顺序由 `runNavAction` 固定（有单测钉住 close 在 action 之前）。
+   */
+  const navTo = (action: () => void): void => {
+    runNavAction(closeFolderView, () => {
+      exitTrash()
+      action()
+    })
+  }
+
+  /** 视图切换（「最近删除」）：它自己就是视图入口，**不能**套 `exitTrash`（会先被拉回资产视图） */
+  const navToView = (action: () => void): void => {
+    runNavAction(closeFolderView, action)
   }
 
   // ── 反馈 6d：拖拽归类（拖卡片上的「归类抓手」→ 松手在分类节点上） ──
@@ -325,8 +365,8 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
             此前这里是 `trashMode ? 'pointer-events-none …'`（并同时加 `opacity-40` 灰置），进回收站后
             左栏除「最近删除」外全部点不动，用户只能靠再点一次「最近删除」退出——
             正是用户反馈的「没有办法通过直接去点侧边栏的任何一个按键退出」。
-            现在的口径：回收站 = 当前视图，不是锁定；点任意条目 → 先 `exitTrash()`
-            再应用该条筛选（筛选状态本身仍不清空，与既有语义一致）。
+            现在的口径：回收站 = 当前视图，不是锁定；点任意条目 → 先 `navTo`（退出文件视图
+            + 退出回收站）再应用该条筛选（筛选状态本身仍不清空，与既有语义一致）。
             下面这层 div 仅作结构分组保留（拆掉会产生 300 行纯缩进 diff）。 */}
         <div>
         <button
@@ -350,23 +390,24 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
             'neutral'
           )}
           onClick={() => {
-            // 「全部」= 退出回收站 + 清空所有筛选维度（唯一能回到整库的入口）
-            exitTrash()
-            setDupOnly(false)
-            setFilter({
-              kind: 'all',
-              tag: null,
-              source: null,
-              suVersion: null,
-              category1: null,
-              category2: null,
-              styles: [],
-              favoriteOnly: false,
-              colorTags: [],
-              minBytes: null,
-              maxBytes: null,
-              importedAfter: null,
-              importedBefore: null
+            // 「全部」= 退出文件视图 + 退出回收站 + 清空所有筛选维度（唯一能回到整库的入口）
+            navTo(() => {
+              setDupOnly(false)
+              setFilter({
+                kind: 'all',
+                tag: null,
+                source: null,
+                suVersion: null,
+                category1: null,
+                category2: null,
+                styles: [],
+                favoriteOnly: false,
+                colorTags: [],
+                minBytes: null,
+                maxBytes: null,
+                importedAfter: null,
+                importedBefore: null
+              })
             })
           }}
         >
@@ -387,13 +428,14 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
               <button
                 className={itemCls(filters.kind === node && !dupOnly && !trashMode, 'accent')}
                 onClick={() => {
-                  // 点大类：退出回收站 → 筛选到该大类（分组节点 = texture+material）、清空分类筛选；
-                  // 首次点击即展开，再点该大类 = 折叠
-                  exitTrash()
-                  setDupOnly(false)
-                  setFilter({ kind: node, tag: null, source: null, category1: null, category2: null })
-                  setExpandKind(nextExpandKind(expanded, node))
-                  setExpandL1(null)
+                  // 点大类：退出文件视图 → 退出回收站 → 筛选到该大类（分组节点 = texture+material）、
+                  // 清空分类筛选；首次点击即展开，再点该大类 = 折叠
+                  navTo(() => {
+                    setDupOnly(false)
+                    setFilter({ kind: node, tag: null, source: null, category1: null, category2: null })
+                    setExpandKind(nextExpandKind(expanded, node))
+                    setExpandL1(null)
+                  })
                 }}
                 title={expanded ? '点击折叠子分类' : '点击筛选并展开子分类'}
               >
@@ -417,11 +459,13 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                         key={member}
                         className={on ? 'chip-accent' : 'chip-ghost'}
                         onClick={() => {
-                          exitTrash()
-                          setFilter({
-                            kind: on ? MATERIAL_GROUP : member,
-                            tag: null,
-                            source: null
+                          // 材质分组下的单类 chip：同样是导航（退出文件视图 + 退出回收站）
+                          navTo(() => {
+                            setFilter({
+                              kind: on ? MATERIAL_GROUP : member,
+                              tag: null,
+                              source: null
+                            })
                           })
                         }}
                         title={on ? '再点回到「材质」（两类）' : `只看${KIND_LABEL[member]}`}
@@ -450,10 +494,11 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                         className={itemCls(l1Active, 'accent', dropKey === l1Key)}
                         {...dropProps(l1Key, node, n.value)}
                         onClick={() => {
-                          // 一级分类：退出回收站 → 筛选到「大类 + 一级」，再点同一节点折叠
-                          exitTrash()
-                          setFilter({ kind: node, category1: n.value, category2: null, tag: null, source: null })
-                          setExpandL1(l1Open ? null : n.value)
+                          // 一级分类：退出文件视图 → 退出回收站 → 筛选到「大类 + 一级」，再点同一节点折叠
+                          navTo(() => {
+                            setFilter({ kind: node, category1: n.value, category2: null, tag: null, source: null })
+                            setExpandL1(l1Open ? null : n.value)
+                          })
                         }}
                         title={
                           n.value === UNCLASSIFIED
@@ -485,14 +530,16 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                               className={itemCls(l2Active, 'accent', dropKey === l2Key)}
                               {...dropProps(l2Key, node, n.value, c2.value)}
                               onClick={() => {
-                                // 二级分类：退出回收站 → 筛选到「大类 + 一级 + 二级」，再点同一条取消二级
-                                exitTrash()
-                                setFilter({
-                                  kind: node,
-                                  category1: n.value,
-                                  category2: l2Active ? null : c2.value,
-                                  tag: null,
-                                  source: null
+                                // 二级分类：退出文件视图 → 退出回收站 → 筛选到「大类 + 一级 + 二级」，
+                                // 再点同一条取消二级
+                                navTo(() => {
+                                  setFilter({
+                                    kind: node,
+                                    category1: n.value,
+                                    category2: l2Active ? null : c2.value,
+                                    tag: null,
+                                    source: null
+                                  })
                                 })
                               }}
                               title={full}
@@ -522,10 +569,12 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
           <button
             className={itemCls(favoriteActive, 'neutral')}
             onClick={() => {
-              // 退出回收站 + 只切这一个维度：收藏是属性筛选，不应顺带清掉分类/搜索
-              exitTrash()
-              setDupOnly(false)
-              setFilter({ favoriteOnly: !favoriteActive })
+              // 退出文件视图 + 退出回收站 + 只切这一个维度：
+              // 收藏是属性筛选，不应顺带清掉分类/搜索
+              navTo(() => {
+                setDupOnly(false)
+                setFilter({ favoriteOnly: !favoriteActive })
+              })
             }}
             title={favoriteActive ? '取消「仅看收藏」' : `只看收藏（${favoriteCount} 个）`}
           >
@@ -546,23 +595,24 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
             }`}
             disabled={dupExtra === 0}
             onClick={() => {
-              // 退出回收站 + 进入重复视图时清掉其它筛选维度：
+              // 退出文件视图 + 退出回收站 + 进入重复视图时清掉其它筛选维度：
               // 入口语义是「看全库哪些资产重复了」
-              exitTrash()
-              setFilter({
-                kind: 'all',
-                tag: null,
-                source: null,
-                suVersion: null,
-                category1: null,
-                category2: null,
-                styles: [],
-                favoriteOnly: false,
-                colorTags: []
+              navTo(() => {
+                setFilter({
+                  kind: 'all',
+                  tag: null,
+                  source: null,
+                  suVersion: null,
+                  category1: null,
+                  category2: null,
+                  styles: [],
+                  favoriteOnly: false,
+                  colorTags: []
+                })
+                setDupOnly(true)
+                setExpandKind(null)
+                setExpandL1(null)
               })
-              setDupOnly(true)
-              setExpandKind(null)
-              setExpandL1(null)
             }}
             title={
               dupExtra === 0
@@ -599,9 +649,9 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
               <button
                 className={itemCls(false, 'neutral')}
                 onClick={() => {
-                  // 套用智能集合也要先退出回收站：集合里的筛选只对资产视图有意义
-                  exitTrash()
-                  applySavedView(v)
+                  // 套用智能集合也是导航：先离开文件视图，再退出回收站
+                  // （集合里的筛选只对资产视图有意义）
+                  navTo(() => applySavedView(v))
                 }}
                 title={`套用「${v.name}」（替换当前全部筛选条件与排序）`}
               >
@@ -642,10 +692,12 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                 // 点击语义相应按"未选中 → 选中该标签"处理（否则会出现反向 toggle）
                 className={itemCls(filters.tag === tag && !trashMode, 'neutral')}
                 onClick={() => {
-                  exitTrash()
-                  setFilter({
-                    tag: filters.tag === tag && !trashMode ? null : tag,
-                    source: null
+                  // 标签筛选同样是导航：先离开文件视图，再退出回收站
+                  navTo(() => {
+                    setFilter({
+                      tag: filters.tag === tag && !trashMode ? null : tag,
+                      source: null
+                    })
                   })
                 }}
               >
@@ -668,7 +720,7 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
         <button
           className={itemCls(trashMode, 'neutral')}
           aria-pressed={trashMode}
-          onClick={() => setLibraryView(trashMode ? 'assets' : 'trash')}
+          onClick={() => navToView(() => setLibraryView(trashMode ? 'assets' : 'trash'))}
           title={
             trashMode
               ? '返回资产列表（筛选条件会原样恢复）'
