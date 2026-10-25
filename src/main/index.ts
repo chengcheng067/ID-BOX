@@ -112,10 +112,171 @@ import { registerVaultScheme, serveVault } from './protocol'
 import { normalizeTargetWidth, prepareHdrFile } from './hdrDecode'
 import { isHdrExt } from '../shared/hdrExts'
 import { sanitizeName } from '../shared/naming'
+import {
+  CRASH_WINDOW_MS,
+  MAX_RELOADS_PER_WINDOW,
+  STABLE_ALIVE_MS,
+  decideCrashRecovery,
+  isStableAlive
+} from './crashGuard'
 
 let win: BrowserWindow | null = null
 let settings: Settings = { ...DEFAULT_SETTINGS }
 const watcher = new ArchiveWatcher()
+
+// ── 渲染进程崩溃自动恢复（DEF-19-5）────────────────────────────────────
+//
+// 决策逻辑全在 `crashGuard.ts`（纯函数，可单测）；这里只持有**运行时状态**：
+// - `crashHistory`：真的触发过自动 reload 的崩溃时间戳（ms）。用时间戳而不是计数器，
+//   是因为"5 分钟窗口"必须能自然过期 —— 用户白天崩一次、晚上再崩一次不算连续；
+// - `crashReloadTimer`：退避中的 reload 定时器，窗口销毁 / 退出前必须清掉，
+//   否则定时器在 `win` 已销毁后触发会碰 `webContents` 而抛异常；
+// - `stableTimer`：reload 成功后观察"是否稳住 60s"的定时器，满了就清零历史；
+// - `appQuitting`：`before-quit` 之后为 true。退出过程中的崩溃一律不救
+//   （这是 `killed` 也能安全 reload 的前提，见 crashGuard 注释）；
+// - `recoveryDialogOpen`：放弃恢复的原生弹窗只弹一个，别让后续崩溃叠窗。
+let crashHistory: number[] = []
+let crashReloadTimer: ReturnType<typeof setTimeout> | null = null
+let stableTimer: ReturnType<typeof setTimeout> | null = null
+let appQuitting = false
+let recoveryDialogOpen = false
+
+/** 清掉崩溃恢复相关定时器（窗口关闭 / 退出 / 已排队的 reload 执行前都会调用） */
+function clearCrashTimers(): void {
+  if (crashReloadTimer !== null) {
+    clearTimeout(crashReloadTimer)
+    crashReloadTimer = null
+  }
+  if (stableTimer !== null) {
+    clearTimeout(stableTimer)
+    stableTimer = null
+  }
+}
+
+/**
+ * reload 成功后的"稳定性观察"：页面 `did-finish-load` 起存活满 {@link STABLE_ALIVE_MS}
+ * 就把崩溃历史清零。
+ *
+ * 注意**每次 load 都要重置这个定时器**：reload 后立刻再崩，`did-finish-load` 可能已经
+ * 触发过一次，旧定时器如果继续跑，会在新一轮崩溃后把历史清空 → 退避上限被绕过 → 循环崩溃。
+ */
+function armStableTimer(): void {
+  if (stableTimer !== null) {
+    clearTimeout(stableTimer)
+    stableTimer = null
+  }
+  if (crashHistory.length === 0) return
+  stableTimer = setTimeout(() => {
+    stableTimer = null
+    if (!isStableAlive(STABLE_ALIVE_MS)) return
+    const cleared = crashHistory.length
+    crashHistory = []
+    logInfo('crash:recovery-stable', {
+      cleared,
+      stableMs: STABLE_ALIVE_MS,
+      reason: '页面持续存活，崩溃计数已重置'
+    })
+  }, STABLE_ALIVE_MS)
+  // 短命场景（单测 / 无窗口）不该被这个定时器吊住
+  stableTimer.unref?.()
+}
+
+/**
+ * 连续崩溃超过上限后的兜底：原生弹窗告知 + 「打开日志目录」/「重启应用」。
+ *
+ * 重启的安全性说明：本应用所有用户数据都在 **IndexedDB（渲染进程）与磁盘库目录**里，
+ * 主进程没有"未保存缓冲区"这类易失状态；导入批次是落盘后台任务，`app.exit` 前会
+ * `clearPendingAsks` 把挂起的重复询问按「跳过」收尾、`flushLogsSync` 把日志冲刷完。
+ * 已写入磁盘的文件不会因为重启丢失，最坏情况是某个正在解压的批次留下 `.staging`
+ * （启动时的 `cleanupStaging` 会清掉）。因此这里可以直接 relaunch。
+ */
+function showCrashGiveUpDialog(context: {
+  reason: string
+  crashesInWindow: number
+  attempt: number
+}): void {
+  if (recoveryDialogOpen) return
+  recoveryDialogOpen = true
+  const logs = logDir()
+  const options = {
+    type: 'error' as const,
+    title: 'ID BOX 界面组件连续崩溃',
+    message: '界面组件连续崩溃，已停止自动恢复',
+    detail:
+      `最近 ${CRASH_WINDOW_MS / 60_000} 分钟内界面组件崩溃 ${context.crashesInWindow} 次` +
+      `（最后一次原因：${context.reason}），自动恢复已停止。\n\n` +
+      `请先点「重启应用」；若重启后仍然崩溃，请把日志目录里的文件发给我们：\n${logs}`,
+    buttons: ['重启应用', '打开日志目录', '稍后'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true
+  }
+  const show = win && !win.isDestroyed() ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options)
+  void show
+    .then((result) => {
+      recoveryDialogOpen = false
+      logInfo('crash:give-up:choice', {
+        response: result.response,
+        reason: context.reason,
+        crashesInWindow: context.crashesInWindow
+      })
+      if (result.response === 1) {
+        void shell.openPath(logs)
+        return
+      }
+      if (result.response !== 0) return
+      // 重启：先置退出标记并停掉所有恢复定时器，避免渲染进程退出时又被 reload 一次
+      appQuitting = true
+      clearCrashTimers()
+      clearPendingAsks('app-relaunch')
+      flushLogsSync()
+      app.relaunch()
+      app.exit(0)
+    })
+    .catch((err: unknown) => {
+      recoveryDialogOpen = false
+      logWarn('crash:give-up:dialog-failed', {
+        error: err instanceof Error ? err.message : String(err)
+      })
+    })
+}
+
+/**
+ * 排一次自动 reload。
+ *
+ * 执行前重新校验窗口与退出状态：退避期间用户可能已经关窗 / 退出应用，
+ * 这时 `win.webContents` 已销毁，`reload()` 会抛 `Object has been destroyed`。
+ */
+function scheduleCrashReload(delayMs: number): void {
+  if (crashReloadTimer !== null) {
+    clearTimeout(crashReloadTimer)
+    crashReloadTimer = null
+  }
+  const run = (): void => {
+    crashReloadTimer = null
+    if (appQuitting) {
+      logWarn('crash:reload:skipped', { why: '应用正在退出' })
+      return
+    }
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) {
+      logWarn('crash:reload:skipped', { why: '窗口已销毁' })
+      return
+    }
+    try {
+      logInfo('crash:reload:do', { delayMs })
+      win.webContents.reload()
+    } catch (err) {
+      // reload 本身失败（极少数：webContents 在检查与调用之间被销毁）：
+      // 不再重试，留给下一次 render-process-gone 或用户手动重开
+      logError('crash:reload:failed', err)
+    }
+  }
+  if (delayMs <= 0) {
+    run()
+    return
+  }
+  crashReloadTimer = setTimeout(run, delayMs)
+}
 
 /**
  * 回收站策略（P0-16 删除链路 / P0-5 原包处置共用）。
@@ -455,6 +616,10 @@ function resolveDragCard(cardPng: unknown): DragIconResolution | null {
  */
 function installCrashHandlers(): void {
   const cleanup = (): void => {
+    // 退出流程开始：崩溃自动恢复必须立刻停手（否则关窗时 render-process-gone
+    // 会把正在销毁的窗口又 reload 回来，用户看到"关不掉"）
+    appQuitting = true
+    clearCrashTimers()
     // 退出前必须把挂起的重复询问兑现掉，否则正在等答复的批次会卡在 await 上，
     // `cleanupStaging` 会把它的 staging 删掉而 Promise 永远不返回（docs/27 §4.3）
     clearPendingAsks('before-quit')
@@ -485,8 +650,9 @@ function installCrashHandlers(): void {
 
   // 渲染进程崩溃（含 OOM / 被系统 kill）：reason + exitCode 是唯一线索
   app.on('render-process-gone', (_event, webContents, details) => {
+    const reason = details?.reason ?? null
     logError('process:render-gone', undefined, {
-      reason: details?.reason ?? null,
+      reason,
       exitCode: details?.exitCode ?? null,
       webContentsId: webContents?.id ?? null,
       url: (() => {
@@ -500,7 +666,69 @@ function installCrashHandlers(): void {
     // 渲染进程没了 = 没人能回答重复询问：**立刻**全按「跳过」收尾，绝不干等 120s
     // （docs/27 §4.3 / 端到端验收 6：kill 渲染进程后主进程要立即收尾）
     clearPendingAsks('render-gone')
+    // 新一轮崩溃开始：旧"稳定观察"定时器必须停掉，否则它会在本轮崩溃后把历史清零，
+    // 把退避上限绕过去（= 循环崩溃）
+    if (stableTimer !== null) {
+      clearTimeout(stableTimer)
+      stableTimer = null
+    }
+
+    // 只处理主窗口的崩溃；其他 webContents（极少数隐藏窗口）只留日志
+    if (!win || win.isDestroyed() || webContents !== win.webContents) {
+      logWarn('crash:recovery:skipped', {
+        reason,
+        why: '不是主窗口的渲染进程，无法自动恢复'
+      })
+      flushLogsSync()
+      return
+    }
+
+    const now = Date.now()
+    const decision = decideCrashRecovery({
+      reason,
+      now,
+      history: crashHistory,
+      quitting: appQuitting
+    })
+
+    if (decision.action === 'ignore') {
+      logWarn('crash:recovery', {
+        action: 'ignore',
+        reason: decision.reason,
+        why: decision.why,
+        crashesInWindow: crashHistory.length
+      })
+      flushLogsSync()
+      return
+    }
+
+    // 进入历史：这一条代表"本次已经消耗了一次自动恢复额度"。
+    // 先记账再排定时器，保证退避期间若窗口被关/再崩，计数不会漏。
+    crashHistory.push(now)
+
+    logWarn('crash:recovery', {
+      action: decision.action,
+      reason: decision.reason,
+      why: decision.why,
+      attempt: decision.attempt,
+      delayMs: decision.action === 'reload' ? decision.delayMs : 0,
+      crashesInWindow: decision.crashesInWindow,
+      windowMs: CRASH_WINDOW_MS,
+      maxPerWindow: MAX_RELOADS_PER_WINDOW
+    })
+    // 先冲刷：reload 会销毁当前渲染进程，这条现场必须已经落盘
     flushLogsSync()
+
+    if (decision.action === 'reload') {
+      scheduleCrashReload(decision.delayMs)
+      return
+    }
+
+    showCrashGiveUpDialog({
+      reason: decision.reason,
+      crashesInWindow: decision.crashesInWindow,
+      attempt: decision.attempt
+    })
   })
 
   // 子进程（GPU / utility / plugin）崩溃
@@ -543,7 +771,17 @@ function createWindow(): void {
 
   // 窗口关掉 = 没人能回答重复询问（docs/27 §4.3）：立即按「跳过」收尾
   win.on('closed', () => {
+    // 窗口没了：崩溃恢复的定时器必须清掉。否则退避中的 reload 会在 `win` 已销毁后
+    // 触发（碰 webContents 抛异常），"稳定观察"也会在进程退出前继续跑。
+    appQuitting = true
+    clearCrashTimers()
     clearPendingAsks('window-closed')
+  })
+
+  // 每次页面加载完成都重新起"稳定观察"：只有 reload 之后才需要观察，
+  // 历史为空时 `armStableTimer` 直接返回，不会平白多一个定时器。
+  win.webContents.on('did-finish-load', () => {
+    armStableTimer()
   })
 
   const devUrl = process.env['ELECTRON_RENDERER_URL']
