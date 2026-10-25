@@ -14,9 +14,24 @@
  */
 import type { Asset } from '../../shared/types'
 import { baseNameOf, dedupeKeyOf, displayName } from '../../shared/naming'
+import { formatBytes, formatDate } from '../../shared/format'
 
 /** 体积差异阈值：最大体积比最小体积大 30% 以上视为「可疑同名」（0.3 = 30%） */
 export const SIZE_MISMATCH_RATIO = 0.3
+
+/**
+ * 参与重复判定的记录 = **还活着**的记录。
+ *
+ * ⚠️ P0（2026-10 用户报「保留这份」把本体也删了）：回收站里的记录仍然留在
+ * `store.assets` 里（软删只写 `deletedAt`，见 store 的删除链路）。若把软删记录也算进
+ * 重复组，用户在「最近删除」页打开一条记录时，它会把**唯一还活着的同 key 资产**
+ * 当成"重复副本"，点「保留这份」→ `requestDelete(活的那些)` → 把本体推进回收站。
+ *
+ * 因此所有对外的组/副本/份数计算**必须先过这一层**。`0` 视为活着（时间戳不会是 0）。
+ */
+function liveOnly(assets: Asset[]): Asset[] {
+  return assets.filter((a) => !!a && !a.deletedAt)
+}
 
 export interface DupGroup {
   /** 分组键：`zhimo:<知末ID>`（有 ID 时）或资产的 `dedupeKey` */
@@ -84,8 +99,9 @@ function hasSizeMismatch(list: Asset[]): boolean {
  */
 export function groupDuplicates(assets: Asset[]): DupGroup[] {
   const byKey = new Map<string, Asset[]>()
-  for (const a of assets) {
-    if (!a || typeof a.id !== 'string') continue
+  // P0：软删（回收站）里的记录不参与分组
+  for (const a of liveOnly(assets)) {
+    if (typeof a.id !== 'string') continue
     const key = keyOf(a)
     const list = byKey.get(key)
     if (list) list.push(a)
@@ -118,26 +134,49 @@ export function groupDuplicates(assets: Asset[]): DupGroup[] {
 /**
  * 某资产的**其它副本**（不含自己）。空数组 = 该资产没有重复。
  * 用于卡片角标（`×N` 里 N = 返回值长度 + 1）与详情面板的「重复副本」区。
+ *
+ * P0：只在**活着**的记录之间成立。自己已软删 → 直接返回 `[]`（回收站里的记录
+ * 绝不能反向把活着的资产认成"副本"）。
  */
 export function duplicatesOf(assets: Asset[], id: string): Asset[] {
-  const self = assets.find((a) => a.id === id)
+  const live = liveOnly(assets)
+  const self = live.find((a) => a.id === id)
   if (!self) return []
   const key = keyOf(self)
-  return assets.filter((a) => a.id !== id && keyOf(a) === key)
+  return live.filter((a) => a.id !== id && keyOf(a) === key)
 }
 
 /** 某资产所属的重复组；不在重复组里返回 null（详情面板取 `sizeMismatch` 用） */
 export function groupOf(assets: Asset[], id: string): DupGroup | null {
-  const self = assets.find((a) => a.id === id)
+  const live = liveOnly(assets)
+  const self = live.find((a) => a.id === id)
   if (!self) return null
   const key = keyOf(self)
-  const group = groupDuplicates(assets).find((g) => g.key === key)
+  const group = groupDuplicates(live).find((g) => g.key === key)
   return group ?? null
+}
+
+/**
+ * 「保留这一份，其余移入回收站」的**删除目标 id**（P0 修复的核心）。
+ *
+ * 安全口径（每条都对应一次真实事故/回归）：
+ * - `keepId` 自己**不在**结果里（不能删掉要保留的那份）；
+ * - 只取 `keyOf` 相同的活着的记录（不误伤别的资产）；
+ * - 软删记录全部排除（不重复入回收站、也不把回收站条目当副本）；
+ * - `keepId` 已软删 / 不存在 → **返回空数组**：回收站视图里调用它什么也不会发生。
+ */
+export function keepOnlyTargets(assets: Asset[], keepId: string): string[] {
+  const live = liveOnly(assets)
+  const keep = live.find((a) => a.id === keepId)
+  if (!keep) return []
+  const key = keyOf(keep)
+  return live.filter((a) => a.id !== keepId && keyOf(a) === key).map((a) => a.id)
 }
 
 /**
  * `assetId → 该组份数（含自己）`。份数 1 的资产不放进 Map（卡片不显示角标）。
  * 网格一次算好复用，避免每张卡片各扫一遍全库。
+ * 软删记录不参与（`groupDuplicates` 已过滤）→ 回收站条目不会带 `×N` 角标。
  */
 export function duplicateCountMap(assets: Asset[]): Map<string, number> {
   const map = new Map<string, number>()
@@ -161,4 +200,51 @@ export function groupLabel(group: DupGroup): string {
   if (!first) return group.key
   // 显示名：先剥自动序号（`椅子-2` → `椅子`），再剥知末 ID 尾巴（只影响显示）
   return displayName(baseNameOf(first.name)) || first.name || group.key
+}
+
+// ── 并排对比（用户 2026-10 反馈：「只列一行路径不够直观，看不出差异就敢点删」）──
+
+/** 对比表的一行：一个字段在每列上的展示值 + 是否存在差异 */
+export interface CompareField {
+  key: string
+  label: string
+  /** 与传入列一一对应的展示值（空串 = 该列没有这个值） */
+  values: string[]
+  /** 各列值不完全相同 → UI 用强调色标出来 */
+  differs: boolean
+}
+
+/** 分类展示成 `一级 / 二级`（缺省按「未分类」，与 UI 口径一致） */
+function categoryText(a: Asset): string {
+  const c1 = a.category1 ?? '未分类'
+  const c2 = a.category2 ?? '未分类'
+  return `${c1} / ${c2}`
+}
+
+/**
+ * 逐字段并排对比（纯函数，供 `DuplicateCompareDialog` 渲染）。
+ *
+ * 字段顺序固定：显示名 / 相对路径 / 体积 / 文件数 / 导入时间 / 分类 / SU 版本。
+ * `differs` 用**原始展示值集合**判断（`['SU 2024', '']` 也算不同 —— 一份有版本一份没有
+ * 正是用户需要看见的差异）。"有才显示"的字段（SU 版本）由调用方按 `values` 是否全空过滤。
+ */
+export function compareFields(assets: Asset[]): CompareField[] {
+  const defs: { key: string; label: string; get: (a: Asset) => string }[] = [
+    { key: 'name', label: '显示名', get: (a) => displayName(a.name) || a.name },
+    { key: 'relFolder', label: '相对路径', get: (a) => a.relFolder },
+    { key: 'size', label: '体积', get: (a) => formatBytes(a.size) },
+    { key: 'files', label: '文件数', get: (a) => `${a.files.length}` },
+    { key: 'importedAt', label: '导入时间', get: (a) => formatDate(a.importedAt) },
+    { key: 'category', label: '分类', get: categoryText },
+    { key: 'suVersion', label: 'SU 版本', get: (a) => a.suVersion?.trim() ?? '' }
+  ]
+  return defs.map((d) => {
+    const values = assets.map(d.get)
+    return {
+      key: d.key,
+      label: d.label,
+      values,
+      differs: new Set(values).size > 1
+    }
+  })
 }

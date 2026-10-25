@@ -8,7 +8,7 @@ import { beginSystemDrag } from '../logic/dragOut'
 import { cachedDragCard, cancelDragCardPrewarm, dragCardKey, prewarmDragCard } from '../logic/dragCard'
 import { IMAGE_FILE_EXTS } from '../../shared/imageExts'
 import { categoriesOf } from '../logic/category'
-import { duplicatesOf, groupOf } from '../logic/duplicates'
+import { duplicatesOf, groupOf, keepOnlyTargets } from '../logic/duplicates'
 import { groupFilesBySlot } from '../logic/fileGroups'
 import { effectiveMaterialSlots } from '../logic/materialBall'
 import {
@@ -19,6 +19,7 @@ import { isDeletedAsset, trashNoticeText } from '../logic/trashView'
 import { EMPTY_ALIASES, aliasIndexOf, resolveAssetDisplayName } from '../logic/aliasIndex'
 import { zhimoIdOf } from '../../shared/naming'
 import { CoverPicker } from './CoverPicker'
+import { DuplicateCompareDialog } from './DuplicateCompareDialog'
 import { PurgeConfirmDialog } from './PurgeConfirmDialog'
 import { CustomRenderDialog } from './CustomRenderDialog'
 import { ColorTagPicker, StarIcon, StarRating } from './MarkControls'
@@ -193,6 +194,8 @@ export function DetailPanel() {
   const [coverPickerOpen, setCoverPickerOpen] = useState(false)
   const [coverDragOver, setCoverDragOver] = useState(false)
   const [renderOpen, setRenderOpen] = useState(false)
+  /** 重复副本并排对比弹窗（2026-10 用户反馈：只列路径不够直观） */
+  const [compareOpen, setCompareOpen] = useState(false)
   /** 「彻底删除」二次确认（软删态才可达）；true = 弹窗打开 */
   const [purgeOpen, setPurgeOpen] = useState(false)
   /**
@@ -245,20 +248,26 @@ export function DetailPanel() {
   )
 
   /**
-   * 「保留这份，其余移入回收站」：复用既有删除链路（二次确认 → 5 秒撤销 → trashPaths），
-   * 不自己写 trash。体积差异大时确认框额外警示（误删大体积原件的代价很高）。
+   * 「保留某一份，其余移入回收站」：复用既有删除链路（二次确认 → 5 秒撤销 → trashPaths），
+   * 不自己写 trash。
+   *
+   * ⚠️ P0（2026-10 用户报「本体也被删了」）：目标 id 由 `keepOnlyTargets()` 统一计算——
+   * 它只取**同一重复组的活着的记录**，并排除要保留的那份。若 `keepId` 本身已软删
+   * （回收站视图）→ 返回空数组，这里直接 return，**一个都不会删**。
    */
+  const requestKeepOnly = (keepId: string) => {
+    if (!asset || asset.deletedAt) return
+    const ids = keepOnlyTargets(assets, keepId)
+    if (ids.length === 0) return
+    requestDelete(ids, {
+      warning: dupGroup?.sizeMismatch ? '体积差异较大，请先确认是同一套资产' : undefined,
+      notice: '已移入回收站，5 秒内可撤销'
+    })
+  }
+
+  /** 详情面板里的「保留这份」= 保留**当前选中的这条** */
   const keepThisCopyOnly = () => {
-    if (dupCopies.length === 0) return
-    requestDelete(
-      dupCopies.map((c) => c.id),
-      {
-        warning: dupGroup?.sizeMismatch
-          ? '体积差异较大，请先确认是同一套资产'
-          : undefined,
-        notice: '已移入回收站，5 秒内可撤销'
-      }
-    )
+    requestKeepOnly(asset?.id ?? '')
   }
 
   const toggleStyle = (v: string) => {
@@ -274,6 +283,8 @@ export function DetailPanel() {
     setTagInput('')
     setCoverPickerOpen(false)
     setRenderOpen(false)
+    // 切到别的资产时关掉对比弹窗：它的内容绑定在上一组资产上
+    setCompareOpen(false)
   }, [asset?.id])
 
   // 走查 v0.2.2 B2#4：空态同属右栏，浅色走白卡（画布 2:124）
@@ -615,14 +626,28 @@ export function DetailPanel() {
 
         {/* ── v0.4 重复副本 ──────────────────────────────────────────────
             同组其它资产的相对路径 + 体积；「保留这份」走 requestDelete（二次确认 + 5 秒撤销）。
-            只有真的存在副本时才渲染，普通资产的面板完全不变。 */}
-        {dupCopies.length > 0 && (
+            只有真的存在副本时才渲染，普通资产的面板完全不变。
+
+            ⚠️ P0（2026-10）：**回收站里的记录整块不渲染**。软删记录仍在 `assets` 里，
+            若在「最近删除」页显示「保留这份」，语义上等于"从回收站里再删一次"，
+            实际会把它唯一活着的同组副本推进回收站（用户实测「本体也被删了」）。
+            这里用资产自身的 `deletedAt` 判定，不猜视图。 */}
+        {!asset.deletedAt && dupCopies.length > 0 && (
           <div className="mt-4">
-            <div className="mb-1.5 flex items-baseline justify-between">
+            <div className="mb-1.5 flex items-baseline justify-between gap-2">
               <span className="text-[11px] font-medium text-primary">
                 重复副本（{dupCopies.length}）
               </span>
-              <span className="text-[10px] text-muted">同一大类下名字相同</span>
+              <div className="flex shrink-0 items-center gap-2">
+                <span className="text-[10px] text-muted">同一大类下名字相同</span>
+                <button
+                  className="text-[11px] text-accent-text transition hover:underline"
+                  onClick={() => setCompareOpen(true)}
+                  title="并排对比各副本的字段差异（缩略图 / 路径 / 体积 / 分类…）"
+                >
+                  对比
+                </button>
+              </div>
             </div>
             <div className="rounded-slotgroup border border-soft-line">
               {dupCopies.map((c) => (
@@ -824,6 +849,20 @@ export function DetailPanel() {
       </div>
 
       {purgeOpen && <PurgeConfirmDialog ids={[asset.id]} onClose={() => setPurgeOpen(false)} />}
+
+      {/* 重复副本并排对比（回收站视图不渲染：那里的"保留这份"语义不成立） */}
+      {compareOpen && !asset.deletedAt && (
+        <DuplicateCompareDialog
+          asset={asset}
+          copies={dupCopies}
+          sizeMismatch={dupGroup?.sizeMismatch ?? false}
+          onKeep={(keepId) => {
+            setCompareOpen(false)
+            requestKeepOnly(keepId)
+          }}
+          onClose={() => setCompareOpen(false)}
+        />
+      )}
 
       {coverPickerOpen && <CoverPicker asset={asset} onClose={() => setCoverPickerOpen(false)} />}
       {renderOpen && (
