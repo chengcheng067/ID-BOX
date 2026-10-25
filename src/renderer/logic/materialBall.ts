@@ -567,6 +567,23 @@ export interface MaterialParamValues {
    * 是为了让"按当前倍率 + 最终基准重算"这一次计算把六个参数一次算全。
    */
   light: number
+  /**
+   * 是否按 albedo 灰度做透明度分布（0.7.6）。
+   *
+   * 不写进材质 —— 它决定的是「要不要把 albedo 再挂一份到 `material.alphaMap`」
+   * （见 `BallScene.applyMaps` 的 entries 收集）。放进值对象是为了让
+   * `applyParams` 一次拿到"当前这批贴图该不该有 alphaMap"的完整口径。
+   */
+  alphaFromMap: boolean
+  /** 反转灰度（深色 = 不透明）；只在 `alphaFromMap` 为真时有意义，写 shader uniform */
+  alphaInvert: boolean
+  /**
+   * 本批贴图**实际**有没有挂上 alphaMap（来自 `ParamBasis.hasAlphaMap`，不是参数）。
+   *
+   * `applyMaterialParams` 用它决定 `transparent` 必须为真（否则 OPAQUE 抹平灰度）。
+   * 与 `alphaFromMap` 的区别：开关开着但资产没有 albedo（灰球）时，这里是 false。
+   */
+  hasAlphaMap: boolean
 }
 
 /**
@@ -609,13 +626,19 @@ export interface ParamMaterialTarget {
  * ★ 但**只在翻转时**置 `needsUpdate`：它会导致整条管线重编译（几百毫秒级），
  * 每次拖滑块都置会明显卡顿；`0.5 → 0.7` 这类同侧调整只改 `opacity` uniform，不需要。
  * `metalness` 同理（普通 uniform），不要顺手加。
+ *
+ * ★★ 0.7.6「按贴图灰度做透明」的关键修复：`hasAlphaMap` 也算进 `nextTransparent`。
+ * 只判 `alpha < 1` 的话，用户开着灰度图而整体不透明度仍是 100%（默认）时
+ * `transparent` 保持 false → shader 的 `#define OPAQUE` 会在
+ * `opaque_fragment` 里把 `diffuseColor.a = 1.0` 强行拉回不透明 →
+ * **灰度图被整个丢掉**，功能做完用户会说"没反应"。有 alphaMap 就必须走混合路径。
  */
 export function applyMaterialParams(target: ParamMaterialTarget, values: MaterialParamValues): void {
   target.roughness = values.roughness
   target.normalScale.set(values.normalScale, values.normalScale)
   target.displacementScale = values.displacementScale
   target.metalness = values.metal
-  const nextTransparent = values.alpha < 1
+  const nextTransparent = values.alpha < 1 || values.hasAlphaMap
   if (target.transparent !== nextTransparent) {
     target.transparent = nextTransparent
     target.needsUpdate = true // 翻转 → OPAQUE define 变化 → 必须重编译（见上）
@@ -655,6 +678,14 @@ export function renderActionPlan(action: RenderAction): RenderActionPlan {
  */
 export interface ParamBasis {
   hasRoughnessMap: boolean
+  /**
+   * 本批贴图里**有没有 alphaMap**（= `material.alphaMap !== null`）。
+   *
+   * 与 `hasRoughnessMap` 完全同构：它决定 `transparent` 必须为真（否则 OPAQUE
+   * 把灰度透明抹平），所以必须由"贴图批次落定"给出，不能靠参数猜 ——
+   * 用户可能开着 `alphaFromMap` 但该资产没有 albedo（灰球），那时没有 alphaMap。
+   */
+  hasAlphaMap: boolean
   baseRoughness: number
   baseNormalScale: number
   baseDisplacementScale: number
@@ -666,6 +697,7 @@ export type ParamBasisPatch = Partial<ParamBasis>
 /** 与 `BallScene` 一致的默认基准（0.04 位移见组件内注释：球是单位半径，4% 足够看出浮雕） */
 export const DEFAULT_PARAM_BASIS: ParamBasis = {
   hasRoughnessMap: false,
+  hasAlphaMap: false,
   baseRoughness: 0.5,
   baseNormalScale: 1,
   baseDisplacementScale: 0.04
@@ -765,7 +797,12 @@ export class ParamScaleState {
       // 后三个参数与基准（map 有无）无关：直接 clamp 即可，clamp 同时负责 NaN 回落
       metal: clampMetal(this.scales.metal),
       alpha: clampAlpha(this.scales.alpha),
-      light: clampLight(this.scales.light)
+      light: clampLight(this.scales.light),
+      // 灰度透明的开关直接取布尔（不是数值，无需 clamp）；
+      // `hasAlphaMap` 是**贴图批次**的事实，与本批贴图是否真的落到 material 上一致。
+      alphaFromMap: this.scales.alphaFromMap === true,
+      alphaInvert: this.scales.invertAlpha === true && this.scales.alphaFromMap === true,
+      hasAlphaMap: this.basis.hasAlphaMap
     }
   }
 }

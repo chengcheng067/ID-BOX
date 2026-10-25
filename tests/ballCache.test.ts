@@ -101,7 +101,18 @@ const ID = 'a1b2c3d4-1111-4222-8333-444455556666'
 const SLOTS: BallSlots = { albedo: 'vh1sbjl_2K_Albedo.jpg', normal: 'vh1sbjl_2K_Normal.jpg' }
 const DEFAULTS: BallParamScales = { roughness: 1, bump: 1, uv: 1, light: 1, metal: 0, alpha: 1 }
 /** 调过参的一组（golden：340ed45f） */
-const TUNED: BallParamScales = { roughness: 1.5, bump: 1, uv: 0.5, light: 1, metal: 0, alpha: 1 }
+// 0.7.6 起 normalizeParams 会补齐 alphaFromMap / invertAlpha（默认 false）——
+// 落库值是**规范化形态**，所以这里必须写全，否则 toEqual 会差两个字段。
+const TUNED: BallParamScales = {
+  roughness: 1.5,
+  bump: 1,
+  uv: 0.5,
+  light: 1,
+  metal: 0,
+  alpha: 1,
+  alphaFromMap: false,
+  invertAlpha: false
+}
 
 async function exists(p: string): Promise<boolean> {
   try {

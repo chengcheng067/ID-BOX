@@ -224,7 +224,10 @@ describe('init · 救援接线', () => {
       uv: 3.1,
       light: 1,
       metal: 0,
-      alpha: 1
+      alpha: 1,
+      // 0.7.6：灰度透明开关默认关（补齐成完整结构的一部分）
+      alphaFromMap: false,
+      invertAlpha: false
     })
   })
 

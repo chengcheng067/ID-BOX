@@ -31,13 +31,16 @@ import type { Asset } from '../src/shared/types'
 describe('logic/materialBall · 调参渲染（需求书 §3.3）', () => {
   it('DEFAULT_PARAM_SCALES = 1 倍 × 1 倍 × 1 倍（未调参 = 与旧渲染完全一致）', () => {
     // 0.6.9 追加三个参数：光强 1（默认照度）、金属 0（非金属=现状）、不透明 1
+    // 0.7.6 追加两个灰度透明开关：默认关（关着时成像与缓存名一个字节都不变）
     expect(DEFAULT_PARAM_SCALES).toEqual({
       roughness: 1,
       bump: 1,
       uv: 1,
       light: 1,
       metal: 0,
-      alpha: 1
+      alpha: 1,
+      alphaFromMap: false,
+      invertAlpha: false
     })
     // 1 倍时 roughness 恒等于基准、bump 恒等于基准、UV 恒等于形态基准（回归保障）
     expect(effectiveRoughness(false, 0.55, 1)).toBeCloseTo(0.55)
@@ -230,15 +233,35 @@ describe('shared/ballParams · 参数进 hash 后的缓存语义（docs/12 §6.3
       uv: 1,
       light: 1,
       metal: 0,
-      alpha: 1
+      alpha: 1,
+      alphaFromMap: false,
+      invertAlpha: false
     })
     expect(
       resolveRenderParams({ renderParams: { roughness: 9, bump: -1, uv: 0.05 } } as unknown as Asset)
-    ).toEqual({ roughness: 2, bump: 0, uv: 0.1, light: 1, metal: 0, alpha: 1 })
+    ).toEqual({
+      roughness: 2,
+      bump: 0,
+      uv: 0.1,
+      light: 1,
+      metal: 0,
+      alpha: 1,
+      alphaFromMap: false,
+      invertAlpha: false
+    })
     // 历史脏值（浮点噪声）读时再规范化一次 → 与 hash 输入一致
     expect(
       resolveRenderParams({ renderParams: { roughness: 0.30000000000000004, bump: 1, uv: 1 } } as unknown as Asset)
-    ).toEqual({ roughness: 0.3, bump: 1, uv: 1, light: 1, metal: 0, alpha: 1 })
+    ).toEqual({
+      roughness: 0.3,
+      bump: 1,
+      uv: 1,
+      light: 1,
+      metal: 0,
+      alpha: 1,
+      alphaFromMap: false,
+      invertAlpha: false
+    })
   })
 
   it('方案 B 硬约束：未调参（undefined）与显式默认值算出同一个名字（既有缓存全部保留）', () => {
@@ -287,7 +310,16 @@ describe('shared/ballParams · 0.6.9 新增三参数（light / metal / alpha）'
   it('normalizeParams 六参数：先 clamp 再 round2（NaN 不许进 hash）', () => {
     expect(
       normalizeParams({ roughness: 1.374, bump: 0.04, uv: 4.6, light: 0.1, metal: 1.9, alpha: 0 })
-    ).toEqual({ roughness: 1.37, bump: 0.04, uv: 4, light: 0.2, metal: 1, alpha: 0.1 })
+    ).toEqual({
+      roughness: 1.37,
+      bump: 0.04,
+      uv: 4,
+      light: 0.2,
+      metal: 1,
+      alpha: 0.1,
+      alphaFromMap: false,
+      invertAlpha: false
+    })
     // 全非法 → 全默认；hash 输入里不会出现 "NaN"
     const bad = normalizeParams({
       roughness: Number.NaN,
@@ -346,5 +378,66 @@ describe('shared/ballParams · 0.6.9 新增三参数（light / metal / alpha）'
     expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe(fnv1a(`rev${RENDER_REV}\n` + BASE))
     // 参数没变、只有修订号变 → 名字必须不同（否则"作废旧缓存"这件事根本没发生）
     expect(fnv1a('rev2\n' + BASE)).not.toBe(fnv1a('rev3\n' + BASE))
+  })
+})
+
+// ── 0.7.6：按贴图灰度做透明（用户拍板，docs/25「未来需求 · 渐变贴图按灰度做透明度」）──
+//
+// 两条硬约束：
+// ① 默认（两个开关都关）时 paramsKey 与 hash **逐字符不变** → 存量球图一个都不重渲；
+// ② 任一开关变化 → 名字必须变，否则新观感会写进旧名字的缓存文件。
+// 另外 `{alphaFromMap:false, invertAlpha:true}` 必须与 `{}` 同 hash：没有灰度图时
+// 「反转」不产生任何成像差异，不该占一份缓存。
+
+describe('shared/ballParams · 0.7.6 灰度透明（alphaFromMap / invertAlpha）', () => {
+  /** 只关心灰度开关时的「其余全默认」底座 */
+  const P = { roughness: 1, bump: 1, uv: 1 }
+
+  it('★默认参数：paramsKey 与 golden hash 逐字符不变（存量零重渲的唯一证据）', () => {
+    expect(paramsKey(DEFAULT_PARAM_SCALES)).toBe('1.00,1.00,1.00')
+    expect(paramsKey({ ...P, alphaFromMap: false, invertAlpha: false })).toBe('1.00,1.00,1.00')
+    expect(isDefaultParams(DEFAULT_PARAM_SCALES)).toBe(true)
+    // 与 0.7.5 的 golden 完全一致（改任何一个字符都会让全库缓存作废）
+    expect(ballHash(SLOTS, DEFAULT_PARAM_SCALES)).toBe('d9d58630')
+    expect(ballThumbName(ID, SLOTS, DEFAULT_PARAM_SCALES)).toBe(`${ID}-d9d58630.png`)
+  })
+
+  it('alphaFromMap 翻转 → paramsKey 追加 A1、缓存名变', () => {
+    expect(paramsKey({ ...P, alphaFromMap: true })).toBe('1.00,1.00,1.00,A1')
+    expect(ballThumbName(ID, SLOTS, { ...P, alphaFromMap: true })).not.toBe(
+      ballThumbName(ID, SLOTS, DEFAULT_PARAM_SCALES)
+    )
+    expect(isDefaultParams({ ...P, alphaFromMap: true })).toBe(false)
+  })
+
+  it('invertAlpha 翻转 → 再追加 I1、缓存名再变一次（三种状态三个名字）', () => {
+    expect(paramsKey({ ...P, alphaFromMap: true, invertAlpha: true })).toBe(
+      '1.00,1.00,1.00,A1,I1'
+    )
+    const off = ballThumbName(ID, SLOTS, DEFAULT_PARAM_SCALES)
+    const on = ballThumbName(ID, SLOTS, { ...P, alphaFromMap: true })
+    const inverted = ballThumbName(ID, SLOTS, { ...P, alphaFromMap: true, invertAlpha: true })
+    expect(new Set([off, on, inverted]).size).toBe(3)
+  })
+
+  it('★没有灰度图时 invertAlpha 一律归 false（两种表示同一成像 → 同 hash）', () => {
+    expect(normalizeParams({ ...P, alphaFromMap: false, invertAlpha: true }).invertAlpha).toBe(
+      false
+    )
+    expect(paramsKey({ ...P, alphaFromMap: false, invertAlpha: true })).toBe(paramsKey(P))
+    expect(ballHash(SLOTS, { ...P, alphaFromMap: false, invertAlpha: true })).toBe(
+      ballHash(SLOTS, DEFAULT_PARAM_SCALES)
+    )
+    // 历史/脏数据里 alphaFromMap 不是布尔值 → 按关闭处理（不做真值强转）
+    expect(normalizeParams({ ...P, alphaFromMap: 1 as unknown as boolean }).alphaFromMap).toBe(
+      false
+    )
+  })
+
+  it('灰度透明可以与不透明度滑块共存（滑块是整体强度，乘在最外层）', () => {
+    expect(paramsKey({ ...P, alpha: 0.5, alphaFromMap: true })).toBe('1.00,1.00,1.00,A0.50,A1')
+    expect(ballThumbName(ID, SLOTS, { ...P, alpha: 0.5, alphaFromMap: true })).not.toBe(
+      ballThumbName(ID, SLOTS, { ...P, alpha: 0.5 })
+    )
   })
 })

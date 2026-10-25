@@ -8,6 +8,7 @@ import type { Asset } from '../../shared/types'
 import type { MaterialSlots } from '../logic/materialBall'
 import { renderActionPlan, type RenderAction } from '../logic/materialBall'
 import { stageController } from '../logic/stageController'
+import { AlphaMapToggles } from './AlphaMapToggles'
 import type { MaterialBallApi } from './MaterialBall'
 
 /**
@@ -404,7 +405,7 @@ export function CustomRenderDialog({
               </label>
               <label className="block">
                 <span className="flex items-baseline justify-between text-[13px] text-secondary">
-                  透明度
+                  {scales.alphaFromMap ? '整体不透明度' : '透明度'}
                   <span className="text-[12px] font-medium text-accent-text">{Math.round(scales.alpha * 100)}%</span>
                 </span>
                 <input
@@ -415,10 +416,25 @@ export function CustomRenderDialog({
                   value={scales.alpha}
                   onChange={(e) => setScales((s) => ({ ...s, alpha: Number(e.target.value) }))}
                   className="slider-accent mt-1.5 w-full"
-                  title="不透明度：100% = 完全不透明（默认），越小越透"
+                  title={
+                    scales.alphaFromMap
+                      ? '整体不透明度：逐像素分布由灰度图决定，这个滑块在最外层整体缩放（100% = 不额外压暗）'
+                      : '不透明度：100% = 完全不透明（默认），越小越透'
+                  }
                 />
-                <div className="mt-1 text-[11px] text-muted">不透明度 · 默认 100%（10%–100%）</div>
+                <div className="mt-1 text-[11px] text-muted">
+                  {scales.alphaFromMap
+                    ? '整体不透明度 · 灰度图决定分布，此滑块整体缩放（10%–100%）'
+                    : '不透明度 · 默认 100%（10%–100%）'}
+                </div>
               </label>
+              {/* 0.7.6「按贴图灰度做透明」：与详情面板共用同一个组件，避免两份文案/行为漂移。
+                  勾选后灰度源就是上面的 albedo 本身（不新增 PBR 槽位、不弹文件选择器）。 */}
+              <AlphaMapToggles
+                alphaFromMap={scales.alphaFromMap}
+                invertAlpha={scales.invertAlpha}
+                onChange={(next) => setScales((s) => ({ ...s, ...next }))}
+              />
               <label className="block">
                 <span className="flex items-baseline justify-between text-[13px] text-secondary">
                   UV 大小

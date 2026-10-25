@@ -335,14 +335,17 @@ describe('RENDER_PARAMS_RESTORE · 事故参数的字面量证据', () => {
     expect(afterAlbedoFix).not.toBe(`${TARGET_ID}-e94039c0.png`)
   })
 
-  it('restoreParamsFor 必须补齐成六字段完整结构（不能让下游读到 undefined）', () => {
+  it('restoreParamsFor 必须补齐成完整结构（不能让下游读到 undefined）', () => {
+    // 0.7.6 追加 alphaFromMap / invertAlpha：读回形态必须是 normalizeParams 的完整结果
     expect(restoreParamsFor(RENDER_PARAMS_RESTORE[0]!)).toEqual({
       roughness: 1,
       bump: 1,
       uv: 3.1,
       light: 1,
       metal: 0,
-      alpha: 1
+      alpha: 1,
+      alphaFromMap: false,
+      invertAlpha: false
     })
   })
 })

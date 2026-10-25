@@ -56,8 +56,14 @@ describe('MaterialBall：renderer 只建一次，换资产只换贴图', () => {
     expect(mount).not.toContain('applyMaps')
   })
 
-  it('换资产那个 effect（deps: [urlsKey]）只 applyMaps，不重建场景', () => {
-    const swap = effectBlock(BALL, 'ballRef.current?.applyMaps(urlsRef.current)', '}, [urlsKey])')
+  it('换资产那个 effect（deps: [urlsKey, alphaMapEnabled]）只 applyMaps，不重建场景', () => {
+    // 0.7.6 起 deps 多了 `alphaMapEnabled`（灰度透明开关要能重新收集 entries），
+    // 守卫的**意图不变**：这个 effect 只 applyMaps、不重建场景。
+    const swap = effectBlock(
+      BALL,
+      'ballRef.current?.applyMaps(urlsRef.current)',
+      '}, [urlsKey, alphaMapEnabled])'
+    )
     expect(swap).toContain('applyMaps')
     expect(swap).not.toContain('new BallScene')
     expect(swap).not.toContain('.dispose()')
@@ -115,8 +121,11 @@ describe('MaterialBall：renderer 只建一次，换资产只换贴图', () => {
   it('Promise 语义不变：applyMaps 仍等全部槽位（离屏渲染依赖它）', () => {
     const at = BALL.indexOf('applyMaps(urls: MaterialSlotUrls): Promise<void> {')
     const body = BALL.slice(at, BALL.indexOf('\n  }', at))
-    expect(body).toContain('const jobs = entries.map(')
+    // 0.7.6：alpha 项从并发批次里摘出来（同 URL 串行，避免解码两遍），
+    // 但仍在这个 Promise 里被 await →「等全部槽位才 resolve」的语义不变。
+    expect(body).toContain('const jobs = mapEntries.map(')
     expect(body).toContain('return Promise.all(jobs).then(')
+    expect(body).toContain("await this.loadMap('alpha', alphaEntry[1], gen)")
     // 不能在 albedo 回调里提前 resolve / return
     expect(body).not.toContain('return Promise.resolve()\n    }')
   })

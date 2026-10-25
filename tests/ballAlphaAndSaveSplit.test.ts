@@ -52,6 +52,10 @@ function values(patch: Partial<MaterialParamValues> = {}): MaterialParamValues {
     metal: 0,
     alpha: 1,
     light: 1,
+    // 0.7.6 灰度透明：默认关、无 alphaMap（这些用例只关心 transparent 翻转）
+    alphaFromMap: false,
+    alphaInvert: false,
+    hasAlphaMap: false,
     ...patch
   }
 }

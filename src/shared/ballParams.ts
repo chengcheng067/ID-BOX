@@ -30,7 +30,8 @@ import { PBR_SLOT_ORDER } from './pbrSlots'
  * - `uv`：UV 大小 = 贴图平铺倍率（0.1-4，v0.2.1 增补 2）；
  * - `light`：光线强度 = `scene.environmentIntensity`（0.2-2，默认 1）；
  * - `metal`：金属度 = `material.metalness` **绝对值**（0-1，默认 0 = 现状非金属）；
- * - `alpha`：不透明度（0.1-1，默认 1 = 不透明）。
+ * - `alpha`：不透明度（0.1-1，默认 1 = 不透明）；
+ * - `alphaFromMap` / `invertAlpha`：0.7.6 的「按贴图灰度做透明度」（见字段注释）。
  *
  * 后三个字段**可选**：历史 DB 里只有前三个字段（`renderParams` 落库早于本轮），
  * 读回来时 `light/metal/alpha` 是 `undefined`，由 `normalizeParams` 补默认值。
@@ -47,19 +48,43 @@ export interface BallParamScales {
   light?: number
   metal?: number
   alpha?: number
+  /**
+   * 按贴图（**albedo**）灰度做透明度分布（0.7.6，用户拍板）。
+   *
+   * 语义：`false` = 只吃整体的 `alpha` 不透明度滑块；`true` = 把 albedo 同一张
+   * 贴图再当 `alphaMap` 采样一次，逐像素决定透明度（three 原生是
+   * `a = opacity × map.a × alphaMap.g`，所以滑块天然乘在最外层）。
+   *
+   * ⚠️ **灰度来源是 albedo 本身**：不新增 PBR 槽位（`PbrSlot` /
+   * `PBR_SLOT_ORDER` 一个字都不许动），也不新增文件选择器 —— 用户要的是
+   * 「手上这张颜色贴图自己当透明度」，不是"再挑一张蒙版图"。
+   * 这也让缓存 hash 不需要新路径：albedo 的 rel 早就在 `ballSlotsRelPaths` 里。
+   */
+  alphaFromMap?: boolean
+  /**
+   * 反转灰度：`false`（默认）= 白 = 不透明（行业 alphaMap 惯例）；
+   * `true` = 深色 = 不透明。
+   *
+   * 只在 `alphaFromMap === true` 时有意义 —— `normalizeParams` 会把「没有灰度图
+   * 却带着 invertAlpha」一律归 false，否则 `{alphaFromMap:false, invertAlpha:true}`
+   * 与 `{}` 会算出两个名字（实质是同一张图，缓存白膨胀）。
+   */
+  invertAlpha?: boolean
 }
 
-/** 规范化后的参数（六个字段全部就位）——UI / 状态机 / hash 都用这个形态 */
+/** 规范化后的参数（八个字段全部就位）——UI / 状态机 / hash 都用这个形态 */
 export type NormalizedBallParams = Required<BallParamScales>
 
-/** 默认（不调参）= 倍率 1、光强 1、非金属、不透明，与未加调参功能前的渲染结果一致 */
+/** 默认（不调参）= 倍率 1、光强 1、非金属、不透明、无灰度透明，与未加调参功能前的渲染结果一致 */
 export const DEFAULT_PARAM_SCALES: NormalizedBallParams = {
   roughness: 1,
   bump: 1,
   uv: 1,
   light: 1,
   metal: 0,
-  alpha: 1
+  alpha: 1,
+  alphaFromMap: false,
+  invertAlpha: false
 }
 
 /** 滑块合法区间 [0, 2]；非法输入（NaN/Infinity）回落到 1（不调参），不抛错 */
@@ -116,13 +141,19 @@ function round2(v: number): number {
  */
 export function normalizeParams(p?: BallParamScales): NormalizedBallParams {
   const s = p ?? DEFAULT_PARAM_SCALES
+  // 灰度透明的两个布尔值：先判"有没有灰度图"，再决定反转值。
+  // 没有灰度图时反转一律归 false —— 否则「关着灰度 + invert 真」与「默认」是
+  // 同一张成像却算出两个 hash（见 paramsKey 的说明），缓存会白白膨胀一倍。
+  const alphaFromMap = s.alphaFromMap === true
   return {
     roughness: round2(clampScale(s.roughness)),
     bump: round2(clampScale(s.bump)),
     uv: round2(clampUv(s.uv)),
     light: round2(clampLight(s.light)),
     metal: round2(clampMetal(s.metal)),
-    alpha: round2(clampAlpha(s.alpha))
+    alpha: round2(clampAlpha(s.alpha)),
+    alphaFromMap,
+    invertAlpha: alphaFromMap ? s.invertAlpha === true : false
   }
 }
 
@@ -134,6 +165,12 @@ export function normalizeParams(p?: BallParamScales): NormalizedBallParams {
  * 1. 默认参数时输出必须与引入新参数前**逐字符一致**（`'1.00,1.00,1.00'`）——
  *    历史参数串（DB 里存的、测试里 golden 的）不会因为多加了三个参数而变形；
  * 2. 前缀字母让"哪个参数变了"在日志里可读，也避免 `,1.50` 这种无主片段。
+ *
+ * 0.7.6 追加灰度透明的两个布尔（都只在**开启**时贡献）：
+ * - `A1` = 按贴图灰度做透明；`I1` = 再反转灰度（紧跟其后，见 `normalizeParams`
+ *   的「没有灰度图就没有反转」口径，所以 `I1` 永远不会单独出现）。
+ * - 与已有的不透明度 `A0.50` 不冲突：那一段总是带两位小数，`A1` 是纯整数。
+ * - 默认（两个都是 false）**一个字符都不加** → 存量 golden 与磁盘缓存名字不变。
  *
  * 键序无关：UI 两处都用 `{ ...s, roughness: x }` 构造对象，展开语法保留插入顺序
  * 但**不保证**跨进程一致 → 这里按固定顺序拼，不读对象键序。
@@ -149,10 +186,16 @@ export function paramsKey(p: BallParamScales): string {
   if (n.light !== 1) parts.push(`L${n.light.toFixed(2)}`)
   if (n.metal !== 0) parts.push(`M${n.metal.toFixed(2)}`)
   if (n.alpha !== 1) parts.push(`A${n.alpha.toFixed(2)}`)
+  // 灰度透明：只在开启时追加（默认空串 → 存量 hash 逐字符不变）。
+  // 源图固定是 albedo，所以**不需要**把路径拼进来：albedo 换图 → rel 集合变 → hash 本来就变。
+  if (n.alphaFromMap) {
+    parts.push('A1')
+    if (n.invertAlpha) parts.push('I1')
+  }
   return parts.join(',')
 }
 
-/** 是否等于默认（1,1,1 + 光 1 + 非金属 + 不透明）——方案 B 的判据：默认参数不贡献 hash */
+/** 是否等于默认（1,1,1 + 光 1 + 非金属 + 不透明 + 无灰度透明）——方案 B 的判据：默认参数不贡献 hash */
 export function isDefaultParams(p: BallParamScales): boolean {
   const n = normalizeParams(p)
   return (
@@ -161,7 +204,9 @@ export function isDefaultParams(p: BallParamScales): boolean {
     n.uv === 1 &&
     n.light === 1 &&
     n.metal === 0 &&
-    n.alpha === 1
+    n.alpha === 1 &&
+    n.alphaFromMap === false &&
+    n.invertAlpha === false
   )
 }
 
@@ -255,6 +300,15 @@ export function ballSlotsRelPaths(slots: BallSlots): string[] {
  *   否则卡片会一直显示那张"球小一圈、上方留黑边"的旧图。
  *   ⚠️ 与 rev 3 不同，本次不再全量重渲：`708caf3` 起是**惰性升级**（看到哪升哪），
  *   只有真正被浏览到的资产才会替换球图。
+ *
+ * ## 0.7.6「按贴图灰度做透明」为什么**不** +1
+ *
+ * - 没开 `alphaFromMap` 的资产：shader 补丁整段包在 `#ifdef USE_ALPHAMAP` 里
+ *   （见 `MaterialBall.tsx` 的 onBeforeCompile），`alphaMap` 为空时连 define 都没有
+ *   → 成像**一个像素都不变**，旧缓存仍然正确；
+ * - 开了的资产：`paramsKey` 追加 `A1` / `I1` → hash 自动换名，旧名字自然作废；
+ * - 所以 +1 只会让**全库**球图白作废一次（素材多时启动压力极大），收益为零。
+ *   这条是纪律的直接应用：功能开发不 +1。
  *
  * 它只进 hash 输入的**前缀**，不参与任何计算、不进参数串 —— 用户调过的参数不会错位
  * （参数串仍然只在非默认时追加）。主进程与渲染进程都只用本文件的 `ballThumbName`

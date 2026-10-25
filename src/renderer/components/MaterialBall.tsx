@@ -79,6 +79,7 @@ import {
 } from '../logic/materialBall'
 import { ballCameraPosition } from '../logic/ballCamera'
 import type { NormalizedBallParams } from '../../shared/ballParams'
+import { AlphaMapToggles } from './AlphaMapToggles'
 import {
   formatBitmapCacheStats,
   textureBitmapCache
@@ -137,7 +138,11 @@ export function resolveBallBackground(
 }
 
 /** 槽位 → MeshPhysicalMaterial 贴图属性（显式 switch，类型安全） */
-function assignMap(material: MeshPhysicalMaterial, slot: MaterialSlotKey, tex: Texture): void {
+function assignMap(
+  material: MeshPhysicalMaterial,
+  slot: MaterialSlotKey | 'alpha',
+  tex: Texture
+): void {
   switch (slot) {
     case 'albedo':
       material.map = tex
@@ -154,6 +159,11 @@ function assignMap(material: MeshPhysicalMaterial, slot: MaterialSlotKey, tex: T
     case 'displacement':
       material.displacementMap = tex
       break
+    // 0.7.6：灰度透明的 alphaMap。**它不是 PBR 槽位**（PbrSlot 一个字都不动），
+    // 只是把 albedo 同一张图再挂一份到材质上（见 applyMaps 的 entries 收集）。
+    case 'alpha':
+      material.alphaMap = tex
+      break
   }
 }
 
@@ -164,7 +174,34 @@ function clearMaps(material: MeshPhysicalMaterial): void {
   material.roughnessMap = null
   material.aoMap = null
   material.displacementMap = null
+  // ⚠️ 漏这行 = 换资产后 USE_ALPHAMAP 这个 define 还指着上一批已 dispose 的纹理
+  // → 采样到空纹理，球直接变黑（而且是"有时黑、有时正常"的偶发 bug）。
+  material.alphaMap = null
 }
+
+/**
+ * 0.7.6「按贴图灰度做透明」的 shader 补丁 —— 替换掉 three 原生的
+ * `#include <alphamap_fragment>`（原生实现见
+ * `ShaderChunk/alphamap_fragment.glsl.js`：`diffuseColor.a *= texture2D(alphaMap, vAlphaMapUv).g`）。
+ *
+ * 两处刻意的偏离：
+ * 1. **取亮度而不是绿通道**：three 取 `.g` 是从"alphaMap 是数据图"的惯例来的；
+ *    用户要的是"识别灰度"，彩色贴图（砖红、木纹）按亮度算才符合直觉。
+ *    Rec.709 权重（0.2126/0.7152/0.0722）是 sRGB 下公认的感知亮度口径。
+ * 2. **反转由 uniform 切换**，不做成两套 shader / 不写死 `#define`：
+ *    `setAlphaInvert()` 在已编译时**只写 uniform**，拖动/勾选不会触发重编译
+ *    （重编译是几百毫秒级的卡顿，交互路径上绝对不能有）。
+ *
+ * 整个块包在 `#ifdef USE_ALPHAMAP` 里 —— 没开灰度图 / 没有 albedo 的资产，
+ * 这段代码连同 define 一起不存在，成像**一个像素都不变**（RENDER_REV 不 +1 的依据）。
+ *
+ * ⚠️ 这段字符串**只能写 ASCII**（连注释都不要写中文）：它是直接拼进 GLSL 源码的，
+ * 部分 ANGLE/驱动对源码里的非 ASCII 字节不宽容。解释写在 TypeScript 注释里。
+ */
+const ALPHA_MAP_FRAGMENT_PATCH = `#ifdef USE_ALPHAMAP
+	float alphaLum = dot( texture2D( alphaMap, vAlphaMapUv ).rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
+	diffuseColor.a *= mix( alphaLum, 1.0 - alphaLum, uAlphaInvert );
+#endif`
 
 /** 形态 → 几何体 */
 function createGeometry(shape: BallShape): BufferGeometry {
@@ -538,6 +575,24 @@ export class BallScene {
   private uvMult = 1
 
   /**
+   * 0.7.6 灰度透明的**反转**开关真值。
+   *
+   * 它必须由场景自己记住：勾选可能发生在材质还没编译之前（构造完立刻 setParamScales），
+   * 那时 `onBeforeCompile` 还没跑、uniform 引用还是 null——只写 uniform 会丢值。
+   * `onBeforeCompile` 里读这个字段，保证"编译那一刻"的取值一定是最新的。
+   */
+  private alphaInvert = false
+
+  /**
+   * `onBeforeCompile` 里拿到的 `uAlphaInvert` uniform 引用（未编译过为 null）。
+   *
+   * 有了它，反转开关在**已编译**时只改 uniform，不置 needsUpdate → 不重编译。
+   * 注意它是 `materialProperties.uniforms` 里的同一个对象（three 在编译时把
+   * `shader.uniforms` 存成材质级 uniform 表），所以这里写进去就是生效值。
+   */
+  private alphaInvertUniform: { value: number } | null = null
+
+  /**
    * 各向异性上限 = min(档位上限, GPU 上限)。构造时算好、`applyMotionProfile` 时更新，
    * 所有贴图统一取它 —— 不要把 `Math.min(4, …)` 写回贴图加载处（那样切档不生效）。
    */
@@ -617,6 +672,25 @@ export class BallScene {
       // 覆盖 material 的同名 uniform（WebGLRenderer 的 refreshMaterialUniforms），
       // 所以写在这里是**死值**——留着只会让人误以为反射默认 1.1，"调"它却毫无反应。
     })
+    /**
+     * 0.7.6 灰度透明：只给 `alphamap_fragment` 换实现（见模块级常量）。
+     *
+     * 不改 `customProgramCacheKey`：默认实现取 `onBeforeCompile.toString()`，
+     * 本函数源码是常量 → 同 key；本仓库每个 WebGLRenderer 只持有一个材质，
+     * 不存在跨材质共享 program 的串味风险。
+     * 没有 alphaMap 的材质连 `USE_ALPHAMAP` define 都不会有 → 补丁整段被预处理器丢掉，
+     * 成像与改动前逐像素一致（这正是不需要 +RENDER_REV 的理由）。
+     */
+    this.material.onBeforeCompile = (shader) => {
+      shader.uniforms.uAlphaInvert = { value: this.alphaInvert ? 1 : 0 }
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <alphamap_pars_fragment>',
+          '#include <alphamap_pars_fragment>\nuniform float uAlphaInvert;'
+        )
+        .replace('#include <alphamap_fragment>', ALPHA_MAP_FRAGMENT_PATCH)
+      this.alphaInvertUniform = shader.uniforms.uAlphaInvert
+    }
     this.geometry = createGeometry(opts.shape)
     this.mesh = new Mesh(this.geometry, this.material)
     this.scene.add(this.mesh)
@@ -728,6 +802,9 @@ export class BallScene {
   private applyParams(values: MaterialParamValues): void {
     if (this.disposed) return
     applyMaterialParams(this.material, values)
+    // 灰度反转：**只写 uniform**，不碰 needsUpdate（交互路径不许重编译）。
+    // alphaMap 的有无由 applyMaps 决定（它是贴图批次的事实，不是参数）。
+    this.setAlphaInvert(values.alphaInvert)
     // 光线强度：**只影响照度，不影响贴图采样** —— 调暗就是少给环境光，贴图颜色本身
     // 一点不改（改 exposure 会连高光滚降一起推，不是用户要的"光弱一点"）。
     // three 在 `material.envMap === null && scene.environment !== null` 时会用
@@ -736,6 +813,21 @@ export class BallScene {
     if (values.uv !== this.uvMult) {
       this.uvMult = values.uv
       this.applyRepeat()
+    }
+  }
+
+  /**
+   * 设置「反转灰度」。
+   *
+   * - 材质已编译（拿得到 uniform 引用）→ 只写值，零重编译；
+   * - 还没编译（刚构造 / 刚换材质）→ 只记字段，等 `onBeforeCompile` 时读。
+   *
+   * 两条路径都覆盖，才不会出现"第一次勾选无效、重新打开弹窗才对"的时序 bug。
+   */
+  private setAlphaInvert(invert: boolean): void {
+    this.alphaInvert = invert
+    if (this.alphaInvertUniform) {
+      this.alphaInvertUniform.value = invert ? 1 : 0
     }
   }
 
@@ -755,7 +847,11 @@ export class BallScene {
   private settleParamBasis(): void {
     if (this.disposed) return
     this.applyParams(
-      this.paramState.markSettled({ hasRoughnessMap: this.material.roughnessMap !== null })
+      this.paramState.markSettled({
+        hasRoughnessMap: this.material.roughnessMap !== null,
+        // 灰度透明的 OPAQUE 陷阱靠它：有 alphaMap 就必须 transparent（见 applyMaterialParams）
+        hasAlphaMap: this.material.alphaMap !== null
+      })
     )
     this.mapsSettledListener?.()
   }
@@ -788,14 +884,26 @@ export class BallScene {
     this.material.color.setHex(BASE_COLOR) // 上一个资产可能把底色让成了纯白
     // 基准复位 + 标记"未落定"：单图资产会把法线基准压到 SYNTH_NORMAL_SCALE，
     // roughness 的口径也要看这一批到底有没有 roughnessMap —— 未落定前算出的只是临时值。
-    this.paramState.markPending({ hasRoughnessMap: false, baseNormalScale: 1 })
+    this.paramState.markPending({ hasRoughnessMap: false, baseNormalScale: 1, hasAlphaMap: false })
     // 卸 map 同样会改 shader define（USE_MAP 等），必须重编译，否则沿用旧 Program 引用已释放的纹理
     this.material.needsUpdate = true
 
-    const entries: Array<[MaterialSlotKey, string]> = []
+    const entries: Array<[MaterialSlotKey | 'alpha', string]> = []
     for (const key of SLOT_ORDER) {
       const u = urls[key]
       if (typeof u === 'string' && u.length > 0) entries.push([key, u])
+    }
+    /**
+     * 0.7.6 灰度透明：**源图就是 albedo 本身**（同一张 URL，不做文件选择器、
+     * 不新增 PBR 槽位）。`loadMap` 会给它建一个**独立的 Texture 实例**并保持线性
+     * 色彩空间（见那里的注释），所以两张纹理互不干扰。
+     *
+     * 用 `paramState.currentScales` 而不是入参：舞台/弹窗/离屏三条路径都可能是
+     * "先 applyMaps 后改参数"，唯一可信的当前值是状态机里那份。
+     */
+    if (this.paramState.currentScales.alphaFromMap === true) {
+      const albedoUrl = urls.albedo
+      if (typeof albedoUrl === 'string' && albedoUrl.length > 0) entries.push(['alpha', albedoUrl])
     }
     if (entries.length === 0) {
       // 没有任何槽位（灰球）：基准立刻落定 → 按当前倍率重算（任务 1 收敛点之一）
@@ -812,27 +920,42 @@ export class BallScene {
       if (this.disposed || gen !== this.mapsGen) return
       this.synthesizeNormalIfMissing(urls)
       // 贴图到位后重算一遍：roughness 要按"有没有 roughnessMap"取不同口径
-      this.setParamBasis({ hasRoughnessMap: this.material.roughnessMap !== null })
+      this.setParamBasis({
+        hasRoughnessMap: this.material.roughnessMap !== null,
+        hasAlphaMap: this.material.alphaMap !== null
+      })
       this.mapsReady = true
     }
 
     const hasAlbedo = entries.some(([slot]) => slot === 'albedo')
-    const jobs = entries.map(async ([slot, url]) => {
+    /**
+     * alpha 项**不参与这一批并发加载**：它与 albedo 是同一个 URL，
+     * 并发会让 `createImageBitmap` 把同一张 8K 图解码两遍（实测 400–800ms，
+     * 而 `textureBitmapCache` 只有在第一份解码**完成后**才写入）。
+     * 放到 `Promise.all` 之后单发 → 必然命中缓存，只付一次上传。
+     */
+    const alphaEntry = entries.find(([slot]) => slot === 'alpha')
+    const mapEntries = entries.filter(([slot]) => slot !== 'alpha')
+    const jobs = mapEntries.map(async ([slot, url]) => {
       await this.loadMap(slot, url, gen)
       // albedo 一落定就上屏（fail 也算：失败槽位保持默认灰，总比永远不亮强）
       if (slot === 'albedo') markReady()
     })
 
     // Promise 语义不变：等**全部**槽位落定才 resolve（离屏渲染依赖这一点）
-    return Promise.all(jobs).then(() => {
+    return Promise.all(jobs).then(async () => {
       if (this.disposed || gen !== this.mapsGen) return
       // 无 albedo 的资产没有"提前放行"的锚点 → 全部到齐才算就绪（与原逻辑一致）；
       // 有 albedo 的只是补一次 isReady。
       if (!hasAlbedo) markReady()
+      // alpha 单发（见上：同 URL 串行，避免二次解码）；失败也只是少一层灰度透明
+      if (alphaEntry) await this.loadMap('alpha', alphaEntry[1], gen)
+      if (this.disposed || gen !== this.mapsGen) return
       // ★ 任务 1：**所有分支**在这里按当前倍率重算一次（不含 albedo 的、单图的、
       //   有 roughnessMap 的、加载失败保底灰的，全部覆盖）。这里不读"调用方快照"，
       //   而是由状态机 `markSettled()` 给出按"当前倍率 + 最终基准"算出的值 ——
       //   即使中间隔着几十毫秒的异步加载、期间用户又拖了滑块，也不会算漏。
+      //   注意：`hasAlphaMap` 必须在这之后取（alpha 贴图落定才算数）。
       this.settleParamBasis()
     })
   }
@@ -863,7 +986,11 @@ export class BallScene {
     this.setParamBasis({ baseNormalScale: SYNTH_NORMAL_SCALE })
   }
 
-  private async loadMap(slot: MaterialSlotKey, url: string, gen: number): Promise<void> {
+  private async loadMap(
+    slot: MaterialSlotKey | 'alpha',
+    url: string,
+    gen: number
+  ): Promise<void> {
     const tex = await loadTexture(url)
     if (!tex) {
       console.warn(`[MaterialBall] 贴图加载失败（${slot}），该槽位保持默认灰：${url}`)
@@ -876,10 +1003,18 @@ export class BallScene {
     }
     tex.wrapS = RepeatWrapping
     tex.wrapT = RepeatWrapping
-    // 色彩空间纪律：albedo 是 sRGB；normal/roughness/ao/displacement 是数据图，保持线性
+    /**
+     * 色彩空间纪律：albedo 是 sRGB；normal/roughness/ao/displacement 是数据图，保持线性。
+     *
+     * ★ `'alpha'`（0.7.6 灰度透明）**必须留在线性**：
+     * 它是 albedo 同一张图的第二个 Texture 实例（位图解码有 textureBitmapCache 命中，
+     * 不会二次解码），但 sRGB → 线性会把 0.5 灰变成 ≈0.21 → 用户眼里"一半灰"
+     * 变成"几乎全透"。按灰度就该按**文件里的原始值**，不做传递函数。
+     */
     if (slot === 'albedo') tex.colorSpace = SRGBColorSpace
     tex.anisotropy = this.maxAnisotropy
-    // 平铺 = 形态基准 × UV 大小倍率（v0.2.1 增补 2）+ 球面 u 方向弧长补偿（见 repeatTexture）
+    // 平铺 = 形态基准 × UV 大小倍率（v0.2.1 增补 2）+ 球面 u 方向弧长补偿（见 repeatTexture）。
+    // alpha 走同一口径：否则透明分布与颜色贴图对不上（半透明的斑块错位）。
     this.repeatTexture(tex)
     this.maps.push(tex)
     assignMap(this.material, slot, tex)
@@ -1280,7 +1415,17 @@ export function MaterialBall({
   useEffect(() => {
     if (params) setScales(normalizeParams(params))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params?.roughness, params?.bump, params?.uv, params?.light, params?.metal, params?.alpha])
+  }, [
+    params?.roughness,
+    params?.bump,
+    params?.uv,
+    params?.light,
+    params?.metal,
+    params?.alpha,
+    // 0.7.6 灰度透明：**必须显式列出**，否则弹窗里勾了开关球不动
+    params?.alphaFromMap,
+    params?.invertAlpha
+  ])
 
   // 滑块 → 场景（只改 material 属性，不重建 WebGL 上下文）。
   // ★ `mapsVersion` 也进 deps（任务 1）：贴图批次落定后必须再同步一次，
@@ -1295,6 +1440,15 @@ export function MaterialBall({
   const urlsRef = useRef<MaterialSlotUrls>(urls)
   urlsRef.current = urls
   const urlsKey = JSON.stringify(urls)
+  /**
+   * 灰度透明的开关（0.7.6）：`applyMaps` 要不要额外把 albedo 挂成 alphaMap 由它决定。
+   *
+   * 它必须进 effect B 的 deps：只按 `urlsKey` 触发的话，勾选 / 取消勾选不会重新
+   * 收集 entries → 用户会觉得"勾了没反应"（或者只有关掉弹窗重开才生效）。
+   * 重新跑一次 applyMaps 会重挂全部贴图，但位图解码走 `textureBitmapCache` 命中，
+   * 只付上传成本（~几十毫秒），换正确性值得。
+   */
+  const alphaMapEnabled = scales.alphaFromMap === true
 
   // ── effect A：建/卸场景（**只在挂载时创建一次 renderer**） ────────────────
   // 性能纪律（2026-10 舞台掉帧修复）：WebGLRenderer / 上下文 / PMREM 烘焙 / shader
@@ -1372,7 +1526,7 @@ export function MaterialBall({
   // 之后 urlsKey 变化只做 dispose 旧贴图 + 加载新贴图，不碰 renderer。
   useEffect(() => {
     void ballRef.current?.applyMaps(urlsRef.current)
-  }, [urlsKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [urlsKey, alphaMapEnabled]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /**
    * `defaultShape` 变化 → 同步内部形态（2026-10 缓存策略：记住形状）。
@@ -1549,7 +1703,7 @@ export function MaterialBall({
               </label>
               <label className="mt-2 block">
                 <span className="flex items-baseline justify-between text-muted">
-                  透明度
+                  {scales.alphaFromMap ? '整体不透明度' : '透明度'}
                   <span className="font-medium text-primary">{Math.round(scales.alpha * 100)}%</span>
                 </span>
                 <input
@@ -1560,9 +1714,21 @@ export function MaterialBall({
                   value={scales.alpha}
                   onChange={(e) => applyScales({ ...scales, alpha: Number(e.target.value) })}
                   className="slider-accent mt-1 w-full"
-                  title="不透明度：100% = 不透明（默认），越小越透"
+                  title={
+                    scales.alphaFromMap
+                      ? '整体不透明度：逐像素分布由灰度图决定，这个滑块在最外层整体缩放（100% = 不额外压暗）'
+                      : '不透明度：100% = 不透明（默认），越小越透'
+                  }
                 />
               </label>
+              {/* 0.7.6：灰度透明开关紧跟在透明度滑块下方（用户要的「分布 + 强度」是同一个心智模型） */}
+              <AlphaMapToggles
+                className="mt-2"
+                alphaFromMap={scales.alphaFromMap}
+                invertAlpha={scales.invertAlpha}
+                onChange={(next) => applyScales({ ...scales, ...next })}
+                compact
+              />
               <label className="mt-2 block">
                 <span className="flex items-baseline justify-between text-muted">
                   UV 大小
