@@ -64,6 +64,17 @@ check('renderer: 球图取景距离 2.935225', rendererAll, '2.935225')
 check('css: --preview-tint token', css, '--preview-tint')
 check('css: folder-stage-leave 260ms', css, 'folder-stage-leave')
 
+// ── 0.7.6 ──
+// 主进程侧用日志字面量当标记：crashGuard 的函数名可能被压缩，但日志串一定保留。
+check('main: crash:recovery 崩溃自恢复', main, 'crash:recovery')
+check('main: crash:give-up 循环崩溃熔断', main, 'crash:give-up')
+// 灰度透明的两个标记分别是 GLSL 里的 uniform 名与参数属性名（都不是压缩目标）。
+check('renderer: 灰度透明 uAlphaInvert uniform', rendererAll, 'uAlphaInvert')
+check('renderer: 灰度透明参数 alphaFromMap', rendererAll, 'alphaFromMap')
+// 函数名会被压缩，用字符串字面量：输入框放行标记 + 漂移提示文案。
+check('renderer: Esc 输入框放行标记 data-esc-own', rendererAll, 'data-esc-own')
+check('renderer: 库目录漂移提示文案', rendererAll, '的索引路径不在当前库目录内')
+
 const qr = find(/contact-qr.*\.png$/)
 console.log('contact-qr in bundle:', qr.join(',') || '(none)')
 if (qr.length) {
