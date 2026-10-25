@@ -858,6 +858,10 @@ export function DetailPanel() {
           sizeMismatch={dupGroup?.sizeMismatch ?? false}
           onKeep={(keepId) => {
             setCompareOpen(false)
+            // 保留的是**某个副本**时，当前这条也会被移入回收站 → commitDelete 会把
+            // selectedId 置空、右栏跳到空态。这里先把焦点切到保住的那份，用户视线不掉。
+            // （保留当前这份时 keepId === asset.id，选中状态本来就不受影响，不做多余跳转）
+            if (keepId !== asset.id) select(keepId)
             requestKeepOnly(keepId)
           }}
           onClose={() => setCompareOpen(false)}

@@ -230,4 +230,22 @@ describe('源码守卫：回收站视图不提供「保留这份」/ 对比弹�
     expect(src).toContain('onKeep(a.id)')
     expect(src).not.toContain('requestDelete(')
   })
+
+  it('对比弹窗自己接 Esc（Modal 外壳不带键盘处理），且用捕获阶段避免关两层', async () => {
+    const src = await fs.readFile(
+      path.join(process.cwd(), 'src', 'renderer', 'components', 'DuplicateCompareDialog.tsx'),
+      'utf8'
+    )
+    expect(src).toContain("if (e.key !== 'Escape') return")
+    expect(src).toContain("window.addEventListener('keydown', onKey, true)")
+    expect(src).toContain('e.stopPropagation()')
+  })
+
+  it('保留某个副本时焦点跟随（select(keepId)），保留当前份时不跳', async () => {
+    const src = await fs.readFile(
+      path.join(process.cwd(), 'src', 'renderer', 'components', 'DetailPanel.tsx'),
+      'utf8'
+    )
+    expect(src).toContain('if (keepId !== asset.id) select(keepId)')
+  })
 })
