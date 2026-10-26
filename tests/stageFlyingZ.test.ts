@@ -165,8 +165,12 @@ describe('表述一致性：提到 handoff 的文件必须把三个飞行相位�
    * 与 closing」，**不**要求"只准出现这三个相位名"——`Z_STAGE_FLYING` 的注释天然要用
    * idle / active / opening 说明"静止时不是 90"，排他式断言必然误报。
    *
-   * 粒度按**文件**而不是按行：注释会换行（"…抬到 90，见\n// tests/xxx"），按行断言会在
-   * 合法的换行处误报；而按文件恰好能抓到这个 bug 的形状（整份文件缺 handback）。
+   * 粒度取**注释集合**，不是文件全文：`src/` 里的代码本来就有 `handback`（三元、
+   * `expect(...)`），用全文判断会让"注释退回两相位"被代码里的 `handback` 掩盖 ——
+   * QA 实测过这个盲区（删掉三元的 handback、注释不动，全文版不红）。
+   * 因此 `.ts/.tsx` 只取注释行（`//`、`/*`、块注释的 `*`），`.md` 整篇就算注释。
+   * 换行不害事：判据是充分条件式，折行只让单行更缺词，整个注释集合仍是齐的；
+   * 真正会误报的是排他式，那种写法这里一条都没有。
    * 覆盖范围只列**本修复涉及**的 6 个文件，不做全仓扫描（`docs/08` 等由各自负责人维护）。
    */
   const GUARDED = [
@@ -182,17 +186,30 @@ describe('表述一致性：提到 handoff 的文件必须把三个飞行相位�
   const readRoot = (rel: string): string =>
     fs.readFileSync(new URL(`../${rel}`, import.meta.url), 'utf-8')
 
-  it('六个相关文件：写了 handoff 的地方，handback 与 closing 一个都不能少', () => {
+  /**
+   * 取"给人读的文字"：`.md` 整篇；`.ts/.tsx` 只留注释行。
+   *
+   * 为什么必须只留注释：`MaterialStage.tsx:675` 的三元、本文件的 `expect` 里都有
+   * `handback` —— 用全文判断的话，注释即使退回「handoff / closing」，`includes` 仍然为真，
+   * 守卫等于对这文件失明（代码有、注释没有，正是最该抓的形状）。
+   */
+  const proseOf = (rel: string, src: string): string =>
+    rel.endsWith('.md')
+      ? src
+      : src
+          .split('\n')
+          .filter((line) => /^\s*(\/\/|\*|\/\*)/.test(line))
+          .join('\n')
+
+  it('六个相关文件：注释里写了 handoff，handback 与 closing 一个都不能少', () => {
     const missing: string[] = []
     for (const rel of GUARDED) {
-      const src = readRoot(rel)
-      // 不涉及飞行三相位表述的文件跳过（本修复的 6 个文件目前都会命中，这条是防御性分支）
-      if (!src.includes('handoff')) continue
-      if (!src.includes('handback')) missing.push(`${rel}：提到 handoff 但没有 handback（回程依据会丢）`)
-      if (!src.includes('closing')) missing.push(`${rel}：提到 handoff 但没有 closing（回网格那段会丢）`)
+      const prose = proseOf(rel, readRoot(rel))
+      // 不涉及飞行三相位表述的跳过（本修复的 6 个文件目前都会命中，这条是防御性分支）
+      if (!prose.includes('handoff')) continue
+      if (!prose.includes('handback')) missing.push(`${rel}：提到 handoff 但没有 handback（回程依据会丢）`)
+      if (!prose.includes('closing')) missing.push(`${rel}：提到 handoff 但没有 closing（回网格那段会丢）`)
     }
-    expect(missing, `以下文件的注释/断言漏了飞行相位，照注释改会把回归装回来：\n${missing.join('\n')}`).toEqual(
-      []
-    )
+    expect(missing, `以下文件的注释漏了飞行相位，照注释改会把回归装回来：\n${missing.join('\n')}`).toEqual([])
   })
 })
