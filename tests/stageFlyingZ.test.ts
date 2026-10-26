@@ -152,3 +152,47 @@ describe('MaterialStage：zIndex 按相位取（静止 45 / 飞行 90）', () =>
     expect(stage).toContain("import { Z_STAGE_BALL, Z_STAGE_FLYING } from '../logic/zStack'")
   })
 })
+
+describe('表述一致性：提到 handoff 的文件必须把三个飞行相位写齐', () => {
+  /*
+   * 这一条是**事故复盘**，不是洁癖：本轮真实踩过两次 —— 实现与断言已经含 `handback`，
+   * 但文件头 / 守卫旁的注释还写着「handoff / closing 抬到 90」。这种"断言新、注释旧"
+   * 最危险：下一个人照注释把 `handback` 从三元里删掉，就会精确复现回归
+   * （回程开头 40% 被遮罩吞掉、球在半空凭空出现），而所有断言当时都是绿的 ——
+   * 因为注释不是断言，没人会因为它红。
+   *
+   * 判据用**充分条件式**（QA 提过的坑）：只要求「出现 handoff ⇒ 必须同时出现 handback
+   * 与 closing」，**不**要求"只准出现这三个相位名"——`Z_STAGE_FLYING` 的注释天然要用
+   * idle / active / opening 说明"静止时不是 90"，排他式断言必然误报。
+   *
+   * 粒度按**文件**而不是按行：注释会换行（"…抬到 90，见\n// tests/xxx"），按行断言会在
+   * 合法的换行处误报；而按文件恰好能抓到这个 bug 的形状（整份文件缺 handback）。
+   * 覆盖范围只列**本修复涉及**的 6 个文件，不做全仓扫描（`docs/08` 等由各自负责人维护）。
+   */
+  const GUARDED = [
+    'src/renderer/components/MaterialStage.tsx',
+    'src/renderer/logic/zStack.ts',
+    'tests/stageFlyingZ.test.ts',
+    'tests/zStack.test.ts',
+    'tests/stagePerf2.test.ts',
+    'docs/25-待办-用户反馈.md'
+  ] as const
+
+  /** 仓库根相对路径读取（上面的 `read` 只到 `src/renderer`，这里要跨 tests / docs） */
+  const readRoot = (rel: string): string =>
+    fs.readFileSync(new URL(`../${rel}`, import.meta.url), 'utf-8')
+
+  it('六个相关文件：写了 handoff 的地方，handback 与 closing 一个都不能少', () => {
+    const missing: string[] = []
+    for (const rel of GUARDED) {
+      const src = readRoot(rel)
+      // 不涉及飞行三相位表述的文件跳过（本修复的 6 个文件目前都会命中，这条是防御性分支）
+      if (!src.includes('handoff')) continue
+      if (!src.includes('handback')) missing.push(`${rel}：提到 handoff 但没有 handback（回程依据会丢）`)
+      if (!src.includes('closing')) missing.push(`${rel}：提到 handoff 但没有 closing（回网格那段会丢）`)
+    }
+    expect(missing, `以下文件的注释/断言漏了飞行相位，照注释改会把回归装回来：\n${missing.join('\n')}`).toEqual(
+      []
+    )
+  })
+})

@@ -36,3 +36,8 @@ qa-v076-tmp/
 docs/screenshots/0.7.7/
 qa-prune-tmp/
 qa-fly-tmp/
+# ⚠️ 上面这几条只影响 git，**不影响打包**：electron-builder 从磁盘拷，不看 .gitignore。
+#    真正把关的是 package.json 的 build.files **白名单**（out/**/* + package.json + resources/**/*），
+#    已实测 0.7.9 包 2130 条目里 qa-*/docs/src/tests 全为 0。
+#    但若有人把 files 改成"全包含 + 排除法"，这些 qa-*-tmp/（真机证据，数 MB）就会被塞进 asar。
+#    → 改 files 写法时，必须同步把 qa-*-tmp/ 与 docs/ 排除掉。
