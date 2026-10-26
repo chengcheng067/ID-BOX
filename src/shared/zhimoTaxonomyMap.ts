@@ -23,7 +23,7 @@
  * 3. **一对多只列候选**：同一个站方名字可能落本地多个二级（贴图与材质同名、
  *    同名二级跨一级），此时返回**候选数组**，不替用户选。
  * 4. **拿不准的不进表**：宁可不分（返回 null），也不写错。清单见 `ZHIMO_HUMAN_REVIEW`，
- *    与 `docs/28` 的「需人工裁定」一节逐条对应（其中 10 条已于 2026-10-26 按 kind 裁定）。
+ *    与 `docs/28 §5` 的裁定表逐条对应（2026-10-26 已全部定案：10 条按 kind 分流 + 5 条不映射）。
  * 5. **零 IO、零 electron / node 依赖**（与 `taxonomy.ts` / `autoClassify.ts` 同纪律），
  *    可直接单测；表在模块加载时一次性摊平成只读索引。
  *
@@ -47,17 +47,21 @@
  * - SU 模型频道：`docs/05 §5` 六组【事实】86 项（剔除 2 个品牌名 → 84 项）
  * - 三级节点归并：`docs/17 §4`（7 个节点）+ `§4.1`（3 个派生词）共 10 项
  * - 站方实测：2026-10-26 从用户库 58 条真实 ID 抓到的名字（每条带 ID）
- * - **合计 58 组 / 385 个唯一名字 / 395 个落点**，其中 10 个名字有 2 个候选。
+ * - **合计 58 组 / 386 个唯一名字 / 396 个落点**，其中 10 个名字有 2 个候选。
  *   这组数字由 `zhimoMapStats()` 现算，`tests/zhimoTaxonomyMap.test.ts` 里有精确断言
  *   （改表就必须同步 docs/28 与断言，防止"表悄悄变了、报告还是旧的"）。
  * - 另有 **1 条「只有一级确定」**（`木纹`，`ZHIMO_LEVEL1_ONLY`）
- *   与 **6 条「就近归并」**（`ZHIMO_APPROX`），均不计入 385。
+ *   与 **6 条「就近归并」**（`ZHIMO_APPROX`），均不计入 386。
  *   `玻璃` / `金属` 因在本地同时是 `模型/SU材质` 的二级（二义）**未登记一级-only**，仍返回 null。
  *   （`夹胶玻璃` → 玻璃 是另一条 `approx`，用站方父链的一级做近似，不是"玻璃"这个名字的一级-only。）
  *
  * 📌 未覆盖的部分**不是站方没有**：SU 模型频道另外 13 个一级的二级全表尚未抄录
  * （`docs/17 §3.2` 明确写了「不要拿没抄到当站方没有」），所以本表对它们没有条目。
  * 要扩展必须先补抄录（走 `docs/06 §12.2` 流程），**不要**用名字相似去补。
+ *
+ * ⚠️ **材质树也只抄到两级，站方存在三级**（与 `docs/07` 同性质）：实测 `石材 > 墙砖 > 其他石材`、
+ * `玻璃 > 玻璃屏幕 > 其他玻璃`，`墙砖` / `玻璃屏幕` 不在 `docs/18` 的 106 条里。
+ * 因此本表对这两个名字**没有条目**（本地也无安全落点，不硬凑）；将来补抄录的入口是 `docs/18`。
  */
 
 import { UNCLASSIFIED } from './taxonomy'
@@ -86,7 +90,7 @@ interface ZhimoTargetBase {
 /**
  * 一个落点。`category1/category2` 必须都存在于本地受控词表（`tests/zhimoTaxonomyMap.test.ts` 守卫）。
  *
- * 运行时**不会**带 `level`（保持 385 条老条目对象形状不变）；类型上允许 `1 | 2`
+ * 运行时**不会**带 `level`（保持既有两级条目对象形状不变）；类型上允许 `1 | 2`
  * 只是为了让「一级-only / 近似」在结构上兼容本类型，便于老调用方零改动。
  */
 export interface ZhimoCategoryTarget extends ZhimoTargetBase {}
@@ -100,7 +104,7 @@ export interface ZhimoCategoryTarget extends ZhimoTargetBase {}
  *
  * 与 `ZhimoCategoryTarget` 的**类型区分**：本类型**必有** `level: 1`，
  * 且 `category2` 收紧为哨兵 `'未分类'`；两级都确定的结果**没有** `level` 字段
- * （保持 385 条老条目的对象形状一字不变）。落库侧用 `isLevel1Only()` 或 `t.level === 1` 判定，
+ * （保持既有两级条目的对象形状一字不变）。落库侧用 `isLevel1Only()` 或 `t.level === 1` 判定，
  * 据此决定日志口径与是否给用户提示"这条只分到一级"。
  *
  * 判据（写死，不许放宽）：
@@ -749,7 +753,7 @@ export const ZHIMO_MAP_GROUPS: readonly ZhimoMapGroup[] = [
     ]
   },
   {
-    source: '站方实测（贴图-木材 1 条样本）',
+    source: '站方实测（贴图-木材 2 条样本）',
     channel: 'texture',
     category1: '木材',
     pairs: [
@@ -759,6 +763,13 @@ export const ZHIMO_MAP_GROUPS: readonly ZhimoMapGroup[] = [
         stationPath: ['木材', '板材'],
         source: '站方实测（ID 1148779647）',
         note: '站方三级名落在二级「板材」下'
+      },
+      {
+        station: '木板',
+        category2: '板材',
+        stationPath: ['木材', '板材'],
+        source: '站方实测（库内材质 ID 1153222981）',
+        note: '父链与「海洋板」完全相同（木材>板材），按同一口径落 木材/板材；详情页 301 到 tietu，属贴图树'
       }
     ]
   },
@@ -913,7 +924,7 @@ export const ZHIMO_APPROX: readonly ZhimoApproxEntry[] = [
 /**
  * 构建期的一条记录：落点 + 它适用的资产大类（`undefined` = 不限制）。
  *
- * `kinds` **不放进对外的 `ZhimoCategoryTarget`**：385 条老条目的对象形状必须一字不变
+ * `kinds` **不放进对外的 `ZhimoCategoryTarget`**：既有两级条目的对象形状必须一字不变
  * （用户要求"kind 省略时与改造前完全等价"），所以 kind 只作为**并行的索引**存在。
  */
 interface MappingSlot {
@@ -1179,7 +1190,7 @@ export function zhimoMapStats(): {
   }
 }
 
-// ── 需人工裁定（**不进映射表**，等用户拍板）─────────────────────────────
+// ── 裁定记录（**不进映射表**；2026-10-26 已全部定案，无待办）─────────────────
 
 /**
  * 人工裁定条目状态：
@@ -1209,6 +1220,15 @@ export interface ZhimoHumanReviewEntry {
    * ② 将来新增 kind 时要回来确认"新大类该走哪一支"。
    */
   resolvedByKind?: true
+  /**
+   * 已裁定「不映射」（2026-10-26，用户拍板 C）。
+   *
+   * 置 `true` 的条目**不再挂账**：查表明确返回 `null`，理由写在 `reason` 里。
+   * 分两类：① 站方父级太宽（布艺软饰/墙饰墙绘/厨房用品）——只映射其下三级；
+   * ② 品牌（Minotti/Poliform）——品牌标签属后续独立功能，不在分类映射职责内。
+   * 保留在清单里的原因同 `resolvedByKind`：作为可读记录 + 防止以后被重新当成"漏映射"。
+   */
+  resolvedNotMapped?: true
   /** 站方父链原文 */
   stationPath?: readonly string[]
   /**
@@ -1325,12 +1345,11 @@ export const ZHIMO_KIND_ROUTING: readonly ZhimoKindRoute[] = [
 ]
 
 /**
- * 需人工裁定的清单（与 `docs/28` 的同名章节逐条对应）。
+ * 裁定记录（与 `docs/28 §5` 的裁定表逐条对应）。**2026-10-26 已全部定案，没有待办**。
  *
- * ⚠️ 这不是"待办清单"的垃圾桶：每一条都写清了为什么进不了表、建议怎么处理。
- * - `ambiguous` + `resolvedByKind`：**已按 kind 裁定**，只剩"新增 kind 时回看"的备忘价值；
- * - `ambiguous`（无 `resolvedByKind`）：仍需人工决定候选优先级（当前无此条目）；
- * - `unmapped`：本地词表确实没有，要么走 `docs/06 §12.2` 补词表，要么接受落 `未分类`。
+ * - `ambiguous` + `resolvedByKind`：已按资产大类分流（10 条，`ZHIMO_KIND_ROUTING`）；
+ * - `unmapped` + `resolvedNotMapped`：已裁定不映射（5 条：3 个父级太宽 + 2 个品牌）；
+ * - 没有 `resolved*` 标记的条目 = 仍未定案（当前为 0）。
  */
 export const ZHIMO_HUMAN_REVIEW: readonly ZhimoHumanReviewEntry[] = [
   // ── A. 已进表但一对多 ────────────────────────────────────────────
@@ -1462,6 +1481,7 @@ export const ZHIMO_HUMAN_REVIEW: readonly ZhimoHumanReviewEntry[] = [
   {
     station: '布艺软饰',
     status: 'unmapped',
+    resolvedNotMapped: true,
     stationPath: ['软装陈设', '布艺软饰'],
     candidates: [{ category1: '软装陈设', category2: '窗帘布艺' }],
     reason: '站方二级「布艺软饰」覆盖面大于本地二级「窗帘布艺」（还含抱枕/床品等）。',
@@ -1470,6 +1490,7 @@ export const ZHIMO_HUMAN_REVIEW: readonly ZhimoHumanReviewEntry[] = [
   {
     station: '墙饰墙绘',
     status: 'unmapped',
+    resolvedNotMapped: true,
     stationPath: ['软装陈设', '墙饰墙绘'],
     candidates: [{ category1: '软装陈设', category2: '挂画' }],
     reason: '站方二级「墙饰墙绘」比本地「挂画」宽（可能含墙贴/墙绘/壁饰）。',
@@ -1478,6 +1499,7 @@ export const ZHIMO_HUMAN_REVIEW: readonly ZhimoHumanReviewEntry[] = [
   {
     station: '厨房用品',
     status: 'unmapped',
+    resolvedNotMapped: true,
     stationPath: ['厨卫五金', '厨房用品'],
     candidates: [],
     reason: '本地厨卫五金组没有这一层级（只有 水龙头/水槽/花洒/马桶/浴缸/浴室柜/厨房电器/五金配件/晾衣架）。',
@@ -1486,6 +1508,7 @@ export const ZHIMO_HUMAN_REVIEW: readonly ZhimoHumanReviewEntry[] = [
   {
     station: 'Minotti',
     status: 'unmapped',
+    resolvedNotMapped: true,
     stationPath: ['家具'],
     candidates: [],
     reason: '品牌名，不是分类层级；`taxonomy.EXCLUDED_TERMS` 已把它从家具组剔除。',
@@ -1494,6 +1517,7 @@ export const ZHIMO_HUMAN_REVIEW: readonly ZhimoHumanReviewEntry[] = [
   {
     station: 'Poliform',
     status: 'unmapped',
+    resolvedNotMapped: true,
     stationPath: ['家具'],
     candidates: [],
     reason: '品牌名，同 Minotti。',

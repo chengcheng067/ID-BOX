@@ -11,6 +11,11 @@
  * - **不读 store、不读 settings**：数据（params / 落盘回调）全部由父层传；
  * - 定位只用 `anchorRect` 算，不写死像素（见 `logic/stageControls.placeBeside`）；
  * - 本组件当前**没有被任何地方 import**（接线是下一批）。
+ *
+ * ⚠️ 0.7.8 T-ZSTACK：本文件仍是**死代码**（全仓无 import，仅 `docs/25` 有引用记录，
+ * 故不删）。它原来那个「61」的层级魔法数已去掉 —— 它只是「比舞台球 60 再高一点」的产物，
+ * 层级现在统一由层栈深度算（`logic/zStack.ts`：弹窗 50 / 60 / 70 / 80）。将来若真要接线，
+ * 请走 `useEscLayer` 并复用 `zClassForDepth()`，不要再写新的魔法数字。
  */
 import { useLayoutEffect, useRef, useState } from 'react'
 import type { BallParamScales } from '../../shared/ballParams'
@@ -68,11 +73,12 @@ export function StageControls({
   const pos = placeBeside(anchor, size, viewport)
 
   return (
+    // 0.7.8 T-ZSTACK：原本的层级魔法数已删除（见文件头注释），层级统一走层栈深度
     <div
       ref={panelRef}
       role="dialog"
       aria-label="材质球快速调参"
-      className="fixed z-[61] w-52 rounded-xl border border-line bg-card/95 p-3 text-[11px] shadow-pop"
+      className="fixed w-52 rounded-xl border border-line bg-card/95 p-3 text-[11px] shadow-pop"
       style={{ left: pos.left, top: pos.top }}
       onKeyDown={(e) => {
         if (e.key === 'Escape') {

@@ -64,6 +64,7 @@ import {
   applyMaterialParams,
   applyUvRepeat,
   decodeTextureBitmap,
+  effectiveRoughness,
   effectiveUvRepeat,
   normalizeParams,
   planTextureDecode,
@@ -86,6 +87,16 @@ import {
   textureBitmapCache
 } from '../logic/textureBitmapCache'
 import { TexturePool, formatTexturePoolStats, texturePoolKey } from '../logic/texturePool'
+import {
+  ConcurrencyLimiter,
+  MAX_PARALLEL_MAP_LOADS,
+  defineKey,
+  defineSetFromSlots,
+  defineSetOfMaterial,
+  isDeferredSlot,
+  scheduleIdleTask,
+  shouldHoldRoughness
+} from '../logic/textureLoadQueue'
 import { currentMotionProfile, subscribeMotionProfile } from '../logic/motionProfile'
 import type { MotionProfile } from '../../shared/motionQuality'
 
@@ -137,6 +148,27 @@ export function resolveBallBackground(
   if (format === 'png') return undefined
   const explicit = typeof background === 'string' ? background.trim() : ''
   return explicit.length > 0 ? explicit : paperColor()
+}
+
+/**
+ * 本批**声明**的槽位 → 预计最终会存在的 define 槽位（B5 的预判口径）。
+ *
+ * 唯一的修补：单图资产（有 albedo、没有 normal）会被 `synthesizeNormalIfMissing()`
+ * 合成一张法线挂上去 → 它的最终定义集里**有** normal。
+ * 不把这条算进去的话，「单图 → 单图」这个最常见的切换每次都会落到"摘贴图"分支
+ * （签名从 `map|normal` 变回 `map`），B5 对最主流的资产类型完全失效。
+ *
+ * 预判**偏保守**是安全的：`syncMaterialDefines()` 永远按材质真实状态重算，
+ * 万一合成失败（拿不到 canvas），多算出来的那一位只会让下一次比较多置一次
+ * `needsUpdate`（多余的重编译，不会漏）。
+ */
+function predictedDefineSlots(slots: Array<MaterialSlotKey | 'alpha'>): Array<
+  MaterialSlotKey | 'alpha'
+> {
+  const out = [...slots]
+  const has = new Set<string>(out)
+  if (has.has('albedo') && !has.has('normal')) out.push('normal')
+  return out
 }
 
 /** 槽位 → MeshPhysicalMaterial 贴图属性（显式 switch，类型安全） */
@@ -283,12 +315,86 @@ export function applyAutoRotate(controls: { autoRotate: boolean } | null, on: bo
   if (controls) controls.autoRotate = on
 }
 
+// ── 球图出图比例（2026-10-27 用户拍板：1:1 → 4:3）────────────────────────────
+/**
+ * 球图离屏画布的**宽高比 = 4/3**（与卡片封面框 `AssetGrid.tsx` 的
+ * `aspect-[4/3]`、详情面板封面框逐字同比例）。
+ *
+ * 为什么必须同比例：卡片封面走 `object-contain`、详情面板走 `object-cover`。
+ * 出图是 1:1 时，塞进 4:3 的框要么**左右各留 12.5% 的画布色**（contain），
+ * 要么**上下裁掉 25%**（cover）—— 两个都不对。出图改成 4:3 之后，两个方向都
+ * 是"图 = 框"，一像素都不缩放、不留白、不裁切。
+ *
+ * ⚠️ 只改**出图画布**的比例；屏幕内舞台仍按容器矩形 `resize()`（那是自适应，
+ * 不是出图），不要把它也钉成 4:3。
+ */
+export const BALL_CANVAS_ASPECT = 4 / 3
+
+/**
+ * 出图高度：`round(宽 × 3/4)`。
+ *
+ * 取整规则：先 `Math.round` 宽度（非有限 / ≤0 回落 `DEFAULT_BALL_CANVAS_WIDTH`），高度同样四舍五入且
+ * **至少 1 像素** —— 奇数宽（例如 481 → 361）不会算出小数画布，也不会退化成 0。
+ */
+export function ballCanvasHeight(width: number): number {
+  const w = normalizeBallCanvasWidth(width)
+  return Math.max(1, Math.round((w * 3) / 4))
+}
+
+function normalizeBallCanvasWidth(width: number): number {
+  if (!Number.isFinite(width) || width <= 0) return DEFAULT_BALL_CANVAS_WIDTH
+  return Math.max(1, Math.round(width))
+}
+
+/** 出图尺寸（`size` 口径 = **宽**，高按 4:3 推）；离屏渲染与 BallScene 共用这一处 */
+export function ballCanvasSize(width: number): { width: number; height: number } {
+  const w = normalizeBallCanvasWidth(width)
+  return { width: w, height: ballCanvasHeight(w) }
+}
+
+/**
+ * 默认出图宽度（像素）→ **640×480**（4:3）。
+ *
+ * 为什么是 640 而不是 480（2026-10-27 team-lead 拍板，别再改回 480）：
+ * 4:3 之后球径只与**高度**有关（`0.944 × 高`）。480 宽 → 高 360 → 球径 340px，
+ * 比 1:1 时代的 453px 少 25%；详情面板的封面框（≈275 CSS px、球 195 CSS px）
+ * 在 dpr2 下需要 ≈390 源像素，340 会明显发虚。640 宽 → 高 480 → 球径 **453px**，
+ * 与 1:1 时代**逐像素同级**，清晰度不退化。
+ *
+ * 代价（量级，别当实测精度看）：
+ * - 像素量 480×360=17.3 万 → 640×480=30.7 万，**+77.8%**；
+ * - 透明 PNG 体积大致随像素量线性增长 → 约 ×1.6~1.8（几十 KB → 一百 KB 上下）；
+ * - 离屏单帧里与像素量成正比的部分（读回 + PNG 编码）同样约 ×1.8，
+ *   绝对增量是**几毫秒~十几毫秒**；首帧的 shader 编译与贴图上传不受影响，仍是主导项。
+ * - 落盘上限 `MAX_BALL_IMAGE_BYTES` 是 5MB，余量充足。
+ */
+export const DEFAULT_BALL_CANVAS_WIDTH = 640
+
+/**
+ * 相机纵横比（`width / height`，高为 0 时按 1 保护）。
+ *
+ * 单独抽出来是为了**在 node 里可直测**：`BallScene` 需要 WebGL 上下文，
+ * vitest（environment: node）里造不出来，而这条恰恰是 4:3 改造最容易出的错——
+ * 忘了同步 `camera.aspect` 会让球被横向拉扁。
+ */
+export function ballCameraAspect(width: number, height: number): number {
+  return width / Math.max(1, height)
+}
+
 interface BallSceneOptions {
   shape: BallShape
   /** true = 可拖拽（OrbitControls + 持续 rAF 渲染）；false = 离屏单帧 */
   interactive: boolean
-  /** 离屏渲染边长（像素）；交互模式由 resize() 驱动，忽略此项 */
+  /** 离屏渲染**画布宽**（像素），高按 4:3 推（见 `ballCanvasHeight`）；交互模式由 resize() 驱动，忽略此项 */
   size?: number
+  /**
+   * 离屏渲染**画布高**（像素）。不传 = `ballCanvasHeight(size)`（4:3）。
+   *
+   * 显式暴露它是为了"非 4:3 的调用方"（目前没有）：出图比例一旦变化，
+   * 必须同时改 `camera.aspect`，所以宽高必须成对传进来，不能只给一个 `size`
+   * 再在内部猜比例。
+   */
+  height?: number
   /**
    * 背景色（CSS 颜色串）。传了 = 不透明背景（离屏 JPG 用，配纸色）；
    * 不传 = 透明画布（实时组件用，透出容器 CSS 背景）。
@@ -298,6 +404,16 @@ interface BallSceneOptions {
   preserveDrawingBuffer?: boolean
   /** 是否持续自转（默认 true；舞台/单击生成的静止球传 false） */
   autoRotate?: boolean
+  /**
+   * **全量加载开关**（第三批 B4 的验收红线）：`true` = `ao` / `displacement`
+   * 不延迟，和核心三槽一起进主 Promise。
+   *
+   * 默认值 = `preserveDrawingBuffer === true`（即**所有离屏渲染**）。离屏路径
+   * （`renderBallToPng` / `renderBallToJpeg` → 卡片球图 / 封面）是"渲一帧就落盘"，
+   * 延迟槽位一旦漏等就会把**缺 AO**的图烤进缓存文件。想显式表态的调用方传 `true`，
+   * 舞台/弹窗这类实时预览保持默认（延迟）。
+   */
+  eagerMaps?: boolean
   /**
    * 调参渲染（2026-10 用户反馈第 3 条，需求书 §3.3）：反光 / 凹凸倍率。
    * 不传 = 默认 1 倍（与未加调参前完全一致）。
@@ -662,6 +778,74 @@ export class BallScene {
   private mapsReady = false
   /** applyMaps 代次令牌（见 applyMaps：只认最新一代，旧一代的加载结果直接丢弃） */
   private mapsGen = 0
+  /**
+   * 当前材质的**定义集签名**（第三批 B5）。
+   *
+   * 决定 shader 要不要重编译的不是「贴图换了没有」，而是「哪些槽有图 +
+   * transparent / alphaTest / side」这些参与 `#ifdef` 的事实。把它们压成一个字符串，
+   * 只有签名真的变了才置 `needsUpdate`：
+   *
+   * - 同一个槽从 A 图换成 B 图（uniform 换引用）→ **不置**（省掉一次 42ms 量级的重编译）；
+   * - 槽位增删 / `transparent` 翻转 / 灰度透明开关切换 → 置。
+   *
+   * 初值在构造末尾按"空材质"算一次；`clearMaps()` 之后立刻重算（否则会拿旧签名比对，
+   * 漏掉一次必要的重编译 → 采样到已释放的纹理）。
+   */
+  private currentDefineKey: string | null = null
+  /**
+   * 自建的**合成法线**贴图（单图资产用 albedo 亮度梯度合成的那张）。
+   *
+   * 它记在 `this.maps` 里（随场景释放），但换资产时若「定义集没变」（B5 的复用分支
+   * 不摘贴图），必须由 `synthesizeNormalIfMissing()` 自己替换并 dispose 上一张，
+   * 否则每换一个单图资产就多泄漏一张 256×256 的纹理直到卸载。
+   */
+  private synthNormal: Texture | null = null
+  /**
+   * 本批**声明**要挂的槽位（`applyMaps` 的 `entries`，含 `'alpha'`）。
+   *
+   * 与 `slotTextures`（已挂上的）刻意区分：B2 的 roughness 门控与 B4 的延迟槽位
+   * 都要按「这一批**打算**做什么」判定，而不是「已经加载到哪一步」——后者在
+   * 第一批异步返回之前恒为空，判据会立刻失效。
+   */
+  private declaredSlots = new Set<MaterialSlotKey | 'alpha'>()
+  /**
+   * 是否**按住** roughness 不写（第三批 B2 方案甲）。
+   *
+   * `true` 的条件（纯函数 `shouldHoldRoughness`）：本批声明了 roughness 槽、
+   * 但该贴图还没挂上、且本批尚未落定。此时 `applyParams` 不写「无 map 口径」的
+   * `base × mult`（默认 0.5 × 1.7 = 0.85），而是按「有 map 口径」呈现倍率本身
+   * （默认 1.7，与贴图到位后的最终值同侧同量级）——观感上只跳一次而不是两次。
+   *
+   * ⚠️ 落定时（`settleParamBasis`）**无条件**置回 false：即使贴图加载失败，
+   * 也要回到「无 map 口径」的最终值，不能永远停在中性值上。
+   */
+  private holdRoughness = false
+  /**
+   * 按住期间**呈现**的 roughness 基准值 = 布防那一刻材质上已有的值
+   * （换资产时就是上一个资产落定的真实值；首次加载就是构造后同步进去的那份）。
+   *
+   * 为什么不写死 0.5 / 1.0：roughness 在「有 map」与「无 map」两种口径下**含义不同**
+   * （前者是乘数，后者是绝对值），任何一个写死的数都只是某一个假设下的近似。
+   * 沿用"上一帧屏幕上真实出现过的值"是唯一不会凭空造出新中间态的选法。
+   */
+  private heldRoughness = 0.5
+  /** 布防时的倍率，用于"用户在按住期间拖滑块"时按比例跟手（否则滑块像卡住） */
+  private heldRoughnessMult = 1
+  /**
+   * 是否**全量立即加载**（第三批 B4）。
+   *
+   * `true` = `ao` / `displacement` 与核心三槽一样进主 Promise（离屏渲染的必选项）；
+   * `false` = 它们被 `requestIdleCallback`（带 timeout 兜底）推到主批次之后，
+   * 给 albedo / normal / roughness 让出带宽与解码线程。
+   */
+  private readonly eagerMaps: boolean
+  /**
+   * 本批**全量**贴图（含延迟的 ao/disp）落定的 Promise（B4）。
+   *
+   * `applyMaps()` 的 resolve 只保证核心三槽（语义不许变，见那里的注释）；
+   * 想要"真的全都在"的调用方（排查 / 离线一帧）用 `whenDeferredReady()` 等它。
+   */
+  private deferredReady: Promise<void> = Promise.resolve()
   private autoRotate = true
   private currentShape: BallShape
   /**
@@ -728,6 +912,11 @@ export class BallScene {
   constructor(canvas: HTMLCanvasElement, opts: BallSceneOptions) {
     this.currentShape = opts.shape
     this.autoRotate = opts.autoRotate !== false
+    /**
+     * B4 的全量开关：显式 `eagerMaps` 优先；否则**离屏渲染**（`preserveDrawingBuffer`）
+     * 一律全量 —— 离屏的产物是磁盘上的球图/封面，"缺 AO"会一直错到缓存失效。
+     */
+    this.eagerMaps = opts.eagerMaps === true || opts.preserveDrawingBuffer === true
     // 基准在构造时就交给状态机：之后 setRoughnessBase() / markSettled() 都会按它重算
     this.paramState = new ParamScaleState({
       baseRoughness: this.baseRoughness,
@@ -773,6 +962,22 @@ export class BallScene {
     // 取景（2026-10 对齐包内预览）：相机仍在同一条射线上，**只改长度**，且分形态——
     // 球 2.935（fill 94.4%，对齐包内 PBR 预览 680²/720²），平面 3.380 / 盒 2.647（fill 90%，
     // 再近就左右切边）。全部数值来自 `logic/ballCamera.ts`，这里不许写死常量。
+    //
+    // ★ 2026-10-27 出图改 4:3 时**故意不动这个距离**（量化依据，别再"顺手调一下"）：
+    //   fov 是**垂直**视场角（42°），`camera.aspect` 只决定水平方向能装多宽，
+    //   所以球在画面**高度**上的占比与画布比例无关：
+    //     · 1:1 画布（480×480）：球径 453px，占高 94.4%，占宽 94.4%，左右各留 2.8%；
+    //     · 4:3 画布（**默认 640×480**）：球径 453px（与 1:1 同级 → 清晰度不退化），
+    //       占高 94.4%（**不变**），占宽 70.8%，左右各留 14.6%（透明像素，卡片上不可见）；
+    //     · 4:3 且宽 480（调用方显式传 size:480，如自定义渲染弹窗的历史口径 480×360）：
+    //       球径 340px，占高仍 94.4%，占宽 70.8%，左右各留 14.6%；
+    //     · 卡片上的观感：改前 1:1 图 contain 进 4:3 框 → 球 = 0.944×框高 = 70.8%×框宽
+    //       + 两侧各 12.5% 的画布色色带；改后 4:3 图铺满框 → 球仍是 70.8%×框宽，
+    //       但**色带消失**（图=框，缩放 1:1）。
+    //       ⚠️ 注意："球在卡片上的直径"改前改后都是 70.8%×框宽 —— 本次**没有把球变大**，
+    //       变的只是"图与框同比例"。别在汇报里说成"球变大了"。
+    //   ⇒ 想再放大球只能提高 fill（上限 0.97，见 ballCamera 的 MAX_SAFE_FILL），
+    //     而不是"按宽度算 fill"——那必然把上下切掉。
     const camPos = ballCameraPosition(opts.shape)
     this.camera.position.set(camPos.x, camPos.y, camPos.z)
     // ★ 必须对准原点。交互形态下 OrbitControls.update() 会代劳，但舞台是
@@ -815,11 +1020,15 @@ export class BallScene {
     this.geometry = createGeometry(opts.shape)
     this.mesh = new Mesh(this.geometry, this.material)
     this.scene.add(this.mesh)
+    // B5 的签名基准：此刻材质上什么贴图都没有（"空集"签名），applyMaps 会拿它比第一轮
+    this.currentDefineKey = this.readDefineKey()
 
     // 调参渲染（需求书 §3.3）：反光 / 凹凸倍率在构建时立即生效
     this.setParamScales(opts.params ?? DEFAULT_PARAM_SCALES)
 
-    if (opts.size) this.resize(opts.size, opts.size)
+    // 出图比例 4:3（2026-10-27）：`size` 是**宽**，高按 3/4 推；两者必须成对进 resize，
+    // 否则 `camera.aspect` 会留在 1 → 4:3 画布里的球被横向拉扁（本轮最容易踩的坑）。
+    if (opts.size) this.resize(opts.size, opts.height ?? ballCanvasHeight(opts.size))
 
     if (opts.interactive) {
       this.controls = new OrbitControls(this.camera, this.renderer.domElement)
@@ -887,6 +1096,58 @@ export class BallScene {
     this.slotTextures.clear()
   }
 
+  /** 从材质**当前状态**解出定义集签名（`clearMaps` 之后调用 = 空集签名） */
+  private readDefineKey(): string {
+    return defineKey(defineSetOfMaterial(this.material))
+  }
+
+  /**
+   * 定义集变了才置 `needsUpdate`（第三批 B5）。
+   *
+   * 调用点：所有「改了 map / transparent / alphaTest / side」之后。
+   * 语义上是 `this.material.needsUpdate = true` 的**条件版**——
+   * 签名不变时赋值等于白白让 three 重新走一遍 program 查表（冷启场景还会重编译）。
+   */
+  private syncMaterialDefines(): void {
+    const next = this.readDefineKey()
+    if (this.currentDefineKey === next) return
+    this.currentDefineKey = next
+    this.material.needsUpdate = true
+  }
+
+  /**
+   * 每批开始时决定要不要**按住** roughness（第三批 B2 方案甲）。
+   *
+   * 三种情形（判据全部来自纯函数 `shouldHoldRoughness`）：
+   * 1. 本批没声明 roughness 槽 → 不按（口径本来就是"无 map"）；
+   * 2. 本批声明了、且材质上**已经有** roughnessMap（B5 的"定义集不变"复用分支
+   *    没摘旧贴图）→ 不按：这一帧仍然是 map 口径，旧贴图先用着，稍后被替换；
+   * 3. 本批声明了、但贴图还没到 → **按住**（0.85 就死在这一支）。
+   */
+  private armRoughnessHold(): void {
+    this.holdRoughness = shouldHoldRoughness(
+      this.declaredSlots.has('roughness'),
+      this.material.roughnessMap !== null,
+      false
+    )
+    if (!this.holdRoughness) return
+    /**
+     * 布防：把**此刻材质上真实呈现的值**记下来。
+     *
+     * 时序上这是「上一批已经 settle 完、这一批刚 clearMaps」的时刻，
+     * 所以拿到的就是用户在屏幕上看到的最后一份 roughness —— 保持它，
+     * 观感上等于"贴图没到之前，反光一点都不变"。
+     * 首次加载时它是构造/同步 effect 写进去的中性值（默认参数下 = 0.5 × 1.7 = 0.85，
+     * 恰好也是"假设贴图是中灰"的估计），不是凭空取的常量。
+     */
+    this.heldRoughness = Number.isFinite(this.material.roughness) ? this.material.roughness : 0.5
+    this.heldRoughnessMult = effectiveRoughness(
+      true,
+      0,
+      this.paramState.currentScales.roughness
+    )
+  }
+
   /**
    * 平铺：形态基准（平面 2×2 检查接缝，球 / 盒 1×1）× UV 大小倍率（v0.2.1 增补 2）。
    * three 支持小数 repeat + RepeatWrapping，倍率 0.1–4 全程有效。
@@ -952,6 +1213,22 @@ export class BallScene {
   private applyParams(values: MaterialParamValues): void {
     if (this.disposed) return
     applyMaterialParams(this.material, values)
+    /**
+     * ★ 第三批 B2（方案甲）：声明了 roughness 槽但贴图还没到 → **这一帧不写**
+     * 「无 map 口径」刚算出的值，而是沿用**布防时**材质上已经呈现的 roughness。
+     *
+     * 读代码才发现：那个"0.85"不是写死的常量，而是 `base(0.5) × mult(1.7)` ——
+     * 它隐含假设"贴图是中灰"，所以它本身是个合理估计，问题在于**换资产时**它会
+     * 突然把上一个资产的真实反光换成一个与两者都无关的数，等 map 到了再跳一次。
+     * 沿用上一帧的值 → 只跳最后那一次（贴图数据带来的那一次，那次是必须的）。
+     *
+     * 用户在按住期间拖滑块时按倍率比例跟手，否则滑块会有几十毫秒"卡住"的手感。
+     */
+    if (this.holdRoughness) {
+      const mult = effectiveRoughness(true, 0, this.paramState.currentScales.roughness)
+      const ratio = this.heldRoughnessMult > 0 ? mult / this.heldRoughnessMult : 1
+      this.material.roughness = Math.min(1, Math.max(0, this.heldRoughness * ratio))
+    }
     // 灰度反转：**只写 uniform**，不碰 needsUpdate（交互路径不许重编译）。
     // alphaMap 的有无由 applyMaps 决定（它是贴图批次的事实，不是参数）。
     this.setAlphaInvert(values.alphaInvert)
@@ -996,6 +1273,13 @@ export class BallScene {
    */
   private settleParamBasis(): void {
     if (this.disposed) return
+    /**
+     * ★ B2：本批落定 → 解除 roughness 的等待门控（**无条件**）。
+     *
+     * 贴图到了当然要解除；贴图加载**失败**时也必须解除，否则球会一直停在
+     * "假设有 map"的中性值上，而正确口径是退回「无 map 口径」（`base × mult`）。
+     */
+    this.holdRoughness = false
     this.applyParams(
       this.paramState.markSettled({
         hasRoughnessMap: this.material.roughnessMap !== null,
@@ -1041,27 +1325,11 @@ export class BallScene {
     const signal = abort.signal
 
     /**
-     * ★ 性能修复 D（第二批）：**池化贴图只归还，不 dispose**。
+     * 先收集本批**声明**的槽位，再决定要不要摘掉旧贴图（第三批 B5）。
      *
-     * 只有 `this.maps`（合成法线 / TextureLoader 兜底）照旧释放；槽位贴图回到
-     * `texPool`（引用 -1），下次切回来就能命中 → 不重 fetch、不重解码、不重上传。
-     *
-     * 顺序纪律：**先 `clearMaps` 摘掉材质引用，再归还/释放**。原因是 `releaseSlots()`
-     * 会顺手跑一次 LRU 逐出（`refs` 归零的条目可能被立刻 dispose），
-     * 若此时 `material.map` 还指着它，就会留下「材质引用已 dispose 纹理」的窗口。
+     * 顺序很重要：定义集签名可以只看 `entries` 预判出来，于是能在"摘旧贴图"之前
+     * 就判断「这一批的定义集和上一批是否一样」。
      */
-    clearMaps(this.material)
-    this.releaseSlots()
-    for (const t of this.maps) t.dispose()
-    this.maps = []
-    // 复用同一个场景换资产：这两个值原本靠"每次新建 BallScene"天然复位，现在必须显式复位
-    this.material.color.setHex(BASE_COLOR) // 上一个资产可能把底色让成了纯白
-    // 基准复位 + 标记"未落定"：单图资产会把法线基准压到 SYNTH_NORMAL_SCALE，
-    // roughness 的口径也要看这一批到底有没有 roughnessMap —— 未落定前算出的只是临时值。
-    this.paramState.markPending({ hasRoughnessMap: false, baseNormalScale: 1, hasAlphaMap: false })
-    // 卸 map 同样会改 shader define（USE_MAP 等），必须重编译，否则沿用旧 Program 引用已释放的纹理
-    this.material.needsUpdate = true
-
     const entries: Array<[MaterialSlotKey | 'alpha', string]> = []
     for (const key of SLOT_ORDER) {
       const u = urls[key]
@@ -1079,9 +1347,68 @@ export class BallScene {
       const albedoUrl = urls.albedo
       if (typeof albedoUrl === 'string' && albedoUrl.length > 0) entries.push(['alpha', albedoUrl])
     }
+    // 本批**声明**的槽位（B2 的 roughness 门控 / B4 的延迟槽位都以它为准，不看"已加载"）
+    this.declaredSlots = new Set(entries.map(([slot]) => slot))
+
+    /**
+     * ★ 第三批 B5：**定义集不变时跳过 `material.needsUpdate`**。
+     *
+     * 判据是「本批声明要挂哪些槽」+ 材质当前的 transparent / alphaTest / side：
+     * 这些才是参与 `#ifdef` 的事实。签名相同 ⇒ 这一批只是把同一个槽换成另一张贴图
+     * （典型：两个都是 5 槽 PBR 预设，来回切）⇒ uniform 换引用，不需要重编译。
+     *
+     * 反过来说：如果为了"先摘干净"而无条件 `clearMaps()`，签名会短暂变成"空集"，
+     * 那一帧就必须重编译一次 —— 优化的收益正好被自己抹掉。所以这里做成
+     * **两条路**：
+     * - 定义集变 → 摘贴图 → 归还/释放 → 签名重算 → 置 needsUpdate（与第二批逐字同序）；
+     * - 定义集不变 → 旧贴图**继续挂在材质上**（球不会闪成白球/灰球），由 `loadMap`
+     *   逐个槽位替换并把旧的那张归还池子。
+     */
+    const declaredDefineKey = defineKey(
+      defineSetFromSlots(
+        predictedDefineSlots(entries.map(([slot]) => slot)),
+        {
+          transparent: this.material.transparent,
+          alphaTest: this.material.alphaTest,
+          side: this.material.side
+        }
+      )
+    )
+    if (declaredDefineKey !== this.currentDefineKey) {
+      /**
+       * ★ 性能修复 D（第二批）：**池化贴图只归还，不 dispose**。
+       *
+       * 只有 `this.maps`（合成法线 / TextureLoader 兜底）照旧释放；槽位贴图回到
+       * `texPool`（引用 -1），下次切回来就能命中 → 不重 fetch、不重解码、不重上传。
+       *
+       * 顺序纪律：**先 `clearMaps` 摘掉材质引用，再归还/释放**。原因是 `releaseSlots()`
+       * 会顺手跑一次 LRU 逐出（`refs` 归零的条目可能被立刻 dispose），
+       * 若此时 `material.map` 还指着它，就会留下「材质引用已 dispose 纹理」的窗口。
+       */
+      clearMaps(this.material)
+      this.releaseSlots()
+      for (const t of this.maps) t.dispose()
+      this.maps = []
+      this.synthNormal = null
+      // 复用同一个场景换资产：这两个值原本靠"每次新建 BallScene"天然复位，现在必须显式复位
+      this.material.color.setHex(BASE_COLOR) // 上一个资产可能把底色让成了纯白
+      // 卸 map 同样会改 shader define（USE_MAP 等），必须重编译，否则沿用旧 Program 引用已释放的纹理
+      this.currentDefineKey = this.readDefineKey()
+      this.material.needsUpdate = true
+    }
+    // 基准复位 + 标记"未落定"：单图资产会把法线基准压到 SYNTH_NORMAL_SCALE，
+    // roughness 的口径也要看这一批到底有没有 roughnessMap —— 未落定前算出的只是临时值。
+    this.paramState.markPending({ hasRoughnessMap: false, baseNormalScale: 1, hasAlphaMap: false })
+    /**
+     * ★ B2：摘贴图**之后**才能判断要不要按住 roughness —— 上面那条 `clearMaps()`
+     * 会让 `material.roughnessMap` 变回 null，正是"贴图还没到"的真实状态。
+     */
+    this.armRoughnessHold()
+
     if (entries.length === 0) {
       // 没有任何槽位（灰球）：基准立刻落定 → 按当前倍率重算（任务 1 收敛点之一）
       this.settleParamBasis()
+      this.deferredReady = Promise.resolve() // B4：本批没有延迟槽位
       if (gen === this.mapsGen) this.mapsReady = true
       return Promise.resolve()
     }
@@ -1109,12 +1436,33 @@ export class BallScene {
      * 放到 `Promise.all` 之后单发 → 必然命中缓存，只付一次上传。
      */
     const alphaEntry = entries.find(([slot]) => slot === 'alpha')
-    const mapEntries = entries.filter(([slot]) => slot !== 'alpha')
-    const jobs = mapEntries.map(async ([slot, url]) => {
-      await this.loadMap(slot, url, gen, signal)
-      // albedo 一落定就上屏（fail 也算：失败槽位保持默认灰，总比永远不亮强）
-      if (slot === 'albedo') markReady()
-    })
+    /**
+     * ★ 第三批 B4：**核心三槽 / 延迟两槽**分流。
+     *
+     * - `albedo` / `normal` / `roughness` 决定颜色、凹凸与反光，晚到一眼可见 → 进主 Promise；
+     * - `ao` / `displacement` 只压暗缝隙、做 4% 半径的微浮雕 → 推到 idle（带 timeout 兜底），
+     *   给核心槽让出 fetch 带宽与解码线程；
+     * - **`eagerMaps`（离屏渲染）时这条分流整体失效**：ao/disp 照旧进主 Promise，
+     *   否则卡片球图/封面会拿到"缺 AO"的一帧并落盘成缓存（本轮验收红线）。
+     *
+     * 并发上限 3 由 `ConcurrencyLimiter` 保证：`eager` 时 5 槽在同一个闸门里排队，
+     * 延迟时核心 3 槽各占一格、ao/disp 在它们之后重新起闸门。
+     */
+    const allMapEntries = entries.filter(([slot]) => slot !== 'alpha')
+    const deferredEntries = this.eagerMaps
+      ? []
+      : allMapEntries.filter(([slot]) => isDeferredSlot(slot))
+    const mapEntries = this.eagerMaps
+      ? allMapEntries
+      : allMapEntries.filter(([slot]) => !isDeferredSlot(slot))
+    const limiter = new ConcurrencyLimiter(MAX_PARALLEL_MAP_LOADS)
+    const jobs = mapEntries.map(([slot, url]) =>
+      limiter.run(async () => {
+        await this.loadMap(slot, url, gen, signal)
+        // albedo 一落定就上屏（fail 也算：失败槽位保持默认灰，总比永远不亮强）
+        if (slot === 'albedo') markReady()
+      })
+    )
 
     // Promise 语义不变：等**全部**槽位落定才 resolve（离屏渲染依赖这一点）
     return Promise.all(jobs).then(async () => {
@@ -1133,7 +1481,61 @@ export class BallScene {
       this.settleParamBasis()
       // 一行汇总（每批一次）：排查「还卡」时能直接看出池是满的还是命中率低
       console.info(`[MaterialBall] ${formatTexturePoolStats(this.texPool.stats())}`)
+      /**
+       * ★ B4：延迟槽位在**主 Promise 之外**开跑 —— 上面的 resolve 语义因此**一字未变**，
+       * 只是 ao/disp 不再占它的时间。想要全量的调用方等 `whenDeferredReady()`。
+       */
+      this.deferredReady = this.loadDeferredMaps(deferredEntries, gen, signal)
     })
+  }
+
+  /**
+   * 把延迟槽位（ao / displacement）排到浏览器空闲时加载（第三批 B4）。
+   *
+   * 三条纪律：
+   * - **idle 必须带 timeout 兜底**（`scheduleIdleTask`，200ms）：隐藏窗口 / 后台标签下
+   *   `requestIdleCallback` 可能长时间不回调，没有兜底的话 `whenDeferredReady()` 会挂住；
+   * - **不 reject**：`ao`/`disp` 加载失败只是少一层细节（`loadMap` 内部已 console.warn
+   *   并保持默认），Promise 永远 resolve —— 等待方不该因为"少一张 AO"拿到异常；
+   * - 代次 / 取消 / 卸载都当场 resolve：换资产时旧一代的延迟任务不能再跑，但也不能
+   *   让旧的 `whenDeferredReady()` 永远 pending。
+   */
+  private loadDeferredMaps(
+    entries: Array<[MaterialSlotKey | 'alpha', string]>,
+    gen: number,
+    signal: AbortSignal | null
+  ): Promise<void> {
+    if (entries.length === 0) return Promise.resolve()
+    const limiter = new ConcurrencyLimiter(MAX_PARALLEL_MAP_LOADS)
+    const tasks = entries.map(
+      ([slot, url]) =>
+        new Promise<void>((resolve) => {
+          scheduleIdleTask(() => {
+            if (this.disposed || gen !== this.mapsGen || signal?.aborted === true) {
+              resolve()
+              return
+            }
+            void limiter.run(async () => {
+              await this.loadMap(slot, url, gen, signal)
+            }).then(
+              () => resolve(),
+              () => resolve()
+            )
+          })
+        })
+    )
+    return Promise.all(tasks).then(() => undefined)
+  }
+
+  /**
+   * 等本批**全量**贴图落定（核心三槽 + 延迟的 ao / displacement）。
+   *
+   * `applyMaps()` 的 resolve 只保证核心槽（B4 的取舍），所以需要"一张不缺"的调用方
+   * 要 `await applyMaps()` 之后再等这个。⚠️ 必须在 `applyMaps()` resolve **之后**取，
+   * 因为 Promise 句柄是在主批次结束时才换成本批的。
+   */
+  whenDeferredReady(): Promise<void> {
+    return this.deferredReady
   }
 
   /**
@@ -1155,9 +1557,20 @@ export class BallScene {
     if (!tex) return
     tex.anisotropy = this.maxAnisotropy
     this.repeatTexture(tex)
+    /**
+     * B5：定义集不变的换资产路径**不会**清空 `this.maps`，所以上一张合成法线必须在这里
+     * 自己回收（否则每换一个单图资产就多挂一张 256² 纹理直到卸载）。
+     * dispose 之后紧接着 assign，中间不渲染 → 不会出现"材质引用已 dispose 纹理"的帧。
+     */
+    if (this.synthNormal !== null && this.synthNormal !== tex) {
+      const at = this.maps.indexOf(this.synthNormal)
+      if (at >= 0) this.maps.splice(at, 1)
+      this.synthNormal.dispose()
+    }
+    this.synthNormal = tex
     this.maps.push(tex)
     assignMap(this.material, 'normal', tex)
-    this.material.needsUpdate = true
+    this.syncMaterialDefines()
     // 让 normalScale 按新基准重算（基准写进状态机，倍率用当前值，不依赖调用方）
     this.setParamBasis({ baseNormalScale: SYNTH_NORMAL_SCALE })
   }
@@ -1233,21 +1646,54 @@ export class BallScene {
         if (at >= 0) this.maps.splice(at, 1)
         prev.dispose()
       }
+    } else if (prev === tex && loaded.pooled) {
+      /**
+       * ★ B5 的配套纪律：同一张贴图**又被 `take()` 到**（同一资产连续 `applyMaps`，
+       * 或是 StrictMode 的 effect 双跑）时，池已经把引用 +1 了，但材质上仍然只有
+       * 一份引用 → 立刻归还这一代多拿的那个。不归还的话它的 `refs` 永远 ≥ 1，
+       * 池的逐出会一直跳过它（`evictIfNeeded` 只看 0），显存只增不减。
+       */
+      this.texPool.release(tex)
     }
     this.slotTextures.set(slot, tex)
+    /**
+     * B5：定义集不变的换资产路径**不清空** `this.maps`，所以「合成法线 → 真实法线」
+     * 这个替换必须在这里自己回收上一张合成图（否则每切一次就多挂一张 256² 纹理）。
+     * 上一张只在 `slotTextures` 之外（它是自建的），`prev` 分支管不到它。
+     */
+    if (slot === 'normal' && this.synthNormal !== null) {
+      const at = this.maps.indexOf(this.synthNormal)
+      if (at >= 0) this.maps.splice(at, 1)
+      this.synthNormal.dispose()
+      this.synthNormal = null
+    }
     // 池管不到的（TextureLoader 兜底）必须记进 `this.maps`，卸载/换资产时才有机会释放
     if (!loaded.pooled) this.maps.push(tex)
     assignMap(this.material, slot, tex)
     // albedo 是**乘法**着色：底色 0xb9b6b0 会把所有贴图整体压暗偏灰。
     // 有 albedo 时把底色让给贴图（纯白），没有贴图时才用中性灰当"陶土球"。
     this.material.color.setHex(slot === 'albedo' ? 0xffffff : this.material.color.getHex())
-    this.material.needsUpdate = true // 增减 map 会改 shader define，必须重编译
+    // 增减 map 会改 shader define → 必须重编译；**同一槽位换一张图**（定义集没变）不置，
+    // 只换 uniform 引用（B5，见 syncMaterialDefines）
+    this.syncMaterialDefines()
+    /**
+     * ★ B2：roughness 贴图**挂上的这一刻**就解除门控并按"有 map 口径"重算。
+     * 不能等 settle —— 那要等 ao/disp 也到齐，中间会有"贴图在了但反光还是中性值"的一段。
+     */
+    if (slot === 'roughness') {
+      this.holdRoughness = false
+      this.setParamBasis({ hasRoughnessMap: true })
+    }
   }
 
   resize(width: number, height: number): void {
+    // 屏幕内舞台按容器矩形 resize（宽高来自 getBoundingClientRect，不是出图比例）；
+    // 离屏出图按 4:3（见 ballCanvasSize）。两条路径共用这一个入口。
     this.lastSize = { w: width, h: height }
     this.renderer.setSize(width, height, false)
-    this.camera.aspect = width / Math.max(1, height)
+    // ★ 4:3 的核心：纵横比必须跟着 w/h 走。写死 1 会让球在 4:3 画布上被横向拉扁；
+    //   垂直 fov 保持 42° 不变 → 球占**画面高度**的比例仍是 94.4%（见 logic/ballCamera.ts）。
+    this.camera.aspect = ballCameraAspect(width, height)
     this.camera.updateProjectionMatrix()
   }
 
@@ -1372,6 +1818,7 @@ export class BallScene {
     this.controls?.dispose()
     for (const t of this.maps) t.dispose()
     this.maps = []
+    this.synthNormal = null
     this.slotTextures.clear()
     /**
      * ★ D：池里的贴图必须在这里全部释放。
@@ -1530,7 +1977,7 @@ export function blobToBase64(blob: Blob): Promise<string | null> {
  * ```tsx
  * const slots = useMemo(() => materialSlots(asset.files), [asset.files])
  * {hasMaterialSlots(slots) && (
- *   <div className="aspect-square w-full">   {/* 材质类预览 1:1，需求书 §3.4 *\/}
+ *   <div className="aspect-[4/3] w-full">   {/* 材质/贴图预览 4:3（2026-10-27：与出图同比例） *\/}
  *     <MaterialBall
  *       relFolder={asset.relFolder}
  *       slots={slots}
@@ -1814,7 +2261,9 @@ export function MaterialBall({
     try {
       const blob = await renderBallToPng(relFolder, slots, {
         shape,
-        size: 480,
+        // 与默认出图同口径（640×480，球径 453px）：封面文件会被详情面板的大框
+        // 以原图直接显示（`asset.cover`），分辨率必须与卡片球图一致，别在这里写小数字。
+        size: DEFAULT_BALL_CANVAS_WIDTH,
         params: scales
       })
       await onSaveAsCover(blob)
@@ -2013,7 +2462,15 @@ export function MaterialBall({
 }
 
 export interface RenderBallOptions {
-  /** 边长像素，默认 480（与 DEFAULT_THUMB_MAX_PX 对齐） */
+  /**
+   * 出图**宽度**（像素），不传 = `DEFAULT_BALL_CANVAS_WIDTH`（**640**）；
+   * 高度按 4:3 推（`ballCanvasHeight(size)`）→ 640×480。
+   *
+   * ⚠️ 口径从"边长"改成了"宽"（2026-10-27，1:1 → 4:3）。传 480 得到的是
+   * 480×360 而不是 480×480：卡片封面框本身就是 4:3，同比例出图才能一像素不留白。
+   * 默认之所以是 640（而不是 480）见 `DEFAULT_BALL_CANVAS_WIDTH` 的注释：
+   * 640×480 的球径 453px 与 1:1 时代完全一致，dpr2 下的大框才不会发虚。
+   */
   size?: number
   /** 形态，默认球 */
   shape?: BallShape
@@ -2057,11 +2514,15 @@ async function renderBallBlob(
   opts: RenderBallOptions = {}
 ): Promise<Blob> {
   const format = opts.format ?? 'jpeg'
-  const size = opts.size && opts.size > 0 ? Math.floor(opts.size) : 480
+  const size = opts.size && opts.size > 0 ? Math.floor(opts.size) : DEFAULT_BALL_CANVAS_WIDTH
+  // ★ 4:3 出图（2026-10-27 用户拍板）：`size` = 宽，高 = round(宽 × 3/4)。
+  //   改前是 `width = height = size`（正方形），塞进 4:3 的卡片封面框后 `object-contain`
+  //   会在左右各留 12.5% 的画布色；同比例之后图 = 框，缩放比 1:1（还顺带更锐）。
+  const out = ballCanvasSize(size)
   const urls = opts.textureUrls ?? slotUrls(relFolder, slots)
   const canvas = document.createElement('canvas')
-  canvas.width = size
-  canvas.height = size
+  canvas.width = out.width
+  canvas.height = out.height
 
   // PNG：background 必须**不传**（不是传空串），BallScene 靠 `undefined` 判定透明画布。
   // JPEG：显式色 → 否则 `paperColor()`（主题画布色）。规则集中在 `resolveBallBackground`，
@@ -2071,9 +2532,14 @@ async function renderBallBlob(
   const ball = new BallScene(canvas, {
     shape: opts.shape ?? 'sphere',
     interactive: false,
-    size,
+    size: out.width,
+    height: out.height,
     background,
     preserveDrawingBuffer: true,
+    // ★ B4 验收红线：离屏渲染必须拿到**全量**贴图（ao / displacement 不许延迟）。
+    // 这里的产物是卡片球图 / 封面文件，`await applyMaps()` 之后立刻 renderOnce() 落盘，
+    // 一旦少等 ao 就会把"缺 AO"的一帧烤进缓存（且缓存名不变 → 一直错）。
+    eagerMaps: true,
     params: opts.params ?? DEFAULT_PARAM_SCALES
   })
   try {

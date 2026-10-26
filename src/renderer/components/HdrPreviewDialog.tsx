@@ -59,6 +59,7 @@ import { assetFileAbs } from '../logic/assetPath'
 import { coverImageInputOf } from '../logic/coverImage'
 import { useVault } from '../store'
 import { useEscLayer } from '../logic/escLayer'
+import { zClassForDepth } from '../logic/zStack'
 import { IconClose, IconImage } from '../icons'
 import type { Asset, AssetFile } from '../../shared/types'
 
@@ -552,8 +553,10 @@ export function HdrPreviewDialog({ asset, onClose }: HdrPreviewDialogProps) {
    * （预览开着时导入重复处置弹出来，Esc 先答重复处置；反过来说预览最后才关）。
    * 以前这里是一条冒泡阶段的 window 监听，靠 App 里对 `hdrPreviewAssetId` 让路来避免
    * 一次按键关两层；现在由栈统一表达，App 那一支只作为兜底。
+   *
+   * 0.7.8 T-ZSTACK：返回值 = 本层在层栈里的位置，遮罩 z-index 由它算出 —— 与 Esc 应答同源。
    */
-  useEscLayer(onClose, true)
+  const escDepth = useEscLayer(onClose, true)
 
   // ── 准备阶段：订阅进度 → prepareHdr → 拿到 hdr:// URL ───────────────
   useEffect(() => {
@@ -720,7 +723,7 @@ export function HdrPreviewDialog({ asset, onClose }: HdrPreviewDialogProps) {
 
   return (
     <div
-      className="dialog-scrim fixed inset-0 z-50 flex items-center justify-center p-6"
+      className={`dialog-scrim fixed inset-0 ${zClassForDepth(escDepth)} flex items-center justify-center p-6`}
       role="dialog"
       aria-modal="true"
       aria-label={`HDR 预览：${asset.name}`}

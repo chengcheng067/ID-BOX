@@ -113,6 +113,22 @@ let overwrittenInBatchCount = 0
 let overwrittenDegradedCount = 0
 
 /**
+ * 本批导入是否**已经**把视图从「最近删除」切回资产视图（**一批只切一次**）。
+ *
+ * 为什么不放 store：它是"当前这一批"的临时账，批次结束即复位，不属于 UI 快照
+ * （放进 store 会让每条 `done` 都触发一次全库订阅者重渲染）。
+ *
+ * 复位点有两处，缺一不可：
+ * - `importPaths()` 入口：UI 导入（拖入 / 选择文件）在有资产落库之前就先把闩锁打开；
+ * - main 的 `import:batchDone` 回调：监控目录导入**不走** `importPaths`，只有批次结束
+ *   事件能给它复位（且 main 保证该事件在整批 `import:event` 之后才发，不会提前放开）。
+ *
+ * 语义：一旦本批的某个 `done` 已经拿到过"切不切"的决定权（无论当时是不是已经在资产视图），
+ * 后续 `done` 都不再抢 —— 这正是"用户中途手动切回回收站，本批不再抢"的实现方式。
+ */
+let libraryViewRestoredInBatch = false
+
+/**
  * 「询问过期」看门狗（DEF-19-1 兜底）：
  *
  * 正常路径是主进程超时后推 `import:conflictExpired`（见 `ensureConflictAskSubscribed`），
@@ -256,6 +272,43 @@ function flushOverwriteSummary(): void {
   overwrittenDegradedCount = 0
   const text = overwriteSummaryText(total, degraded)
   if (text) enqueueNotice(text)
+}
+
+/**
+ * 导入真的有资产落库之后，把用户从「最近删除」拉回资产视图。
+ *
+ * 为什么需要：回收站视图只列软删资产，新导入的资产进去后**看不见** ——
+ * 用户以为"导入没生效"，实际上东西已经在库里了（2026-10 反馈）。
+ *
+ * 为什么不粗暴：只在"本批第一条真正落库的 `done`"上切一次；用户之后手动切回回收站，
+ * 本批剩余 `done` 不会再把他拽出来（见 `libraryViewRestoredInBatch` 的注释）。
+ * 已经在资产视图时只置闩锁、不弹提示（用户没有任何感知需要）。
+ *
+ * 提示文案刻意**不说"导入成功"**（那是导入队列的职责）：这里只说视图发生了什么变化、
+ * 新素材在哪能找到，否则用户会以为这是导入结果的唯一回执。
+ */
+function restoreLibraryViewAfterImport(): void {
+  if (libraryViewRestoredInBatch) return
+  // 先置闩锁再切：切换本身是同步 set，不存在重入窗口，但顺序上"已决定过"更清楚
+  libraryViewRestoredInBatch = true
+  if (useVault.getState().libraryView === 'assets') return
+  // 复用 `setLibraryView`，顺带清掉选择 / 文件视图 / 分类弹窗快照（不要手写第二份清场逻辑）
+  useVault.getState().setLibraryView('assets')
+  enqueueNotice('已切回资产视图：新导入的素材在「全部」或对应分类里（回收站只显示已删除的资产）')
+}
+
+/**
+ * 「指派分类」弹窗的目标是 selection 的**快照**（`categoryPickerIds`）。
+ *
+ * 它不会跟着 selection / assets 自动失效：选中被清空、资产被删、重扫换了记录之后，
+ * 组件按 ids 过滤得到空集合 → 弹窗看起来"自己卸载了"，但 store 里旧数组还挂着，
+ * 下次 `openCategoryPicker` 之前一直悬着（脏状态）。
+ *
+ * 所以**任何会写 `selectedId` / `selectedIds` 的 action** 都用这个包装把快照一并收掉：
+ * 只有一处实现，不会出现"六处各写一遍、新加的第七处忘了写"。
+ */
+function withPickerClosed<P extends object>(patch: P): P & { categoryPickerIds: null } {
+  return { ...patch, categoryPickerIds: null }
 }
 
 /** 本会话已尝试过生成缩略图且失败的资产 id（防止网格反复触发同一个失败的 ensureThumb） */
@@ -2087,6 +2140,9 @@ export const useVault = create<VaultState>((set, get) => ({
       // 两条**互不吞并**（用 `enqueueNotice` 依次展示）：先跳过、后覆盖，顺序即发生顺序。
       flushSkippedSummary()
       flushOverwriteSummary()
+      // 批次边界复位：监控目录导入不走 `importPaths`，只有这里能给下一批重新开门。
+      // main 保证 `import:batchDone` 在整批 `import:event` 之后才发 → 复位不会吞掉本批的切换。
+      libraryViewRestoredInBatch = false
     })
 
     // docs/27 T-06：重复询问的订阅（**幂等**，模块级只注册一次；重复订阅会让一次询问被处理多次）
@@ -2097,22 +2153,42 @@ export const useVault = create<VaultState>((set, get) => ({
       // 悬停暂停 / 恢复、重建 timer 都不会重新计时（见 logic/importText.ts）。
       // ⚠️ `skipped` 必须是终态：它不是进行中，没有倒计时条目就永远留在队列里。
       const settled = isTerminalStatus(ev.status)
-      set((s) => ({
-        imports: [
-          ...s.imports.filter((i) => i.item !== ev.item),
-          {
-            item: ev.item,
-            itemName: ev.itemName,
-            status: ev.status,
-            message: ev.message,
-            asset: ev.asset,
-            needBytes: ev.needBytes,
-            freeBytes: ev.freeBytes,
-            conflict: ev.conflict,
-            settledAt: settled ? Date.now() : undefined
-          }
-        ]
-      }))
+      /**
+       * 一条事件 = 对同一个 `item` 的一次状态推进（pending → extracting → done）。
+       *
+       * 队列顺序**必须是"首次出现顺序"（稳定）**：导入队列现在是「居中 + 向上堆叠」，
+       * 条目下标一变，整张卡就会在屏幕下方跳一下。所以已在队列里的条目**原地更新**
+       * （`map` 保留下标），只有第一次出现才追加到尾部。
+       *
+       * ⚠️ 与呈现层的契约：store 只保证"首次出现顺序"，**"最新在底部"的视觉倒序由组件
+       * 做**（`[...imports].slice(-6).reverse()`）。这里绝不倒序，否则两边各倒一次 = 又反了。
+       *
+       * `settledAt` 必须**显式覆盖**：就地更新时 `{ ...i, ...patch }` 会把上一次的
+       * `settledAt` 原样带过来；新一轮 `extracting` 必须写 `undefined` 清掉，
+       * 否则 ImportQueue 会给"进行中"的条目起一根倒计时（详见 `logic/importText.ts`）。
+       */
+      const patch = {
+        itemName: ev.itemName,
+        status: ev.status,
+        message: ev.message,
+        asset: ev.asset,
+        needBytes: ev.needBytes,
+        freeBytes: ev.freeBytes,
+        conflict: ev.conflict,
+        settledAt: settled ? Date.now() : undefined
+      }
+      set((s) => {
+        const exists = s.imports.some((i) => i.item === ev.item)
+        // 第一次出现 → 追加到队尾（与旧行为一致；队尾 = 最新出现的条目）
+        if (!exists) return { imports: [...s.imports, { item: ev.item, ...patch }] }
+        // 已在队列里 → **原地更新**（`map` 保留下标：状态推进不改变位置）
+        const updated = s.imports.map((i) => (i.item === ev.item ? { ...i, ...patch } : i))
+        // 兜底去重：历史遗留的同 item 重复条目只保留"首次出现"那一条
+        // （旧实现用 filter 重建数组，天然去重；保序后必须显式补回来，
+        //   否则 `importPaths` 预置的 pending 条目与后续事件可能各留一份）
+        const firstAt = s.imports.findIndex((i) => i.item === ev.item)
+        return { imports: updated.filter((i, idx) => i.item !== ev.item || idx === firstAt) }
+      })
       // 跳过的重复素材：只累计，等批次结束汇总成一条 notice（§3.1）
       if (ev.status === 'skipped') skippedInBatchCount += 1
       // 覆盖的重复素材：批次级汇总的累计。
@@ -2133,6 +2209,9 @@ export const useVault = create<VaultState>((set, get) => ({
         enqueueBallThumb(ev.asset)
         // 知末封面：只收 model + 名字里有 ID 的（材质/贴图不做，docs/24 口径 #8）
         enqueueZhimoCover(ev.asset)
+        // 资产**真的落库**（不是 skipped / error）→ 若用户停在「最近删除」，切回资产视图。
+        // 一批只切一次；只有 skipped / error 的批次不切（没有新资产可看）。
+        restoreLibraryViewAfterImport()
       }
     })
     } finally {
@@ -2227,18 +2306,20 @@ export const useVault = create<VaultState>((set, get) => ({
    *   返回资产视图时原样继续生效（回收站视图本来也不套用它们，见 matchesFilters）。
    */
   setLibraryView: (view) =>
-    set((s) => ({
-      libraryView: view,
-      selectedId: null,
-      selectedIds: [],
-      lastClickedId: null,
-      folderViewAssetId: null,
-      dupOnly: view === 'trash' ? false : s.dupOnly
-    })),
+    set((s) =>
+      withPickerClosed({
+        libraryView: view,
+        selectedId: null,
+        selectedIds: [],
+        lastClickedId: null,
+        folderViewAssetId: null,
+        dupOnly: view === 'trash' ? false : s.dupOnly
+      })
+    ),
 
   // 首次点开该资产且球图缓存未命中 → 后台渲一张（网格/详情共用这张缓存图）
   select: (id) => {
-    set({ selectedId: id, selectedIds: id ? [id] : [], lastClickedId: id })
+    set(withPickerClosed({ selectedId: id, selectedIds: id ? [id] : [], lastClickedId: id }))
     if (id) {
       const asset = get().assets.find((a) => a.id === id)
       if (asset) enqueueBallThumb(asset)
@@ -2255,31 +2336,33 @@ export const useVault = create<VaultState>((set, get) => ({
       const selectedId = has ? (selectedIds[0] ?? null) : id
       // 切换也算一次"点击" → 更新 Shift 锚点（取消选中后仍以它为锚点，
       // 这是文件管理器的通行手感：勾掉一个再 Shift 点另一个，从刚才那格开始扩）
-      return { selectedIds, selectedId, lastClickedId: id }
+      return withPickerClosed({ selectedIds, selectedId, lastClickedId: id })
     }),
 
   // 整批选中：重复组标题行点击 → 组内全部进入多选（批量删除 / 批量指派可直接用）。
   // 普通 `select` 会清空多选，所以这里必须走独立入口。
   selectMany: (ids) => {
     const next = dedupeIds(ids)
-    set({ selectedIds: next, selectedId: next[0] ?? null, lastClickedId: next[0] ?? null })
+    set(withPickerClosed({ selectedIds: next, selectedId: next[0] ?? null, lastClickedId: next[0] ?? null }))
   },
 
   // 全选当前可见结果（Ctrl/Cmd+A / 中栏头「全选」）；空数组 = 取消全选
   selectAll: (ids) => {
     const next = dedupeIds(ids)
-    set({ selectedIds: next, selectedId: next[0] ?? null, lastClickedId: next[0] ?? null })
+    set(withPickerClosed({ selectedIds: next, selectedId: next[0] ?? null, lastClickedId: next[0] ?? null }))
   },
 
   // Shift+点击的范围选择（区间顺序 = 可见顺序，含两端）
   selectRange: (anchorId, targetId, visibleIds) => {
     const next = selectRangeIds(anchorId, targetId, visibleIds)
-    set({
-      selectedIds: next,
-      // target 不可见时 next 为空 → 详情面板同时清空，不留下"选中了看不见的东西"的错觉
-      selectedId: next.length > 0 ? targetId : null,
-      lastClickedId: targetId
-    })
+    set(
+      withPickerClosed({
+        selectedIds: next,
+        // target 不可见时 next 为空 → 详情面板同时清空，不留下"选中了看不见的东西"的错觉
+        selectedId: next.length > 0 ? targetId : null,
+        lastClickedId: targetId
+      })
+    )
   },
 
   /**
@@ -2296,19 +2379,30 @@ export const useVault = create<VaultState>((set, get) => ({
         next.length === s.selectedIds.length && next.every((id, i) => id === s.selectedIds[i])
       if (unchanged) return {}
       const keep = new Set(next)
-      return {
+      return withPickerClosed({
         selectedIds: next,
         selectedId: s.selectedId && keep.has(s.selectedId) ? s.selectedId : (next[0] ?? null),
         lastClickedId: s.lastClickedId && keep.has(s.lastClickedId) ? s.lastClickedId : null
-      }
+      })
     }),
 
   async importPaths(paths) {
+    // 新一轮导入开始：复位「本批已切回资产视图」闩锁。
+    // ⚠️ 只在这里（和批次结束）复位，**绝不在每条 `done` 里复位** ——
+    // 否则用户中途手动切回回收站后，下一条 `done` 又会把他拽回资产视图。
+    // 放在空数组短路之前：`importPaths([])` 是一次"空批次"，复位它是正确语义
+    // （也让单测可以用它显式开一批）。
+    libraryViewRestoredInBatch = false
     if (paths.length === 0) return
     set((s) => ({
+      // 队列顺序契约 = **首次出现顺序**（稳定）：新条目一律**追加到队尾**。
+      // 旧实现是前置（`...paths, ...s.imports`），那会让"后来的一批"排到最前 ——
+      // 与呈现层 `imports.slice(-6).reverse()`（最新在底部）刚好相反：
+      // 队列超过 6 条时，新导入的条目会被 `slice(-6)` 挡在可见窗口之外。
+      // store 只负责"首次出现顺序"，视觉倒序只在组件里做一次（别两边都倒）。
       imports: [
-        ...paths.map((p) => ({ item: p, itemName: p.split(/[\\/]/).pop() ?? p, status: 'pending' as const })),
-        ...s.imports
+        ...s.imports,
+        ...paths.map((p) => ({ item: p, itemName: p.split(/[\\/]/).pop() ?? p, status: 'pending' as const }))
       ]
     }))
     // docs/27 §4.1 / D22：判重快照由**渲染层**在调用时一次性传入（主进程拿不到 Dexie）。
@@ -2449,7 +2543,7 @@ export const useVault = create<VaultState>((set, get) => ({
       }
       set((s) => {
         const removedIds = new Set(removed.map((a) => a.id))
-        return {
+        return withPickerClosed({
           assets: s.assets.filter((a) => !removedIds.has(a.id)),
           selectedId: s.selectedId && removedIds.has(s.selectedId) ? null : s.selectedId,
           selectedIds: s.selectedIds.filter((id) => !removedIds.has(id)),
@@ -2460,7 +2554,7 @@ export const useVault = create<VaultState>((set, get) => ({
             failed.length > 0
               ? `已删除 ${removed.length} 个；${failed.length} 个失败（文件可能被占用），已保留`
               : s.notice
-        }
+        })
       })
       return
     }
@@ -2496,7 +2590,7 @@ export const useVault = create<VaultState>((set, get) => ({
     set((s) => {
       const patched = new Map(updated.map((u) => [u.id, u]))
       const movedIds = new Set(updated.map((u) => u.id))
-      return {
+      return withPickerClosed({
         // 原地替换成带 deletedAt/trashRel 的记录：资产仍在 `assets` 里（回收站要能列出来），
         // 只是 `applyFilters(..., 'assets')` 会把它排除掉。
         assets: s.assets.map((a) => patched.get(a.id) ?? a),
@@ -2508,7 +2602,7 @@ export const useVault = create<VaultState>((set, get) => ({
           res.failed.length > 0
             ? `已移入「最近删除」${updated.length} 项；${res.failed.length} 项失败（文件可能被占用），已保留在原位置`
             : `已移入「最近删除」（左侧栏可还原）`
-      }
+      })
     })
   },
 
@@ -2602,7 +2696,7 @@ export const useVault = create<VaultState>((set, get) => ({
 
     set((s) => {
       const gone = new Set(purgedIds)
-      return {
+      return withPickerClosed({
         assets: s.assets.filter((a) => !gone.has(a.id)),
         selectedId: s.selectedId && gone.has(s.selectedId) ? null : s.selectedId,
         selectedIds: s.selectedIds.filter((id) => !gone.has(id)),
@@ -2612,7 +2706,7 @@ export const useVault = create<VaultState>((set, get) => ({
           failedIds.size > 0
             ? `已彻底删除 ${purgedIds.length} 项；${failedIds.size} 项失败（文件可能被占用），可重试`
             : `已彻底删除 ${purgedIds.length} 项`
-      }
+      })
     })
   },
 
@@ -2630,7 +2724,7 @@ export const useVault = create<VaultState>((set, get) => ({
     }
     set((s) => {
       const gone = new Set(victimIds)
-      return {
+      return withPickerClosed({
         assets: s.assets.filter((a) => !gone.has(a.id)),
         selectedId: s.selectedId && gone.has(s.selectedId) ? null : s.selectedId,
         selectedIds: s.selectedIds.filter((id) => !gone.has(id)),
@@ -2638,7 +2732,7 @@ export const useVault = create<VaultState>((set, get) => ({
           failedIds.size > 0
             ? `已清空 ${victimIds.length} 项；${failedIds.size} 项失败（文件可能被占用）`
             : `已清空回收站（${victimIds.length} 项）`
-      }
+      })
     })
   },
 
@@ -3391,11 +3485,13 @@ export const useVault = create<VaultState>((set, get) => ({
     const rescanBackupCount = (await listRescanBackups()).length
     // 文件视图看着的资产可能在重扫中消失（目录被删 / 被重建换 UUID）→ 退回网格
     const viewedId = get().folderViewAssetId
-    set({
-      assets: merged,
-      rescanBackupCount,
-      folderViewAssetId: viewedId && merged.some((a) => a.id === viewedId) ? viewedId : null
-    })
+    set(
+      withPickerClosed({
+        assets: merged,
+        rescanBackupCount,
+        folderViewAssetId: viewedId && merged.some((a) => a.id === viewedId) ? viewedId : null
+      })
+    )
     // ── T-PRUNE ④：prune 白名单必须是**库里写入后的真实 id 集合** ──────────
     //
     // 旧实现传的是 `merged`（本次 rescan 的合并结果）当白名单 —— 那是 0.7.6 真机
@@ -3564,7 +3660,8 @@ export const useVault = create<VaultState>((set, get) => ({
         const kept = s.assets
           .filter((a) => !removedIds.has(a.id))
           .map((a) => fixedById.get(a.id) ?? a)
-        return { assets: [...addedAssets, ...kept] }
+        // 移除索引后，按旧 id 派生的弹窗快照必须一起收掉（否则组件按 ids 过滤得到空集）
+        return withPickerClosed({ assets: [...addedAssets, ...kept] })
       })
       if (removedIds.size > 0) {
         // 被移除资产的缩略图缓存成了孤儿 → 清掉（只动缓存，不动素材）

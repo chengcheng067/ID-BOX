@@ -39,6 +39,7 @@ import {
 } from '../logic/updateState'
 import { Modal } from './Modal'
 import { useEscLayer } from '../logic/escLayer'
+import { zClassForDepth } from '../logic/zStack'
 import { IconCheck, IconRefresh } from '../icons'
 import { UNCLASSIFIED } from '../../shared/taxonomy'
 // 品牌资源（2026-10 用户要求「图标 logo 换一下」「关于页做上打赏和反馈」）：
@@ -1011,8 +1012,12 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
    *
    * 现在两层保障同时成立：本层在栈里（App 不动作）+ `useEscLayer` 认 `data-esc-own`
    * （输入框那一格按 Esc 只回滚草稿，不关弹窗）。
+   *
+   * 0.7.8 T-ZSTACK：返回值是**本层在层栈里的位置**，遮罩的 z-index 由它算出（见
+   * `logic/zStack.ts`）。层级与 Esc 应答因此同源：设置开着时再开一个弹窗，新弹窗是栈顶
+   * （z 更高、Esc 先答它）；它一关，本层重新变成栈顶，z 也回到 50。
    */
-  useEscLayer(onClose, !!settings)
+  const escDepth = useEscLayer(onClose, !!settings)
 
   if (!settings) return null
 
@@ -2409,7 +2414,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div className="dialog-scrim fixed inset-0 z-50 flex items-center justify-center p-6" onClick={onClose}>
+    <div
+      className={`dialog-scrim fixed inset-0 ${zClassForDepth(escDepth)} flex items-center justify-center p-6`}
+      onClick={onClose}
+    >
       {/* 走查 v0.2.2 B4 拍板：弹窗圆角分组件 —— 设置弹窗 16（画布 2:479/2:541），
           渲染弹窗 12（画布 2:242）；深色四屏一致 14（2:842/2:879/2:935/2:1024），由 --radius-modal-settings 的深色覆盖承担。 */}
       <div

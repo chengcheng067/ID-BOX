@@ -2046,6 +2046,19 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
         cancelPrewarm(hoverTimer.current)
         hoverTimer.current = 0
       }
+      // docs/29 §5 第 1 条：**撤回**已经排给舞台球的预热。
+      //
+      // 只取消定时器是不够的：`preview(id)` 一旦跑过，球那边已经在解码 4K 贴图；
+      // 快速划过一排卡会让"最后一个"继续解码，用户真正的双击目标反而排在它后面。
+      // 传 `null` 的契约（`stageController.preview`）= 撤回预热，**球保持当前贴图、
+      // 不卸载**（`MaterialStage` 只在 asset 非空时更新 `shownRef`，建场景 effect 是 `[]`），
+      // 所以这里不会闪、也不会把球拆掉。
+      //
+      // 竞态：`preview()` 本身是同步写快照（防抖/排队在**调用侧**的 `hoverTimer`）。
+      // 本块先把两个定时器都取消，再发 `null`；紧接着若指针进到相邻卡片，
+      // `onPointerEnter` 只会新排一个定时器（>=0ms 后才跑），所以那个 `preview(新 id)`
+      // 永远发生在这次 `null` 之后 —— 不会把新预热顶掉。
+      stageController.preview(null)
     }
   })
 

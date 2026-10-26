@@ -989,8 +989,10 @@ describe('源码守卫：组件接线', () => {
     // 提交走 store 的唯一入口，不直接调 IPC
     expect(dialog).toContain('answerConflict(')
     expect(dialog).not.toContain('window.modvault.answerImportConflict')
-    // 层级压在其它弹窗之上（§5.4）
-    expect(dialog).toContain('z-[60]')
+    // 层级压在其它弹窗之上（§5.4）—— 0.7.8 T-ZSTACK 换实现：不再写死 z-[60]，
+    // 改由 Esc 层栈深度算（后开的 = 栈顶 = 更高），与「Esc 先答它」同源。
+    expect(dialog).not.toContain('z-[60]')
+    expect(dialog).not.toContain('zClass=')
     expect(read('App.tsx')).toContain('<ImportConflictDialog />')
   })
 

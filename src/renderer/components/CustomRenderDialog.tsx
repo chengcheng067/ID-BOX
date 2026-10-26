@@ -4,6 +4,7 @@ import { resolveRenderParams, resolveRenderShape, type NormalizedBallParams } fr
 import { displayName } from '../../shared/naming'
 import { IconClose } from '../icons'
 import { useEscLayer } from '../logic/escLayer'
+import { zClassForDepth } from '../logic/zStack'
 import type { Asset } from '../../shared/types'
 import type { MaterialSlots } from '../logic/materialBall'
 import { renderActionPlan, type RenderAction } from '../logic/materialBall'
@@ -196,8 +197,10 @@ export function CustomRenderDialog({
    * Esc 关闭（0.7.6 T-ESC）：本弹窗是自绘 `dialog-scrim`、不走 `Modal`，
    * 所以显式占一层。走 `beginClose` 而不是 `onClose`：交接过的球要先飞回顶栏，
    * 与点遮罩 / 点 ✕ 完全同一条关闭路径（否则 Esc 会让球凭空消失）。
+   *
+   * 0.7.8 T-ZSTACK：返回值 = 本层在层栈里的位置，遮罩 z-index 由它算出 —— 与 Esc 应答同源。
    */
-  useEscLayer(beginClose, renderable)
+  const escDepth = useEscLayer(beginClose, renderable)
 
   if (!renderable) return null
 
@@ -222,7 +225,9 @@ export function CustomRenderDialog({
       await useVault.getState().persistRenderParams(asset.id, scales)
 
       if (plan.writeCover) {
-        const { renderBallToPng, blobToBase64 } = await import('./MaterialBall')
+        const { renderBallToPng, blobToBase64, DEFAULT_BALL_CANVAS_WIDTH } = await import(
+          './MaterialBall'
+        )
         // 形态必须跟着"用户正看着的那颗球"（2026-10 缓存策略）：用户看到平面却渲出球，
         // 封面就和预览不一致。`getShape()` 拿的是场景当前形态；API 还没就绪时回落到资产记忆值。
         const shape = ballApiRef.current?.getShape() ?? resolveRenderShape(asset)
@@ -230,8 +235,10 @@ export function CustomRenderDialog({
         // 这样 `manual` 封面 → 缩略图（`toPNG()` 保 alpha）→ 卡片透出画布色，
         // 「保存封面后出现一块方底」从根上消失，也不需要为渲图单开一个 coverSource。
         // ⚠️ 不要再传 `background`：PNG 分支恒为透明（见 resolveBallBackground）。
+        // 2026-10-27：尺寸不再写 480 —— 直接用默认口径（640×480，球径 453px）。
+        // 封面会被详情面板以**原图**显示（`asset.cover`），写小了那一栏就发虚。
         const blob = await renderBallToPng(asset.relFolder, slots, {
-          size: 480,
+          size: DEFAULT_BALL_CANVAS_WIDTH,
           params: scales,
           shape
         })
@@ -267,7 +274,7 @@ export function CustomRenderDialog({
 
   return (
     <div
-      className="dialog-scrim fixed inset-0 z-50 flex items-center justify-center p-6"
+      className={`dialog-scrim fixed inset-0 ${zClassForDepth(escDepth)} flex items-center justify-center p-6`}
       onClick={beginClose}
     >
       {/* 走查 v0.2.2 B4 拍板（分组件）：渲染弹窗 r12（画布 2:242 浅）/ 深色 r14（画布 2:842）

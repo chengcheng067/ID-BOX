@@ -158,7 +158,11 @@ describe('G · 无 albedo 时渲灰球、保持挂载（不卸载、不重建上
     expect(block).toContain("if (phase === 'opening' || phase === 'closing') doneRef.current?.()")
   })
 
-  it('zIndex 保持 60（T-ZSTACK 是下一批，本批不许动）', () => {
-    expect(STAGE).toContain('zIndex: 60')
+  // 0.7.8 T-ZSTACK 翻转了这条规格：本批就是"下一批"。
+  // 60 → 45：球是 pointer-events:none 的纯装饰，必须低于所有弹窗（基座 50），
+  // 否则打开设置/渲染弹窗时球浮在弹窗之上（用户 2026-10-26 真机截图）。
+  it('zIndex 45（低于全部弹窗，高于全部内容层）', () => {
+    expect(STAGE).toContain('zIndex: 45')
+    expect(STAGE).not.toContain('zIndex: 60')
   })
 })

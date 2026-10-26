@@ -61,8 +61,24 @@ describe('记住形状 · MaterialBall 的接线点', () => {
     expect(BALL).toContain('const shapeRef = useRef(shape)')
     expect(BALL).toContain('shapeRef.current = shape')
     expect(BALL).toContain('getShape: () => shapeRef.current')
-    // 不许写成 `getShape: () => shape`（挂载时的闭包值，永远返回初始形态）
-    expect(BALL).not.toContain('getShape: () => shape\n')
+    // 不许写成 `getShape: () => shape`（挂载时的闭包值，永远返回初始形态）。
+    /**
+     * ⚠️ 2026-10-27 修：源码是 **CRLF**，原来写的是
+     * `not.toContain('getShape: () => shape\n')` —— `\n` 前面卡着 `\r`，
+     * 这条**永远匹配不上**（= 该守卫从未生效，形同虚设）。
+     * 改成 `\r?\n` 正则：语义一字不变（还是要求"这一行到此结束"，
+     * 也就是一个完整的 `getShape: () => shape` 值），且真的会红。
+     *
+     * **为什么行尾的 `\r?\n` 不能省**：`'getShape: () => shape'` 正是合法写法
+     * `getShape: () => shapeRef.current` 的**前缀**，去掉换行约束就会误报。
+     * 下面第二条断言是**反向对照**：喂一段"真的写坏了"的 CRLF 片段，必须命中
+     * —— 证明这条守卫具备"变红"的能力，而不是又一次静默通过。
+     */
+    const BAD = 'getShape: () => shape\r\n'
+    expect(BAD).toMatch(/getShape: \(\) => shape\r?\n/)
+    expect(BALL).not.toMatch(/getShape: \(\) => shape\r?\n/)
+    // 合法写法不能被误报（`shapeRef.current` 后面不是换行）
+    expect('getShape: () => shapeRef.current\r\n').not.toMatch(/getShape: \(\) => shape\r?\n/)
   })
 })
 

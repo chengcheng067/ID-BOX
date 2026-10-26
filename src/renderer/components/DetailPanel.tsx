@@ -433,13 +433,17 @@ export function DetailPanel() {
         </div>
       )}
       {/* 封面：详情面板读**原图**（vault://asset/...），网格才走缩略图（C4）。
-          §3.4：预览区 r14（画布 2:125 浅 / 2:403 深 r10 → --radius-preview 按主题各一套），材质 1:1 / 模型 16:10。
+          §3.4：预览区 r14（画布 2:125 浅 / 2:403 深 r10 → --radius-preview 按主题各一套），材质 4:3 / 模型 16:10。
           2026-10-21 用户反馈：**贴图类也是球图**（720×720 方图），塞进 16:10 会被 `object-cover`
-          纵向裁掉 37.5%，球看起来"被砍掉一截"。→ 材质 + 贴图统一 1:1；模型仍是 16:10（横向构图，裁切合理）。 */}
+          纵向裁掉 37.5%，球看起来"被砍掉一截"。→ 材质 + 贴图统一 4:3（**2026-10-27 由 1:1 改**：
+          球图出图已改 4:3，框与图必须同比例，否则 `object-cover` 又会上下/左右切一刀）；
+          模型仍是 16:10（横向构图，裁切合理）。
+          ⚠️ 代价：材质/贴图这一栏的封面区高度从「面板宽 × 1」变成「面板宽 × 0.75」，
+          右栏首屏整体矮约 25% 的面板宽（宽度不变），信息区相应上移。 */}
       <div className="shrink-0 p-3 pb-0">
         <div
           className={`relative overflow-hidden rounded-preview bg-canvas transition ${
-            asset.kind === 'material' || asset.kind === 'texture' ? 'aspect-square' : 'aspect-[16/10]'
+            asset.kind === 'material' || asset.kind === 'texture' ? 'aspect-[4/3]' : 'aspect-[16/10]'
           } ${coverDragOver ? 'ring-2 ring-accent ring-inset' : ''}`}
           onDragEnter={(e) => {
             if (Array.from(e.dataTransfer.types).includes('Files')) {

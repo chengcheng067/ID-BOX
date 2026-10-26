@@ -132,6 +132,22 @@ export function CategoryPicker() {
   /** Esc：只在浮层展开期间占一层，收起浮层（不关弹窗） */
   useEscLayer(() => setOpenField(null), openField !== null)
 
+  /**
+   * 兜底自愈：`categoryPickerIds` 非空，但按 id 过滤后**一个目标都不剩**时收口。
+   *
+   * 什么时候会这样：资产被彻底删除 / 被 rescan 换成新记录 / 选中被别处清空
+   * （正常路径下 store 里会同步清 `categoryPickerIds`；这里是第二道保险，
+   * 防的是"某条新加的链路忘了清"）。不收口的话 render 返回 null 只是看起来像
+   * 弹窗自己卸载了，store 里的旧 id 仍悬着，下次打开会带着上一批 id。
+   *
+   * 必须放在 `useEffect`（不能在 render 里 setState）：render 期间改 store 会触发
+   * React 的 "Cannot update a component while rendering" 警告并可能死循环。
+   * 依赖只取长度：`targets` 每次 render 都是新数组，取引用会每帧重跑。
+   */
+  useEffect(() => {
+    if (pickerIds && targets.length === 0) close()
+  }, [pickerIds, targets.length, close])
+
   if (!pickerIds || targets.length === 0 || !kind) return null
 
   const l1Options = level1OptionsFor(kind)

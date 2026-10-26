@@ -15,7 +15,10 @@
  * 性能红线（docs/19 实测）：
  * - P1 期间**不碰任何 `.card`**：不要逐卡写 style/class（2000 张 = 95ms 长任务）；
  * - 落点用 CSS 变量 `--stage-target-x/y`，**绝不去改顶栏 height**（每帧重排整页）；
- * - z-index 60：落定的球住在顶栏槽位里，顶栏（50）有不透明底色，低于它会被盖住。
+ * - z-index 45：**低于所有弹窗**（弹窗基座 50，见 `logic/zStack.ts`）、高于所有内容层（≤40）。
+ *   舞台球是 `pointer-events:none` 的纯装饰，没有资格压过任何可交互元素 —— 0.7.8 T-ZSTACK 前
+ *   它是 60，用户实测「打开设置后球还浮在设置之上」。旧注释写的「顶栏 50」是过期的：
+ *   `Toolbar` 顶栏实际是 z-20，顶栏下拉浮层/中栏浮层才是 z-40（球仍在其上，落定后不会被顶栏盖住）。
  */
 import { useEffect, useRef } from 'react'
 import type { Asset } from '../../shared/types'
@@ -651,7 +654,9 @@ export function MaterialStage({
         width: LOCAL,
         height: LOCAL,
         transformOrigin: '0 0',
-        zIndex: 60,
+        // = Z_STAGE_BALL（logic/zStack.ts）：低于所有弹窗（≥50）、高于所有内容层（≤40）。
+        // 写成字面量而不是常量引用，是因为源码守卫测试要能直接 grep 到这个数（见 tests/zStack.test.ts）。
+        zIndex: 45,
         opacity: 0,
         pointerEvents: 'none',
         willChange: 'transform, opacity'

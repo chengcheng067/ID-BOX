@@ -203,8 +203,8 @@ describe('数据合法性 · 每个落点都必须在受控词表里', () => {
   it('映射表规模与人工裁定数量（改动表必须同步 docs/28 与本节数字）', () => {
     expect(zhimoMapStats()).toEqual({
       groups: 58,
-      names: 385,
-      targets: 395,
+      names: 386,
+      targets: 396,
       multiCandidateNames: 10,
       groupsByChannel: { model: 15, texture: 23, material: 20 }
     })
@@ -503,5 +503,50 @@ describe('就近归并 · approx:true 与可回溯字段', () => {
       ['布艺软饰', '墙饰墙绘', '厨房用品', 'Minotti', 'Poliform'].sort()
     )
     for (const name of unmapped) expect(mapZhimoCategory(name)).toBeNull()
+  })
+})
+
+// ── 2026-10-26 收尾：剩余 5 条已定案「不映射」 ─────────────────────────
+
+describe('裁定记录 · 无未定案条目', () => {
+  it('清单 = 10 条已按 kind 裁定 + 5 条已裁定不映射，没有挂账项', () => {
+    expect(ZHIMO_HUMAN_REVIEW).toHaveLength(15)
+    expect(ZHIMO_HUMAN_REVIEW.filter((e) => e.resolvedByKind === true)).toHaveLength(10)
+    expect(ZHIMO_HUMAN_REVIEW.filter((e) => e.resolvedNotMapped === true)).toHaveLength(5)
+    for (const entry of ZHIMO_HUMAN_REVIEW) {
+      expect(
+        entry.resolvedByKind === true || entry.resolvedNotMapped === true,
+        `${entry.station} 仍未定案`
+      ).toBe(true)
+      if (entry.resolvedNotMapped === true) {
+        expect(entry.status).toBe('unmapped')
+        expect(mapZhimoCategory(entry.station)).toBeNull()
+      }
+    }
+  })
+})
+
+// ── 2026-10-26 收尾：补「木板」精确映射（与「海洋板」同父链）──────────
+
+describe('木板 · 与海洋板同父链的精确落点', () => {
+  it('texture → 木材/板材，与海洋板同一落点', () => {
+    const board = mapZhimoCategory('木板', 'texture')
+    expect(board).toMatchObject({ category1: '木材', category2: '板材' })
+    const ocean = mapZhimoCategory('海洋板', 'texture')
+    expect(ocean).toMatchObject({ category1: '木材', category2: '板材' })
+    expect((board as ZhimoLookupTarget).category1).toBe((ocean as ZhimoLookupTarget).category1)
+    expect((board as ZhimoLookupTarget).category2).toBe((ocean as ZhimoLookupTarget).category2)
+    // 无 kind 时仍是数组（长度 1），保持老契约
+    const arr = mapZhimoCategory('木板')
+    expect(Array.isArray(arr)).toBe(true)
+    expect(arr).toHaveLength(1)
+  })
+
+  it('material 语境不套用（退回单候选数组，不跨册写「板材」）', () => {
+    // 站方父链 木材>板材 属贴图树；材质册「木材」组没有「板材」（docs/18 §3.2），
+    // 因此 kind='material' 不应返回 木材/板材，而是退回候选数组交给调用方。
+    const hit = mapZhimoCategory('木板', 'material')
+    expect(Array.isArray(hit)).toBe(true)
+    expect(hit).toHaveLength(1)
   })
 })

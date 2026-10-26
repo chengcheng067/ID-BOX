@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createLogThrottle, type LogThrottle } from './rendererLog'
 import type { RendererLogPayload } from '../../shared/types'
 
@@ -20,6 +20,43 @@ import type { RendererLogPayload } from '../../shared/types'
  */
 const layers: number[] = []
 let seq = 0
+
+/**
+ * 层栈变化的订阅者（0.7.8 T-ZSTACK）。
+ *
+ * 为什么要有订阅：视觉层级（z-index）必须由**层栈深度**算（见 `logic/zStack.ts`），
+ * 而深度会随着「上面又开了一个弹窗 / 上面那个弹窗关了」变化 —— 组件必须被通知重算，
+ * 否则第 1 层的设置弹窗会一直停在 50、后开的重复处置弹窗也是 50，谁在上只由 DOM 顺序碰运气。
+ *
+ * 这里刻意只暴露「变化了」这一件事，不暴露具体深度：订阅方用**自己的 token** 去
+ * `getEscLayerRank()` 读位置，于是层级与 Esc 应答永远是同一份数据的两种读法。
+ */
+const layerSubscribers = new Set<() => void>()
+
+/** 通知所有订阅者「栈变了」（push / pop / 复位三处调用；订阅方自会比对是否真的变了） */
+function notifyLayerChange(): void {
+  // 先拷一份再遍历：订阅方在回调里可能又触发 push/pop（例如同步卸载一个弹窗）
+  for (const listener of [...layerSubscribers]) listener()
+}
+
+/** 订阅层栈变化，返回取消订阅函数（StrictMode 双挂载安全：每次 effect 各自订阅/退订） */
+export function subscribeEscLayers(listener: () => void): () => void {
+  layerSubscribers.add(listener)
+  return () => {
+    layerSubscribers.delete(listener)
+  }
+}
+
+/**
+ * 本层在栈里的位置：**1 = 最底**，栈顶 = `layers.length`，token 不在栈里 = 0。
+ *
+ * 与 `isTopEscLayer()` 同源（都读 `layers`）：`isTopEscLayer(token)` ≡ `getEscLayerRank(token) === depth`。
+ * 层级换算只在 `logic/zStack.ts` 里做，本模块不引入任何 z-index 概念。
+ */
+export function getEscLayerRank(token: number): number {
+  const at = layers.indexOf(token)
+  return at < 0 ? 0 : at + 1
+}
 
 /**
  * 深度探针（0.7.7，用户点名要修的理论风险：**孤儿 token**）。
@@ -60,13 +97,18 @@ let lastPress: EscPressRecord | null = null
 export function pushEscLayer(): number {
   seq += 1
   layers.push(seq)
+  notifyLayerChange()
   return seq
 }
 
 /** 弹出指定层（token 已不在栈里时静默忽略：StrictMode 双挂载下清理可能重复跑） */
 export function popEscLayer(token: number): void {
   const index = layers.indexOf(token)
-  if (index >= 0) layers.splice(index, 1)
+  if (index >= 0) {
+    layers.splice(index, 1)
+    // 只在本层真的在栈里时才通知：重复弹（StrictMode 清理重复执行）不该引发一轮无意义的重算
+    notifyLayerChange()
+  }
   // 出栈的层不可能再有活监听：一起清掉，避免 `liveListeners` 与栈不一致
   liveListeners.delete(token)
 }
@@ -284,6 +326,8 @@ export function isEscProbeEnabled(): boolean {
 export function resetEscLayers(): void {
   layers.length = 0
   liveListeners.clear()
+  // 订阅方（已挂载的弹窗）据此把深度归零，避免测试之间残留上一轮的层级
+  notifyLayerChange()
 }
 
 /** 仅供测试：清空探针计数与开关 */
@@ -347,10 +391,15 @@ export function escOwnedByControl(target: EventTarget | null): boolean {
  * 监听挂在 `window` 捕获阶段，与 `Modal` 同阶段；只有自己是栈顶时才 stop + 回调。
  * handler 存 ref（依赖只写 `active`）：否则调用方每次 render 传内联箭头都会重挂监听，
  * 频繁 pop/push 会让本层在栈里的位置漂移。
+ *
+ * **返回值 = 本层在栈里的位置**（1 = 最底；`active=false` / 未入栈 = 0）。0.7.8 T-ZSTACK：
+ * 自绘 `dialog-scrim` 的弹窗用这个数去 `zClassForDepth()` 算遮罩的 z-index —— 视觉层级与
+ * Esc 应答因此读的是**同一个 token 在同一个栈里的位置**，不存在两套来源对不上的可能。
  */
-export function useEscLayer(handler: () => void, active: boolean): void {
+export function useEscLayer(handler: () => void, active: boolean): number {
   const handlerRef = useRef(handler)
   handlerRef.current = handler
+  const [depth, setDepth] = useState(0)
 
   useEffect(() => {
     // `active = false` 不入栈：这一层根本没挂监听，压栈就成了「栈里有 token 却没有活监听」
@@ -358,6 +407,10 @@ export function useEscLayer(handler: () => void, active: boolean): void {
     if (!active) return
     const token = pushEscLayer()
     noteEscLayerListener(token, true)
+    // 深度是「本层 token 在栈里的位置」：push/pop 后都要重读，本层被新弹窗压下去时深度会变
+    const syncDepth = (): void => setDepth(getEscLayerRank(token))
+    syncDepth()
+    const unsubscribe = subscribeEscLayers(syncDepth)
     const onKey = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
       if (!isTopEscLayer(token)) {
@@ -377,9 +430,15 @@ export function useEscLayer(handler: () => void, active: boolean): void {
     }
     window.addEventListener('keydown', onKey, true)
     return () => {
+      // 先退订：pop 会通知所有订阅者，本层此时正在卸载，不该再被叫醒
+      unsubscribe()
       window.removeEventListener('keydown', onKey, true)
       noteEscLayerListener(token, false)
       popEscLayer(token)
+      // 出栈后本层不再占位置（active 变 false 的场合；卸载时这句是无害的空写）
+      setDepth(0)
     }
   }, [active])
+
+  return depth
 }

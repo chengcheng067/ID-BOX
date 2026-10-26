@@ -122,6 +122,19 @@ export default {
         tab: 'var(--radius-tab)',
         winbtn: 'var(--radius-winbtn)'
       },
+      /**
+       * 弹窗层级（0.7.8 T-ZSTACK）：`z-60 / z-70 / z-80` 必须在这里显式登记。
+       *
+       * Tailwind 默认的 zIndex 只有 0/10/20/30/40/50 —— `z-60` 这类类名即使出现在源码里
+       * 也**不会**生成 CSS（不是"tree-shaken"，是压根没有这个工具类）。弹窗层级由层栈
+       * 深度算出（`src/renderer/logic/zStack.ts`：第 2 层 60、第 3 层 70、第 4 层起 80），
+       * 少了这三档，多层弹窗会全部退回文档流默认层级 → 叠放顺序变成"碰运气"。
+       */
+      zIndex: {
+        60: '60',
+        70: '70',
+        80: '80'
+      },
       boxShadow: {
         card: 'var(--shadow-card)',
         'card-active': 'var(--shadow-card-active)',

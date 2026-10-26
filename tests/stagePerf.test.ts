@@ -128,8 +128,19 @@ describe('MaterialBall：renderer 只建一次，换资产只换贴图', () => {
     // 第二批（docs/29 方案 E）给 loadMap 加了第 4 个参数 `signal`（取消在途加载）。
     // 断言的**意图不变**：alpha 仍在 Promise.all 之后单发、仍带同一个代次令牌。
     expect(body).toMatch(/await this\.loadMap\('alpha', alphaEntry\[1\], gen(?:, signal)?\)/)
-    // 不能在 albedo 回调里提前 resolve / return
-    expect(body).not.toContain('return Promise.resolve()\n    }')
+    // 不能在 albedo 回调里提前 resolve / return。
+    // ⚠️ 2026-10-27 修：源码是 **CRLF**，原来写的 `'return Promise.resolve()\n    }'`
+    // 里的 `\n` 前面卡着一个 `\r`，**永远匹配不上** → 这条守卫此前形同虚设（永远绿）。
+    // 现在把范围收窄到 `jobs` 那一段（每个槽位的 loadMap 回调）+ 用 `\r?\n` 正则，
+    // 语义只强不弱：真的出现"加载完就提前 resolve"会立刻红。
+    const jobsRegion = body.slice(
+      body.indexOf('const jobs = mapEntries.map('),
+      body.indexOf('// Promise 语义不变')
+    )
+    expect(jobsRegion.length).toBeGreaterThan(0)
+    expect(jobsRegion).not.toMatch(/return\s+Promise\.resolve\(\)/)
+    // 反向对照：这条正则在"真的写坏了"时必须命中（证明它不是又一次永远绿的守卫）
+    expect('return Promise.resolve()').toMatch(/return\s+Promise\.resolve\(\)/)
   })
 })
 
@@ -166,8 +177,15 @@ describe('MaterialStage：opening 就绪门控 + 让一帧', () => {
     const hide = opening.indexOf("host.style.opacity = '0'")
     expect(hide).toBeGreaterThan(-1)
     expect(hide).toBeLessThan(opening.indexOf('place(start, COLD_Z0)'))
-    // 统一 setOpacity('1') 的老写法必须已经拆掉：opening 的显示点在门控之后
-    expect(STAGE).not.toContain('setRunning(true)\n    host.style.opacity')
+    // 统一 setOpacity('1') 的老写法必须已经拆掉：opening 的显示点在门控之后。
+    // ⚠️ 2026-10-27 修：源码是 **CRLF**，`'setRunning(true)\n    host.style…'` 里的
+    // `\n` 前有 `\r` → 原来那条**永远匹配不上**（守卫形同虚设）。改 `\r?\n\s*` 正则，
+    // 语义不变（"setRunning(true) 之后紧跟着改 opacity"），但现在真的能拦住回退。
+    expect(STAGE).not.toMatch(/setRunning\(true\)\r?\n\s*host\.style\.opacity/)
+    // 反向对照：喂一段"真的写坏了"的 CRLF 片段必须命中（旧 `\n` 字面量版本在这里会漏）
+    expect('setRunning(true)\r\n    host.style.opacity').toMatch(
+      /setRunning\(true\)\r?\n\s*host\.style\.opacity/
+    )
   })
 
   it('轮询 isReady() 才放行，且放行后先让一帧再显示', () => {

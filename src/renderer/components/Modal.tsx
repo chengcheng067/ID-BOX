@@ -1,6 +1,14 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { escOwnedByControl, isTopEscLayer, popEscLayer, pushEscLayer } from '../logic/escLayer'
+import {
+  escOwnedByControl,
+  getEscLayerRank,
+  isTopEscLayer,
+  popEscLayer,
+  pushEscLayer,
+  subscribeEscLayers
+} from '../logic/escLayer'
+import { zClassForDepth } from '../logic/zStack'
 import { IconClose } from '../icons'
 
 interface ModalProps {
@@ -26,14 +34,6 @@ interface ModalProps {
    * 全局快捷键去清选中 / 关掉下面那层视图），只是不触发 `onClose`。
    */
   dismissOnEsc?: boolean
-  /**
-   * 遮罩层的 z-index 类（默认 `z-50`）。
-   *
-   * 为什么需要可调：导入重复处置弹窗必须在**其它弹窗之上**（docs/27 §5.4）——
-   * 第一批在等用户答复（最长 120s）时第二批在排队，若被设置/详情弹窗盖住，
-   * 用户看不见它会以为导入卡死。仅该弹窗传 `z-[60]`。
-   */
-  zClass?: string
 }
 
 /**
@@ -45,23 +45,30 @@ interface ModalProps {
  *
  * 捕获阶段 + `stopPropagation`：App 的全局 Esc 挂在冒泡阶段，捕获阶段吃掉后它收不到，
  * 一次按键只关一层。多层弹窗/弹窗内浮层谁先吃，由 `logic/escLayer.ts` 的栈决定（栈顶优先）。
+ *
+ * **层级（0.7.8 T-ZSTACK）**：遮罩的 z-index 不再写死 `z-50`，而是由本层在层栈里的位置算出
+ * （第 1 层 50、第 2 层 60…，见 `logic/zStack.ts`）—— 用户要的「新点出来的弹窗层级更高」。
+ * 关键点：`depth` 和「谁吃 Esc」读的是**同一个 token 的同一个栈位置**，所以视觉上在最上的
+ * 那个弹窗，一定也是 Esc 的第一个应答者，不会出现「看着在上层、Esc 答下层」的错配。
+ * 旧的可调 `zClass` 已删除：谁都不该再手写一个更大的数字去插队（`ImportConflictDialog`
+ * 曾经写死 `z-[60]`，与本层栈并存时谁在上只取决于 DOM 顺序）。
  */
-export function Modal({
-  title,
-  onClose,
-  children,
-  width = 'max-w-lg',
-  dismissOnScrim = true,
-  dismissOnEsc = true,
-  zClass = 'z-50'
-}: ModalProps) {
+export function Modal({ title, onClose, children, width = 'max-w-lg', dismissOnScrim = true, dismissOnEsc = true }: ModalProps) {
   // handler 存 ref：调用方普遍传内联箭头（`onClose={() => setX(null)}`），
   // 直接进依赖会让监听每次 render 都重挂，多弹窗在场时本层在栈里的位置会漂移。
   const handlerRef = useRef({ onClose, dismissOnEsc })
   handlerRef.current = { onClose, dismissOnEsc }
 
+  /** 本层在层栈里的位置（1 = 最底）；首帧还是 0 → `zClassForDepth(0)` 兜底成 `z-50` */
+  const [depth, setDepth] = useState(0)
+
   useEffect(() => {
     const token = pushEscLayer()
+    // 深度与 Esc 应答同源：都读这一层 token 在同一个栈里的位置。
+    // 订阅是为了「上面又开了一层 / 上面那层关了」时把本层重算一次（否则层级会卡在旧值）。
+    const syncDepth = (): void => setDepth(getEscLayerRank(token))
+    syncDepth()
+    const unsubscribe = subscribeEscLayers(syncDepth)
     const onKey = (e: KeyboardEvent): void => {
       if (e.key !== 'Escape') return
       // 不是栈顶就原样放行：上面还有一层（后开的弹窗 / 弹窗内的浮层）要吃这次按键
@@ -74,6 +81,8 @@ export function Modal({
     }
     window.addEventListener('keydown', onKey, true)
     return () => {
+      // 先退订再出栈：pop 会通知所有订阅者，本层正在卸载不该再被叫醒
+      unsubscribe()
       window.removeEventListener('keydown', onKey, true)
       popEscLayer(token)
     }
@@ -81,8 +90,9 @@ export function Modal({
 
   return (
     <div
-      className={`dialog-scrim fixed inset-0 ${zClass} flex items-center justify-center p-6`}
+      className={`dialog-scrim fixed inset-0 ${zClassForDepth(depth)} flex items-center justify-center p-6`}
       onClick={dismissOnScrim ? onClose : undefined}
+      data-modal-layer={depth}
     >
       <div
         className={`w-full ${width} max-h-[86vh] overflow-auto rounded-modal border border-line bg-card shadow-modal`}

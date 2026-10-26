@@ -52,7 +52,9 @@ import type { ImportConflictResolution } from '../../shared/types'
  * ③ ✕ 关闭 = 等同 `cancelled`（显式动作，保留）。
  *
  * 没做焦点陷阱（项目无先例，`ConfirmDialog` 也没有）：靠原生 `<button>` 的 Tab/Enter 可达。
- * 层级用 `z-[60]` 压在其它弹窗之上（§5.4：导入等待答复最长 120s，被盖住会像卡死）。
+ * 层级（0.7.8 T-ZSTACK）：**不再自己写死一个 60 的层级魔法数**，改由层栈深度算 —— 本弹窗天然是后开的那一层
+ * 就是栈顶，`Modal` 会把它放到 60（甚至更高），与「Esc 先答它」同源。写死一个数字的时代，
+ * 它和舞台球同为 60，谁在上只取决于 DOM 顺序（碰巧正确）。
  */
 export function ImportConflictDialog() {
   const ask = useVault((s) => s.conflictAsk)
@@ -85,7 +87,6 @@ export function ImportConflictDialog() {
       width="max-w-2xl"
       dismissOnScrim={false}
       dismissOnEsc={false}
-      zClass="z-[60]"
     >
       {remaining && <p className="mb-3 text-[12px] text-muted">{remaining}</p>}
 
