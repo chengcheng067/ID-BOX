@@ -203,6 +203,79 @@ export function settingsTmpPath(): string {
   return `${settingsFilePath()}.tmp`
 }
 
+// ── 设置写盘串行队列（0.7.10 / 真机 QA 抓到的并发写 ENOENT） ────────────────
+//
+// 现场（qa-settings-tmp/evidence-settings-write-race.log）：连续调 6 个开关时，
+// 130ms 内触发 6 次 `settings:set` → 6 个 `saveSettings` 同时在跑，其中一次的
+// `rename(settings.json.tmp → settings.json)` 抛 ENOENT，冒到渲染层变成
+// unhandledrejection（用户看到"保存失败"的红色报错，但最终内容又是对的）。
+//
+// 根因：原子写本身是对的（写 tmp → 备份 → rename），但**临时文件名是固定的**
+// `${settings.json}.tmp`（固定名是刻意保留的：保证 rename 与主档同目录同卷、
+// 崩溃后残留文件可预测、清理逻辑只需认一个名字）。固定名 + 无串行 = 多次并发
+// 共用同一个 tmp：
+//   A.writeFile(tmp) → B.writeFile(tmp) → A.rename 成功 → B.rename 时 tmp 已不在 → ENOENT
+//
+// 比 ENOENT 更隐蔽的是**内容互相覆盖**：A、B 在同一个 tmp 上先后写入，谁 rename
+// 得晚谁的旧内容覆盖新内容 → 中间某次设置被静默丢弃（"改了没生效"）。
+// 注意：**换成随机 tmp 名只能消掉 ENOENT，治不了覆盖/乱序**，所以修法是串行化。
+//
+// 串行后语义：写盘顺序 === `saveSettings` 调用顺序，最后调用的那次内容即最终落盘
+// 内容；每次写仍是完整的「写 tmp → 备份 → rename」，崩溃安全性不变。
+
+/** 串行写队列（纯逻辑、零 IO，可单测） */
+export interface SettingsWriteQueue {
+  /** 把一次写盘动作排到链尾；返回的 Promise 兑现这一次任务自己的结果/错误 */
+  enqueue<T>(fn: () => Promise<T>): Promise<T>
+  /** 队列**排空**后 resolve（失败也算排空）；永不 reject，方便测试收尾 */
+  idle(): Promise<void>
+}
+
+/**
+ * 创建一个串行写队列。
+ *
+ * 关键点（两条都不能少）：
+ * 1. `writeChain.then(fn, fn)`：**前一次失败时仍要执行这一次**。只写 `then(fn)`
+ *    的话，一个 ENOENT/EACCES 会把队列永久卡死——之后所有设置都存不下去，而且
+ *    用户不会看到任何报错（链上挂着一个已 reject 的 Promise）。
+ * 2. `writeChain = next.catch(() => undefined)`：链自己**不持有 rejection**。
+ *    若把 `next` 直接赋给链，无人 await 的那次失败就是一个 unhandledrejection
+ *    （正是本次 bug 冒到渲染层的形态）。失败只回传给该次的调用方。
+ */
+export function createSettingsWriteQueue(): SettingsWriteQueue {
+  let writeChain: Promise<unknown> = Promise.resolve()
+  return {
+    enqueue<T>(fn: () => Promise<T>): Promise<T> {
+      const next = writeChain.then(fn, fn)
+      writeChain = next.catch(() => undefined)
+      return next
+    },
+    idle(): Promise<void> {
+      return writeChain.then(
+        () => undefined,
+        () => undefined
+      )
+    }
+  }
+}
+
+/** 全进程唯一的设置写队列：`saveSettings` 的每次调用都排在这条链上 */
+const settingsWriteQueue = createSettingsWriteQueue()
+
+/**
+ * 把一次写盘动作排进串行队列（导出仅供测试与诊断；生产只有 `saveSettings` 走它）。
+ *
+ * 任何新增的"写 settings.json"路径都**必须**经过这里，否则又会绕过串行化。
+ */
+export function enqueueSettingsWrite<T>(fn: () => Promise<T>): Promise<T> {
+  return settingsWriteQueue.enqueue(fn)
+}
+
+/** 等待当前写队列排空（测试/退出前用；永不 reject） */
+export function settingsWritesIdle(): Promise<void> {
+  return settingsWriteQueue.idle()
+}
+
 // ── 品牌更名设置迁移（modvault → idbox，2026-10 装机反馈 P0） ──────────────
 //
 // 背景：userData 目录名取自 package.json 的 `name`。name 从 `modvault` 改成 `idbox`
@@ -464,7 +537,7 @@ export async function loadSettings(): Promise<Settings> {
 }
 
 /**
- * 保存设置（**原子写**）：
+ * 保存设置（**原子写 + 串行化**）：
  *
  * ① 先写 `settings.json.tmp`（完整内容落盘，主档此刻仍完好）；
  * ② 把**当前有效的** `settings.json` 复制成 `settings.json.bak`（一代，不链式）；
@@ -473,16 +546,26 @@ export async function loadSettings(): Promise<Settings> {
  * 这样任何时刻被杀进程，磁盘上要么是旧档、要么是新档，**不会出现半截 JSON**。
  * 旧实现直接 `writeFile(主档)`：关机/任务管理器结束进程会留下截断文件 →
  * `loadSettings` 解析失败回落默认值 → `libraryDir` 丢失 → 用户看到"库空了"。
+ *
+ * ⚠️ ①~③ 整体在 `enqueueSettingsWrite` 里串行执行：tmp 名固定，并发会互相覆盖
+ * 甚至 rename 到已消失的 tmp 抛 ENOENT（见上面写队列的大段注释）。串行后
+ * 「写盘顺序 = saveSettings 调用顺序」，最后一次调用即最终落盘内容。
  */
 export async function saveSettings(s: Settings): Promise<void> {
-  await mkdir(app.getPath('userData'), { recursive: true })
-  const target = settingsFilePath()
-  const tmp = settingsTmpPath()
+  // 归一化 / 序列化放在**入队之前**：这是调用瞬间的内容快照，
+  // 排队期间调用方再改传入对象也不会污染这一次要写的内容（也缩短了占队时间）。
+  const payload = JSON.stringify(normalizeSettings(s), null, 2)
 
-  await writeFile(tmp, JSON.stringify(normalizeSettings(s), null, 2), 'utf-8')
+  return enqueueSettingsWrite(async () => {
+    await mkdir(app.getPath('userData'), { recursive: true })
+    const target = settingsFilePath()
+    const tmp = settingsTmpPath()
 
-  // 首次运行主档还不存在 → copyFile 抛 ENOENT，属正常情况（没有"上一份好档"）
-  await copyFile(target, settingsBackupPath()).catch(() => undefined)
+    await writeFile(tmp, payload, 'utf-8')
 
-  await rename(tmp, target)
+    // 首次运行主档还不存在 → copyFile 抛 ENOENT，属正常情况（没有"上一份好档"）
+    await copyFile(target, settingsBackupPath()).catch(() => undefined)
+
+    await rename(tmp, target)
+  })
 }

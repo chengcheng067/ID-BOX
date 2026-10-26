@@ -1909,7 +1909,7 @@ async function handleMergeProbe(info: MergeMaterialDetectResult): Promise<void> 
   if (!info.needMerge) return
   if (info.count > AUTO_MIGRATE_LIMIT) {
     useVault.setState({
-      notice: `检测到 ${info.count} 个资产仍在旧「贴图 / 材质预设」目录下，请在「设置 → 库与分类 → 材质大类合并」中手动合并`
+      notice: `检测到 ${info.count} 个资产仍在旧「贴图 / 材质预设」目录下，请在「设置 → 库 → 材质大类合并」中手动合并`
     })
     return
   }
@@ -3039,7 +3039,7 @@ export const useVault = create<VaultState>((set, get) => ({
       if (result.needsManual) {
         set({
           materialMergeCount: result.count,
-          notice: `检测到 ${result.count} 个资产的旧大类目录待合并，请在「设置 → 库与分类 → 材质大类合并」中手动合并`
+          notice: `检测到 ${result.count} 个资产的旧大类目录待合并，请在「设置 → 库 → 材质大类合并」中手动合并`
         })
         return summary
       }

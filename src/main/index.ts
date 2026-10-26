@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import { existsSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { IPC } from '../shared/ipc'
+import { resolveExternalUrl, truncateUrlForLog } from '../shared/urlPolicy'
 import {
   DEFAULT_SETTINGS,
   type AiClassifyPayload,
@@ -1829,17 +1830,38 @@ function checkUpdateWithCache(force: boolean): Promise<UpdateInfo> {
 ipcMain.handle(IPC.checkUpdate, (_e, force: unknown) => checkUpdateWithCache(force === true))
 
 /**
- * 用系统默认浏览器打开外链（「去下载」）。
+ * 用系统默认浏览器打开外链（设置页「在 GitHub 提 Issue」/「去下载」）。
  * 与 `openPath` 分开：`shell.openPath` 面向本地路径，喂 URL 在 Windows 上会返回错误串。
- * **只放行 http(s)**：防止渲染层被注入后借 `file://` / 自定义协议拉起本机程序。
+ *
+ * **协议白名单只有 http / https**，判定逻辑抽在 `shared/urlPolicy.ts`
+ * （纯函数，可单测；本文件一 import 就拉进 electron，测不了）。
+ * 存在意义：渲染层被注入后，这个通道等于"能拉起本机程序"的钥匙 ——
+ * `file:` 能跑本地 exe、`ms-settings:` 类能拉起系统面板、`javascript:` / `data:`
+ * 能在浏览器上下文执行脚本，一律必须挡在 `shell.openExternal` 之前。
+ *
+ * **永不向渲染层抛错**：拒绝与打开失败都返回 `false`（渲染层只做静默忽略）。
  */
 ipcMain.handle(IPC.openExternal, async (_e, url: unknown) => {
-  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false
+  const verdict = resolveExternalUrl(url)
+  if (!verdict.ok) {
+    // 拒绝路径也要留痕：线上出现成批拒绝 = 要么有注入尝试，要么调用方传错了
+    logWarn('app:open-external-failed', {
+      url: typeof url === 'string' ? truncateUrlForLog(url) : null,
+      type: typeof url,
+      reason: verdict.reason
+    })
+    return false
+  }
   try {
-    await shell.openExternal(url)
+    await shell.openExternal(verdict.url)
     return true
   } catch (err) {
-    logWarn('openExternal 失败', err)
+    // 系统没有默认浏览器 / 被策略拦截 / 协议处理程序缺失 —— 都归到这里
+    logWarn('app:open-external-failed', {
+      url: truncateUrlForLog(verdict.url),
+      reason: 'open-failed',
+      error: String(err)
+    })
     return false
   }
 })

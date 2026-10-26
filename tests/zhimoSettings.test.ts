@@ -23,17 +23,20 @@ const codeOnly = (src: string): string =>
   src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 
 /**
- * 切出「按站方分类重排」那一段（设置页新段落）。
+ * 切出「存量重排」那张卡（含按站方分类重排的控件集）。
  *
- * 边界取 `SectionTitle` 到下一个设置行（「监控下载目录」）之间：这一段里出现的控件
- * 全部是本轮新加的，所以"没有原生 checkbox / select"的断言可以严格只扫这里
- * （整份文件扫描会连带扫到既有控件，判红时说不清是谁的问题）。
+ * 边界用组件里的**显式守卫标记**（`@guard:zhimo-reclass` … `-end`）：
+ * - v0.8.1 设置页重排把 `SectionTitle` 换成了 `SettingsCard.title`，原来的文字锚点失效；
+ * - v0.8.1b 又把「可撤销备份 N 份」从行右侧挪进**卡底 note**，所以标记上移到卡片开头
+ *   （note 是 `<SettingsCard>` 的属性、在源码里位于 children 之前）。
+ * 标记只用于切段、不参与渲染；检查项一字未改。
  */
 function zhimoSectionSource(): string {
   const src = read('renderer/components/SettingsDialog.tsx')
-  const start = src.indexOf('<SectionTitle>按站方分类重排</SectionTitle>')
+  // 标记字面量里刻意不含注释结束符，避免本文件自己的块注释被提前闭合
+  const start = src.indexOf('@guard:zhimo-reclass ')
   if (start < 0) return ''
-  const end = src.indexOf('title="监控下载目录"', start)
+  const end = src.indexOf('@guard:zhimo-reclass-end', start)
   return codeOnly(src.slice(start, end > start ? end : src.length))
 }
 

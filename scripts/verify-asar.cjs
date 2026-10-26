@@ -107,6 +107,22 @@ check('renderer: 导入后切回资产视图提示', rendererAll, '已切回资�
 check('renderer: ao/disp 走 idle 调度', rendererAll, 'requestIdleCallback')
 check('renderer: 知末映射 木板（材质册无「板材」故 texture-only）', rendererAll, '木板')
 
+// ── 0.8.1 ──
+// 设置页整体重排（7 tab + 设计语言）+ 外链白名单 + 写盘串行化。
+// 判据仍是"压缩不会动的东西"：UI 文案、tab 中文标签、日志字面量、拒绝原因枚举值。
+// ① tab 重排证据：分类拆成独立 tab 后「数据与备份」这个 label 与页头副标题是新写的
+check('renderer: 设置 tab「数据与备份」', rendererAll, '数据与备份')
+check('renderer: 设置页头副标题（外观）', rendererAll, '主题、动效、侧栏显示')
+check('renderer: 设置卡「存量重排」', rendererAll, '存量重排')
+check('renderer: 长路径提示压一行', rendererAll, '超过 260 字符时提示；开启系统长路径支持可根治')
+check('renderer: 反馈卡 GitHub Issue 入口', rendererAll, '在 GitHub 提 Issue')
+// ② 外链白名单：拒绝原因枚举值只在 shared/urlPolicy.ts 出现，命中即证明该模块真进了主进程包
+check('main: 外链白名单 reason control-char', main, 'control-char')
+check('main: 外链白名单 reason no-host', main, 'no-host')
+check('main: 外链失败日志 app:open-external-failed', main, 'app:open-external-failed')
+// ③ 写盘串行化：tmp 固定名仍是原语义（改名才是错），这里认"串行队列真的被 saveSettings 用上"
+check('main: 设置写盘串行队列 enqueueSettingsWrite', main, 'enqueueSettingsWrite')
+
 const qr = find(/contact-qr.*\.png$/)
 console.log('contact-qr in bundle:', qr.join(',') || '(none)')
 if (qr.length) {
