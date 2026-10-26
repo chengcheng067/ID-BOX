@@ -3,7 +3,9 @@
  *
  * 流程四步（store.ts 持有状态，这里只放可单测的计算）：
  *   requestDelete(ids)  → pendingDelete(stage='confirming')  弹 ConfirmDialog（二次确认）
- *   confirmDelete()     → pendingDelete(stage='grace')       弹 UndoToast，**5 秒倒计时开始**
+ *   confirmDelete()     → pendingDelete(stage='grace')       弹撤销条，**倒计时开始**
+ *                         （时长 = `pendingDelete.graceMs`，来自设置 `undoGraceMs`；
+ *                          为 0「不等待」时**跳过本阶段**直接 commitDelete）
  *   undoDelete()        → 清空 pendingDelete                 什么都不删
  *   commitDelete()      → trashPaths + 删索引 + 删缩略图      到期自动触发，此时才真正删
  *

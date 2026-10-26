@@ -8,6 +8,7 @@ import type {
   ColorTag,
   CoverSource,
   FetchZhimoCoverResult,
+  FetchZhimoMetaResult,
   ImportConflictAnswer,
   ImportConflictAsk,
   ImportEvent,
@@ -35,7 +36,11 @@ import { dedupeIds, pruneToVisible, selectRangeIds } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
 import { planDuplicateCleanup, planThumbPresenceRepair } from './logic/recordHygiene'
 import { assetFileAbs } from './logic/assetPath'
-import { DELETE_GRACE_MS, toDeleteTargets, type DeleteTarget } from './logic/deleteFlow'
+import { toDeleteTargets, type DeleteTarget } from './logic/deleteFlow'
+// 删除撤销期三档（0 / 3000 / 5000）：用户可在设置·数据与备份里改。
+// `graceMs` 已是 `pendingDelete` 的字段，所以这里只负责**取值**，纯函数的默认参数
+// （`DELETE_GRACE_MS`）保持不动，避免既有 import 炸掉。
+import { normalizeUndoGraceMs } from '../shared/undoGrace'
 import { isLegacyLayout, planLegacyMoves, categoriesOf } from './logic/category'
 import { reconcile, type ReconcileReport } from './logic/reconcile'
 import {
@@ -63,6 +68,18 @@ import {
   type ZhimoCoverTarget
 } from './logic/zhimoCover'
 import { resolveZhimoStyle } from './logic/zhimoStyle'
+import {
+  ZHIMO_RECLASS_BACKUP_PREFIX,
+  groupByCategoryPair,
+  isZhimoReclassCandidate,
+  parseCategoryPairKey,
+  runZhimoReclassQueue,
+  zhimoReclassIdOf,
+  zhimoReclassSummaryText,
+  type ZhimoReclassLogContext,
+  type ZhimoReclassProgress,
+  type ZhimoReclassTarget
+} from './logic/zhimoReclass'
 import { buildDedupeSnapshot } from './logic/importConflict'
 import {
   applyThumbRescue,
@@ -248,6 +265,27 @@ const thumbAttempted = new Set<string>()
 const ENSURE_THUMB_BATCH = 120
 
 /**
+ * `init()` 的重入闸门（模块级，与 `conflictUnsubscribers` 同一种守卫）。
+ *
+ * 用户 2026-10-26 点名：「init() 一次加载跑两次」。真实来源是 React 18 StrictMode
+ * 在开发模式下的**双挂载**（`App.tsx:369` 的 effect 被跑两次）：第二次调用时第一次
+ * 的 promise 还挂着 → 看到本标志为 true，直接 return，不做任何第二次 DB 写、不重订事件。
+ *
+ * ⚠️ 语义是**互斥**而不是"只跑一次"：闸门只在**正在跑的那次未结束时**生效，跑完后复位。
+ * 所以真需要重跑的路径（rescan 后重建、单测里逐条 `await init()`）仍能完整执行——
+ * 这与"进程内只允许跑一次"的写法有实质区别，绝不能改成一次性标志。
+ *
+ * 为什么不能靠调用方防：`App.tsx` 的 effect 依赖 `[init]`，StrictMode 下 React 自己
+ * 就会重跑 effect；渲染层没有别的时机能把两次压成一次。
+ */
+let initInFlight = false
+
+/** 仅供单测：复位重入闸门（运行时无调用点） */
+export function resetInitGuardForTests(): void {
+  initInFlight = false
+}
+
+/**
  * 材质球离屏渲染（2026-10 任务 6）：**后台串行队列**。
  * 每个球要自建自销一个 WebGL 上下文（Chromium 上限 8-16 个），并发必炸，
  * 所以严格串行；`BALL_THUMB_BATCH` 封顶防止大库一次性排队几千个。
@@ -423,6 +461,94 @@ export interface ReclassifySummary {
 
 const EMPTY_RECLASSIFY_SUMMARY: ReclassifySummary = { moved: 0, missed: 0, failed: 0 }
 
+/**
+ * 知末「站方分类」重排的结果计数（`runZhimoCategoryReclass`）。
+ *
+ * 为什么有这么多桶：站方分类的失败**不是一种**。
+ * - `noStation`：站方根本没给分类（`classifyBaseName === null`）→ 正常结果，不是故障；
+ * - `unmapped`：站方给了，但映射表没有（本地词表缺口 / 该频道未抄录）；
+ * - `ambiguous`：映射表返回候选数组（筛不出唯一）→ 按纪律不猜；
+ * - `failed`：详情页请求失败 + `assignCategory` 移动失败。
+ * 合成一个 "missed" 会让"站方覆盖不全"和"网络挂了"永远分不清。
+ */
+export interface ZhimoReclassSummary {
+  /** 实际发出详情页请求的条数（含失败；取消时为已发出的部分） */
+  scanned: number
+  /** 真实移动了目录的资产数 */
+  moved: number
+  /**
+   * ⚠️ `moved` 的**子集**：其中"按相近类目归并"（映射表 `approx: true`）的条数。
+   * 这是"有多少条是猜的"的唯一锚点，必须单独计数并写日志。
+   */
+  approx: number
+  /** 映射表返回候选数组（不猜）而跳过的条数 */
+  ambiguous: number
+  /** 映射表里没有该站方名而跳过的条数 */
+  unmapped: number
+  /** 站方没给分类（正常结果）而跳过的条数 */
+  noStation: number
+  /** 详情页请求失败 + 移动失败的条数 */
+  failed: number
+}
+
+const EMPTY_ZHIMO_RECLASS_SUMMARY: ZhimoReclassSummary = {
+  scanned: 0,
+  moved: 0,
+  approx: 0,
+  ambiguous: 0,
+  unmapped: 0,
+  noStation: 0,
+  failed: 0
+}
+
+/**
+ * 「站方分类重排」的进度状态（设置页显示 / 取消按钮读它）。
+ *
+ * 放 state（不像 `pendingZhimoIds` 那样放模块级）的原因：设置页要实时显示
+ * "已完成 12 / 共 30"，这是**渲染层要读**的状态，不是过程量。
+ */
+export interface ZhimoReclassState {
+  /** 正在跑（含正在落库阶段） */
+  running: boolean
+  /** 已处理条数（抓取阶段单调递增） */
+  done: number
+  /** 本轮候选总数 */
+  total: number
+  /** 用户点了取消（停止发新请求；已抓到的仍然落库） */
+  cancelRequested: boolean
+}
+
+const IDLE_ZHIMO_RECLASS_STATE: ZhimoReclassState = {
+  running: false,
+  done: 0,
+  total: 0,
+  cancelRequested: false
+}
+
+/** `runZhimoCategoryReclass()` 的可选参数 */
+export interface RunZhimoCategoryReclassOptions {
+  /**
+   * true = 用户在设置页手动点的：**不看** `settings.zhimoAutoCategory`，
+   * 且结束后给一条 notice；false / 缺省 = 导入批次后的自动任务（全程静默）。
+   */
+  manual?: boolean
+  /** 外部停止条件（窗口关闭等）；与 `zhimoReclass.cancelRequested` 取「或」 */
+  shouldStop?: () => boolean
+  /** 进度回调（除了写 store 状态，还额外通知调用方） */
+  onProgress?: (progress: ZhimoReclassProgress) => void
+  /**
+   * 节流 sleep 的注入点（**仅供单测**传即时桩，运行时不传）。
+   * 与 `runZhimoCovers({ sleep })` 同款：避免 N 条用例真等 N×250ms。
+   */
+  sleep?: (ms: number) => Promise<void>
+}
+
+/**
+ * 并发保护：站方分类重排同一时刻只允许一个在跑（理由同 `aiClassifyRunning`：
+ * 必须在 `set()` 之前就能拦住重入）。
+ */
+let zhimoReclassRunning = false
+
 /** 「撤销上次重跑」结果 */
 export interface ReclassUndoSummary {
   /** 成功搬回原分类的资产数 */
@@ -457,7 +583,7 @@ interface ReclassRecord {
 }
 
 
-/** 删除流程阶段：`confirming`=待二次确认；`grace`=已确认、5 秒撤销倒计时中 */
+/** 删除流程阶段：`confirming`=待二次确认；`grace`=已确认、撤销倒计时中（时长见 `graceMs`） */
 export type DeleteStage = 'confirming' | 'grace'
 
 /**
@@ -471,13 +597,17 @@ export interface PendingDelete {
   stage: DeleteStage
   /** grace 阶段的起始时间戳；confirming 阶段为 0 */
   startedAt: number
+  /**
+   * 本次删除的撤销期（毫秒，来自设置 `undoGraceMs`，三档 0 / 3000 / 5000）。
+   * `0` = 不等待：`confirmDelete()` 不进 `grace`，直接 `commitDelete()`。
+   */
   graceMs: number
   /**
    * 确认框里的额外警示（v0.4 重复资产：「体积差异较大，请先确认是同一套资产」）。
    * 普通删除不传 → 确认框保持原样。
    */
   warning?: string
-  /** 用户确认后要落的轻提示（v0.4 重复资产：「已移入回收站，5 秒内可撤销」） */
+  /** 用户确认后要落的轻提示（v0.4 重复资产；文案由 `logic/graceText.ts` 按档位生成） */
   notice?: string
 }
 
@@ -485,7 +615,7 @@ export interface PendingDelete {
 export interface RequestDeleteOptions {
   /** 二次确认框里的额外红色警示行 */
   warning?: string
-  /** 确认（进入 5 秒宽限期）后展示的轻提示 */
+  /** 确认后（进入撤销宽限期，`graceMs === 0` 时不展示）的轻提示 */
   notice?: string
 }
 
@@ -700,6 +830,21 @@ interface VaultState {
   reclassifyBusy: boolean
   /** 可用的「重跑分类备份」条数（>0 时设置页「撤销上次重跑」按钮可用） */
   reclassifyBackupCount: number
+  /**
+   * 可用的「**知末**重排备份」条数（`zhimo-reclass-*`，>0 时设置页
+   * 「撤销上次知末重排」按钮可用）。
+   *
+   * 与 `reclassifyBackupCount` 分开计数：两条通道前缀不同、各留 3 份，
+   * 合成一个数字会让撤销按钮在错误的通道上亮起。
+   */
+  zhimoReclassBackupCount: number
+  /**
+   * 「站方分类重排」进度（设置页显示 / 取消按钮）。
+   *
+   * 与 `reclassifyBusy` 分开：老「重跑自动分类」按本地词表重判，
+   * 本项按**知末站方分类**重判，两者是不同通道（备份前缀也不同）。
+   */
+  zhimoReclass: ZhimoReclassState
   /** CategoryPicker 当前打开的目标 id 集合；null = 关闭（详情面板 / 右键菜单 / 批量栏共用） */
   categoryPickerIds: string[] | null
   /**
@@ -951,7 +1096,8 @@ interface VaultState {
   ) => Promise<boolean>
   // ── 知末封面（docs/24，T-04）─────────────────────────────────
   /**
-   * 自动抓取（导入后由 `scheduleZhimoCovers()` 触发）**与手动抓取共用的唯一入口**。
+   * 自动抓取（导入批次结束后由 `scheduleZhimoPipeline()` **在站方分类重排之后**触发）
+   * **与手动抓取共用的唯一入口**。
    *
    * 只处理 `kind === 'model'` 且名字里有知末 ID 的资产；**成功逐个 `commitCover`
    * （卡片逐张变化），自动任务失败全程静默**（不 notice、不弹错、不阻塞导入）。
@@ -1018,16 +1164,54 @@ interface VaultState {
    */
   reclassifyUnclassified: () => Promise<ReclassifySummary>
   /**
+   * 按**知末站方分类**重排（`未分类/未分类` → 站方分类）。
+   *
+   * 为什么不是导入时写分类：站方分类来自详情页，而详情页抓取是 `import:batchDone`
+   * 之后的后置任务（见 `shared/types.ts` 的 `classifyBaseName` 契约），**不在导入链路里**。
+   * 所以真实形态是：导入先按既有规则落盘 → 批次结束后抓详情页 → 用 `assignCategory` 搬目录。
+   *
+   * 顺序（不可调换）：
+   * ① 候选 = `!isDeletedAsset` + `未分类/未分类` + 能取到知末 ID（**软删记录必须排除**，
+   *    它们目录已在 `.trash/`，调 `assignCategory` 必然失败）；
+   * ② **先全部抓完**（`fetchZhimoMeta`，只 GET 详情页、不下图片）并按
+   *    `shared/zhimoTaxonomyMap` 判定，攒出命中；
+   * ③ **抓完之后**才 `backupReclassMoves(hits, 'zhimo-reclass-')`（备份早于任何移动）；
+   * ④ 按分类对分组，逐组调既有 `assignCategory`（真实搬目录 + 缩略图重生 + 写库）；
+   * ⑤ 返回分桶计数（`approx` 是 `moved` 的子集，必须单独报）。
+   *
+   * 取消语义：`shouldStop` 每轮查一次；取消后**不再发新请求**，但**已抓到的仍然落库**
+   * （搬到一半丢结果比不搬更糟）。
+   *
+   * 自动触发由 `settings.zhimoAutoCategory` 控制（缺省 true），
+   * 且必须**先跑本重排、跑完再抓封面**——两者不许并行打同一个站。
+   */
+  runZhimoCategoryReclass: (opts?: RunZhimoCategoryReclassOptions) => Promise<ZhimoReclassSummary>
+  /**
+   * 取消正在跑的站方分类重排：置 `zhimoReclass.cancelRequested = true`。
+   * 停止的是"发新请求"；已抓到的命中仍会落库（见 `runZhimoCategoryReclass` 注释）。
+   */
+  cancelZhimoCategoryReclass: () => void
+  /**
    * 撤销**最近一次**重跑分类：把备份里的资产按原 `category1/category2` 搬回。
    *
+   * - `prefix` 是**通道选择**：缺省 `'reclass-'` = 老通道「重跑自动分类」（行为与改造前
+   *   逐字一致，所有老调用点一行都不用改）；知末通道传 `'zhimo-reclass-'`。
+   *   两个通道的备份互不可见（见 `logic/zhimoReclass.ts` 的前缀注释）。
    * - 同样走 `assignCategory`（不自己写移动逻辑）；原值是 `未分类` 就搬回双哨兵目录；
    * - 资产在当前索引里已不存在（被删了）→ 跳过并计入 `failed`；
-   * - 没有 `reclass-*` 备份 → `{ restored: 0, failed: 0 }`，只给一句 notice，**不报错**；
+   * - 该前缀没有备份 → `{ restored: 0, failed: 0 }`，只给一句 notice，**不报错**；
    * - 备份在还原成功后即删除（"撤销"是消费型操作，避免无限撤销到更早状态）。
    */
-  undoLastReclassify: () => Promise<ReclassUndoSummary>
+  undoLastReclassify: (prefix?: string) => Promise<ReclassUndoSummary>
   /** 刷新「可撤销的重跑备份」条数（设置页打开时 / 重跑或撤销完成后调用） */
   refreshReclassBackupCount: () => Promise<void>
+  /**
+   * 刷新「可撤销的**知末**重排备份」条数（`zhimo-reclass-*`）。
+   *
+   * 与 `refreshReclassBackupCount` 分开：两个通道的前缀不同、上限各自 3 份，
+   * 混用一个计数器会让「撤销上次知末重排」在只剩老通道备份时错误地亮起。
+   */
+  refreshZhimoReclassBackupCount: () => Promise<void>
   /**
    * 材质球调参持久化（docs/12 §5.2）。
    *
@@ -1615,11 +1799,17 @@ async function repairThumbPresence(): Promise<void> {
 
 // ── 重跑自动分类：移动前备份（v1.0.13） ─────────────────────────────
 
-/** 取 `reclass-*` 备份，按时间降序（最新在前） */
-async function listReclassBackups(): Promise<IndexBackup[]> {
+/**
+ * 取 `reclass-*` 备份，按时间降序（最新在前）。
+ *
+ * `prefix` 是**通道隔离**用的，默认 `'reclass-'` = 与改造前逐字一致（老调用点不传）。
+ * 知末站方分类重排传 `'zhimo-reclass-'`（见 `logic/zhimoReclass.ts` 的注释：
+ * 两个通道必须各有各的前缀，否则会互相消费对方备份 / 挤掉对方的 3 条上限）。
+ */
+async function listReclassBackups(prefix: string = 'reclass-'): Promise<IndexBackup[]> {
   const all = await db.backups.toArray()
   return all
-    .filter((b) => typeof b.id === 'string' && b.id.startsWith('reclass-'))
+    .filter((b) => typeof b.id === 'string' && b.id.startsWith(prefix))
     .sort((a, b) => b.at - a.at)
 }
 
@@ -1628,13 +1818,18 @@ async function listReclassBackups(): Promise<IndexBackup[]> {
  *
  * 必须在任何 `assignCategory` 之前调用：目录一旦搬走，原 `folder` 只存在于这份 json 里
  * （就像重扫前备份的意义一样——磁盘上没有"它原来在哪"的副本）。
- * 只保留最近 `RECLASS_BACKUP_KEEP` 条 `reclass-*`。
+ * 只保留最近 `RECLASS_BACKUP_KEEP` 条**同前缀**备份。
+ *
+ * `prefix` 默认 `'reclass-'`：不传 = 现有行为**逐字不变**（id 形状、保留条数、清理范围）。
  */
-async function backupReclassMoves(records: ReclassRecord[]): Promise<void> {
+async function backupReclassMoves(
+  records: ReclassRecord[],
+  prefix: string = 'reclass-'
+): Promise<void> {
   if (records.length === 0) return
   const at = Date.now()
-  await db.backups.put({ id: `reclass-${at}`, at, json: JSON.stringify(records) })
-  const list = await listReclassBackups()
+  await db.backups.put({ id: `${prefix}${at}`, at, json: JSON.stringify(records) })
+  const list = await listReclassBackups(prefix)
   const stale = list.slice(RECLASS_BACKUP_KEEP)
   if (stale.length > 0) await db.backups.bulkDelete(stale.map((b) => b.id))
 }
@@ -1819,6 +2014,8 @@ export const useVault = create<VaultState>((set, get) => ({
   zhimoCoverBusyId: null,
   reclassifyBusy: false,
   reclassifyBackupCount: 0,
+  zhimoReclassBackupCount: 0,
+  zhimoReclass: { ...IDLE_ZHIMO_RECLASS_STATE },
   categoryPickerIds: null,
   renameIds: null,
   folderViewAssetId: null,
@@ -1828,6 +2025,11 @@ export const useVault = create<VaultState>((set, get) => ({
   conflictAsk: null,
 
   async init() {
+    // 重入闸门（见模块级 `initInFlight` 注释）：正在跑的这一次未结束前，第二次调用直接返回。
+    // 跑完即复位，所以 rescan 后重建、单测里逐条 `await init()` 仍能正常执行。
+    if (initInFlight) return
+    initInFlight = true
+    try {
     const [settings, assets] = await Promise.all([
       window.modvault.getSettings(),
       db.assets.toArray()
@@ -1878,8 +2080,9 @@ export const useVault = create<VaultState>((set, get) => ({
     // 事件由 main 在 `importPaths` 返回后 fire-and-forget 发出（UI 导入与监控目录导入都覆盖）。
     window.modvault.onImportBatchDone(() => {
       scheduleAiClassify()
-      // 知末封面（docs/24，T-04）：同一时机、同样 `setTimeout(0)`，绝不 await
-      scheduleZhimoCovers()
+      // 知末后置流水线：**先按站方分类重排、跑完再抓封面**（串行，不并行打同一个站）。
+      // 同 `scheduleAiClassify`：`setTimeout(0)`，绝不 await 网络请求。
+      scheduleZhimoPipeline()
       // docs/27 §3.1：批次结束后把「已跳过 N 个」/「已覆盖 N 个」各汇总成一条 toast。
       // 两条**互不吞并**（用 `enqueueNotice` 依次展示）：先跳过、后覆盖，顺序即发生顺序。
       flushSkippedSummary()
@@ -1932,6 +2135,9 @@ export const useVault = create<VaultState>((set, get) => ({
         enqueueZhimoCover(ev.asset)
       }
     })
+    } finally {
+      initInFlight = false
+    }
   },
 
   setFilter: (patch) =>
@@ -2113,8 +2319,9 @@ export const useVault = create<VaultState>((set, get) => ({
     // ⚠️ `scheduleAiClassify` 只是 `setTimeout(..., 0)`，**没有 await 任何网络请求**：
     // 导入动作的耗时不因配置了 AI 而增加一个毫秒（main 侧也会推 import:batchDone，双保险）。
     scheduleAiClassify()
-    // 同上：知末封面是**后置任务**，不在导入链路上（双触发由 pending 清空 + 重入锁去重）
-    scheduleZhimoCovers()
+    // 同上：知末这边是**一条链**（先站方分类重排 → 再抓封面），不是两个并行任务。
+    // 链式的原因：两者打同一个站；重排只取详情页（便宜）且必须先跑完，封面才开工。
+    scheduleZhimoPipeline()
   },
 
   /**
@@ -2152,17 +2359,38 @@ export const useVault = create<VaultState>((set, get) => ({
         targets: toDeleteTargets(targets),
         stage: 'confirming',
         startedAt: 0,
-        graceMs: DELETE_GRACE_MS,
+        // 撤销期由用户在设置·数据与备份里决定（0 = 不等待 / 3000 / 5000，默认 5000）。
+        // 快照在**这一刻**取值：确认过程中用户去改设置，不改变本次删除的等待时长。
+        // `normalizeUndoGraceMs` 兜脏值（存档被手改成 9999 之类），绝不返回 undefined。
+        graceMs: normalizeUndoGraceMs(get().settings?.undoGraceMs),
         warning: opts?.warning,
         notice: opts?.notice
       }
     })
   },
 
-  /** 第二步：用户确认 → 进入 5 秒撤销宽限期。**此时文件仍在磁盘上**（这正是 undo 可行的前提）。 */
+  /**
+   * 第二步：用户确认。
+   *
+   * 两条分支（2026-10 用户裁定「删除是否要等 5 秒给用户自己定」）：
+   * - `graceMs > 0`（3 / 5 秒）→ 进入 `grace` 宽限期，底部撤销条倒计时，
+   *   此时文件仍在磁盘上（这正是 undo 可行的前提）；
+   * - `graceMs === 0`（不等待）→ **不进入 `grace`**，直接调 `commitDelete()` 落盘。
+   *
+   * 为什么用"跳过 grace"而不是"grace 但 0 秒"：`NoticeToast` 只在
+   * `pendingDelete.stage === 'grace'` 时渲染撤销条，跳过阶段就**天然没有倒计时条**，
+   * 不需要在 toast 里加 `graceMs === 0` 的特判（少一处分支 = 少一处漂移）。
+   * 二次确认弹窗**仍然存在**（它绑定的是 `stage === 'confirming'`，与本分支无关）。
+   */
   confirmDelete() {
     const p = get().pendingDelete
     if (!p || p.stage !== 'confirming') return
+    // 不等待：直接走真正落盘的那一步（commitDelete 内部先同步清 pendingDelete，
+    // 再 await IPC —— 所以调用返回时状态机已经收场，不会残留 grace 阶段）。
+    if (p.graceMs <= 0) {
+      void get().commitDelete()
+      return
+    }
     set({
       pendingDelete: { ...p, stage: 'grace', startedAt: Date.now() },
       // 场景化提示（v0.4 重复资产）：普通删除不传 notice → 行为与原来完全一致
@@ -3798,19 +4026,198 @@ export const useVault = create<VaultState>((set, get) => ({
   },
 
   /**
+   * 按**知末站方分类**重排（`未分类/未分类` → 站方分类）—— 与 `reclassifyUnclassified`
+   * 的关键差别：判定依据不是本地词表，而是**知末详情页**（只 GET 详情页、不下图片）。
+   *
+   * 为什么必须"先全部抓完、再统一搬"（顺序不可调换）：
+   * ① 备份必须在**任何移动之前**写完 —— 否则搬了一半崩了就没有还原凭证；
+   * ② 抓取是慢活（站点限流），先攒命中再一次落库，备份只需写一条、日志只有一个总数；
+   * ③ 取消时**已抓到的仍然落库**：用户点取消是"别再打站了"，不是"把已拿到的结果丢掉"。
+   *
+   * 落库**只**走 `get().assignCategory()`：目标重名 `X-2`、缩略图重生、`dedupeKey` 重算、
+   * `db.assets.bulkPut`、内存同步都由它负责。这里**绝不**自己 `fs.rename` 或改记录。
+   *
+   * 失败语义：详情页请求失败 + 移动失败都计入 `failed`；单组失败不中断其余组。
+   * 自动任务（`manual !== true`）全程静默（不 notice），但**必写一条日志**（含 approx 计数）。
+   */
+  async runZhimoCategoryReclass(opts) {
+    // 防重入：两个触发点（importPaths 收尾 + main 的 import:batchDone）可能几乎同时到
+    if (zhimoReclassRunning) return EMPTY_ZHIMO_RECLASS_SUMMARY
+
+    const manual = opts?.manual === true
+    // 自动路径受设置开关约束；手动路径不看开关（用户点了就是要）。缺省 true。
+    if (!manual && !zhimoAutoCategoryEnabled(get().settings)) {
+      return EMPTY_ZHIMO_RECLASS_SUMMARY
+    }
+
+    // ① 候选：非软删 + 双未分类 + 能取到知末 ID（判定全在纯函数里，与单测同一口径）
+    const candidates = get().assets.filter(isZhimoReclassCandidate)
+    if (candidates.length === 0) {
+      if (manual) set({ notice: '没有需要按知末分类整理的资产' })
+      return EMPTY_ZHIMO_RECLASS_SUMMARY
+    }
+
+    const targets: ZhimoReclassTarget[] = []
+    for (const asset of candidates) {
+      const zhimoId = zhimoReclassIdOf(asset)
+      // `isZhimoReclassCandidate` 已保证非 null；这里只是类型收窄 + 防御
+      if (!zhimoId) continue
+      targets.push({ id: asset.id, zhimoId, kind: asset.kind, name: asset.name })
+    }
+    if (targets.length === 0) {
+      if (manual) set({ notice: '没有需要按知末分类整理的资产' })
+      return EMPTY_ZHIMO_RECLASS_SUMMARY
+    }
+
+    zhimoReclassRunning = true
+    set({
+      zhimoReclass: { running: true, done: 0, total: targets.length, cancelRequested: false }
+    })
+    const summary: ZhimoReclassSummary = { ...EMPTY_ZHIMO_RECLASS_SUMMARY }
+    let cancelled = false
+    try {
+      // ② 抓取 + 判定（不碰磁盘）。`fetchZhimoMeta` 永不抛错，这里再兜一层 IPC 异常。
+      const out = await runZhimoReclassQueue(targets, {
+        fetchMeta: (target) =>
+          window.modvault
+            .fetchZhimoMeta({ id: target.zhimoId })
+            .catch(() => ({ ok: false, reason: 'network' }) as FetchZhimoMetaResult),
+        onProgress: (progress) => {
+          set((s) => ({
+            zhimoReclass: { ...s.zhimoReclass, done: progress.done, total: progress.total }
+          }))
+          opts?.onProgress?.(progress)
+        },
+        shouldStop: () =>
+          opts?.shouldStop?.() === true || get().zhimoReclass.cancelRequested === true,
+        // 仅单测注入（运行时不传 → 队列用真实 setTimeout 节流）
+        sleep: opts?.sleep
+      })
+
+      cancelled = out.stopped
+      summary.scanned = out.scanned
+      summary.ambiguous = out.ambiguous
+      summary.unmapped = out.unmapped
+      summary.noStation = out.noStation
+      summary.failed = out.failed
+
+      if (out.hits.length > 0) {
+        // 抓取期间资产可能被删 / 被 rescan 换掉 → 落库前按 id 重查（找不到计入失败）
+        const byId = new Map(get().assets.map((a) => [a.id, a]))
+        const kept: typeof out.hits = []
+        const records: ReclassRecord[] = []
+        for (const hit of out.hits) {
+          const asset = byId.get(hit.id)
+          if (!asset) {
+            summary.failed += 1
+            continue
+          }
+          const cur = categoriesOf(asset)
+          records.push({
+            id: asset.id,
+            name: asset.name,
+            folder: asset.folder,
+            relFolder: asset.relFolder,
+            category1: cur.category1,
+            category2: cur.category2
+          })
+          kept.push(hit)
+        }
+
+        if (records.length > 0) {
+          // ③ 备份（**早于任何移动**；前缀区分通道，见 ZHIMO_RECLASS_BACKUP_PREFIX 注释）
+          await backupReclassMoves(records, ZHIMO_RECLASS_BACKUP_PREFIX)
+
+          // ④ 按分类对分组：一次 assignCategory 只接受一个分类对
+          const groups = groupByCategoryPair(
+            kept.map((h) => ({ id: h.id, category1: h.category1, category2: h.category2 }))
+          )
+          const approxIds = new Set(kept.filter((h) => h.approx).map((h) => h.id))
+          for (const [key, ids] of groups) {
+            const pair = parseCategoryPairKey(key)
+            const groupApprox = ids.reduce((n, id) => n + (approxIds.has(id) ? 1 : 0), 0)
+            try {
+              const assigned = await get().assignCategory(ids, pair.category1, pair.category2)
+              summary.moved += assigned.moved
+              summary.failed += assigned.failed
+              // approx 必须是 moved 的**子集**：按该组真实移动数封顶（个别资产失败时不虚报）
+              summary.approx += Math.min(groupApprox, assigned.moved)
+            } catch {
+              // 单组异常（不该发生：assignCategory 内部已逐条 catch）→ 计失败，继续下一组
+              summary.failed += ids.length
+            }
+          }
+        }
+      }
+    } catch {
+      // 后台任务兜底：任何未预期异常都静默降级，不冒泡到 UI
+      summary.failed += 1
+    } finally {
+      zhimoReclassRunning = false
+      set((s) => ({
+        zhimoReclass: { ...s.zhimoReclass, running: false, cancelRequested: false }
+      }))
+    }
+
+    // ⑤ 日志：approx 必须出现在这里（"有多少条是猜的"的唯一锚点）
+    const ctx: ZhimoReclassLogContext = {
+      scanned: summary.scanned,
+      moved: summary.moved,
+      approx: summary.approx,
+      ambiguous: summary.ambiguous,
+      unmapped: summary.unmapped,
+      noStation: summary.noStation,
+      failed: summary.failed,
+      cancelled,
+      manual
+    }
+    try {
+      window.modvault?.reportLog?.({
+        level: 'info',
+        message: 'zhimo:reclass',
+        context: { ...ctx, text: zhimoReclassSummaryText(ctx) }
+      })
+    } catch {
+      /* 日志失败绝不影响落库 */
+    }
+    // 自动任务静默（同封面：不 notice、不弹错）；手动才给汇总
+    if (manual) set({ notice: zhimoReclassSummaryText(ctx) })
+    return summary
+  },
+
+  cancelZhimoCategoryReclass() {
+    set((s) => ({ zhimoReclass: { ...s.zhimoReclass, cancelRequested: true } }))
+  },
+
+  /**
    * 撤销最近一次重跑分类（v1.0.13）。
    *
-   * 依据 `reclass-*` 备份里记录的**原分类对**搬回（原值是 `未分类` 就搬回双哨兵目录），
+   * 依据**同通道**备份里记录的**原分类对**搬回（原值是 `未分类` 就搬回双哨兵目录），
    * 同样走 `assignCategory`。索引里已不存在的资产（用户删了）跳过并计入 `failed`。
    * 还原成功后**删除该备份**——"撤销"是消费型操作，否则按钮会永远亮着且行为不可预期。
+   *
+   * `prefix` 缺省 `'reclass-'`（老通道，行为逐字不变）；知末通道传
+   * `ZHIMO_RECLASS_BACKUP_PREFIX`。前缀同时决定：读哪条通道的备份、刷新哪个计数器、
+   * 以及 notice 的措辞（"重跑" vs "知末重排"）。
    */
-  async undoLastReclassify() {
+  async undoLastReclassify(prefix: string = 'reclass-') {
     if (reclassifyRunning) return { restored: 0, failed: 0 }
 
-    const backups = await listReclassBackups().catch(() => [] as IndexBackup[])
+    const isZhimo = prefix === ZHIMO_RECLASS_BACKUP_PREFIX
+    /** 刷新**本通道**的备份条数（两条通道各自计数，不能互相覆盖） */
+    const refreshCount = async (): Promise<void> => {
+      try {
+        if (isZhimo) await get().refreshZhimoReclassBackupCount()
+        else await get().refreshReclassBackupCount()
+      } catch {
+        /* 计数刷新失败不影响还原结果（按钮下一次打开设置会再刷） */
+      }
+    }
+
+    const backups = await listReclassBackups(prefix).catch(() => [] as IndexBackup[])
     const last = backups[0]
     if (!last) {
-      set({ notice: '没有可撤销的重跑记录' })
+      set({ notice: isZhimo ? '没有可撤销的知末重排记录' : '没有可撤销的重跑记录' })
       return { restored: 0, failed: 0 }
     }
 
@@ -3823,10 +4230,8 @@ export const useVault = create<VaultState>((set, get) => ({
     }
     if (records.length === 0) {
       await db.backups.bulkDelete([last.id]).catch(() => undefined)
-      await get()
-        .refreshReclassBackupCount()
-        .catch(() => undefined)
-      set({ notice: '重跑备份内容不可用，已清理' })
+      await refreshCount()
+      set({ notice: isZhimo ? '知末重排备份内容不可用，已清理' : '重跑备份内容不可用，已清理' })
       return { restored: 0, failed: 0 }
     }
 
@@ -3869,9 +4274,7 @@ export const useVault = create<VaultState>((set, get) => ({
       set({ reclassifyBusy: false })
     }
 
-    await get()
-      .refreshReclassBackupCount()
-      .catch(() => undefined)
+    await refreshCount()
     set({ notice: `已还原 ${restored} 个资产（${failed} 个失败）` })
     return { restored, failed }
   },
@@ -3880,6 +4283,17 @@ export const useVault = create<VaultState>((set, get) => ({
   async refreshReclassBackupCount() {
     const list = await listReclassBackups().catch(() => [] as IndexBackup[])
     set({ reclassifyBackupCount: list.length })
+  },
+
+  /**
+   * 刷新「可撤销的知末重排备份」条数（`zhimo-reclass-*`）。
+   * 与 `refreshReclassBackupCount` 同形，只是换了通道前缀。
+   */
+  async refreshZhimoReclassBackupCount() {
+    const list = await listReclassBackups(ZHIMO_RECLASS_BACKUP_PREFIX).catch(
+      () => [] as IndexBackup[]
+    )
+    set({ zhimoReclassBackupCount: list.length })
   },
 
   /**
@@ -3991,13 +4405,56 @@ function scheduleAiClassify(): void {
  * 与 `scheduleAiClassify` 同一理由与同一写法：抓取是**后置任务**，
  * 不能坐在导入的 Promise 链里（导入耗时必须与"是否开封面抓取"严格无关）。
  *
- * 双触发（`store.importPaths` 收尾 + main 的 `import:batchDone`）都走这里：
+ * ⚠️ 导入结束的两个触发点（`store.importPaths` 收尾 + main 的 `import:batchDone`）
+ * **不再**直接调本函数 —— 它们走 `scheduleZhimoPipeline()`（先站方分类重排、再抓封面，
+ * 串行打同一个站）。本函数只剩 `runZhimoCovers` 收尾时的一个用途：
+ * 运行期间又导入了新资产（`pendingZhimoIds` 非空）→ 再排一次**仅封面**的补齐。
  * `pendingZhimoIds` 是消费型的（`runZhimoCovers` 里 splice 清空），
- * 第二次调用拿到空清单 → `pickZhimoCoverTargets` 直接返回空 → 零请求。
+ * 第二次拿到空清单 → `pickZhimoCoverTargets` 直接返回空 → 零请求。
  */
 function scheduleZhimoCovers(): void {
   setTimeout(() => {
     void useVault.getState().runZhimoCovers()
+  }, 0)
+}
+
+/**
+ * 读「导入后按站方分类自动重排」开关（默认 **true**）。
+ *
+ * 字段已在 `shared/types.ts` 的 `Settings` 里定稿（`zhimoAutoCategory: boolean`），
+ * 这里直接读类型化字段，不再需要可选扩展 / cast。
+ * 语义与 `zhimoCover` 一致：只认严格 `false`，缺键 / 脏值一律按开
+ * （`normalizeSettings` 已在主进程侧收口，这里再兜一层，防未归一化的对象流进来）。
+ */
+function zhimoAutoCategoryEnabled(settings: Settings | null): boolean {
+  return settings?.zhimoAutoCategory !== false
+}
+
+/**
+ * 导入批次结束后的**知末后置流水线**：先「站方分类重排」，跑完再「抓封面」。
+ *
+ * 为什么必须链式、不能像以前那样两个 `schedule*` 同时发起：
+ * 两者打的是**同一个站**（`znzmo.com`），并行会让请求量翻倍、更容易被限流 403；
+ * 而重排只 GET 详情页（便宜、且是分类的唯一来源），封面要下图片（贵），
+ * 所以顺序写死为「重排 → 封面」。
+ *
+ * 仍然保持 `setTimeout(0)`：整条流水线必须离开导入的 Promise 链
+ * （导入耗时不能因为开了这两个开关而增加一毫秒）。
+ *
+ * 双触发（`store.importPaths` 收尾 + main 的 `import:batchDone`）都走这里，
+ * 由各自的模块级重入锁 + 消费型清单保证不会重复劳动。
+ */
+function scheduleZhimoPipeline(): void {
+  setTimeout(() => {
+    void (async () => {
+      const state = useVault.getState()
+      if (zhimoAutoCategoryEnabled(state.settings)) {
+        // 永不抛错（内部兜底）；再 catch 一层只是防将来改坏
+        await state.runZhimoCategoryReclass().catch(() => undefined)
+      }
+      // 重排结束后才抓封面（串行打站）；开关关闭时 runZhimoCovers 自己会早退
+      await useVault.getState().runZhimoCovers().catch(() => undefined)
+    })()
   }, 0)
 }
 

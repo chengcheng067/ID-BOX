@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useVault } from '../store'
+import { useVault, type ZhimoReclassSummary } from '../store'
 import { DISPOSAL_LABEL, SEVEN_ZIP_DOWNLOAD_URL } from '../../shared/types'
 import type { AiClassifySettings, AliasRecord, ArchiveDisposal, MotionQuality } from '../../shared/types'
 import { MOTION_PROFILES, MOTION_QUALITY_ORDER } from '../../shared/motionQuality'
@@ -18,6 +18,14 @@ import {
   type AliasSuggestion
 } from '../logic/aliasIndex'
 import { RETENTION_OPTIONS } from '../logic/trashView'
+// 删除撤销期（2026-10 用户需求）：三档选项与文案只从 `logic/graceText.ts` 取，
+// 与删除链路（右键菜单 / 详情面板 / 确认弹窗）共用同一份口径，避免两处文案漂移。
+import { UNDO_GRACE_OPTIONS } from '../logic/graceText'
+import { normalizeUndoGraceMs } from '../../shared/undoGrace'
+// 知末「站方分类重排」：候选筛选与备份前缀都用**同一个**纯逻辑模块，
+// 与 `store.runZhimoCategoryReclass` 完全同一口径（渲染层不另写一套判定）。
+// 备份前缀只从常量取（`'zhimo-reclass-'`），绝不在 UI 里手抄字符串 —— 抄一份就会漂移。
+import { ZHIMO_RECLASS_BACKUP_PREFIX, isZhimoReclassCandidate } from '../logic/zhimoReclass'
 // DEF-19-3：库目录被改过 / 搬过之后，老资产的 folder 不在新根下 → 主进程的
 // probeSizes 守卫会一律拒绝（这是对的），但"整库尺寸补不上"必须在界面上有解释。
 // 判据是纯函数，和分辨率浮层的就近提示**共用同一份**（两套判据必然漂移）。
@@ -104,6 +112,83 @@ function Toggle({
       <span
         className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${checked ? 'left-[18px]' : 'left-0.5'}`}
       />
+    </button>
+  )
+}
+
+/**
+ * 复选框的视觉标记（16×16 方块）。
+ *
+ * 沿用仓库既有语言，不另造一套：
+ * - 未勾 = §3.6 单选圆点 `RadioDot` 的同一档（`h-4 w-4` + `border-2 border-line`）；
+ *   形状用方块而不是圆 —— 圆已经被单选语义占用，方块对应 §3.3 选中徽章。
+ * - 已勾 = §3.3 `.check-badge` / `AssetGrid.SelectBox` 方块档：accent 底 + 白勾。
+ *
+ * 尺寸取 16×16 而不是 22×22：22 是网格卡片的选中徽章，放进设置页 12px 文字的行内
+ * 会过重；16 与 `RadioDot` 同档，正好配 `gap-2` 的行密度。
+ */
+function CheckMark({ checked, className = '' }: { checked: boolean; className?: string }) {
+  return (
+    <span
+      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border-2 transition ${
+        checked ? 'border-accent bg-accent text-white' : 'border-line text-transparent'
+      } ${className}`}
+    >
+      {checked && <IconCheck width={10} height={10} strokeWidth={3} />}
+    </span>
+  )
+}
+
+/**
+ * 自绘复选框行（用户 2026-10 拍板：「不要系统的默认控件」）。
+ *
+ * 为什么用 `<button>` 而不是 `<span>` + `tabIndex`：button 原生可聚焦、Enter/Space
+ * 直接切换，不需要再手写按键；`role="checkbox"` + `aria-checked` 保住复选框语义，
+ * 读屏仍读得出当前值。整行可点（不靠 `<label>` 的隐式关联：label 包 button
+ * 点了不会切换）。`disabled` 走 `aria-disabled`：属性 disabled 的 button 不可聚焦，
+ * 键盘用户会整行失踪 —— 这里置灰但仍可聚焦（与 `Toggle` 的「置灰不改值」口径一致）。
+ *
+ * ⚠️ 只换呈现、不改语义：每个调用点的 `onChange(next)` 与原 `e.target.checked`
+ * 完全等价（别名建议 `setPicked` / 强制重扫 `setForceAck` / 对账三个 apply 勾选）。
+ */
+function CheckRow({
+  checked,
+  onChange,
+  disabled = false,
+  align = 'center',
+  className = '',
+  title,
+  children
+}: {
+  checked: boolean
+  /** 新值（原 `e.target.checked` 的等价物） */
+  onChange: (next: boolean) => void
+  /** 置灰但不改值：仍然可聚焦、仍可读出 `aria-checked` */
+  disabled?: boolean
+  /** 单行用 `items-center`；多行文案要贴第一行对齐 → `items-start` */
+  align?: 'center' | 'start'
+  /** 调用点原有的排版（`mt-3` / `py-0.5` / `leading-relaxed`…） */
+  className?: string
+  title?: string
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={checked}
+      aria-disabled={disabled}
+      title={title}
+      onClick={() => {
+        if (disabled) return
+        onChange(!checked)
+      }}
+      className={`flex w-full gap-2 text-[12px] text-secondary transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/20 ${
+        align === 'start' ? 'items-start' : 'items-center'
+      } ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'} ${className}`}
+    >
+      <CheckMark checked={checked} className={align === 'start' ? 'mt-0.5' : ''} />
+      {children}
     </button>
   )
 }
@@ -669,19 +754,16 @@ function AliasTab() {
           </p>
           <div className="max-h-40 overflow-auto">
             {suggestions.map((s) => (
-              <label
+              <CheckRow
                 key={s.key}
-                className="flex items-center gap-2 py-0.5 text-[12px] text-secondary"
+                checked={picked.includes(s.key)}
+                onChange={(next) =>
+                  setPicked((prev) =>
+                    next ? [...prev, s.key] : prev.filter((k) => k !== s.key)
+                  )
+                }
+                className="py-0.5"
               >
-                <input
-                  type="checkbox"
-                  checked={picked.includes(s.key)}
-                  onChange={(e) =>
-                    setPicked((prev) =>
-                      e.target.checked ? [...prev, s.key] : prev.filter((k) => k !== s.key)
-                    )
-                  }
-                />
                 <span className="min-w-0 flex-1 truncate text-muted" title={s.sourceName}>
                   {s.sourceName}
                 </span>
@@ -689,7 +771,7 @@ function AliasTab() {
                 <span className="w-24 shrink-0 truncate font-medium text-primary" title={s.name}>
                   {s.name}
                 </span>
-              </label>
+              </CheckRow>
             ))}
           </div>
           <button
@@ -848,6 +930,38 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     failed: number
   } | null>(null)
   const [undoResult, setUndoResult] = useState<{ restored: number; failed: number } | null>(null)
+  /**
+   * 知末「站方分类重排」（手动通道）—— 与上面「重跑自动分类」是**两条不同的通道**：
+   * 上一段按**本地词表**重判，本段按**知末详情页的站方分类**重判；备份前缀、
+   * 撤销入口、进度状态全部独立（`zhimoReclass` / `zhimoReclassBackupCount`）。
+   *
+   * 候选数在**渲染层**算（`isZhimoReclassCandidate` 是纯函数，与 store 同一口径），
+   * 只用于按钮文案 + 置灰；真正跑的时候 store 会自己再筛一遍（索引可能刚变过）。
+   */
+  const zhimoReclass = useVault((s) => s.zhimoReclass)
+  const zhimoReclassBackupCount = useVault((s) => s.zhimoReclassBackupCount)
+  const runZhimoCategoryReclass = useVault((s) => s.runZhimoCategoryReclass)
+  const cancelZhimoCategoryReclass = useVault((s) => s.cancelZhimoCategoryReclass)
+  const refreshZhimoReclassBackupCount = useVault((s) => s.refreshZhimoReclassBackupCount)
+  /** 候选数（`allAssets` 复用上面 library drift 那一个选择器，不重复订阅） */
+  const zhimoCandidateCount = useMemo(
+    () => allAssets.filter(isZhimoReclassCandidate).length,
+    [allAssets]
+  )
+  const [zhimoReclassOpen, setZhimoReclassOpen] = useState(false)
+  const [zhimoReclassResult, setZhimoReclassResult] = useState<ZhimoReclassSummary | null>(null)
+  /**
+   * 本轮是否被用户主动取消。
+   *
+   * 为什么在组件里记而不是读 store：`runZhimoCategoryReclass` 的返回值没有
+   * `cancelled` 字段（老接口不动），而 `zhimoReclass.cancelRequested` 在结束时会被复位。
+   * 取消只能从本页面（或窗口关闭）发起，所以组件内记一个布尔就足够，且不会误报。
+   */
+  const [zhimoCancelled, setZhimoCancelled] = useState(false)
+  const [zhimoUndoResult, setZhimoUndoResult] = useState<{
+    restored: number
+    failed: number
+  } | null>(null)
   // AI 辅助分类（docs/15 §7）：表单先本地编辑，失焦/切换时落库（避免每敲一个字符写一次 settings.json）
   const aiSettings: AiClassifySettings = settings?.aiClassify ?? {
     enabled: false,
@@ -874,7 +988,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     void detectMaterialMerge()
     // 只读刷新「可恢复的重扫备份」条数（决定按钮可用性）
     void refreshRescanBackupCount()
-  }, [detectMaterialMerge, refreshRescanBackupCount])
+    // 只读刷新「可撤销的知末重排备份」条数（决定「撤销上次知末重排」按钮可用性）
+    void refreshZhimoReclassBackupCount()
+  }, [detectMaterialMerge, refreshRescanBackupCount, refreshZhimoReclassBackupCount])
 
   const refreshThumbStat = () => {
     void window.modvault.thumbStats().then(setThumbStat).catch(() => undefined)
@@ -904,6 +1020,80 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     setSaved(true)
     window.setTimeout(() => setSaved(false), 1200)
   }
+
+  /**
+   * 「按站方分类重排」运行中的进度块。
+   *
+   * 抽成变量是因为设置页段落与确认弹窗**共用同一份**（弹窗打开时遮住了下面的段落，
+   * 两处各写一遍必然漂移）。取消语义必须写在旁边：**取消 ≠ 回滚**，
+   * 底层只停止"发新请求"，已经抓到的命中照样落库 —— 写成"什么都没做"就是骗人。
+   */
+  const zhimoProgressBlock = zhimoReclass.running ? (
+    <div className="mt-2 flex flex-wrap items-center gap-3 rounded-lg border border-line bg-canvas px-3 py-2">
+      <span className="text-[11px] text-secondary">
+        已完成 <span className="font-semibold text-primary">{zhimoReclass.done}</span> / 共{' '}
+        {zhimoReclass.total}
+      </span>
+      <button
+        className="btn !py-1 text-xs"
+        disabled={zhimoReclass.cancelRequested}
+        onClick={() => {
+          // 本地记一笔"本轮被取消"（store 的 cancelRequested 结束时会复位，读不到历史）
+          setZhimoCancelled(true)
+          cancelZhimoCategoryReclass()
+        }}
+      >
+        {zhimoReclass.cancelRequested ? '正在停止…' : '取消'}
+      </button>
+      <span className="text-[10px] text-muted">
+        取消只是不再抓新记录；
+        <span className="text-secondary">已抓到的结果会照常落库</span>。
+      </span>
+    </div>
+  ) : null
+
+  /**
+   * 「按站方分类重排」结束后的汇总块（运行中不显示）。
+   *
+   * 六个桶全部列出，`approx` **单列并解释** —— 它是 `moved` 的子集，
+   * 代表"站方类目在本地没有一一对应，按已核准的相近类目归并"的条数，
+   * 是用户判断"有多少条是就近猜的"的唯一依据。
+   */
+  const zhimoResultBlock =
+    zhimoReclassResult && !zhimoReclass.running ? (
+      <div className="mt-2 rounded-lg border border-line bg-canvas px-3 py-2 text-[11px] leading-relaxed text-secondary">
+        <div>
+          {zhimoCancelled ? (
+            <>
+              已取消：本轮抓取 {zhimoReclassResult.scanned} / 共 {zhimoReclass.total} 条候选
+              {zhimoReclassResult.scanned < zhimoReclass.total ? '（剩余未跑）' : ''}，
+              <span className="text-secondary">已抓到的结果已照常落库</span>。
+            </>
+          ) : (
+            <>上次重排完成。</>
+          )}
+        </div>
+        <div className="mt-1">
+          移动{' '}
+          <span className="font-semibold text-primary">{zhimoReclassResult.moved}</span>{' '}
+          个（其中近似归并{' '}
+          <span className="font-semibold">{zhimoReclassResult.approx}</span> 个）；多候选{' '}
+          {zhimoReclassResult.ambiguous} · 未映射 {zhimoReclassResult.unmapped} · 站方未给{' '}
+          {zhimoReclassResult.noStation} · 失败{' '}
+          <span
+            className={
+              zhimoReclassResult.failed > 0 ? 'font-semibold text-danger' : 'font-semibold'
+            }
+          >
+            {zhimoReclassResult.failed}
+          </span>
+          。
+        </div>
+        <div className="mt-1 text-[10px] text-muted">
+          「近似归并」= 站方类目在本地没有一一对应，按已核准的「相近类目」归并（日志里标 approx）。
+        </div>
+      </div>
+    ) : null
 
   const clearThumbs = async () => {
     setClearing(true)
@@ -1360,6 +1550,23 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         </div>
       </div>
 
+      {/* ── 知末「按站方分类」自动落库（默认开）────────────────────────────
+          与上面两个封面开关**互不牵连**：它管的是"分类"这条后置任务
+          （导入批次结束后先重排、再抓封面，串行打同一个站）。
+          只约束自动任务 —— 设置页「按站方分类重排」的手动按钮不看这个开关。 */}
+      <Row
+        title="按站方分类自动落库"
+        desc="导入批次结束后，用知末站方的分类把仍是「未分类」的资产搬到对应目录。只处理未分类的资产，已分类的一律不动；手动按钮不受此开关影响。"
+      >
+        <Toggle
+          checked={settings.zhimoAutoCategory}
+          onChange={(v) => {
+            void saveSettings({ zhimoAutoCategory: v })
+            flash()
+          }}
+        />
+      </Row>
+
       {/* ── 0.6.0 批量重命名：默认命名模板（只影响「重命名…」弹窗的初值） ──
           只改**文件夹名**，不改包里的文件；真正落盘前还有预览表 + 冲突拦截 + 失败回滚。 */}
       <Row
@@ -1573,6 +1780,92 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             {undoResult.failed > 0 && (
               <>
                 ，失败 <span className="font-semibold text-danger">{undoResult.failed}</span> 个
+              </>
+            )}
+            。
+          </p>
+        )}
+      </div>
+
+      {/* ── 知末「按站方分类重排」（手动通道）──────────────────────────────
+          与上一段「重跑自动分类」是**两条不同的通道**（不是同一功能的两个入口）：
+          上一段按**本地词表**重判，本段按**知末详情页的站方分类**重判；
+          备份前缀 `zhimo-reclass-` 与老通道的 `reclass-` 互不可见，各自留 3 份、各撤各的。
+          只处理「未分类」+ 带知末 ID 的资产（已分类的一个人工归类都不碰）。 */}
+      <div className="mt-4">
+        <SectionTitle>按站方分类重排</SectionTitle>
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            className="btn !py-1.5 text-xs"
+            disabled={
+              zhimoReclass.running || reclassifyBusy || zhimoCandidateCount === 0 || materialMergeBusy
+            }
+            onClick={() => {
+              setZhimoReclassResult(null)
+              setZhimoUndoResult(null)
+              setZhimoCancelled(false)
+              setZhimoReclassOpen(true)
+            }}
+            title={
+              materialMergeBusy
+                ? '材质大类合并进行中，暂不能重排分类'
+                : reclassifyBusy
+                  ? '另一条分类通道正在跑，请稍候'
+                  : zhimoCandidateCount === 0
+                    ? '当前没有「未分类」且带知末 ID 的资产'
+                    : '按知末站方分类重排；会真实移动目录，移动前自动备份，可撤销'
+            }
+          >
+            <IconRefresh />
+            {zhimoReclass.running ? '处理中…' : `按站方分类重跑（${zhimoCandidateCount} 个）`}
+          </button>
+          <button
+            className="btn !py-1.5 text-xs"
+            disabled={zhimoReclass.running || reclassifyBusy || zhimoReclassBackupCount === 0}
+            onClick={async () => {
+              setZhimoReclassResult(null)
+              const r = await undoLastReclassify(ZHIMO_RECLASS_BACKUP_PREFIX)
+              setZhimoUndoResult(r)
+              void refreshZhimoReclassBackupCount()
+            }}
+            title={
+              zhimoReclassBackupCount === 0
+                ? '还没有知末重排备份：每次重排移动前会自动备份一份'
+                : '把上次「按站方分类重排」移动过的资产按原分类搬回去（备份前缀 zhimo-reclass-，与「重跑自动分类」的 reclass- 互不干扰）'
+            }
+          >
+            <IconRefresh />
+            撤销上次知末重排
+          </button>
+          <span className="text-[11px] text-muted">
+            {zhimoReclassBackupCount > 0
+              ? `可撤销备份 ${zhimoReclassBackupCount} 份（只保留最近 3 份）`
+              : '暂无知末重排备份'}
+          </span>
+        </div>
+        <p className="mt-2 text-[10px] leading-relaxed text-muted">
+          只处理<span className="text-secondary">「未分类」且带知末 ID</span>
+          的资产：按知末详情页的站方分类搬到对应目录，会
+          <span className="text-secondary">真实移动磁盘上的目录</span>
+          （以磁盘为准）；移动前自动备份，只保留最近 3 份。部分站方类目在本地没有对应，会按已核准的
+          「相近类目」归并，并在日志里标 <code>approx</code>
+          {zhimoCandidateCount > 0 && (
+            <>
+              ；当前有 <span className="font-semibold text-primary">{zhimoCandidateCount}</span> 个候选。
+            </>
+          )}
+          {zhimoCandidateCount === 0 && '。'}
+        </p>
+        {zhimoProgressBlock}
+        {zhimoResultBlock}
+        {zhimoUndoResult && (
+          <p className="mt-1 text-[11px] text-secondary">
+            上次撤销：还原{' '}
+            <span className="font-semibold text-primary">{zhimoUndoResult.restored}</span> 个
+            {zhimoUndoResult.failed > 0 && (
+              <>
+                ，失败 <span className="font-semibold text-danger">{zhimoUndoResult.failed}</span>{' '}
+                个
               </>
             )}
             。
@@ -1808,6 +2101,54 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   const dataTab = (
     <div>
+      {/* ── 删除撤销期（2026-10 用户需求原话：「删除是否要等 5 秒在设置里面给用户权限，
+             因为不是所有用户都需要等 5 秒撤销的。」）──────────────────────────
+          三档：不等待 / 3 秒 / 5 秒（默认）。控件语言完全沿用仓库既有自绘档：
+          `Row`（标题+说明+右侧操作） + `RadioDot`（§3.6 单选圆点）——
+          **不用原生 radio / 原生 select**（用户 2026-10 拍板「不要系统默认控件」）。
+          ⚠️「不等待」只取消倒计时条，**二次确认弹窗仍然在**：说明文案必须写死这一点，
+          否则用户会以为"不等待"= 一键直删。 */}
+      <Row
+        title="删除撤销期"
+        desc="删除确认后给多久的反悔时间。选「不等待」时仍会二次确认，但确认后立即移入回收站，没有倒计时条。"
+      >
+        <div
+          className="flex items-center gap-1 rounded-btn border border-line p-0.5"
+          role="radiogroup"
+          aria-label="删除撤销期"
+        >
+          {UNDO_GRACE_OPTIONS.map((opt) => {
+            // 归一化后再比对：万一 settings 被手改成 9999（主进程会 clamp，但内存对象
+            // 也可能来自旧版本/测试桩），界面上仍然高亮「5 秒」而不是三个都不选中。
+            const active = normalizeUndoGraceMs(settings.undoGraceMs) === opt.value
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                title={opt.hint}
+                className={`flex items-center gap-1.5 rounded-btn px-1.5 py-1 text-[12px] transition ${
+                  active
+                    ? 'bg-accent-tint font-semibold text-accent-text'
+                    : 'text-secondary hover:bg-elevated/60'
+                }`}
+                onClick={() => {
+                  void saveSettings({ undoGraceMs: opt.value })
+                  flash()
+                }}
+              >
+                <RadioDot checked={active} />
+                <span>{opt.label}</span>
+                {opt.value === 5000 && (
+                  <span className="text-[10px] font-normal text-muted">默认</span>
+                )}
+              </button>
+            )
+          })}
+        </div>
+      </Row>
+
       {/* 缩略图缓存：显示当前数量 / 占用，一键清空（清空后网格回退占位图，按需重建） */}
       <Row
         title="缩略图缓存"
@@ -2177,19 +2518,18 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               <p className="mt-2 text-[12px] leading-relaxed text-muted">
                 删除前会自动写入一份完整备份；确认后仍可用「恢复上次重扫前索引」救回（磁盘文件需你自己放回原位）。
               </p>
-              <label className="mt-3 flex items-start gap-2 text-[12px] leading-relaxed text-secondary">
-                <input
-                  type="checkbox"
-                  className="mt-0.5"
-                  checked={forceAck}
-                  onChange={(e) => setForceAck(e.target.checked)}
-                />
+              <CheckRow
+                checked={forceAck}
+                onChange={setForceAck}
+                align="start"
+                className="mt-3 leading-relaxed"
+              >
                 <span>
                   {forceGone > 0
                     ? '我已了解标签 / 备注 / 风格会丢失，仍要强制重扫'
                     : '我已了解，确认强制重扫'}
                 </span>
-              </label>
+              </CheckRow>
               <div className="mt-4 flex justify-end gap-2">
                 <button className="btn" onClick={() => setForceOpen(false)}>
                   取消
@@ -2296,36 +2636,30 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 )}
               </div>
 
-              {/* 三个复选框默认全 false：勾选后才会修改 */}
+              {/* 三个勾选项默认全 false：勾选后才会修改（自绘控件，不用系统默认控件） */}
               <div className="mt-3 space-y-1.5">
                 <p className="text-[11px] text-tertiary">勾选后才会修改（默认全部不勾）：</p>
-                <label className="flex items-center gap-2 text-[12px] text-secondary">
-                  <input
-                    type="checkbox"
-                    checked={pickMissing}
-                    disabled={report.counts['missing-on-disk'] === 0}
-                    onChange={(e) => setPickMissing(e.target.checked)}
-                  />
-                  移除索引中磁盘已不存在的 {report.counts['missing-on-disk']} 项
-                </label>
-                <label className="flex items-center gap-2 text-[12px] text-secondary">
-                  <input
-                    type="checkbox"
-                    checked={pickNotIndexed}
-                    disabled={report.counts['not-in-index'] === 0}
-                    onChange={(e) => setPickNotIndexed(e.target.checked)}
-                  />
-                  把磁盘上已有的 {report.counts['not-in-index']} 项补入索引
-                </label>
-                <label className="flex items-center gap-2 text-[12px] text-secondary">
-                  <input
-                    type="checkbox"
-                    checked={pickMismatch}
-                    disabled={report.counts['category-mismatch'] === 0}
-                    onChange={(e) => setPickMismatch(e.target.checked)}
-                  />
-                  按磁盘目录名修正 {report.counts['category-mismatch']} 项分类
-                </label>
+                <CheckRow
+                  checked={pickMissing}
+                  disabled={report.counts['missing-on-disk'] === 0}
+                  onChange={setPickMissing}
+                >
+                  <span>移除索引中磁盘已不存在的 {report.counts['missing-on-disk']} 项</span>
+                </CheckRow>
+                <CheckRow
+                  checked={pickNotIndexed}
+                  disabled={report.counts['not-in-index'] === 0}
+                  onChange={setPickNotIndexed}
+                >
+                  <span>把磁盘上已有的 {report.counts['not-in-index']} 项补入索引</span>
+                </CheckRow>
+                <CheckRow
+                  checked={pickMismatch}
+                  disabled={report.counts['category-mismatch'] === 0}
+                  onChange={setPickMismatch}
+                >
+                  <span>按磁盘目录名修正 {report.counts['category-mismatch']} 项分类</span>
+                </CheckRow>
                 <p className="text-[10px] leading-relaxed text-muted">
                   移除索引前会自动备份被删记录（可从「恢复上次重扫前索引」找回），素材文件本身不会被删除。
                 </p>
@@ -2455,6 +2789,61 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           {reclassResult && (
             <div className="mt-3 flex justify-end">
               <button className="btn" onClick={() => setReclassOpen(false)}>
+                关闭
+              </button>
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {/* 知末「按站方分类重排」确认弹窗（结构照「重跑自动分类」那条）：
+          候选数写清楚，并明确"会真实搬目录"与"取消 ≠ 回滚"。 */}
+      {zhimoReclassOpen && (
+        <Modal
+          title="确认按站方分类重排"
+          onClose={() => {
+            if (!zhimoReclass.running) setZhimoReclassOpen(false)
+          }}
+          width="max-w-md"
+        >
+          <p className="text-[13px] leading-relaxed">
+            将处理 <span className="font-semibold text-danger">{zhimoCandidateCount}</span> 个
+            「未分类」且带知末 ID 的资产：
+            <span className="text-secondary">
+              按知末详情页上的站方分类把它们搬到对应分类目录（
+              <b>会真实移动磁盘上的目录</b>；已分类的资产一律不动）。
+            </span>
+          </p>
+          <p className="mt-2 text-[12px] leading-relaxed text-muted">
+            移动前会自动写一份备份（只保留最近 3 份），跑完后可在设置页点「撤销上次知末重排」按原分类搬回。
+            过程需要逐条访问知末详情页，可能持续几分钟；请不要关闭应用或手动改动库目录。
+          </p>
+          {zhimoProgressBlock}
+          {zhimoResultBlock}
+          {!zhimoReclass.running && !zhimoReclassResult && (
+            <div className="mt-4 flex justify-end gap-2">
+              <button className="btn" onClick={() => setZhimoReclassOpen(false)}>
+                取消
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={zhimoCandidateCount === 0}
+                onClick={async () => {
+                  setZhimoCancelled(false)
+                  setZhimoReclassResult(null)
+                  const r = await runZhimoCategoryReclass({ manual: true })
+                  setZhimoReclassResult(r)
+                  void refreshZhimoReclassBackupCount()
+                  flash()
+                }}
+              >
+                开始重排（{zhimoCandidateCount} 个）
+              </button>
+            </div>
+          )}
+          {zhimoReclassResult && !zhimoReclass.running && (
+            <div className="mt-3 flex justify-end">
+              <button className="btn" onClick={() => setZhimoReclassOpen(false)}>
                 关闭
               </button>
             </div>

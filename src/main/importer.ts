@@ -16,7 +16,17 @@ import {
 } from './fsutil'
 import { kindFolder, kindOfExt, pickCover, primaryKind } from '../shared/classify'
 import { isHdrExt, panoramaNoteFromName } from '../shared/hdrExts'
-import { composeRelFolder, dedupeKeyOf, pickAssetName, sanitizeName, stripNoise, uniqueName, zhimoIdFromSources } from '../shared/naming'
+import {
+  composeRelFolder,
+  dedupeKeyOf,
+  normalizeCategoryPair,
+  pickAssetName,
+  sanitizeCategorySegment,
+  sanitizeName,
+  stripNoise,
+  uniqueName,
+  zhimoIdFromSources
+} from '../shared/naming'
 import { classifyAssetName } from '../shared/classifyAsset'
 import { parseSkpVersion, SKP_HEAD_BYTES } from '../shared/skpVersion'
 import { IMAGE_FILE_EXTS } from '../shared/imageExts'
@@ -219,6 +229,49 @@ export function isInsideLibraryDir(libraryDir: string, target: string): boolean 
   const p = norm(target)
   if (!root || !p) return false
   return p === root || p.startsWith(root + path.sep)
+}
+
+/**
+ * DEF-14（0.7.8）：把「预分类给出的 category1/category2」变成**可落盘的目录段**。
+ *
+ * ## 缺陷（DEF-14，`docs/08` §7.1）
+ *
+ * 词表里有含 `/` 的并列词条（`椅子/凳子`、`酒店/民宿`、`筒灯/射灯`、`金箔/银箔`、
+ * `灯膜/灯罩`…）。旧实现把**原始值**直接喂给 `path.join(lib, kind, cat1, cat2)`
+ * —— `path.join` 把 `/` 当目录分隔符 → 磁盘变**五段**；而 `relFolder` 走
+ * `composeRelFolder`（内部已把 `/` 换成 `_`）→ 记录是**四段**，
+ * 于是 `asset.folder !== path.join(lib, asset.relFolder)`。下一次 `rescan`
+ * （固定三层下钻，`src/renderer/store.ts` 注释：磁盘目录名才是权威）把它读成
+ * `category2='椅子'` / `name='凳子'` —— **分类和资产名同时损坏**。
+ *
+ * ## 修法（只改导入侧，不动 `composeRelFolder` / `sanitizeCategorySegment` / rescan）
+ *
+ * 在**算目录之前**一次算出 `cat1`/`cat2`，并让三处共用同一对字符串：
+ * ① `cat2Dir` 的分段；② `composeRelFolder` 的分段；③ `Asset.category1/2`。
+ * 记录必须存**净化后**的值（不是词表原貌）：rescan 以磁盘为权威，存原始值只会
+ * 造成"记录先假一致、用户点一次重新扫描就被推翻"。
+ *
+ * 两道清洗，顺序有意义：
+ * 1. `normalizeCategoryPair` —— 与用户「指派分类」IPC（`main/index.ts:assignCategory`）
+ *    **同一口径**（`cleanSegment` / `ILLEGAL_RE`）：Windows 非法字符 `<>:"/\|?*` 与控制
+ *    字符 → `_`，收拢空白、去尾部 `.`/空格、超长按码点截断。这样「导入落盘」与
+ *    「事后指派」不会给出两个不同的目录名。
+ * 2. `sanitizeCategorySegment` —— 就是 `composeRelFolder` 内部用的那个函数（幂等）。
+ *    保留这一步是为了让「磁盘段 = relFolder 段」由**同一个函数**保证，
+ *    不依赖第 1 步的实现细节（将来任一侧改规则，这里仍然是同一条）。
+ *
+ * ⚠️ 不在这里做任何 IO，纯函数；两个导入路径（压缩包 `importOne` / 单图 `importMediaOne`）
+ * 都必须在 `mkdir` 之前调用。
+ */
+function resolveCategorySegments(
+  category1: string,
+  category2: string
+): { cat1Seg: string; cat2Seg: string } {
+  const pair = normalizeCategoryPair(category1, category2)
+  return {
+    cat1Seg: sanitizeCategorySegment(pair.category1),
+    cat2Seg: sanitizeCategorySegment(pair.category2)
+  }
 }
 
 /**
@@ -704,6 +757,16 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
       kind
     )
 
+    // ── DEF-14（0.7.8）：落盘段必须在**算目录之前**净化，且只算一次 ────────────
+    // 词表里有含 `/` 的并列词条（「椅子/凳子」「酒店/民宿」「筒灯/射灯」「金箔/银箔」…）。
+    // 旧实现把原始值直接喂给 `path.join`，而 `relFolder` 走 `composeRelFolder`（内部已把
+    // `/` 换成 `_`）→ 磁盘变五段、记录四段、`folder ≠ libraryDir + relFolder`；
+    // rescan 固定三层下钻回读后 `category2='椅子'`、`name='凳子'`（分类 + 资产名双损）。
+    //
+    // 修法见 `resolveCategorySegments`：`cat1Seg/cat2Seg` 同时用于 `cat2Dir` 分段、
+    // `relFolder` 分段、`Asset.category1/2` —— 三者必须逐字相等。
+    const { cat1Seg, cat2Seg } = resolveCategorySegments(category1, category2)
+
     // ── 判重点（docs/27 §2.3）：解压之后、**任何 mkdir 之前** ────────────────
     // 位置是硬约束：判定早于 `mkdir(cat2Dir)` 才能保证「跳过」连空分类目录都不产生
     // （§3.1 / §6.1 判据 ①）。空间预检（P0-3）仍然严格更早，故不破坏
@@ -756,7 +819,7 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
       // D10：id / 名称 / 分类 / 磁盘路径全是旧的，只换内容与派生字段
       const target = overwriteMatch.folder
       const relFolder =
-        overwriteMatch.relFolder || composeRelFolder(folderName, category1, category2, overwriteMatch.name)
+        overwriteMatch.relFolder || composeRelFolder(folderName, cat1Seg, cat2Seg, overwriteMatch.name)
       const replace = await replaceAssetFolder(target, overwriteMatch.id, deps, (t) =>
         moveDir(contentRoot, t)
       )
@@ -772,7 +835,7 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
       // ── T06 固定四层：<大类>/<一级>/<二级>/<资产名>（06 §11.1） ────────
       // ⚠️ 空间预检已在本函数更早处完成（P0-3），此处才允许第一次 mkdir。
       //    预检必须严格早于任何 mkdir（含分类目录），否则"空间不足不产生半成品"契约（:163 断言）会红。
-      const cat2Dir = path.join(deps.libraryDir, folderName, category1, category2)
+      const cat2Dir = path.join(deps.libraryDir, folderName, cat1Seg, cat2Seg)
       await fs.mkdir(cat2Dir, { recursive: true }) // 一次建齐两级
 
       let diskNames: string[] = []
@@ -796,7 +859,7 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
         id: overwriteMatch ? overwriteMatch.id : randomUUID(),
         finalName,
         target,
-        relFolder: composeRelFolder(folderName, category1, category2, finalName),
+        relFolder: composeRelFolder(folderName, cat1Seg, cat2Seg, finalName),
         replace: null,
         inheritFrom: null
       }
@@ -907,8 +970,10 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
       mojibake: extractMojibake,
       // T06：预分类命中词表 → 落词表类目；未命中落双哨兵。
       // 真实分类仍可由用户在 UI 指派（assignCategory）后迁移
-      category1,
-      category2,
+      // DEF-14（0.7.8）：**存净化后的段**（= 磁盘目录段 = relFolder 段），不是词表原貌。
+      // 词表原貌仍留在 `zhimoId` / 归类命中的 matchedTerm 侧，UI 展示不需要它。
+      category1: cat1Seg,
+      category2: cat2Seg,
       styles: [],
       materialMeta,
       tags: [],
@@ -1038,6 +1103,11 @@ async function importMediaOne(
   // `hdri` 在一级容器表里没有条目 → 必然回退到 `未分类/未分类`（预期行为）。
   const { category1, category2 } = classifyAssetName(assetName, [itemName], kind)
 
+  // ── DEF-14（0.7.8）：与压缩包路径同一条修法，必须在此处（**算目录之前**）净化 ──
+  // 单图也会命中含 `/` 的词条（例：「金箔.png」→ 金属/金箔/银箔），不净化的后果与
+  // 压包完全相同（磁盘五段 / 记录四段 / rescan 回读改名）。实现见 `resolveCategorySegments`。
+  const { cat1Seg, cat2Seg } = resolveCategorySegments(category1, category2)
+
   deps.emit({ item: src, itemName, status: 'organizing', message: '正在分类归档…' })
 
   // ── 判重点（docs/27 §2.3）：**早于任何 mkdir**（含上面的 cat2Dir 与下面的占位目录）──
@@ -1079,7 +1149,7 @@ async function importMediaOne(
     // 资产名（= 目录名）保持旧值。
     const target = overwriteMatch.folder
     const relFolder =
-      overwriteMatch.relFolder || composeRelFolder(folderName, category1, category2, overwriteMatch.name)
+      overwriteMatch.relFolder || composeRelFolder(folderName, cat1Seg, cat2Seg, overwriteMatch.name)
     const replace = await replaceAssetFolder(target, overwriteMatch.id, deps, async (t) => {
       await fs.mkdir(t)
       try {
@@ -1099,7 +1169,7 @@ async function importMediaOne(
       inheritFrom: overwriteMatch
     }
   } else {
-    const cat2Dir = path.join(deps.libraryDir, folderName, category1, category2)
+    const cat2Dir = path.join(deps.libraryDir, folderName, cat1Seg, cat2Seg)
     await fs.mkdir(cat2Dir, { recursive: true })
 
     // 防重名 + 并发安全：mkdir（非 recursive）当作"占位锁"——EEXIST 说明
@@ -1158,7 +1228,7 @@ async function importMediaOne(
       id: overwriteMatch ? overwriteMatch.id : randomUUID(),
       finalName,
       target,
-      relFolder: composeRelFolder(folderName, category1, category2, finalName),
+      relFolder: composeRelFolder(folderName, cat1Seg, cat2Seg, finalName),
       replace: null,
       inheritFrom: null
     }
@@ -1215,8 +1285,10 @@ async function importMediaOne(
     suVersion: undefined,
     suMajor: undefined,
     mojibake: false,
-    category1,
-    category2,
+    // DEF-14（0.7.8）：与压缩包路径同口径 —— 记录存**净化后的段**，
+    // 保证 `asset.category1/2` 与磁盘目录段逐字相等（rescan 以磁盘为权威）。
+    category1: cat1Seg,
+    category2: cat2Seg,
     styles: [],
     materialMeta: undefined,
     tags: [],

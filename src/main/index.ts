@@ -12,6 +12,8 @@ import {
   type Asset,
   type FetchZhimoCoverPayload,
   type FetchZhimoCoverResult,
+  type FetchZhimoMetaPayload,
+  type FetchZhimoMetaResult,
   type ImportConflictAnswer,
   type ImportConflictAsk,
   type ImportConflictContext,
@@ -53,9 +55,10 @@ import {
 import { findSevenZip, thumbsDir } from './paths'
 import { fetchLatestRelease } from './updateCheck'
 import { freeBytesOf } from './disk'
-import { deleteThumb, deleteOneThumb, ensureThumb, clearThumbs, listThumbFiles, pruneThumbs, thumbStats } from './thumb'
+import { deleteThumb, deleteOneThumb, ensureThumb, ensurePreview, clearThumbs, listThumbFiles, pruneThumbs, thumbStats } from './thumb'
 import { MAX_COVER_IMAGE_BYTES, writeCoverImageInto } from './coverImage'
 import {
+  fetchZhimoMeta,
   refreshZhimoCoverInto,
   zhimoCoverFailLogContext,
   type ZhimoAttemptFailure
@@ -1251,6 +1254,47 @@ ipcMain.handle(IPC.setCoverImage, async (_e, payload: SetCoverImagePayload) => {
 })
 
 /**
+ * 知末**只取详情页**的轻量通道（站方分类 / 风格 / 版本 / 标题）。
+ *
+ * 为什么单独开一条通道，而不是复用封面通道：
+ * 封面通道必须走完「详情页 → 下图片 → 校验 ≥200px」十步才算成功，
+ * **图片 404 / 太小会让"详情页其实已经拿到分类"一起丢**。
+ * 本通道只发一次详情页 GET，解析 `classifyBaseName` 等元信息，
+ * **零图片请求、零写盘**，因此也**不需要 `folder` / 库内越界校验**。
+ *
+ * 只做三件事：
+ *   ① 参数校验：`id` 非字符串 / 空 → `no-id`（核心模块会再校验一次格式，不发请求）；
+ *   ② 调 `fetchZhimoMeta({ id })`（它**绝不抛错**，失败返回 reason）；
+ *   ③ 失败记一条 warn（**不是 error**：站方没有这个 ID / 网络抖动都是正常业务结果），
+ *      成功原样把四个字段回给渲染层（`null` = 站方没给，**不是失败**）。
+ *
+ * ⚠️ 本通道**不做分类映射**：渲染层落库前必须查
+ * `shared/zhimoTaxonomyMap.ts` 的 `mapZhimoCategory(name, kind)`。
+ */
+ipcMain.handle(
+  IPC.fetchZhimoMeta,
+  async (_e, payload: FetchZhimoMetaPayload): Promise<FetchZhimoMetaResult> => {
+    const id = typeof payload?.id === 'string' ? payload.id : ''
+    if (!id) return { ok: false, reason: 'no-id' }
+
+    const res = await fetchZhimoMeta({ id })
+    if (!res.ok) {
+      logWarn('zhimo:meta-failed', { id, reason: res.reason })
+      return { ok: false, reason: res.reason }
+    }
+
+    // 显式摊平四个字段（不透传内部对象，避免将来加字段时无意改 IPC 契约）
+    return {
+      ok: true,
+      classifyBaseName: res.classifyBaseName,
+      style: res.style,
+      version: res.version,
+      title: res.title
+    }
+  }
+)
+
+/**
  * 知末封面抓取（docs/24 §3.4，T-03）。
  *
  * 只做四件事（抓取/解析/校验/落盘全在 `zhimoCover.ts`，那里刻意不 import electron，
@@ -1392,6 +1436,30 @@ ipcMain.on(IPC.dragStart, (event, filePath: string, thumbName?: string | null, c
 ipcMain.handle(IPC.thumbEnsure, (_e, id: string, coverAbs: string | null) =>
   ensureThumb(id, coverAbs, { maxPx: settings.thumbMaxPx })
 )
+
+/**
+ * ≤1024 预览图（docs/26 方案 C + H：拖拽卡片不再解码原图）。
+ *
+ * 越界校验与 `drag:start` 同一口径：**只接受库目录内**的源文件。
+ * `ensureThumb` 的 coverAbs 是主进程自己算出来的，而这里路径来自渲染层，
+ * 所以必须自己再挡一道（否则被注入的渲染层可以让主进程去解码任意路径的图片）。
+ * 校验不过返回 null（渲染层回退缩略图，不弹错、不阻断拖拽）。
+ */
+ipcMain.handle(IPC.thumbPreview, (_e, id: string, absPath: string | null) => {
+  if (!id || !absPath) return null
+  try {
+    const lib = path.resolve(settings.libraryDir)
+    const abs = path.resolve(absPath)
+    if (!isWithinRoot(lib, abs, path.sep)) {
+      logWarn('thumb:preview:rejected-outside-library', { absPath })
+      return null
+    }
+    return ensurePreview(id, abs)
+  } catch (err) {
+    logWarn('thumb:preview:failed', { id, absPath, error: String(err) })
+    return null
+  }
+})
 
 ipcMain.handle(IPC.thumbDelete, (_e, id: string) => deleteThumb(id))
 

@@ -52,9 +52,17 @@
  * ── 扩展属性（风格，2026-10 TODO-3）──────────────────────────────────
  * 详情页同一次 GET 里还带 `res.detailParamsExtract`（`style` / `renderer` / `polys` …）
  * 与 `res.classifyBaseName`。本模块**只解析**（`ZhimoDetailExtras`），
- * 其中 `style` 原样放进成功结果；**是否落库由渲染层按本地受控词表判定**
- * （`renderer/logic/zhimoStyle.ts`：只补空、只认词表、只对 model）。
- * 分类（`classifyBaseName`）与版本（`version`）**本批不落库**，理由见 `ZhimoDetailExtras`。
+ * 其中 `style` / `classifyBaseName` 原样放进成功结果（**仍是附加字段，不影响封面成败**）；
+ * **是否落库由渲染层判定**：
+ * - `style`：`renderer/logic/zhimoStyle.ts`（只补空、只认词表、只对 model）；
+ * - `classifyBaseName`：必须查 `shared/zhimoTaxonomyMap.ts` 的 `mapZhimoCategory()`，
+ *   **不准**直接写 `category1/2`（站方三级轴与本地两级不是一一对应）。
+ * `renderer` / `polys` 仍只解析不落库。
+ *
+ * ── 只取详情页的轻量入口（2026-10，站方分类）──────────────────────────
+ * 见文件末尾的 `fetchZhimoMeta()`：**只 GET 详情页、解析元信息、绝不下图片**。
+ * 存在理由：封面路径必须"下到图且 ≥200px"才算成功，图挂了会把已经拿到的
+ * 站方分类一起丢掉；本入口把"取分类"与"取封面"解耦（同样零 throw / 同一套重试口径）。
  */
 
 import { validateCoverImage, writeCoverImageInto, type CoverImageFormat } from './coverImage'
@@ -126,8 +134,10 @@ export interface ZhimoBreadcrumbItem {
  *
  * 全部来自**同一次 GET**（零额外请求）。
  *
- * ⚠️ 这批字段本批只做两件事：`style` 交给渲染层按本地词表过滤后可能落库；
- * 其余（`classifyBaseName` / `version` / `renderer` / `polys`）**只解析、不落库**：
+ * ⚠️ 这批字段的处理口径：
+ * - `style` / `classifyBaseName` **随成功结果带出去**（附加字段，不影响成败），
+ *   写不写库由渲染层判定（`style` 过词表；`classifyBaseName` 必须查映射表）；
+ * - `version` / `renderer` / `polys` **只解析、不落库**：
  * - `classifyBaseName` 是站方三级轴的名字，与本地重排过的两级分类不是一一对应
  *   （本地没有「墙饰墙绘」、`木材`/`木纹` 层级也不同）→ 不写 `category1/2`；
  * - `version` 是"上传时用的版本"，`.skp` 内嵌的才是真实版本 → **不写 `asset.suVersion`**；
@@ -194,6 +204,16 @@ export interface ZhimoCoverSuccess {
   watermarked: boolean
   title: string | null
   version: string | null
+  /**
+   * 站方三级分类名（如 `卡座沙发` / `壁灯`）；站方没给 → `null`。
+   *
+   * 与 `style` 一样是**附加信息**：解析不到绝不影响封面成败。
+   *
+   * ⚠️ 这是**站方原话**（`res.classifyBaseName`），与本地两级分类不是一一对应 ——
+   * 落库前必须查 `shared/zhimoTaxonomyMap.ts` 的 `mapZhimoCategory()`，
+   * **不要**直接写进 `asset.category1/2`（理由见 `ZhimoDetailExtras` 注释）。
+   */
+  classifyBaseName: string | null
   /**
    * 站方风格自由词（**原样，未经本地词表过滤**）；解析不到 / 占位 `--` 时为 `null`。
    *
@@ -491,6 +511,40 @@ function parseBreadcrumb(raw: unknown): ZhimoBreadcrumbItem[] | undefined {
 }
 
 /**
+ * 从详情页 HTML 取 `__NEXT_DATA__.props.pageProps`（**纯函数，绝不抛错**）。
+ *
+ * 抽成独立函数的理由：`parseZhimoDetail`（取图）与 `parseZhimoMeta`（分类/风格）
+ * 必须用**同一套**取值逻辑 —— 两份实现迟早会在"JSON 截断怎么办"这种边界上分叉。
+ *
+ * 解析不出（没有该 script / JSON 截断 / 结构不对）→ `null`（当没有，不抛错）。
+ */
+function pagePropsOf(html: string): Record<string, unknown> | null {
+  const source = typeof html === 'string' ? html : ''
+  const nextMatch = NEXT_DATA_RE.exec(source)
+  if (!nextMatch) return null
+  try {
+    const json: unknown = JSON.parse(nextMatch[1])
+    const props = isRecord(json) ? json.props : undefined
+    const rawProps = isRecord(props) ? props.pageProps : undefined
+    return isRecord(rawProps) ? rawProps : null
+  } catch {
+    return null // JSON 截断 / 非 JSON → 当没有
+  }
+}
+
+/**
+ * `pageProps` → 详情页数据根 `res`；不是普通对象 → `null`。
+ *
+ * ⚠️ 取值一律经过「类型 + 非空」双重判定：软 404 的 `res` 可能是 `{}`、
+ * 可能是 `{"0":"F","1":"o",…}`（错误文案按字符展开）、也可能是 `null`。
+ * JS 里对 null/字符串取属性只会得到 undefined，所以不必先判 `res` 是不是对象。
+ */
+function detailResOf(pageProps: Record<string, unknown> | null): Record<string, unknown> | null {
+  const raw = pageProps?.res
+  return isRecord(raw) ? raw : null
+}
+
+/**
  * 给定详情页 HTML → 解析结果（**纯函数，绝不抛错**）。
  *
  * 返回 `null` 的**唯一**条件：`__NEXT_DATA__` 与 JSON-LD **两条路径都解析不出图 URL**
@@ -505,25 +559,8 @@ export function parseZhimoDetail(html: string): ZhimoDetailInfo | null {
   const source = typeof html === 'string' ? html : ''
 
   // ── 路径 ①：__NEXT_DATA__（**取图的唯一来源**）──────────────────────
-  let pageProps: Record<string, unknown> | null = null
-  const nextMatch = NEXT_DATA_RE.exec(source)
-  if (nextMatch) {
-    try {
-      const json: unknown = JSON.parse(nextMatch[1])
-      const props = isRecord(json) ? json.props : undefined
-      const rawProps = isRecord(props) ? props.pageProps : undefined
-      pageProps = isRecord(rawProps) ? rawProps : null
-    } catch {
-      pageProps = null // JSON 截断 / 非 JSON → 当没有
-    }
-  }
-
-  // ⚠️ 取值一律经过「类型 + 非空」双重判定：软 404 的 `res` 可能是 `{}`、
-  //    可能是 `{"0":"F","1":"o",…}`（错误文案按字符展开）、也可能是 `null`。
-  //    JS 里对 null/字符串取属性只会得到 undefined，所以不必先判 res 是不是对象。
-  const res: Record<string, unknown> | null = isRecord(pageProps?.res)
-    ? (pageProps?.res as Record<string, unknown>)
-    : null
+  const pageProps = pagePropsOf(source)
+  const res = detailResOf(pageProps)
 
   // 图 URL 只从这里来：listImageUrl（无水印 400×300）→ mainImageUrl（带水印，仅兜底）
   const listImageUrl = nonEmptyString(res?.listImageUrl)
@@ -771,6 +808,9 @@ async function attemptFetchZhimoCover(
       watermarked,
       title: detail.title,
       version: detail.version,
+      // 站方三级分类名：**附加信息**（取不到就是 null）。
+      // 只带出去，不在主进程做映射 —— 映射表在 `shared/zhimoTaxonomyMap.ts`。
+      classifyBaseName: detail.detail?.classifyBaseName ?? null,
       // 风格只是**附加信息**：解析不到就是 null，绝不影响封面成败
       style: detail.detail?.style ?? null
     }
@@ -813,11 +853,72 @@ function normalizeBackoff(value: number | undefined): number {
 }
 
 /**
- * 抓取 + 校验（**有界重试**：只对 `timeout` / `network`，初次 + 1 次，退避 800ms）。
+ * 重试策略（`fetchZhimoCover` 与 `fetchZhimoMeta` **共用同一份口径**）。
  *
- * 重试结构刻意写成"单次尝试抽成 {@link attemptFetchZhimoCover}，外层一个按 reason
- * 判定是否继续的循环"——**不是**在每个 catch 里各写一遍重试，
- * 那样迟早出现"某个分支漏了判定 → 变成无限重试 / 所有失败都重试"。
+ * 单独抽出来的目的：两条入口的"哪些 reason 值得重试、最多几发、退避多久"
+ * **必须是同一套判定**（`isRetryableZhimoReason`）—— 各写一遍迟早分叉成
+ * "封面重试两次、元信息重试三次"这种说不清的行为。
+ */
+interface ZhimoRetryPolicy {
+  maxAttempts: number
+  backoffMs: number
+  sleep: (ms: number) => Promise<void>
+  onAttemptFailed?: (failure: ZhimoAttemptFailure) => void
+}
+
+/**
+ * 有界重试编排（**只对 `timeout` / `network`**，其余 reason 一次都不重试）。
+ *
+ * 结构刻意写成"单次尝试由调用方提供，外层一个按 reason 判定是否继续的循环"
+ * ——**不是**在每个 catch 里各写一遍重试，那样迟早出现
+ * "某个分支漏了判定 → 变成无限重试 / 所有失败都重试"。
+ *
+ * 每次尝试都重新计时（`elapsedMs` 只算本次，`totalMs` 含退避与之前的尝试），
+ * 诊断回调抛错会被吞掉（日志不该影响抓取结果）。
+ */
+async function runZhimoAttempts<T>(
+  policy: ZhimoRetryPolicy,
+  attemptOf: () => Promise<{ ok: true; value: T } | ZhimoStepFailure>
+): Promise<{ ok: true; value: T } | ZhimoCoverFailure> {
+  const startedAt = Date.now()
+
+  let attempt = 1
+  for (;;) {
+    const attemptStartedAt = Date.now()
+    const attemptResult = await attemptOf()
+    const elapsedMs = Date.now() - attemptStartedAt
+    const totalMs = Date.now() - startedAt
+
+    // 成功：无论第几次尝试成功，行为与返回值都和改造前完全一致
+    if (attemptResult.ok) return { ok: true, value: attemptResult.value }
+
+    const willRetry = attempt < policy.maxAttempts && isRetryableZhimoReason(attemptResult.reason)
+    const failure: ZhimoAttemptFailure = {
+      reason: attemptResult.reason,
+      step: attemptResult.step,
+      attempt,
+      elapsedMs,
+      totalMs,
+      willRetry
+    }
+    if (policy.onAttemptFailed) {
+      try {
+        policy.onAttemptFailed(failure)
+      } catch {
+        // 诊断回调（写日志）绝不能影响抓取结果
+      }
+    }
+
+    // 不可重试（no-id 之外的全部业务失败）/ 已经是最后一发 → 到此为止
+    if (!willRetry) return { ok: false, reason: attemptResult.reason }
+
+    if (policy.backoffMs > 0) await policy.sleep(policy.backoffMs)
+    attempt += 1
+  }
+}
+
+/**
+ * 抓取 + 校验（**有界重试**：只对 `timeout` / `network`，初次 + 1 次，退避 800ms）。
  *
  * 重试的是**整条流程**（而不是单步）：这样最坏耗时口径简单（每次尝试 = 一次
  * page 超时 + 一次 image 超时），也不会出现"页面已过期、却拿旧 HTML 里的 URL 再试一次图"。
@@ -844,44 +945,21 @@ async function runFetchZhimoCover(opts: ZhimoCoverFetchOptions): Promise<ZhimoCo
         : DEFAULT_MIN_WIDTH
   }
 
-  const maxAttempts = normalizeAttempts(opts.maxAttempts)
-  const backoffMs = normalizeBackoff(opts.retryBackoffMs)
-  const sleep = opts.sleep ?? realSleep
-  const startedAt = Date.now()
-
-  let attempt = 1
-  for (;;) {
-    const attemptStartedAt = Date.now()
-    const attemptResult = await attemptFetchZhimoCover(config)
-    const elapsedMs = Date.now() - attemptStartedAt
-    const totalMs = Date.now() - startedAt
-
-    // 成功：无论第几次尝试成功，行为与返回值都和改造前完全一致
-    if (attemptResult.ok) return attemptResult.outcome
-
-    const willRetry = attempt < maxAttempts && isRetryableZhimoReason(attemptResult.reason)
-    const failure: ZhimoAttemptFailure = {
-      reason: attemptResult.reason,
-      step: attemptResult.step,
-      attempt,
-      elapsedMs,
-      totalMs,
-      willRetry
+  const result = await runZhimoAttempts<ZhimoCoverSuccess>(
+    {
+      maxAttempts: normalizeAttempts(opts.maxAttempts),
+      backoffMs: normalizeBackoff(opts.retryBackoffMs),
+      sleep: opts.sleep ?? realSleep,
+      onAttemptFailed: opts.onAttemptFailed
+    },
+    async () => {
+      const attempt = await attemptFetchZhimoCover(config)
+      // 单次尝试用的是 `outcome` 字段名（历史形状），泛型编排统一用 `value`
+      return attempt.ok ? { ok: true, value: attempt.outcome } : attempt
     }
-    if (opts.onAttemptFailed) {
-      try {
-        opts.onAttemptFailed(failure)
-      } catch {
-        // 诊断回调（写日志）绝不能影响抓取结果
-      }
-    }
-
-    // 不可重试（no-id 之外的全部业务失败）/ 已经是最后一发 → 到此为止
-    if (!willRetry) return { ok: false, reason: attemptResult.reason }
-
-    if (backoffMs > 0) await sleep(backoffMs)
-    attempt += 1
-  }
+  )
+  // 失败对象形状（`{ ok:false, reason }`）与改造前一字不差
+  return result.ok ? result.value : result
 }
 
 /**
@@ -953,12 +1031,176 @@ export async function refreshZhimoCoverInto(
       sourceHost: outcome.sourceHost,
       watermarked: outcome.watermarked,
       title: outcome.title,
+      // 站方三级分类名（**原话，未映射**）：附加字段，落库前必须过 `mapZhimoCategory()`
+      classifyBaseName: outcome.classifyBaseName,
       // 风格随封面一起回给渲染层（**未过滤**原始词）；写不写由 `logic/zhimoStyle.ts` 判定
       style: outcome.style
     }
   } catch {
     // 目录不存在 / 权限不足 / 路径非法 —— 一律转成 reason，绝不抛给 IPC 层
     return { ok: false, reason: 'write-failed' }
+  }
+}
+
+// ── 详情页元信息（只取详情页、绝不下图片）──────────────────────────────
+//
+// 为什么要这条入口：`fetchZhimoCover` 必须走完「详情页 → 下载图片 → 校验 ≥200px」
+// 十步才算成功 —— 图片 404 / 太小会让"详情页其实已经拿到站方分类"一起丢掉。
+// 这里只发**一次详情页 GET**，解析 `classifyBaseName` / `style` / `version` / `title`，
+// **一个图片字节都不下载、不写盘**。
+//
+// ⚠️ 本节的任何函数**不得**出现图片 URL 拼接 / 图片下载调用：
+// `tests/zhimoMeta.test.ts` 有源码守卫（切片断言），加图片逻辑会直接把测试打红。
+
+/**
+ * 详情页元信息（**全部来自同一次详情页 GET，零额外请求**）。
+ *
+ * 字段语义与 `ZhimoDetailExtras` 完全一致（复用同一个解析函数 `parseDetailExtras`）：
+ * `null` = 站方没给 / 给了占位符 `--`，**不是错误**。
+ */
+export interface ZhimoMetaInfo {
+  /** 站方三级分类名（如 `卡座沙发`）；未做本地映射，落库前查 `mapZhimoCategory()` */
+  classifyBaseName: string | null
+  /** 站方风格自由词；未经本地词表过滤 */
+  style: string | null
+  /** 站方上传版本（如 `sketchup 2014`）；不是 `.skp` 内嵌的真实版本 */
+  version: string | null
+  /** 站方标题 */
+  title: string | null
+}
+
+/**
+ * 详情页 HTML → 元信息（**纯函数，绝不抛错**）。
+ *
+ * 有效性判据（比取图路径**多一条**，但不冲突）：
+ * 1. `parseZhimoDetail()` 认可（= 能解析出图 URL / JSON-LD 有 ImageObject）→ 有效；
+ * 2. 或者页面给了扩展属性（`res.classifyBaseName` 或 `res.detailParamsExtract` 是对象）
+ *    → 也有效 —— 这正是本入口存在的理由："页面在、只是图挂了"不该把分类一起丢掉。
+ *
+ * 两条都不满足（软 404 空壳 / 裸 404 / WAF 404）→ `null`，由调用方转 `not-found`。
+ *
+ * ⚠️ **绝不**因为 `classifyBaseName` 为 `null` 就返回 `null`：
+ * "站方没给分类"与"这一页根本不存在"是两件事，前者是 `ok:true` + `null`。
+ */
+export function parseZhimoMeta(html: string): ZhimoMetaInfo | null {
+  const source = typeof html === 'string' ? html : ''
+  const res = detailResOf(pagePropsOf(source))
+  const extras = parseDetailExtras(res)
+  // 复用取图路径的有效性判据（软 404 的 `res` 既没有图也没有扩展属性）
+  const detail = parseZhimoDetail(source)
+
+  if (!detail && !extras) return null
+
+  return {
+    classifyBaseName: extras?.classifyBaseName ?? null,
+    style: extras?.style ?? null,
+    // `extras.version` 已经带 `res.version` 兜底；detail 再兜一次只为防 dpe 缺失
+    version: extras?.version ?? detail?.version ?? null,
+    title: detail?.title ?? nonEmptyString(res?.title)
+  }
+}
+
+/** 元信息成功结果（**扁平、可直接跨 IPC**） */
+export interface ZhimoMetaSuccess {
+  ok: true
+  classifyBaseName: string | null
+  style: string | null
+  version: string | null
+  title: string | null
+}
+
+/** 元信息失败：只有 `ok` + `reason`（与封面失败同一套枚举口径） */
+export type ZhimoMetaFailure = { ok: false; reason: ZhimoCoverFailReason }
+
+export type ZhimoMetaOutcome = ZhimoMetaSuccess | ZhimoMetaFailure
+
+/** {@link fetchZhimoMeta} 的入参（默认值全部可覆盖，测试靠它把退避压到 0） */
+export interface ZhimoMetaFetchOptions {
+  id: string
+  fetcher?: ZhimoFetcher
+  /** 详情页超时（默认 {@link DEFAULT_PAGE_TIMEOUT_MS} = 10s） */
+  pageTimeoutMs?: number
+  /** 最多尝试次数（默认 {@link DEFAULT_MAX_ATTEMPTS} = 2；传 1 = 关闭重试） */
+  maxAttempts?: number
+  /** 重试退避毫秒（默认 {@link DEFAULT_RETRY_BACKOFF_MS} = 800；**测试传 0**） */
+  retryBackoffMs?: number
+  /** 退避用的 sleep（默认真实 setTimeout；测试注入即时桩） */
+  sleep?: (ms: number) => Promise<void>
+  /** 每次尝试失败的回调（只服务日志，不影响返回值） */
+  onAttemptFailed?: (failure: ZhimoAttemptFailure) => void
+}
+
+/** 详情页超时归一（`NaN` / 非有限 / 负数一律回默认；与封面路径同一口径） */
+function normalizePageTimeout(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(1, Math.floor(value))
+    : DEFAULT_PAGE_TIMEOUT_MS
+}
+
+/** 元信息单次尝试：**只 GET 详情页** → 解析（不发任何图片请求） */
+async function attemptFetchZhimoMeta(config: {
+  id: string
+  fetcher: ZhimoFetcher
+  pageTimeoutMs: number
+}): Promise<{ ok: true; value: ZhimoMetaInfo } | ZhimoStepFailure> {
+  const page = await fetchDetailHtml(config.fetcher, config.id, config.pageTimeoutMs)
+  if (!page.ok) return { ok: false, reason: page.reason, step: 'page' }
+
+  const meta = parseZhimoMeta(page.html)
+  // 页面两条有效性判据都不满足（软 404 / 裸 404 / 结构改版）→ 与封面路径同一个 reason
+  if (!meta) return { ok: false, reason: 'not-found', step: 'page' }
+
+  return { ok: true, value: meta }
+}
+
+/**
+ * 只取详情页的轻量入口（**公开入口，绝不对调用方抛错**）。
+ *
+ * 与 {@link fetchZhimoCover} 的差异（**只有这些**）：
+ * - 不发图片请求、不校验图片、不落盘 → 不需要 `folder`，也不会产生 `image` 步骤的失败；
+ * - 返回值只带元信息（`classifyBaseName` / `style` / `version` / `title`）。
+ *
+ * 与它**保持一致**的部分：
+ * - ID 校验（6 位以上纯数字，否则 `no-id` 且**一个请求都不发**）；
+ * - 详情页抓取（同一 UA / `redirect: 'follow'` / `AbortSignal.timeout`）与解析；
+ * - 有界重试（只对 `timeout` / `network`，`DEFAULT_MAX_ATTEMPTS` 次，退避 800ms）；
+ * - `classifyBaseName` 为 `null` 时仍然 `ok:true`（"站方没给"不是错误）。
+ */
+export async function fetchZhimoMeta(opts: ZhimoMetaFetchOptions): Promise<ZhimoMetaOutcome> {
+  try {
+    // ── 步骤 1：ID 格式（不发任何请求，也**不重试**）──────────────────
+    const id = String(opts.id ?? '').trim()
+    if (!ZHIMO_ID_RE.test(id)) return { ok: false, reason: 'no-id' }
+
+    const config = {
+      id,
+      fetcher: opts.fetcher ?? defaultFetcher,
+      pageTimeoutMs: normalizePageTimeout(opts.pageTimeoutMs)
+    }
+
+    const result = await runZhimoAttempts<ZhimoMetaInfo>(
+      {
+        maxAttempts: normalizeAttempts(opts.maxAttempts),
+        backoffMs: normalizeBackoff(opts.retryBackoffMs),
+        sleep: opts.sleep ?? realSleep,
+        onAttemptFailed: opts.onAttemptFailed
+      },
+      () => attemptFetchZhimoMeta(config)
+    )
+
+    if (!result.ok) return { ok: false, reason: result.reason }
+
+    // 明确摊平成四个字段：`ZhimoMetaInfo` 将来加字段也不会意外扩大 IPC 契约
+    return {
+      ok: true,
+      classifyBaseName: result.value.classifyBaseName,
+      style: result.value.style,
+      version: result.value.version,
+      title: result.value.title
+    }
+  } catch {
+    // 最后一道保险（运行时信号不可用 / 注入桩抛意外异常）：收敛成 reason，绝不抛错
+    return { ok: false, reason: 'network' }
   }
 }
 

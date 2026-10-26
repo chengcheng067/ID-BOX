@@ -11,6 +11,8 @@ import type {
   Asset,
   FetchZhimoCoverPayload,
   FetchZhimoCoverResult,
+  FetchZhimoMetaPayload,
+  FetchZhimoMetaResult,
   HdrPrepareResult,
   HdrProgressEvent,
   ImportBatchDoneEvent,
@@ -144,6 +146,16 @@ const api = {
   /** 生成缩略图；返回缓存文件名，无封面/失败返回 null */
   ensureThumb: (id: string, coverAbs: string | null): Promise<string | null> =>
     ipcRenderer.invoke(IPC.thumbEnsure, id, coverAbs),
+  /**
+   * 生成 / 复用 **≤1024 预览图**（拖拽卡片专用，docs/26 方案 C+H），返回缓存文件名。
+   *
+   * - 幂等：文件已存在时主进程直接返回文件名（只 stat，**不解码原图**）；
+   * - `null` = 源文件不存在 / 解码不了（TGA、EXR 等）/ 写盘失败 → 调用方回退缩略图；
+   * - 拿到文件名后用 `thumbVaultUrl(name)` 拼 `vault://thumb/<name>` 即可。
+   * `absPath` 必须在库目录内（主进程会做越界校验，越界返回 null）。
+   */
+  ensurePreview: (id: string, absPath: string | null): Promise<string | null> =>
+    ipcRenderer.invoke(IPC.thumbPreview, id, absPath),
   /** 删除某资产的全部缩略图，返回删掉的数量 */
   deleteThumb: (id: string): Promise<number> => ipcRenderer.invoke(IPC.thumbDelete, id),
   /**
@@ -235,6 +247,19 @@ const api = {
    */
   fetchZhimoCover: (payload: FetchZhimoCoverPayload): Promise<FetchZhimoCoverResult> =>
     ipcRenderer.invoke(IPC.fetchZhimoCover, payload),
+
+  /**
+   * **只取详情页**拿站方元信息（分类 / 风格 / 版本 / 标题），**绝不下图片、不写盘**。
+   *
+   * 返回 `{ ok:true, classifyBaseName, style, version, title }`
+   * 或 `{ ok:false, reason }`；四个字段为 `null` 是**正常结果**（站方没给），不是失败。
+   *
+   * 用途：只需要站方分类时**不要**调 `fetchZhimoCover` —— 后者要下到图且 ≥200px
+   * 才算成功，图挂了会让已经拿到的分类一起丢。
+   * 分类落库前必须查 `shared/zhimoTaxonomyMap.ts` 的 `mapZhimoCategory()`。
+   */
+  fetchZhimoMeta: (payload: FetchZhimoMetaPayload): Promise<FetchZhimoMetaResult> =>
+    ipcRenderer.invoke(IPC.fetchZhimoMeta, payload),
 
   // ── HDR 预览（0.6.5） ─────────────────────────────────────────────
   /**

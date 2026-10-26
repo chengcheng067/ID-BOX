@@ -6,6 +6,7 @@ import { formatBytes, formatDate, thumbVaultUrl, vaultUrl } from '../../shared/f
 import { assetFileAbs } from '../logic/assetPath'
 import { beginSystemDrag } from '../logic/dragOut'
 import { cachedDragCard, cancelDragCardPrewarm, dragCardKey, prewarmDragCard } from '../logic/dragCard'
+import { peekPreviewUrl } from '../logic/previewThumb'
 import { IMAGE_FILE_EXTS } from '../../shared/imageExts'
 import { categoriesOf } from '../logic/category'
 import { duplicatesOf, groupOf, keepOnlyTargets } from '../logic/duplicates'
@@ -16,6 +17,8 @@ import {
   firstImageFileOfDataTransfer
 } from '../logic/coverImage'
 import { isDeletedAsset, trashNoticeText } from '../logic/trashView'
+import { undoGraceHint, undoGraceSuffix } from '../logic/graceText'
+import { DEFAULT_UNDO_GRACE_MS } from '../../shared/undoGrace'
 import { EMPTY_ALIASES, aliasIndexOf, resolveAssetDisplayName } from '../logic/aliasIndex'
 import { zhimoIdOf } from '../../shared/naming'
 import { CoverPicker } from './CoverPicker'
@@ -56,15 +59,28 @@ function FileRow({ asset, file, readOnly = false }: { asset: Asset; file: AssetF
   const abs = assetFileAbs(asset.folder, file.rel)
   /**
    * 拖拽卡片（2026-10-21，与网格/文件视图同源）：原来只传缩略图路径，拖起来的影像
-   * 由系统随手画（会被裁切、没有卡片外观）。这里 hover 预热同一张 168×210 卡片位图，
-   * dragstart 同步读缓存；图片文件用**它自己的**预览，非图片文件退回资产缩略图。
+   * 由系统随手画（会被裁切、没有卡片外观）。这里 hover 预热同一张 176×176 卡片位图，
+   * dragstart 同步读缓存。
+   *
+   * 2026-10（docs/26 方案 C + H）：图片文件的底图改成 **≤1024 预生成预览图**，
+   * 不再把原图 URL 塞进 canvas（8K 贴图拖一次要解码几十 MB —— 这是本次要修的性能问题）。
+   * 取值优先级：
+   * ① 已生成过的预览图（`peekPreviewUrl`：同步、零 IPC，第二次 hover 走这条）；
+   * ② 资产缩略图（480，最便宜）；
+   * ③ 原图（前两者都没有时的兜底，保证卡片**永远不空白**）。
+   *
+   * 预览的**生成**放在 hover 预热里（下面的 `preview` 参数 → 主进程 `thumb:preview`），
+   * 因为 `startDrag` 必须在 dragstart 的同步段发起，不能在那里等 IPC。
    */
   const cardKey = dragCardKey(asset.id, file.rel)
-  const cardThumb = IMAGE_FILE_EXTS.has(file.ext.toLowerCase())
-    ? vaultUrl(asset.relFolder ? `${asset.relFolder}/${file.rel}` : file.rel)
-    : asset.thumbStatus === 'ready' && asset.thumbPath
-      ? thumbVaultUrl(asset.thumbPath)
-      : null
+  const isImageFile = IMAGE_FILE_EXTS.has(file.ext.toLowerCase())
+  const assetThumbUrl =
+    asset.thumbStatus === 'ready' && asset.thumbPath ? thumbVaultUrl(asset.thumbPath) : null
+  const cardThumb = isImageFile
+    ? peekPreviewUrl(asset.id, abs) ??
+      assetThumbUrl ??
+      vaultUrl(asset.relFolder ? `${asset.relFolder}/${file.rel}` : file.rel)
+    : assetThumbUrl
   const onDragStart = (e: DragEvent) => {
     // 拖单个文件（贴图 / HDRI 单拖是高频场景）。
     // 统一走 beginSystemDrag：第一步 preventDefault 取消渲染进程自己的 HTML5 拖拽，
@@ -78,7 +94,16 @@ function FileRow({ asset, file, readOnly = false }: { asset: Asset; file: AssetF
     <div
       className="group flex h-7 items-center gap-2 rounded-md px-2 text-[12px] transition hover:bg-elevated/60"
       onMouseEnter={
-        readOnly ? undefined : () => prewarmDragCard(cardKey, { thumbUrl: cardThumb, name: file.name })
+        readOnly
+          ? undefined
+          : () =>
+              prewarmDragCard(cardKey, {
+                thumbUrl: cardThumb,
+                name: file.name,
+                // 只有图片文件才值得请求预览：模型 / HDR / 压缩包不是 <img> 能解的，
+                // 请求了也只会拿到 null（主进程 nativeImage 读不出来）。
+                preview: isImageFile ? { id: asset.id, absPath: abs } : null
+              })
       }
       onMouseLeave={readOnly ? undefined : () => cancelDragCardPrewarm()}
       {...(readOnly
@@ -172,6 +197,12 @@ export function DetailPanel() {
   // C 线「最近删除」：软删态下的还原 / 彻底删除
   const restoreAssets = useVault((s) => s.restoreAssets)
   const trashRetention = useVault((s) => s.settings?.trashRetention ?? '30d')
+  /**
+   * 删除撤销期（设置·数据与备份，三档 0 / 3000 / 5000）。
+   * 本面板有 3 处提示文案提到「5 秒内可撤销」，必须跟着设置渲染，
+   * 否则用户改成 3 秒 / 不等待后提示会自相矛盾（`undoGraceSuffix` 统一口径）。
+   */
+  const undoGraceMs = useVault((s) => s.settings?.undoGraceMs ?? DEFAULT_UNDO_GRACE_MS)
   // v0.4 标记（收藏 / 评分 / 色标）：多选时作用于全部选中项
   const setFavorite = useVault((s) => s.setFavorite)
   const setRating = useVault((s) => s.setRating)
@@ -248,7 +279,7 @@ export function DetailPanel() {
   )
 
   /**
-   * 「保留某一份，其余移入回收站」：复用既有删除链路（二次确认 → 5 秒撤销 → trashPaths），
+   * 「保留某一份，其余移入回收站」：复用既有删除链路（二次确认 → 撤销期 → trashPaths），
    * 不自己写 trash。
    *
    * ⚠️ P0（2026-10 用户报「本体也被删了」）：目标 id 由 `keepOnlyTargets()` 统一计算——
@@ -261,7 +292,8 @@ export function DetailPanel() {
     if (ids.length === 0) return
     requestDelete(ids, {
       warning: dupGroup?.sizeMismatch ? '体积差异较大，请先确认是同一套资产' : undefined,
-      notice: '已移入回收站，5 秒内可撤销'
+      // 文案随设置变（5 秒 / 3 秒 / 不等待）
+      notice: undoGraceHint(undoGraceMs)
     })
   }
 
@@ -672,7 +704,7 @@ export function DetailPanel() {
             <button
               className="btn btn-outline-danger mt-2 w-full !bg-transparent"
               onClick={keepThisCopyOnly}
-              title="保留当前这份，其余副本移入回收站（二次确认，5 秒内可撤销）"
+              title={`保留当前这份，其余副本移入回收站（二次确认，${undoGraceSuffix(undoGraceMs)}）`}
             >
               <IconTrash width={14} height={14} />
               保留这份，其余移入回收站
@@ -839,7 +871,7 @@ export function DetailPanel() {
             <button
               className="btn btn-outline-danger w-[72px] shrink-0 !bg-transparent"
               onClick={() => requestDelete([asset.id])}
-              title="删除（二次确认，5 秒内可撤销）"
+              title={`删除（二次确认，${undoGraceSuffix(undoGraceMs)}）`}
             >
               <IconTrash width={14} height={14} />
               删除

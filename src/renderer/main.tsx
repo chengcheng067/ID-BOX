@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import App from './App'
 import './styles.css'
 import { installRendererLogHooks } from './logic/rendererLog'
+import { installEscProbe } from './logic/escLayer'
 import { startAutoCheck } from './logic/updateState'
 import { startSizeBackfill } from './logic/sizeBackfill'
 
@@ -15,6 +16,24 @@ installRendererLogHooks((payload) => {
     window.modvault?.reportLog(payload)
   } catch {
     /* preload 缺失 / 窗口已销毁：日志转发绝不能反过来影响渲染 */
+  }
+})
+
+// Esc 层栈深度探针（0.7.8：用户点名要修的「按 Esc 没反应」取证开关）。
+//
+// 为什么挂在入口而不是某个组件里：它要观察的是**全局**按键行为，且必须是「最后一个
+// 还活着的观察者」—— 挂在任何弹窗组件里都会随弹窗卸载而消失，正好错过要取证的时机。
+// 探针挂在 `keydown` **冒泡阶段**、只读记账、不 stopPropagation，绝不参与「谁吃按键」；
+// 只有真的出现「按了 Esc 但没人应答」时才落一条 **debug** 日志（`verboseLogging`
+// 关闭时不写盘，所以默认零成本、零噪音），并靠限流器封顶 20 条 / 10 秒。
+// 限流与 sink 都复用渲染层日志那套，不新造通道。
+installEscProbe({
+  sink: (payload) => {
+    try {
+      window.modvault?.reportLog(payload)
+    } catch {
+      /* preload 缺失 / 窗口已销毁：取证绝不能反过来影响渲染 */
+    }
   }
 })
 

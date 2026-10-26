@@ -4,6 +4,8 @@ import { revealTargetFor } from '../logic/assetPath'
 import { duplicatesOf, groupOf } from '../logic/duplicates'
 import { assetMenuItems } from '../logic/contextMenu'
 import { effectiveMaterialSlots } from '../logic/materialBall'
+import { undoGraceHint } from '../logic/graceText'
+import { DEFAULT_UNDO_GRACE_MS } from '../../shared/undoGrace'
 import { ContextMenu } from './ContextMenu'
 import { CoverPicker } from './CoverPicker'
 import { CustomRenderDialog } from './CustomRenderDialog'
@@ -42,6 +44,9 @@ export function AssetContextMenu({
   const setNotice = useVault((s) => s.setNotice)
   const openFolderView = useVault((s) => s.openFolderView)
   const openHdrPreview = useVault((s) => s.openHdrPreview)
+  // 删除撤销期（设置·数据与备份，三档 0 / 3000 / 5000）：提示文案必须跟着设置走，
+  // 不能写死「5 秒内可撤销」——否则用户把撤销期设成 3 秒 / 不等待时提示会自相矛盾。
+  const undoGraceMs = useVault((s) => s.settings?.undoGraceMs ?? DEFAULT_UNDO_GRACE_MS)
 
   /**
    * 菜单打开期间要接管的两个既有弹窗：`null` = 都关着（显示菜单本身）。
@@ -149,7 +154,7 @@ export function AssetContextMenu({
     },
     onKeepThis: () => {
       if (!single || dupCopies.length === 0) return
-      // 复用详情面板那条既有链路（二次确认 → 5 秒撤销 → trashPaths），不自己写 trash。
+      // 复用详情面板那条既有链路（二次确认 → 撤销期 → trashPaths），不自己写 trash。
       // 体积差异大时确认框额外警示（误删大体积原件的代价很高）。
       requestDelete(
         dupCopies.map((c) => c.id),
@@ -157,7 +162,8 @@ export function AssetContextMenu({
           warning: groupOf(assets, single.id)?.sizeMismatch
             ? '体积差异较大，请先确认是同一套资产'
             : undefined,
-          notice: '已移入回收站，5 秒内可撤销'
+          // 文案随设置变：5 秒 / 3 秒 / 不等待（0 = 没有撤销期）
+          notice: undoGraceHint(undoGraceMs)
         }
       )
     },

@@ -125,7 +125,9 @@ describe('MaterialBall：renderer 只建一次，换资产只换贴图', () => {
     // 但仍在这个 Promise 里被 await →「等全部槽位才 resolve」的语义不变。
     expect(body).toContain('const jobs = mapEntries.map(')
     expect(body).toContain('return Promise.all(jobs).then(')
-    expect(body).toContain("await this.loadMap('alpha', alphaEntry[1], gen)")
+    // 第二批（docs/29 方案 E）给 loadMap 加了第 4 个参数 `signal`（取消在途加载）。
+    // 断言的**意图不变**：alpha 仍在 Promise.all 之后单发、仍带同一个代次令牌。
+    expect(body).toMatch(/await this\.loadMap\('alpha', alphaEntry\[1\], gen(?:, signal)?\)/)
     // 不能在 albedo 回调里提前 resolve / return
     expect(body).not.toContain('return Promise.resolve()\n    }')
   })

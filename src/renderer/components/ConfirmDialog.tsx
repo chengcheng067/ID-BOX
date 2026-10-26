@@ -10,8 +10,11 @@ import { IconAlert, IconTrash } from '../icons'
  * - 单选：显示名称 + 大小 + 文件数；
  * - 多选：显示「N 个资产 · 合计 X GB」+ 名称预览（封顶 6 条）。
  *
- * 点「确认删除」只进入 5 秒撤销宽限期（`confirmDelete()`），**此处不删任何东西**；
- * 真正删除由 UndoToast 到期后的 `commitDelete()` 完成。
+ * 点「确认删除」后的行为由设置 `undoGraceMs`（三档 0 / 3000 / 5000）决定：
+ * - `> 0`：进入撤销宽限期（`confirmDelete()`），**此处不删任何东西**，真正删除由
+ *   底部撤销条到期后的 `commitDelete()` 完成；
+ * - `= 0`：不进宽限期，`confirmDelete()` 直接 `commitDelete()`（立即移入回收站）。
+ *   二次确认弹窗**永远在**——"不等待"只取消倒计时，不取消确认。
  */
 export function ConfirmDialog() {
   const pending = useVault((s) => s.pendingDelete)
@@ -24,6 +27,10 @@ export function ConfirmDialog() {
 
   const { title, detail, count } = describeDelete(pending.targets)
   const names = pending.targets.map((t) => t.name)
+  // 撤销期取自本次删除的快照（`requestDelete` 时写入），不是全局常量：
+  // 用户在确认框里停留期间去改设置，不会改变这一次的等待时长。
+  const graceMs = pending.graceMs
+  const graceSeconds = graceMs > 0 ? graceMs / 1000 : 0
 
   return (
     <Modal title="确认删除" onClose={undoDelete} width="max-w-md">
@@ -59,15 +66,30 @@ export function ConfirmDialog() {
         </p>
       )}
 
+      {/* 撤销期说明随设置变（设置·数据与备份「删除撤销期」）：
+          - 3 / 5 秒：说清"撤销期内文件仍在磁盘上"，到期才移入回收站；
+          - 0（不等待）：明确说"立即移入、没有撤销期"，绝不能让用户以为还有反悔机会。 */}
       <p className="mt-3 text-[12px] leading-relaxed text-muted">
-        确认后还有 <span className="font-medium text-primary">5 秒</span>
-        撤销期，撤销期内文件仍在磁盘上；
-        {retention === 'recycle' ? (
-          <>到期后移入 Windows 回收站（可从回收站找回）。</>
+        {graceSeconds > 0 ? (
+          <>
+            确认后还有 <span className="font-medium text-primary">{graceSeconds} 秒</span>
+            撤销期，撤销期内文件仍在磁盘上；
+            {retention === 'recycle' ? (
+              <>到期后移入 Windows 回收站（可从回收站找回）。</>
+            ) : (
+              <>
+                到期后移入<span className="font-medium text-primary">「最近删除」</span>
+                （左侧栏可还原），保留 {retentionDaysOf(retention) ?? 30} 天后自动彻底删除。
+              </>
+            )}
+          </>
+        ) : retention === 'recycle' ? (
+          <>
+            确认后<span className="font-medium text-primary">立即</span>移入 Windows 回收站（可从回收站找回），没有撤销期；撤销期可在设置 · 数据与备份里调整。
+          </>
         ) : (
           <>
-            到期后移入<span className="font-medium text-primary">「最近删除」</span>
-            （左侧栏可还原），保留 {retentionDaysOf(retention) ?? 30} 天后自动彻底删除。
+            确认后<span className="font-medium text-primary">立即</span>移入<span className="font-medium text-primary">「最近删除」</span>（左侧栏可还原），保留 {retentionDaysOf(retention) ?? 30} 天后自动彻底删除，没有撤销期。
           </>
         )}
       </p>

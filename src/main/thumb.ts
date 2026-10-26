@@ -5,12 +5,14 @@ import { thumbsDir } from './paths'
 import {
   resizeToMaxPx,
   thumbFileName,
+  previewFileName,
   thumbOutputExt,
   thumbFileSalt,
   matchThumbNames,
   findOrphanThumbs,
   parseThumbFileName,
   DEFAULT_THUMB_MAX_PX,
+  PREVIEW_MAX_PX,
   THUMB_JPEG_QUALITY
 } from '../shared/thumb'
 import { extOf } from '../shared/format'
@@ -79,6 +81,74 @@ export async function ensureThumb(
     const dir = await ensureThumbsDir()
     const buffer = ext === 'png' ? scaled.toPNG() : scaled.toJPEG(THUMB_JPEG_QUALITY)
     await fs.writeFile(path.join(dir, name), buffer)
+    return name
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 生成（或复用）≤1024 的**预览图**，返回缓存文件名（相对 thumbs 目录）；失败返回 `null`。
+ *
+ * 用途（docs/26 方案 C + H）：拖拽卡片原来拿的是**原图 URL**，8K 贴图拖一次要解码
+ * 几十 MB；改成 hover 时先请求这张 ≤1024 的预生成图，卡片只解一两百 KB。
+ *
+ * 契约与 {@link ensureThumb} **完全一致**（幂等、全程 try/catch、绝不向上抛）：
+ * - 返回文件名 → 调用方直接用 `vault://thumb/<name>`；
+ * - 返回 `null` → 无源文件 / 解码不了（TGA、EXR 等）/ 写盘失败 → 调用方回退缩略图或原图；
+ * - 绝不抛异常：预览只是**观感优化**，不能因为它阻断拖拽。
+ *
+ * 幂等性（性能关键）：文件名由「路径 + mtime + 字节数 + 扩展名」唯一确定，所以
+ * **文件已存在时直接返回文件名，不再 `nativeImage.createFromPath`**。
+ * hover 会反复调用，若每次都解码一张 8K 原图，这个方案就白做了。
+ *
+ * 为什么 id 是「资产 id」而不是从路径现算：
+ * 缓存清理（`pruneThumbs(liveIds)` / `deleteThumb(id)`）的判据是
+ * `parseThumbFileName(name).id ∈ liveIds`。把**资产 id** 放进文件名，预览图才会
+ * 随资产一起被清掉；若用路径哈希当 id，它永远不在 liveIds 里 → 每次 prune 都被
+ * 当成孤儿删掉（等于每次 hover 都重新解码），反过来又会积累永不回收的垃圾。
+ *
+ * 同一资产的多个文件不会撞名：salt 来自**各自的绝对路径 + stat**，路径不同则 salt 不同。
+ *
+ * @param id 资产 id（只用于命名与清理归属，不参与像素计算）
+ * @param absPath 源文件绝对路径（调用方保证在库目录内，IPC 层已校验）
+ * @param opts 仅 `salt`（显式覆盖，测试用）/ `maxPx`（默认 {@link PREVIEW_MAX_PX}）
+ */
+export async function ensurePreview(
+  id: string,
+  absPath: string | null,
+  opts?: EnsureThumbOptions
+): Promise<string | null> {
+  try {
+    if (!id || !absPath) return null
+    const st = await fs.stat(absPath).catch(() => null)
+    if (!st || !st.isFile()) return null
+
+    const ext = thumbOutputExt(extOf(absPath))
+    // 与 480 缩略图**同一套内容身份 salt**（路径 + mtime + size）：源文件被原地覆盖时
+    // 文件名必然变化 → `vault://thumb/<name>` 也变 → Chromium 不会命中旧字节。
+    const salt = opts?.salt ?? thumbFileSalt(absPath, st)
+    const name = previewFileName(id, salt, ext)
+
+    const dir = await ensureThumbsDir()
+    const out = path.join(dir, name)
+    // ① 已生成过 → 直接复用（**不 decode**）。尺寸为 0 视为上次写盘被打断的残骸，重做。
+    const cached = await fs.stat(out).catch(() => null)
+    if (cached && cached.isFile() && cached.size > 0) return name
+
+    // ② 现生成：等比缩到最长边 ≤ maxPx（`resizeToMaxPx` 不放大，小图原样）
+    const img = nativeImage.createFromPath(absPath)
+    if (!img || img.isEmpty()) return null
+    const maxPx = opts?.maxPx && opts.maxPx > 0 ? opts.maxPx : PREVIEW_MAX_PX
+    const size = img.getSize()
+    const target = resizeToMaxPx(size.width, size.height, maxPx)
+    const scaled =
+      target.width === size.width && target.height === size.height
+        ? img
+        : img.resize({ width: target.width, height: target.height, quality: 'good' })
+
+    const buffer = ext === 'png' ? scaled.toPNG() : scaled.toJPEG(THUMB_JPEG_QUALITY)
+    await fs.writeFile(out, buffer)
     return name
   } catch {
     return null

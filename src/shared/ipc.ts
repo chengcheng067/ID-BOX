@@ -34,6 +34,15 @@ export const IPC = {
    */
   dragStart: 'drag:start',
   thumbEnsure: 'thumb:ensure',
+  /**
+   * 生成 / 复用 **≤1024 预览图**（docs/26 方案 C + H，拖拽卡片用）。
+   * 入参 `(assetId, absPath)`，返回缓存文件名（`vault://thumb/<name>` 可直接读）。
+   *
+   * 与 `thumb:ensure` 的区别只有「尺寸档位 + 文件名后缀」：缩略图是 480（网格），
+   * 预览图是 1024（拖拽卡片）。**幂等**：文件已存在时主进程只 stat，不解码原图。
+   * 返回 null = 读不了 / 解码不了（TGA 等）→ 渲染层必须回退缩略图或原图。
+   */
+  thumbPreview: 'thumb:preview',
   thumbDelete: 'thumb:delete',
   /** 材质球调参持久化：单删某资产的**某一个**缓存文件（`thumbDelete` 是按 id 通配全删，不能复用） */
   thumbDeleteOne: 'thumb:deleteOne',
@@ -146,6 +155,20 @@ export const IPC = {
    * 主进程侧必须校验 `folder` 在库目录内；本通道**不抛错**。
    */
   fetchZhimoCover: 'zhimo:fetchCover',
+  /**
+   * 知末**只取详情页**的轻量入口（站方分类 / 风格 / 版本 / 标题）。
+   *
+   * 与 `fetchZhimoCover` 的区别只有"不下图片、不写盘"：
+   * 只发**一次**详情页 GET，绝不请求任何图片字节，因此**不需要 `folder`**、
+   * 也不会出现 `too-small` / `bad-image` 这类只在图片步骤才有的失败。
+   *
+   * 存在理由：封面通道必须"下到图且 ≥200px"才算成功，图 404 会让
+   * **已经解析出来的站方分类**跟着一起丢。分类落库前必须查
+   * `shared/zhimoTaxonomyMap.ts` 的 `mapZhimoCategory()`（本通道不做映射）。
+   *
+   * 入参 `FetchZhimoMetaPayload`，返回 `FetchZhimoMetaResult`（扁平结构，**不抛错**）。
+   */
+  fetchZhimoMeta: 'zhimo:fetchMeta',
   // ── HDR 预览（0.6.5） ─────────────────────────────────────────────
   /**
    * 准备 HDR 预览：主进程流式解码 + 盒式降采样 + 落缓存（命中直接返回）。

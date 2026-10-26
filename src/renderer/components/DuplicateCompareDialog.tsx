@@ -17,6 +17,9 @@
 import { KIND_LABEL } from '../../shared/classify'
 import { thumbVaultUrl } from '../../shared/format'
 import { compareFields } from '../logic/duplicates'
+import { undoGraceSuffix } from '../logic/graceText'
+import { useVault } from '../store'
+import { DEFAULT_UNDO_GRACE_MS } from '../../shared/undoGrace'
 import { Modal } from './Modal'
 import { IconHdr, IconImage, IconMaterial, IconOther, IconTrash, IconBox } from '../icons'
 import type { Asset, AssetKind } from '../../shared/types'
@@ -71,6 +74,8 @@ export function DuplicateCompareDialog({
 }) {
   // 防御：即使调用方传了软删记录进来，也不在对比里展示（它们不该被"保留/删除"）
   const columns = [asset, ...copies].filter((a) => a && !a.deletedAt)
+  // 删除撤销期来自设置（三档 0 / 3000 / 5000）：按钮 title 与底部说明都必须跟着变
+  const undoGraceMs = useVault((s) => s.settings?.undoGraceMs ?? DEFAULT_UNDO_GRACE_MS)
   // 「有才显示」的字段（SU 版本）全空时整行不渲染
   const fields = compareFields(columns).filter((f) => f.values.some((v) => v !== ''))
 
@@ -135,7 +140,7 @@ export function DuplicateCompareDialog({
                   <button
                     className="btn btn-outline-danger w-full !bg-transparent !py-1 text-[11px]"
                     onClick={() => onKeep(a.id)}
-                    title="保留这一份，其余副本移入回收站（二次确认，5 秒内可撤销）"
+                    title={`保留这一份，其余副本移入回收站（二次确认，${undoGraceSuffix(undoGraceMs)}）`}
                   >
                     <IconTrash width={12} height={12} />
                     保留这份
@@ -147,9 +152,17 @@ export function DuplicateCompareDialog({
         </div>
       </div>
 
+      {/* 说明必须与设置里的撤销期一致：0 = 确认后立即移入，不能让用户以为还能反悔 */}
       <p className="mt-2 text-[11px] leading-relaxed text-muted">
-        「保留这份」只处理同组副本，素材文件不会立刻消失（先进入 5 秒撤销期，到期后移入
-        Windows 回收站）。
+        {undoGraceMs > 0 ? (
+          <>
+            「保留这份」只处理同组副本，素材文件不会立刻消失（先进入 {undoGraceMs / 1000} 秒撤销期，到期后移入 Windows 回收站）。
+          </>
+        ) : (
+          <>
+            「保留这份」只处理同组副本，素材文件在二次确认后立即移入 Windows 回收站，没有撤销期。
+          </>
+        )}
       </p>
 
       <div className="mt-4 flex justify-end">

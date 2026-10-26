@@ -152,6 +152,10 @@ export function planThumbRescue(
   for (const f of files) {
     const parsed = parseThumbFileName(f?.name ?? '')
     if (!parsed) continue
+    // ⚠️ ≤1024 **预览图**（`<id>-<salt>-p1024.<ext>`）不参与救援：它的前缀确实是资产 id，
+    // 但图的内容是**某个具体文件**（用户 hover 过的任意一张贴图），把它挂回 `thumbPath`
+    // 会让卡片显示"随便一张贴图"而不是封面缩略图。救援只认 480 缩略图。
+    if (parsed.preview) continue
     if (!Number.isFinite(f?.size) || f.size <= 0) continue
     const mtimeMs = Number.isFinite(f?.mtimeMs) ? f.mtimeMs : 0
     const list = byId.get(parsed.id)

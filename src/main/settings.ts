@@ -14,6 +14,7 @@ import {
 } from '../shared/types'
 import { DEFAULT_LIBRARY_DIR } from './paths'
 import { freeBytesOf } from './disk'
+import { DEFAULT_UNDO_GRACE_MS, normalizeUndoGraceMs } from '../shared/undoGrace'
 
 /** 首次运行选盘时的最低可用空间门槛（U3） */
 export const MIN_FREE_BYTES_FOR_LIBRARY = 20 * 1024 * 1024 * 1024
@@ -76,6 +77,17 @@ export const SettingsSchema = z.object({
    * 绝不能拖垮整份 settings.json（否则 libraryDir 一起丢，库会"消失"）。
    */
   trashRetention: z.enum(['5d', '10d', '30d', 'recycle']).optional().catch('30d'),
+  /**
+   * 删除撤销宽限期三档（毫秒：0 / 3000 / 5000，默认 5000）。
+   *
+   * `.optional().catch(5000)` = **单项降级**：`'abc'` / `null` / `true` 这类脏值只让
+   * 这一项回落默认，绝不拖垮整份 settings.json（否则 `libraryDir` 一起丢、库会"消失"）。
+   *
+   * ⚠️ 这里只校验"是个数字"：`9999` 这类**越界但类型正确**的值由
+   * `normalizeSettings` 里的 `normalizeUndoGraceMs` clamp 到三档（`0` 必须原样保留 ——
+   * `0` 是合法档位「不等待」，任何 `|| 5000` 写法都会把它吃掉）。
+   */
+  undoGraceMs: z.number().optional().catch(DEFAULT_UNDO_GRACE_MS),
   spaceSafetyFactor: z.number().positive().optional(),
   /** UI 主题（规范 §1；0.6.0 起支持 `system` = 跟随 Windows 深浅色） */
   theme: z.enum(['light', 'dark', 'system']).optional(),
@@ -117,6 +129,14 @@ export const SettingsSchema = z.object({
    * 同上：单项降级 + 默认开；与总开关**互不牵连**（见 normalizeSettings）。
    */
   zhimoCoverReplacePacked: z.boolean().optional().catch(true),
+  /**
+   * 导入批次结束后是否自动「按站方分类重排」（默认 **true**）。
+   *
+   * `.catch(true)`：**单项降级** —— 脏值（`'yes'` / `1` / `null`）只让这一项回落默认，
+   * 不拖垮整份 settings.json（否则 libraryDir 一起丢，库会"消失"）。
+   * 方向与 `zhimoCover` 一致：默认开，只有严格 `false` 才关。
+   */
+  zhimoAutoCategory: z.boolean().optional().catch(true),
   /**
    * 启动时自动检查更新（默认 **true**）。
    *
@@ -265,6 +285,9 @@ export function migrateSettings(raw: RawSettings): Settings {
     // zod 的 `.optional()` 对缺键会产出 undefined（`.catch` 只管解析失败），
     // 所以缺键/脏值都要在这里再收口一次，保证返回的 Settings 是完整对象
     trashRetention: normalizeTrashRetention(raw.trashRetention),
+    // 删除撤销期三档：旧档缺键（undefined）/ 脏值都在这里收口成 5000；
+    // `0`（不等待）必须原样保留 —— 它是合法档位，不能被"falsy 兜底"吃掉。
+    undoGraceMs: normalizeUndoGraceMs(raw.undoGraceMs),
     // zod 侧字段都是 optional（脏值逐字段降级），这里收口成完整对象，旧档缺键 → 默认关闭
     aiClassify: normalizeAiClassify(raw.aiClassify),
     // 0.6.0：别名表 / 智能集合 / 重命名模板 —— 旧档缺键 → 空数组 / 保守模板
@@ -331,6 +354,11 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   merged.materialStage = merged.materialStage === true ? true : false
   // 删除策略四档（C 线）：缺键 / 脏值一律回落 '30d'，单项降级不拖垮整份设置
   merged.trashRetention = normalizeTrashRetention(merged.trashRetention)
+  // 删除撤销期三档（0 / 3000 / 5000）：缺键 / 9999 / 'abc' / null 一律回落 5000。
+  // ⚠️ 绝不能写成 `merged.undoGraceMs || 5000`：`0` 是合法档位「不等待」，
+  //    `||` 会把 0 当 falsy 吃掉 → 用户设了"不等待"却仍然等 5 秒。
+  //    `{ ...DEFAULT_SETTINGS, ...s }` 在 s 里显式带 0 时保留 0，这里只需 clamp 类型范围。
+  merged.undoGraceMs = normalizeUndoGraceMs(merged.undoGraceMs)
   if (!Number.isFinite(merged.spaceSafetyFactor) || merged.spaceSafetyFactor <= 0) {
     merged.spaceSafetyFactor = DEFAULT_SETTINGS.spaceSafetyFactor
   }
@@ -355,6 +383,9 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   //    绝不能因为"总开关关了"就把它强制写成 false —— 用户关一次总开关会丢掉子偏好
   //    （下次打开总开关时用户设置被静默重置，属数据丢失）。
   merged.zhimoCoverReplacePacked = merged.zhimoCoverReplacePacked === false ? false : true
+  // 按站方分类自动落库（知末通道）：只认严格 false（缺键 / 'false' / 0 之类脏值一律按开）。
+  // 与 `zhimoCover` 同口径：它只约束自动任务，设置页的手动重排按钮不看这个开关。
+  merged.zhimoAutoCategory = merged.zhimoAutoCategory === false ? false : true
   // 启动时自动检查更新：只认严格 false（缺键 / 'false' / 0 之类脏值一律按开）
   merged.autoCheckUpdate = merged.autoCheckUpdate === false ? false : true
   // 并发 stepper（§3.6）：默认 2，夹到 [1, 8]

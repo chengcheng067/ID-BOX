@@ -74,7 +74,20 @@ export const stageController = {
     }
   },
 
-  /** hover 预热：只在 idle 阶段接受，避免干扰正在演的过场 */
+  /**
+   * hover 预热：只在 idle 阶段接受，避免干扰正在演的过场。
+   *
+   * ★ 性能修复 G（docs/26 §4-G，第二批只写契约，接线在 `AssetGrid`）：
+   * 传 `null` = **撤回预热**。契约是「球保持当前贴图不动，不卸载」——
+   * `App.tsx` 把 `previewId` 映射成 `asset=null` 交给 `MaterialStage`，
+   * 而它只在 `asset` 非空时更新 `shownRef`（`MaterialStage.tsx:227`），
+   * 所以 `MaterialBall` 既不换 `urls`、也不卸载（`deps: []` 的建场景 effect 不受影响）。
+   *
+   * 为什么这里已经能接受 `null`：① `emitPreview` 对 `null` 有 `if (next === previewId) return`
+   * 的短路；② `MaterialStage` 有 `if (!shown) return null` 兜底（真正的空态才卸载）。
+   * **目前 `AssetGrid` 的 `onPointerLeave` 还没有调用它**（那是禁止本批修改的文件），
+   * 所以「快速划过一排卡不再白解码」这条收益要等下一批接线（docs/29 §5 第 1 条）。
+   */
   preview(assetId: string | null): void {
     if (state.phase !== 'idle') return
     emitPreview(assetId)

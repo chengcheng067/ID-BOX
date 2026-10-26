@@ -235,11 +235,26 @@ describe('store：commitCover 三处共用 / rescan 保活 / 自动任务静默'
 
   it('双触发都推到当前调用栈之外（setTimeout，不 await）', () => {
     expect(src).toContain('function scheduleZhimoCovers()')
-    const sched = sliceBetween(src, 'function scheduleZhimoCovers()', 'function maybeAutoMigrate')
+    const sched = sliceBetween(src, 'function scheduleZhimoCovers()', 'function zhimoAutoCategoryEnabled')
     expect(sched).toContain('setTimeout(')
     expect(sched).toContain('runZhimoCovers()')
+
+    // 0.7.8：两个触发点改走「先站方分类重排、再抓封面」的串行流水线
+    // （并行打同一个站会让请求量翻倍、更易被 403）。
+    // 守卫意图不变：① 必须离开导入的 Promise 链（setTimeout）；② 两个触发点都要走到。
+    expect(src).toContain('function scheduleZhimoPipeline()')
+    const pipeline = sliceBetween(src, 'function scheduleZhimoPipeline()', 'async function maybeAutoMigrate')
+    expect(pipeline).toContain('setTimeout(')
+    // 顺序写死：重排在前、封面在后（用下标比较，防止有人把两行对调）
+    const reclassAt = pipeline.indexOf('runZhimoCategoryReclass(')
+    const coverAt = pipeline.indexOf('runZhimoCovers()')
+    expect(reclassAt).toBeGreaterThan(-1)
+    expect(coverAt).toBeGreaterThan(-1)
+    expect(reclassAt).toBeLessThan(coverAt)
+    // 受开关控制：重排那一段必须在 zhimoAutoCategoryEnabled 判定之内
+    expect(pipeline).toContain('zhimoAutoCategoryEnabled(')
     // onImportBatchDone 与 importPaths 收尾各触发一次
-    expect(src.match(/scheduleZhimoCovers\(\)/g)?.length ?? 0).toBeGreaterThanOrEqual(3)
+    expect(src.match(/scheduleZhimoPipeline\(\)/g)?.length ?? 0).toBeGreaterThanOrEqual(3)
   })
 
   it('pending 只收 model + 有 ID（材质/贴图不做）', () => {

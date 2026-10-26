@@ -26,6 +26,8 @@ import { ColorDot, FavoriteStar, StarIcon, colorSwatchStyle } from './MarkContro
 import { ASSET_DRAG_MIME, dragIdsOf, serializeDragIds } from '../logic/dragAssign'
 import { beginSystemDrag } from '../logic/dragOut'
 import { cacheDragCard, cachedDragCard, cancelDragCardPrewarm, dragCardKey, prewarmDragCard as prewarmDragCardBitmap, renderDragCard } from '../logic/dragCard'
+import { peekPreviewUrl } from '../logic/previewThumb'
+import { isImageFileExt } from '../../shared/imageExts'
 import { DEFAULT_FILTERS, activeFilterDimensions, applyFilters } from '../logic/filters'
 import { isDeletedAsset, trashBadgeText } from '../logic/trashView'
 import { isHdrExt } from '../../shared/hdrExts'
@@ -844,7 +846,12 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
   const fileCardThumbUrl = (row: FileRow): string | null => {
     // ⚠️ 只在「安全」时才用文件自己的图：`fileThumbUrl` 对非封面图片返回的是**原图**
     // （库里的 4K 贴图常有几十 MB），而网格的铁律是「绝不把原图塞进 canvas」。
-    // 只接受 ① 该文件就是资产封面（走缩略图缓存）② 8MB 以内的图片。
+    // 2026-10（docs/26 方案 C + H）：优先用**已生成过的 ≤1024 预览图**
+    // （第一次 hover 由 `prewarmDragCardBitmap` 的 `preview` 参数触发生成，
+    // 之后这里同步命中 → 卡片永远只解一两百 KB，不再碰原图）。
+    const cachedPreview = peekPreviewUrl(asset.id, row.absPath)
+    if (cachedPreview) return cachedPreview
+    // 兜底口径不变：① 该文件就是资产封面（走缩略图缓存）② 8MB 以内的图片
     const own = fileThumbUrl(asset, row)
     if (own && (asset.cover === row.rel || row.size <= FILE_DRAG_CARD_MAX_IMAGE_BYTES)) return own
     return dragCardThumbUrl(asset)
@@ -852,7 +859,12 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
 
   const fileDragProps = (row: FileRow) => ({
     draggable: true,
-    onMouseEnter: () => prewarmDragCardBitmap(fileCardKey(row), { thumbUrl: fileCardThumbUrl(row), name: row.name }),
+    onMouseEnter: () => prewarmDragCardBitmap(fileCardKey(row), {
+      thumbUrl: fileCardThumbUrl(row),
+      name: row.name,
+      // 图片文件才请求 ≤1024 预览（非图片 nativeImage 读不出来，请求只会白跑一趟 IPC）
+      preview: isImageFileExt(row.ext) ? { id: asset.id, absPath: row.absPath } : null
+    }),
     onMouseLeave: () => cancelDragCardPrewarm(),
     onDragStart: (e: DragEvent) => {
       // 同网格：同步读预热缓存，未命中传 null（主进程回退缩略图，绝不因没预热拖不动）

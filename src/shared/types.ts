@@ -547,6 +547,18 @@ export interface Settings {
    * `'recycle'` = 旧行为（直接进系统回收站），其余三档 = 库内 `.trash/` 保留期。
    */
   trashRetention: TrashRetention
+  /**
+   * 删除撤销宽限期（毫秒，2026-10 用户需求：「删除是否要等 5 秒在设置里面给用户权限」）。
+   *
+   * 只允许三档（由 `shared/undoGrace.ts` 的 `normalizeUndoGraceMs` 收口）：
+   * - `0`    = 不等待：**仍然二次确认**，但确认后立即移入回收站 /「最近删除」，
+   *            不进入 `grace` 阶段 —— 底部撤销条（`NoticeToast`）也就不会出现；
+   * - `3000` = 3 秒反悔时间；
+   * - `5000` = 5 秒（默认，与新增本设置之前的行为一致）。
+   *
+   * 只影响渲染层「确认后等多久才真正落盘」，不改任何落盘路径与保留期。
+   */
+  undoGraceMs: number
   /** 默认来源标签 */
   defaultSource: string
   /** 监控目录（自动导入新下载的压缩包） */
@@ -622,6 +634,16 @@ export interface Settings {
    */
   zhimoCoverReplacePacked: boolean
   /**
+   * 导入批次结束后是否**自动按站方分类重排**（默认 true）。
+   *
+   * 语义：批次收尾后用知末详情页的 `classifyBaseName`，把仍然是「未分类/未分类」
+   * 且带知末 ID 的资产搬到对应分类目录（真实搬目录，移动前自动备份）。
+   *
+   * ⚠️ 只约束**自动任务**：设置页那段「按站方分类重排」的手动按钮**不受**本开关影响
+   * （用户点了就是要跑）。归一化方向与 `zhimoCover` 一致：只认严格 `false`。
+   */
+  zhimoAutoCategory: boolean
+  /**
    * 启动时自动检查更新（GitHub Releases，默认 **true**）。
    *
    * 关闭后 `startAutoCheck()` 一次请求都不发（手动点「立即检查」仍然可用）。
@@ -653,6 +675,8 @@ export const DEFAULT_SETTINGS: Settings = {
   archiveDisposal: 'recycle',
   // C 线：默认保留 30 天（对用户最安全；真实语义变更，UI 必须显式说明）
   trashRetention: '30d',
+  // 删除撤销期默认 5 秒 = 新增本设置之前的旧行为（老用户升级后不感知变化）
+  undoGraceMs: 5000,
   defaultSource: '知末网',
   watchDir: null,
   watchEnabled: false,
@@ -687,6 +711,8 @@ export const DEFAULT_SETTINGS: Settings = {
   zhimoCover: true,
   // 子开关默认开 = 用无水印小图替换包内预览图（只约束自动任务，手动永远替换）
   zhimoCoverReplacePacked: true,
+  // 导入后按站方分类自动落库：默认开 = 装上就有效果（只处理未分类，已分类不动）
+  zhimoAutoCategory: true,
   // 启动时自动检查更新默认开（装上就有效果）；失败静默，绝不影响启动
   autoCheckUpdate: true,
   // 0.6.0：别名表 / 智能集合默认空（= 行为与 0.5.x 一致），模板给一个保守默认
@@ -1198,6 +1224,16 @@ export interface FetchZhimoCoverResult {
   /** 站方标题（可用于日志/调试，不落库） */
   title?: string | null
   /**
+   * 站方**三级分类名**（如 `卡座沙发` / `壁灯`；`res.classifyBaseName` **原话**）。
+   *
+   * 取不到 / 站方占位 → `null`（或字段缺省）。它**不影响封面成败**。
+   *
+   * ⚠️ 落库前必须查 `shared/zhimoTaxonomyMap.ts` 的 `mapZhimoCategory(name, kind)`：
+   * 站方三级轴与本地两级分类不是一一对应，**禁止**直接写 `category1/2`。
+   * 只需要分类、不需要封面时，走轻量通道 `zhimo:fetchMeta`（不下图片）。
+   */
+  classifyBaseName?: string | null
+  /**
    * 知末站方的风格**自由词**（如 `现代` / `中古`；原样，**未经本地词表过滤**）。
    *
    * 取不到 / 站方占位 `--` / 解析失败 → `null`（或字段缺省）。它**不影响封面成败**。
@@ -1207,6 +1243,40 @@ export interface FetchZhimoCoverResult {
    * 站方自由词绝不直接进受控维度。
    */
   style?: string | null
+}
+
+// ── 知末详情页元信息（只取详情页、不下图片；2026-10 站方分类） ─────────────
+//
+// 与封面通道的分工：`zhimo:fetchCover` 要"下到图且 ≥200px"才算成功，
+// 图挂了会把**已经拿到**的站方分类一起丢掉。`zhimo:fetchMeta` 只发一次详情页 GET，
+// 解析 `classifyBaseName` / `style` / `version` / `title`，**零图片请求、零写盘**。
+
+/** `zhimo:fetchMeta` 入参（**没有 `folder`**：本通道不写盘，不需要库内路径） */
+export interface FetchZhimoMetaPayload {
+  /** 知末商品 ID：6 位以上纯数字；不合法 → `{ ok:false, reason:'no-id' }` 且不发请求 */
+  id: string
+}
+
+/**
+ * `zhimo:fetchMeta` 返回值。
+ *
+ * 形状与 `FetchZhimoCoverResult` 同款（**扁平、不是联合**）：渲染层手写 `if (!r.ok)` 即可。
+ *
+ * - `ok === true`：四个字段恒在，**值为 `null` 是正常结果**（"站方没给"，不是错误）；
+ * - `ok === false` 且带 `reason`：详情页请求/解析失败（reason 沿用封面那套枚举，
+ *   本通道**只会**出现 `no-id` / `not-found` / `timeout` / `network`）。
+ */
+export interface FetchZhimoMetaResult {
+  ok: boolean
+  reason?: ZhimoCoverFailReason
+  /** 站方三级分类名（原话，未映射）；需要时查 `mapZhimoCategory()` */
+  classifyBaseName?: string | null
+  /** 站方风格自由词（原样，未经词表过滤） */
+  style?: string | null
+  /** 站方上传版本（如 `sketchup 2014`；不是 `.skp` 内嵌版本） */
+  version?: string | null
+  /** 站方标题 */
+  title?: string | null
 }
 
 // ── HDR 预览（0.6.5，HDR 入库 + 降采样预览） ──────────────────────────────

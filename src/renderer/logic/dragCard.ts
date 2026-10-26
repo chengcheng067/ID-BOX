@@ -7,6 +7,13 @@
  * 没有 HTML overlay、没有动画、没有实时的"跟手动效"。所以要"看起来像卡片"，
  * 只能预先画好一张 PNG（圆角底 + 缩略图 cover 裁切 + 底部资产名）。
  *
+ * ## 卡片上的图：≤1024 预览图（docs/26 方案 C + H）
+ *
+ * 预热时**先用 IPC 请求一张预生成的 ≤1024 预览图**（`thumb:preview`），拿到 URL 才画；
+ * 拿不到（源文件读不了 / 解码失败 / IPC 异常）就退回调用方给的 `thumbUrl`
+ * （通常是 480 缩略图）。这样"拖一次 8K 贴图要解码几十 MB"的路径就不存在了，
+ * 并且**回退语义不变**：卡片的图永远是"便宜的"，绝不会为了预览把拖拽拖死。
+ *
  * ## 为什么必须预热而不是在 dragstart 里现画
  *
  * `startDrag` 必须在 `dragstart` 的**同步段**里发起（invoke 的 Promise 往返会丢手势，
@@ -18,13 +25,15 @@
  *
  * 一律返回 `null`，由调用方回退到 `resolveDragIcon(thumbName)`：
  * - 没有 DOM（vitest node 环境）；
- * - 缩略图加载失败 / 不是图片；
+ * - 缩略图 / 预览图加载失败、不是图片；
  * - **canvas 被 taint**（跨源图片没有 CORS）→ `toBlob` 抛 `SecurityError`；
  * - `toBlob` 返回 null（内存不足 / 尺寸为 0）。
  *
  * ⚠️ 不要用 `setDragImage`：这条拖拽已被 `beginSystemDrag` 的 `preventDefault()` 取消，
  * 渲染进程根本没有 HTML5 拖拽会话可挂 drag image。
  */
+
+import { ensurePreviewUrl } from './previewThumb'
 
 /** 主题（跟随 `document.documentElement.dataset.theme`） */
 export type DragCardTheme = 'light' | 'dark'
@@ -95,6 +104,18 @@ export interface RenderDragCardOptions {
   theme?: DragCardTheme
   /** 卡片底色覆盖（默认取调色板；一般不用传） */
   surface?: string
+}
+
+/**
+ * hover 预热的入参：在卡片渲染参数之上，多一个**预览图来源**。
+ *
+ * `preview` 非空时，预热会**先** `await ensurePreviewUrl(...)`（主进程生成 / 复用
+ * ≤1024 预览图），成功才把 `thumbUrl` 换成预览 URL 去画；失败就用原来的 `thumbUrl`。
+ * 绝不能因为"预览没生成好"而少画一张卡 —— 拖拽可用性优先于观感。
+ */
+export interface PrewarmDragCardOptions extends RenderDragCardOptions {
+  /** 预览图来源（资产 id + 源文件绝对路径）；`null` / 省略 = 不请求预览 */
+  preview?: { id: string; absPath: string | null } | null
 }
 
 /** 运行环境是否具备 canvas（vitest node 环境没有 → 调用方直接回退） */
@@ -364,9 +385,12 @@ let prewarmKey: string | null = null
  * 为什么必须预热：`startDrag` 必须在 `dragstart` 的同步段发起，而 `canvas.toBlob`
  * 是异步的 —— 现画来不及，只能提前画好放缓存（见文件头注释）。
  *
+ * 时序（方案 C + H）：`hover` → 120ms 防抖 → **请求 ≤1024 预览图（IPC）** →
+ * 用预览 URL 画卡（失败则用 `thumbUrl` 画）→ 写缓存。到 `dragstart` 时再同步读缓存。
+ *
  * 命中缓存 / 无 DOM 环境直接返回；同一时刻只保留最后一次 hover 的那张。
  */
-export function prewarmDragCard(key: string, options: RenderDragCardOptions): void {
+export function prewarmDragCard(key: string, options: PrewarmDragCardOptions): void {
   if (!key || !canRenderCanvas()) return
   if (cardCache.has(key)) return
   if (prewarmKey === key && prewarmTimer !== null) return
@@ -377,10 +401,23 @@ export function prewarmDragCard(key: string, options: RenderDragCardOptions): vo
     const k = prewarmKey
     prewarmKey = null
     if (!k) return
-    void renderDragCard(options)
+    void renderWithPreview(options)
       .then((png) => cacheDragCard(k, png))
       .catch(() => undefined)
   }, PREWARM_DELAY)
+}
+
+/**
+ * 先把「卡片要用的图」定下来，再渲染。
+ *
+ * 预览解析**永不 reject**（`ensurePreviewUrl` 内部吞掉所有错误），
+ * 所以这里的 `await` 不会把拖拽卡片拖成"没图"。
+ */
+async function renderWithPreview(options: PrewarmDragCardOptions): Promise<Uint8Array | null> {
+  if (!options.preview) return renderDragCard(options)
+  const previewUrl = await ensurePreviewUrl(options.preview.id, options.preview.absPath)
+  // 预览失败 → 原样用 thumbUrl（480 缩略图 / 占位），绝不产出空白卡
+  return renderDragCard(previewUrl ? { ...options, thumbUrl: previewUrl } : options)
 }
 
 /** 取消尚未开始的预热（鼠标已移开，没必要再画） */

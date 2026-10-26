@@ -415,8 +415,13 @@ export function normalizeCategoryPair(
  * 分类段净化（DEF-14）：词表里有含 `/` 的词条（「椅子/凳子」「灯膜/灯罩」等），
  * 原样落盘会变成五段路径、破坏固定四层契约（rescan 回读时资产名/分类错乱）。
  * 分隔符替换为 `_`（「椅子/凳子」→「椅子_凳子」，语义保留、单段合法）。
+ *
+ * 【0.7.8 起导出】`main/importer.ts` 在**算目录之前**也要用同一条规则净化
+ * `category1/category2`（磁盘目录段 / `composeRelFolder` / `Asset.category*` 必须
+ * 是同一个字符串），因此必须共用本函数 —— 导入侧**不得**另写一套 replace，
+ * 否则两条规则迟早漂移（本缺陷就是这么来的）。
  */
-function sanitizeCategorySegment(seg: string): string {
+export function sanitizeCategorySegment(seg: string): string {
   return seg.replace(/[\\/]+/g, '_')
 }
 

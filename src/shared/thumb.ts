@@ -8,6 +8,27 @@
 /** 缩略图最长边默认像素（PRD P0-9：≤480px） */
 export const DEFAULT_THUMB_MAX_PX = 480
 
+/**
+ * 「预览图」的最长边像素上限（docs/26 方案 C + H：拖拽卡片改用 ≤1024 预生成预览图）。
+ *
+ * 为什么要单独一档，而不是把 480 调大：
+ * - 480 是**网格卡片**的口径（数量多、只读、要求小）；
+ * - 拖拽卡片是 176×176 逻辑像素，但要跟随系统缩放 / 高 DPI（`dpr ≤ 2`），
+ *   而且用户会把它拖进 DCC 里放大看 —— 480 在 2x 屏上只有 240 逻辑像素，明显糊；
+ * - 1024 的 JPEG 大约 100~300KB，解码成本比 8K 原图（几十 MB、8192²）低两个数量级。
+ * 因此预览图是**独立的一档缓存**（文件名带 `-p1024`），与 480 缩略图并存、互不覆盖。
+ */
+export const PREVIEW_MAX_PX = 1024
+
+/**
+ * 预览图文件名的后缀（紧跟 salt，插在扩展名之前）：`<id>-<salt>-p1024.jpg`。
+ *
+ * 为什么用后缀而不是另一个目录：`vault://thumb/<name>` 已经能读 `thumbsDir` 里的
+ * 任何文件（见 `main/protocol.ts`），同目录只差文件名 → 零协议改动、零新目录、
+ * 清理逻辑（`deleteThumb` / `pruneThumbs` / `clearThumbs`）天然覆盖。
+ */
+export const PREVIEW_SUFFIX = '-p1024'
+
 /** JPEG 输出质量 */
 export const THUMB_JPEG_QUALITY = 82
 
@@ -88,21 +109,62 @@ export function thumbFileName(id: string, salt: string, ext: 'jpg' | 'png'): str
   return `${id}-${salt}.${ext}`
 }
 
+/**
+ * `<id>-<salt>-p1024.<ext>`，如 `a1b2c3d4-…-9f3c-p1024.jpg`（≤1024 预览图）。
+ *
+ * 与 {@link thumbFileName} 的差别只有中间那段后缀，好处：
+ * ① 同一资产的 480 缩略图与 1024 预览图**文件名不同**，不会互相覆盖；
+ * ② 老的 `<id>-<salt>.<ext>` 解析结果**一字不变**（后缀是新增语法，旧名不可能带）；
+ * ③ `p` 不是十六进制，所以旧正则不可能把 `-p1024` 吃进 salt —— 新名字只在
+ *    「以前解析不了」的输入上生效，不存在旧文件被重新解释。
+ */
+export function previewFileName(id: string, salt: string, ext: 'jpg' | 'png'): string {
+  return `${id}-${salt}${PREVIEW_SUFFIX}.${ext}`
+}
+
 export interface ParsedThumbName {
   id: string
   salt: string
   ext: string
+  /**
+   * 是否是 ≤1024 的**预览图**（文件名带 {@link PREVIEW_SUFFIX}）。
+   *
+   * ⚠️ **只有为真时才出现这个键**（类型是 `true` 不是 `boolean`）：
+   * 旧格式的解析结果必须与改造前**逐字段相同**——多一个 `preview: false`
+   * 就会让既有调用方的 `toEqual({id, salt, ext})` 与快照全部失败。
+   * 判假统一用 `parsed.preview === true` / `'preview' in parsed`。
+   */
+  preview?: true
 }
 
 /**
- * 解析缩略图文件名。
- * id 是 UUID（本身含 `-`），所以 salt 取**最后一个** `-` 之后、`.` 之前的十六进制串。
- * 解析不了（不是缩略图文件）返回 null。
+ * 解析缩略图文件名（**同时认 480 缩略图与 1024 预览图**）。
+ *
+ * id 是 UUID（本身含 `-`），所以 salt 取**最后一个** `-` 之后、`.` 之前的十六进制串；
+ * 预览图在此基础上多一段 `-p1024`（大小写不敏感，解析后归一化为 `preview: true`）。
+ *
+ * 兼容性（有守卫级单测，别改）：旧格式 `<id>-<salt>.<ext>` 的返回值**逐字段不变**
+ * —— `{id, salt, ext}` 三个键，且**没有** `preview` 键。
+ * 另外 `-p1024` 不可能被旧正则当成 salt（`p` 不是十六进制），
+ * 所以「以前解析不了的名字」才会被新语法认领，不存在旧文件被重新解释。
+ * 解析不了（不是缓存文件）返回 null。
  */
 export function parseThumbFileName(name: string): ParsedThumbName | null {
-  const m = /^(.+)-([0-9a-f]+)\.(jpg|png)$/i.exec(name)
+  const m = /^(.+)-([0-9a-f]+)(-p1024)?\.(jpg|png)$/i.exec(name)
   if (!m) return null
-  return { id: m[1]!, salt: m[2]!.toLowerCase(), ext: m[3]!.toLowerCase() }
+  const parsed: ParsedThumbName = {
+    id: m[1]!,
+    salt: m[2]!.toLowerCase(),
+    ext: m[4]!.toLowerCase()
+  }
+  // 关键：只有真预览才加键（见 ParsedThumbName.preview 的注释）
+  if (m[3]) parsed.preview = true
+  return parsed
+}
+
+/** 是否是 ≤1024 的预览图文件（解析失败 / 旧 480 缩略图都返回 false） */
+export function isPreviewThumbName(name: string): boolean {
+  return parseThumbFileName(name)?.preview === true
 }
 
 /**
@@ -127,18 +189,27 @@ export function resizeToMaxPx(
   }
 }
 
-/** 文件名是否属于某个 id 的缩略图（salt 会变，必须通配匹配） */
+/**
+ * 文件名是否属于某个 id 的缩略图（salt 会变，必须通配匹配）。
+ *
+ * **包括 ≤1024 预览图**（`<id>-<salt>-p1024.jpg`）：它们与缩略图同 id，
+ * 因此 `deleteThumb(id)` 换封面时的通配删除、`pruneThumbs` 的 live 判定
+ * 都会自动算上它们，不需要第二套白名单。
+ */
 export function isThumbOf(name: string, id: string): boolean {
   const p = parseThumbFileName(name)
   return p !== null && p.id === id
 }
 
-/** 从目录列表里挑出某个 id 的全部缩略图（换封面后 salt 变，可能有多份） */
+/** 从目录列表里挑出某个 id 的全部缓存文件（480 缩略图 + 1024 预览图） */
 export function matchThumbNames(names: string[], id: string): string[] {
   return names.filter((n) => isThumbOf(n, id))
 }
 
-/** 孤儿判定：目录里存在、但 id 已不在 liveIds 中的缩略图 */
+/**
+ * 孤儿判定：目录里存在、但 id 已不在 liveIds 中的缓存文件
+ * （480 缩略图与 1024 预览图一视同仁：id 还在 → 不是孤儿，绝不误删）。
+ */
 export function findOrphanThumbs(names: string[], liveIds: Iterable<string>): string[] {
   const live = new Set(liveIds)
   return names.filter((n) => {

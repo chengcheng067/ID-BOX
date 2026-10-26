@@ -81,9 +81,11 @@ import { ballCameraPosition } from '../logic/ballCamera'
 import type { NormalizedBallParams } from '../../shared/ballParams'
 import { AlphaMapToggles } from './AlphaMapToggles'
 import {
+  bitmapBytes,
   formatBitmapCacheStats,
   textureBitmapCache
 } from '../logic/textureBitmapCache'
+import { TexturePool, formatTexturePoolStats, texturePoolKey } from '../logic/texturePool'
 import { currentMotionProfile, subscribeMotionProfile } from '../logic/motionProfile'
 import type { MotionProfile } from '../../shared/motionQuality'
 
@@ -454,28 +456,112 @@ function downscaleToLimit(bitmap: ImageBitmap, maxPx: number): CanvasImageSource
 }
 
 /**
- * 贴图加载（性能修复 A+B）：优先 `fetch` + `createImageBitmap`，解码在 worker 线程。
+ * `loadTexture` 的入参（性能修复 D + E）
+ */
+interface LoadTextureOptions {
+  /**
+   * 取消信号（方案 E）：换资产时上一代的**在途**加载立刻退出。
+   *
+   * `fetch` 可取消；`createImageBitmap` 一旦开始不可中断 —— 但**还没开始**的那些
+   * 必须在入口判掉（扫过一排卡时，排队的几十个解码就是靠这一行不再启动）。
+   */
+  signal: AbortSignal | null
+  /**
+   * 贴图池（方案 D）：按 renderer 复用 `Texture`。命中时**连 fetch 都不做**，
+   * 直接拿回同一个 Texture 实例（GPU 里已经在册 → 上传也省了）。
+   */
+  pool: TexturePool<Texture> | null
+  /** true = 数据图（线性色彩空间）；false = albedo（sRGB）。进池 key，避免串味 */
+  linear: boolean
+}
+
+/** 加载结果：`pooled` = 由池管理（换资产时只归还，**不许 dispose**） */
+interface LoadedTexture {
+  texture: Texture
+  pooled: boolean
+}
+
+/** 造一个 name === 'AbortError' 的错误（不依赖 DOMException，node 里同样可判） */
+function abortError(): Error {
+  const err = new Error('贴图加载被取消')
+  err.name = 'AbortError'
+  return err
+}
+
+/**
+ * 是不是「主动取消」导致的失败。
  *
- * ★ 性能修复 A（2026-10）：**同一张图只解码一次**。
- * 旧实现先全尺寸解一遍（8192² 原木 482ms）只为拿宽高，再带 resize 解一遍（434ms）
- * → 一次切换 1014ms 全花在 CPU 解码。现在宽高从**文件头**读（`shared/imageSize.ts`，
- * 纯字节解析），然后只解一次并直接带上 `resizeWidth/resizeHeight`。
- * 生成纹理的**最终尺寸语义不变**（超过 `MAX_TEX_PX` 的按最长边等比缩到 1024）。
+ * ⚠️ 取消**不是**故障：`loadTexture` / `loadMap` 判到它之后必须**静默**返回，
+ * 绝不能走 `console.warn` 刷日志（docs/26 §4-E 明确要求）。
+ */
+export function isAbortError(err: unknown): boolean {
+  return (
+    typeof err === 'object' && err !== null && (err as { name?: unknown }).name === 'AbortError'
+  )
+}
+
+/**
+ * 贴图加载（性能修复 A+B+D+E）：优先 `fetch` + `createImageBitmap`，解码在 worker 线程。
+ *
+ * ★ A（2026-10）：**同一张图只解码一次**（宽高从文件头读，`shared/imageSize.ts`）。
+ * ★ B：`willReadFrequently` + 256px 合成法线（落点在 `normalFromBitmap`）。
+ * ★ D（第二批）：**先查 Texture 池**——命中直接返回，`fetch`/解码/上传**全部跳过**。
+ *   这就是「切回看过的资产 ≈ 0ms」的来源；位图缓存只解决「不重解码」，
+ *   池再解决「不重传 + 不重 fetch」（4K 五槽实测 fetch 81ms + 上传 23.7ms，docs/26 §2.2）。
+ * ★ E（第二批）：`signal` 一路传到 `fetch`；`createBitmap` 入口再判一次 aborted。
  *
  * `vault://` 是自定义协议：能不能 fetch 取决于是否注册为 `protocol.handle`（Electron 33
  * 的 handle 支持 fetch）。**拿不到就退回 TextureLoader**，绝不假装成功——退回时会在控制台
  * 留一行 warn，方便判断当前构建走的是哪条路。
+ * ⚠️ `TextureLoader` **不支持取消**（它的 `load` 没有 signal 参数）：只在进入前判一次
+ * aborted，不假装能中断它。
  */
-async function loadTexture(url: string): Promise<Texture | null> {
+async function loadTexture(
+  url: string,
+  opts: LoadTextureOptions
+): Promise<LoadedTexture | null> {
+  const { signal, pool, linear } = opts
+  if (signal?.aborted === true) return null
+
+  /**
+   * ★ D：池命中 —— 这一行是「切回来 0ms」的**唯一**入口。
+   *
+   * key 用 `url|maxPx|srgb|linear`：不需要知道解码后的像素尺寸（`maxPx` 已经决定了
+   * 解码目标尺寸的口径），所以能在 `fetch` **之前**查，真正做到零 IO。
+   */
+  const poolKey = texturePoolKey(url, MAX_TEX_PX, linear)
+  const cachedTex = pool ? pool.take(poolKey) : null
+  if (cachedTex) {
+    console.info(`[MaterialBall] 贴图池命中，跳过 fetch/解码/上传：${url}`)
+    return { texture: cachedTex, pooled: true }
+  }
+
+  // 池未命中：从池里"拿一张再放回去"不算数（take 已记 miss），这里只是把新贴图放进池
+  const putIfPooled = (tex: Texture, image: { width: number; height: number }): LoadedTexture => {
+    if (pool) {
+      pool.put(poolKey, tex, bitmapBytes(image))
+      return { texture: tex, pooled: true }
+    }
+    return { texture: tex, pooled: false }
+  }
+
   if (typeof fetch === 'function' && typeof createImageBitmap === 'function') {
     try {
       const decoded = await decodeTextureBitmap(url, MAX_TEX_PX, {
-        // 显式包一层：避免把 fetch 当方法调用时丢 this
-        fetchImpl: (u) => fetch(u),
-        createBitmap: (blob, opts) => createImageBitmap(blob, opts),
-        // ★ 性能修复 D：命中就不解码（只付上传）。缓存与 WebGL 上下文无关，球卸载后仍然有效
+        // 显式包一层：避免把 fetch 当方法调用时丢 this；signal 让换资产能立刻掐断
+        fetchImpl: (u) => fetch(u, signal ? { signal } : undefined),
+        createBitmap: async (blob, bitmapOpts) => {
+          // ★ E：解码不可中断，但「还没开始」的必须判掉 —— 扫卡时排队的解码就死在这一行
+          if (signal?.aborted === true) throw abortError()
+          return createImageBitmap(blob, bitmapOpts)
+        },
+        // ★ 位图层缓存：命中就不解码（只付上传）。缓存与 WebGL 上下文无关，球卸载后仍然有效
         cache: textureBitmapCache
       })
+      // 解码途中被取消：结果直接丢（已写进位图缓存也没关系，那正是它的用途）
+      // ⚠️ 这里不写 `=== true`：TS 会把首行的守卫收窄成 `false | undefined`，
+      //    后续再比较 `true` 会被判成 TS2367「无意义比较」。
+      if (signal?.aborted) return null
       if (decoded) {
         if (decoded.scaled && decoded.sourceSize && decoded.decodes > 0) {
           const longest = Math.max(decoded.sourceSize.w, decoded.sourceSize.h)
@@ -495,17 +581,21 @@ async function loadTexture(url: string): Promise<Texture | null> {
         const tex = new Texture(image)
         tex.flipY = false // 已在 createImageBitmap 里翻转过，three 不能再翻一次
         tex.needsUpdate = true
-        return tex
+        return putIfPooled(tex, image as unknown as { width: number; height: number })
       }
       console.warn(`[MaterialBall] fetch 返回非 2xx，退回 TextureLoader：${url}`)
     } catch (err) {
+      // ★ E：主动取消是**预期路径**，不是故障 —— 不打 warn（docs/26 §4-E）
+      if (isAbortError(err) || signal?.aborted) return null
       console.warn('[MaterialBall] fetch/createImageBitmap 失败，退回 TextureLoader：', err)
     }
   }
+  if (signal?.aborted) return null
+  // 兜底路径不池化：它没有可控的解码口径，放进池只会占着一条槽（也避免 flipY 口径串味）
   return new Promise((resolve) => {
     new TextureLoader().load(
       url,
-      (t) => resolve(t),
+      (t) => resolve({ texture: t, pooled: false }),
       undefined,
       () => resolve(null)
     )
@@ -530,7 +620,38 @@ export class BallScene {
   private mesh: Mesh
   private controls: OrbitControls | null = null
   private geometry: BufferGeometry
+  /**
+   * **本场景自建、必须 `dispose()` 的贴图**（合成法线；TextureLoader 兜底贴图）。
+   *
+   * ⚠️ 0.7.x 之前它是「全部活动贴图」。第二批（性能修复 D）之后，槽位贴图由
+   * `slotTextures` + `texPool` 管理（换资产只**归还**，不 dispose —— 那样才有
+   * 「切回来 0ms」），这里只剩**池管不到的**那两类。
+   * 于是 `applyMaps` 里那句 `for (const t of this.maps) t.dispose()` 依旧逐字正确，
+   * 语义从「释放全部」收窄成「释放自建的」（stagePerf 的源码守卫仍然成立）。
+   */
   private maps: Texture[] = []
+  /**
+   * 当前挂到材质上的槽位贴图（键 = PBR 槽位 + `'alpha'`）。
+   *
+   * 与 `maps` 的区别只有一个：它们可能在 `texPool` 里（`pool.owns(t)`），
+   * 换资产时只 `release`（引用计数 -1），由池按 LRU 决定何时真正 dispose。
+   */
+  private slotTextures = new Map<MaterialSlotKey | 'alpha', Texture>()
+  /**
+   * 贴图池（性能修复 D）：**按 renderer** 复用 `Texture`。
+   *
+   * 池的生命周期 = 本 BallScene 的生命周期：renderer 一销毁，池里的贴图全部失效，
+   * 所以 `dispose()` 里必须 `disposeAll()`。舞台那颗球整场会话常驻（建场景 effect
+   * 是 `deps: []`），因此「按场景」在这里就等于「按会话」。
+   */
+  private readonly texPool = new TexturePool<Texture>()
+  /**
+   * 本批贴图的取消句柄（性能修复 E）：换资产时 `abort()` 上一代。
+   *
+   * `mapsGen` 只能「丢弃迟到的结果」，不能阻止旧一代继续烧 CPU（docs/26 §3③ 原文）；
+   * 加上 controller 之后，旧一代的 `fetch` 立刻 reject、还没开始的解码直接判掉。
+   */
+  private mapsAbort: AbortController | null = null
   /** rAF 循环（可停可起，stop 不 dispose 上下文） */
   private readonly loop = new FrameLoop()
   private disposed = false
@@ -738,6 +859,35 @@ export class BallScene {
   }
 
   /**
+   * 当前**活动的全部贴图**：槽位贴图（可能来自池）+ 自建贴图（合成法线 / 兜底），去重。
+   *
+   * 所有「对每张贴图做点什么」的地方都必须走这里，不能只遍历 `this.maps`
+   * （第二批之后它只剩自建的那两张）：平铺、各向异性热改、释放。
+   */
+  private liveTextures(): Texture[] {
+    const out: Texture[] = []
+    for (const t of this.slotTextures.values()) out.push(t)
+    for (const t of this.maps) if (!out.includes(t)) out.push(t)
+    return out
+  }
+
+  /**
+   * 换资产时归还槽位贴图（性能修复 D）。
+   *
+   * - 池里的：只 `release`（引用 -1），**绝不 dispose** —— 切回来还要用它，
+   *   那正是「hover 预热过再双击 = 0 成本」的全部来源；
+   * - 自建的（`release` 返回 false）：留给 `applyMaps` 里那句
+   *   `for (const t of this.maps) t.dispose()` 统一释放。
+   *
+   * ⚠️ 先在槽位上 `release` 再 dispose 自建的：`release` 内部会跑一次逐出，
+   * 此时槽位引用已经放开，逐出才可能把上一批资产那几张贴图收掉。
+   */
+  private releaseSlots(): void {
+    for (const t of this.slotTextures.values()) this.texPool.release(t)
+    this.slotTextures.clear()
+  }
+
+  /**
    * 平铺：形态基准（平面 2×2 检查接缝，球 / 盒 1×1）× UV 大小倍率（v0.2.1 增补 2）。
    * three 支持小数 repeat + RepeatWrapping，倍率 0.1–4 全程有效。
    *
@@ -745,7 +895,7 @@ export class BallScene {
    * 是"方砖不变长砖"的唯一正确解：`SphereGeometry` 的 u 一圈 = 2πr、v 半圈 = πr。
    */
   private applyRepeat(): void {
-    for (const t of this.maps) this.repeatTexture(t)
+    for (const t of this.liveTextures()) this.repeatTexture(t)
   }
 
   /** 单张贴图的重复写入口径（所有贴图共用；缺一处就会出现"弹窗正常、卡片还是长砖"） */
@@ -877,9 +1027,33 @@ export class BallScene {
     // 代次令牌：换资产复用同一个场景后，上一份资产的慢加载可能晚于新一份返回，
     // 没有令牌就会把旧贴图贴到新球上（hover 快速划卡时必然踩到）。
     const gen = ++this.mapsGen
+    /**
+     * ★ 性能修复 E（第二批）：**取消上一代的在途加载**。
+     *
+     * `mapsGen` 只能丢弃迟到的结果，拦不住旧一代继续烧 CPU —— 扫过一排材质卡时，
+     * 几十个 `fetch` / 解码会排成队，用户双击的那一张只能排在队尾（docs/26 §3③ 实测
+     * 的"排队来源"）。abort 之后：旧一代的 `fetch` 立刻 reject，还没开始的解码
+     * 在入口就被判掉（`loadTexture` 的 `createBitmap`）。
+     */
+    this.mapsAbort?.abort()
+    const abort = new AbortController()
+    this.mapsAbort = abort
+    const signal = abort.signal
+
+    /**
+     * ★ 性能修复 D（第二批）：**池化贴图只归还，不 dispose**。
+     *
+     * 只有 `this.maps`（合成法线 / TextureLoader 兜底）照旧释放；槽位贴图回到
+     * `texPool`（引用 -1），下次切回来就能命中 → 不重 fetch、不重解码、不重上传。
+     *
+     * 顺序纪律：**先 `clearMaps` 摘掉材质引用，再归还/释放**。原因是 `releaseSlots()`
+     * 会顺手跑一次 LRU 逐出（`refs` 归零的条目可能被立刻 dispose），
+     * 若此时 `material.map` 还指着它，就会留下「材质引用已 dispose 纹理」的窗口。
+     */
+    clearMaps(this.material)
+    this.releaseSlots()
     for (const t of this.maps) t.dispose()
     this.maps = []
-    clearMaps(this.material)
     // 复用同一个场景换资产：这两个值原本靠"每次新建 BallScene"天然复位，现在必须显式复位
     this.material.color.setHex(BASE_COLOR) // 上一个资产可能把底色让成了纯白
     // 基准复位 + 标记"未落定"：单图资产会把法线基准压到 SYNTH_NORMAL_SCALE，
@@ -937,7 +1111,7 @@ export class BallScene {
     const alphaEntry = entries.find(([slot]) => slot === 'alpha')
     const mapEntries = entries.filter(([slot]) => slot !== 'alpha')
     const jobs = mapEntries.map(async ([slot, url]) => {
-      await this.loadMap(slot, url, gen)
+      await this.loadMap(slot, url, gen, signal)
       // albedo 一落定就上屏（fail 也算：失败槽位保持默认灰，总比永远不亮强）
       if (slot === 'albedo') markReady()
     })
@@ -949,7 +1123,7 @@ export class BallScene {
       // 有 albedo 的只是补一次 isReady。
       if (!hasAlbedo) markReady()
       // alpha 单发（见上：同 URL 串行，避免二次解码）；失败也只是少一层灰度透明
-      if (alphaEntry) await this.loadMap('alpha', alphaEntry[1], gen)
+      if (alphaEntry) await this.loadMap('alpha', alphaEntry[1], gen, signal)
       if (this.disposed || gen !== this.mapsGen) return
       // ★ 任务 1：**所有分支**在这里按当前倍率重算一次（不含 albedo 的、单图的、
       //   有 roughnessMap 的、加载失败保底灰的，全部覆盖）。这里不读"调用方快照"，
@@ -957,6 +1131,8 @@ export class BallScene {
       //   即使中间隔着几十毫秒的异步加载、期间用户又拖了滑块，也不会算漏。
       //   注意：`hasAlphaMap` 必须在这之后取（alpha 贴图落定才算数）。
       this.settleParamBasis()
+      // 一行汇总（每批一次）：排查「还卡」时能直接看出池是满的还是命中率低
+      console.info(`[MaterialBall] ${formatTexturePoolStats(this.texPool.stats())}`)
     })
   }
 
@@ -972,7 +1148,7 @@ export class BallScene {
   private synthesizeNormalIfMissing(urls: MaterialSlotUrls): void {
     if (this.disposed) return
     if (typeof urls.normal === 'string' && urls.normal.length > 0) return // 有真法线图
-    const albedo = this.maps.length > 0 ? this.material.map : null
+    const albedo = this.material.map
     const image = albedo?.image as (CanvasImageSource & { width: number; height: number }) | undefined
     if (!image || !image.width || !image.height) return
     const tex = normalFromBitmap(image)
@@ -989,16 +1165,34 @@ export class BallScene {
   private async loadMap(
     slot: MaterialSlotKey | 'alpha',
     url: string,
-    gen: number
+    gen: number,
+    signal: AbortSignal | null
   ): Promise<void> {
-    const tex = await loadTexture(url)
-    if (!tex) {
+    /**
+     * 池 key 的 `linear` 口径必须与下面的 `colorSpace` 写入口径**逐字一致**：
+     * 只有 albedo 是 sRGB，其余（含 `'alpha'`）都是线性数据图（见下面的长注释）。
+     * 两处一旦漂移，池里就会混进「按错的色彩空间建的贴图」→ 颜色/透明度错。
+     */
+    const loaded = await loadTexture(url, {
+      signal,
+      pool: this.texPool,
+      linear: slot !== 'albedo'
+    })
+    if (!loaded) {
+      /**
+       * ★ E：取消 / 过期代次都是**预期路径**，不是加载失败 → 必须静默。
+       * 这里的判据顺序很重要：先判取消，再判代次；两者都成立时也不打日志。
+       */
+      if (signal?.aborted === true || gen !== this.mapsGen) return
       console.warn(`[MaterialBall] 贴图加载失败（${slot}），该槽位保持默认灰：${url}`)
       return
     }
-    // 场景已卸载，或这份贴图属于已被取代的那一代资产 → 立刻释放，绝不能贴上去
+    const tex = loaded.texture
+    // 场景已卸载，或这份贴图属于已被取代的那一代资产 → 立刻归还/释放，绝不能贴上去
     if (this.disposed || gen !== this.mapsGen) {
-      tex.dispose()
+      // ★ D：池里的贴图只**归还**（dispose 会把池里那条变成死纹理）；自建的照旧释放
+      if (loaded.pooled) this.texPool.release(tex)
+      else tex.dispose()
       return
     }
     tex.wrapS = RepeatWrapping
@@ -1012,11 +1206,37 @@ export class BallScene {
      * 变成"几乎全透"。按灰度就该按**文件里的原始值**，不做传递函数。
      */
     if (slot === 'albedo') tex.colorSpace = SRGBColorSpace
-    tex.anisotropy = this.maxAnisotropy
+    /**
+     * 各向异性是**采样器状态**，只在贴图上传（`needsUpdate`）时写进 GPU。
+     * 池命中的贴图可能已经上传过，所以：
+     * - 档位没变 → 什么都不做（**不能无条件 needsUpdate**，否则池命中又要重传一次，
+     *   正好抵消 D 的收益）；
+     * - 档位变了 → 写值 + `needsUpdate`，让新的采样参数落进显存。
+     */
+    if (tex.anisotropy !== this.maxAnisotropy) {
+      tex.anisotropy = this.maxAnisotropy
+      tex.needsUpdate = true
+    }
     // 平铺 = 形态基准 × UV 大小倍率（v0.2.1 增补 2）+ 球面 u 方向弧长补偿（见 repeatTexture）。
     // alpha 走同一口径：否则透明分布与颜色贴图对不上（半透明的斑块错位）。
+    // ⚠️ 池命中的贴图可能是上一次（另一种形态 / 另一个 UV 倍率）用过的 → **每次都要重写**。
     this.repeatTexture(tex)
-    this.maps.push(tex)
+    /**
+     * 同一槽位已有旧贴图时先摘掉它：池化的归还（引用 -1），自建的 dispose。
+     * 正常路径下 `applyMaps` 一开始就清空了 `slotTextures`，这里是防御性分支
+     * （同代内重复挂同一槽位 / 灰度开关切换时会出现）。
+     */
+    const prev = this.slotTextures.get(slot)
+    if (prev !== undefined && prev !== tex) {
+      if (!this.texPool.release(prev)) {
+        const at = this.maps.indexOf(prev)
+        if (at >= 0) this.maps.splice(at, 1)
+        prev.dispose()
+      }
+    }
+    this.slotTextures.set(slot, tex)
+    // 池管不到的（TextureLoader 兜底）必须记进 `this.maps`，卸载/换资产时才有机会释放
+    if (!loaded.pooled) this.maps.push(tex)
     assignMap(this.material, slot, tex)
     // albedo 是**乘法**着色：底色 0xb9b6b0 会把所有贴图整体压暗偏灰。
     // 有 albedo 时把底色让给贴图（纯白），没有贴图时才用中性灰当"陶土球"。
@@ -1134,20 +1354,34 @@ export class BallScene {
     if (this.lastSize) this.resize(this.lastSize.w, this.lastSize.h)
     this.maxAnisotropy = Math.min(profile.anisotropy, this.renderer.capabilities.getMaxAnisotropy())
     // `texture.needsUpdate = true` 才会把新的 anisotropy 送进 GPU（否则采样参数不变）
-    for (const t of this.maps) {
+    // ⚠️ 必须走 liveTextures()：槽位贴图第二批起不在 `this.maps` 里了
+    for (const t of this.liveTextures()) {
       t.anisotropy = this.maxAnisotropy
       t.needsUpdate = true
     }
   }
 
-  /** 全量释放（切资产 / 卸载必经之路，详见类注释） */
+  /** 全量释放（卸载必经之路，详见类注释） */
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    // ★ E：卸载时把在途加载一并掐断（否则关了舞台，旧 fetch / 解码还在烧 CPU）
+    this.mapsAbort?.abort()
+    this.mapsAbort = null
     this.stopLoop()
     this.controls?.dispose()
     for (const t of this.maps) t.dispose()
     this.maps = []
+    this.slotTextures.clear()
+    /**
+     * ★ D：池里的贴图必须在这里全部释放。
+     *
+     * renderer 马上要 `dispose() + forceContextLoss()`，池里的 Texture 全部失效；
+     * 不 disposeAll 的话它们会一直挂在池里（引用计数也不再有人减），
+     * 而且 `sharedEnvCache` 那套 "GPU 资源随上下文归还" 的说法**不适用于 JS 侧的
+     * Texture 对象**（它没有被 GC 回收之前，其 WebGLTexture 记录要等上下文销毁才清）。
+     */
+    this.texPool.disposeAll()
     clearMaps(this.material)
     this.material.dispose()
     this.geometry.dispose()
