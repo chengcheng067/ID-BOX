@@ -80,6 +80,23 @@ check('renderer: 库目录漂移提示文案', rendererAll, '的索引路径不�
 check('renderer: 重复记录清理备份 dup-clean-', rendererAll, 'dup-clean-')
 check('renderer: 缩略图存在性自愈日志', rendererAll, '[recordHygiene]')
 
+// ── 0.7.8 ──
+// 这一批全是"字符串字面量型"标记，压缩不会动；刻意避开函数名/类名（会被 mangle）。
+// 知末分类落库三件套：IPC 通道名、失败日志、preload 桥、备份前缀（与老 reclass- 区分）。
+check('main: 知末元信息 ipc 通道 zhimo:fetchMeta', main, 'zhimo:fetchMeta')
+check('main: 知末元信息失败日志 zhimo:meta-failed', main, 'zhimo:meta-failed')
+check('preload: fetchZhimoMeta bridge', pre, 'fetchZhimoMeta')
+check('renderer: 知末重排备份前缀 zhimo-reclass-', rendererAll, 'zhimo-reclass-')
+check('renderer: 知末自动分类开关 zhimoAutoCategory', rendererAll, 'zhimoAutoCategory')
+// 预览图独立档：文件名后缀 + IPC 通道（两处都在就是真接上了，不是只改了常量）
+check('renderer: 预览图后缀 -p1024', rendererAll, '-p1024')
+check('main: 预览图 ipc 通道 thumb:preview', main, 'thumb:preview')
+// 舞台球贴图池命中的 info 日志（命中即跳过 fetch，是 D 方案的可观测证据）
+check('renderer: 贴图池命中日志', rendererAll, '[MaterialBall] 贴图池命中')
+// 撤销三档：0 档文案与 esc 探针日志（两者都是纯字面量）
+check('renderer: 撤销期 0 档文案', rendererAll, '没有撤销期')
+check('renderer: esc 无应答探针日志', rendererAll, 'esc:unanswered')
+
 const qr = find(/contact-qr.*\.png$/)
 console.log('contact-qr in bundle:', qr.join(',') || '(none)')
 if (qr.length) {
