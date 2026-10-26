@@ -1,6 +1,6 @@
 {
   "name": "idbox",
-  "version": "0.7.8",
+  "version": "0.7.9",
   "private": true,
   "type": "module",
   "description": "ID BOX — 知末网模型/贴图压缩包拖入自动解压归档 + 本地分类浏览器",

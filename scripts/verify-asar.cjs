@@ -97,6 +97,16 @@ check('renderer: 贴图池命中日志', rendererAll, '[MaterialBall] 贴图池�
 check('renderer: 撤销期 0 档文案', rendererAll, '没有撤销期')
 check('renderer: esc 无应答探针日志', rendererAll, 'esc:unanswered')
 
+// ── 0.7.9 ──
+// 同样只挑字符串字面量：类名、UI 文案、浏览器 API 名、映射表里的中文词条都不会被压缩改掉。
+// 弹窗层级：zStack 的深度→类名数组里有 'z-80'（第 4 层封顶）；tailwind 侧必须真的产出 CSS。
+check('renderer: 弹窗层级按层栈 z-80', rendererAll, 'z-80')
+check('css: z-80 已由 tailwind zIndex 扩展产出', css, 'z-80')
+check('renderer: 导入队列向上堆叠 flex-col-reverse', rendererAll, 'flex-col-reverse')
+check('renderer: 导入后切回资产视图提示', rendererAll, '已切回资产视图')
+check('renderer: ao/disp 走 idle 调度', rendererAll, 'requestIdleCallback')
+check('renderer: 知末映射 木板（材质册无「板材」故 texture-only）', rendererAll, '木板')
+
 const qr = find(/contact-qr.*\.png$/)
 console.log('contact-qr in bundle:', qr.join(',') || '(none)')
 if (qr.length) {
