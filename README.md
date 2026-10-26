@@ -8,17 +8,19 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-007AFF)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F)
-![Version](https://img.shields.io/badge/version-0.7.4-4B5563)
-![Tests](https://img.shields.io/badge/tests-2248%20passed-30A46C)
+![Version](https://img.shields.io/badge/version-0.8.1-4B5563)
+![Tests](https://img.shields.io/badge/tests-2909%20passed-30A46C)
 ![Status](https://img.shields.io/badge/status-Preview-7A5AF8)
 
 </div>
 
 > **当前是 Preview 测试版**（顶栏 `ID BOX` 右边那颗紫色胶囊就是它）。功能在快速迭代，
-> 数据结构可能随版本调整；遇到问题请用「设置 → 诊断 → 导出日志」，日志里有足够定位的信息。
+> 数据结构可能随版本调整；遇到问题请用「设置 → 数据与备份 → 日志文件 → 导出日志」，
+> 日志里有足够定位的信息。
 >
-> 0.7.x 已经做过一轮数据修复：重扫不再覆盖你改过的字段，并且覆盖前先落一份快照。
-> 所以调好的材质球参数，不会因为一次重扫被抹掉。
+> 0.7.x–0.8.x 做过两轮数据保全：重扫不再覆盖你改过的字段（覆盖前先落一份快照），
+> 设置写盘改成串行队列（连点开关不会再互相覆盖或报 ENOENT）。
+> 所以调好的材质球参数与设置，不会因为一次重扫或一次连点被抹掉。
 
 ---
 
@@ -100,7 +102,9 @@
 - **拖出到 SketchUp / D5**：原生拖拽，拽到建模软件里就是那个 `.skp`
 - **双击**卡片进文件视图，Esc 返回
 - **别名映射**：软件内显示中文别名，磁盘上的文件名一个字不动
-- **诊断日志**：一键导出，用于反馈问题（不联网、只落本地）
+- **诊断日志**：一键导出成 zip，用于反馈问题（不联网、只落本地）
+- **设置**：7 个分页（外观 / 导入 / 分类 / 库 / 别名 / 数据与备份 / 关于），统一卡片语言
+- **反馈入口**：「设置 → 关于」里有作者微信二维码与「在 GitHub 提 Issue」两条途径
 
 ---
 
@@ -114,7 +118,7 @@
 | 本地库 | Dexie（IndexedDB） |
 | 3D | three.js（材质球、HDR 环境光、PMREM） |
 | 构建 | electron-vite + electron-builder |
-| 测试 | Vitest（纯逻辑层 + 源码守卫，**2248 条**） |
+| 测试 | Vitest（纯逻辑层 + 源码守卫，**2909 条**；带真机 7-Zip 为 2913 条） |
 
 设计原则：**本地优先**。素材、缩略图、索引全在本机，删除软件不删你的文件。
 
@@ -129,7 +133,7 @@ npm install
 
 npm run dev       # 开发（HMR）
 npm run build     # 编译到 out/
-npm run test      # 2248 条测试
+npm run test      # 2909 条测试
 npm run typecheck:node && npm run typecheck:web
 ```
 
@@ -173,7 +177,7 @@ src/
 ├─ renderer/      React UI：组件 / 逻辑（纯函数，可单测）/ 样式 token
 └─ shared/        主进程与渲染层共用：类型、分类词表、自动分类、命名与别名规则
 
-docs/             27 篇工程文档（PRD、架构、分类体系、变更设计、测试报告、性能诊断…）
+docs/             29 篇工程文档（PRD、架构、分类体系、变更设计、测试报告、性能诊断…）
 tests/            Vitest 用例（纯逻辑 + 源码守卫）
 build/            应用图标
 resources/        打包资源（品牌素材、拖拽图标）
