@@ -106,8 +106,19 @@ describe('getEscLayerRank：层级与 Esc 应答读同一份栈', () => {
 describe('舞台球：降到所有弹窗之下', () => {
   const stage = read('components/MaterialStage.tsx')
 
-  it('zIndex 是 45（低于弹窗基座 50）', () => {
-    expect(stage).toContain('zIndex: 45')
+  it('zIndex 静止时是 45（Z_STAGE_BALL，低于弹窗基座 50）', () => {
+    // ⚠️ 0.7.10 起 zIndex 改成**按相位取值**（在飞的三个阶段 handoff / handback / closing
+    // 抬到 90，其余仍 45，见 tests/stageFlyingZ.test.ts），
+    // 所以这条不再能 grep 字面量 `zIndex: 45`。
+    // 断言改成「静止分支用的常量就是 45」—— 语义不变：静止时球仍被弹窗完全盖住。
+    expect(Z_STAGE_BALL).toBe(45)
+    // trimEnd：仓库是 CRLF，`split('\n')` 后行尾带 `\r`，正则的 `$` 会被它挡掉
+    const zLine = lineWith(stage, 'zIndex:').trimEnd()
+    expect(zLine).toContain('Z_STAGE_BALL')
+    // 静止分支必须是三元的 fallback：写成 `... ? Z_STAGE_BALL : Z_STAGE_FLYING` 反了的话，
+    // 静止球会浮在弹窗之上 —— 那正是 0.7.8 前的 bug。
+    expect(zLine.endsWith('Z_STAGE_BALL,')).toBe(true)
+    expect(zLine).toContain('? Z_STAGE_FLYING : Z_STAGE_BALL,')
   })
 
   it('不再出现 zIndex: 60（旧值：比全部弹窗都高，用户看到球浮在设置之上）', () => {

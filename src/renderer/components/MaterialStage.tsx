@@ -15,7 +15,10 @@
  * 性能红线（docs/19 实测）：
  * - P1 期间**不碰任何 `.card`**：不要逐卡写 style/class（2000 张 = 95ms 长任务）；
  * - 落点用 CSS 变量 `--stage-target-x/y`，**绝不去改顶栏 height**（每帧重排整页）；
- * - z-index 45：**低于所有弹窗**（弹窗基座 50，见 `logic/zStack.ts`）、高于所有内容层（≤40）。
+ * - z-index：静止时 45（`Z_STAGE_BALL`）—— **低于所有弹窗**（弹窗基座 50，见 `logic/zStack.ts`）、
+ *   高于所有内容层（≤40）；仅在**在飞的三个阶段**（`handoff` 飞进弹窗 / `handback` 飞回槽位 /
+ *   `closing` 飞回网格）抬到 90（`Z_STAGE_FLYING`），否则球进出弹窗的那段动画会被弹窗遮罩
+ *   盖住（0.7.9 回归）。
  *   舞台球是 `pointer-events:none` 的纯装饰，没有资格压过任何可交互元素 —— 0.7.8 T-ZSTACK 前
  *   它是 60，用户实测「打开设置后球还浮在设置之上」。旧注释写的「顶栏 50」是过期的：
  *   `Toolbar` 顶栏实际是 z-20，顶栏下拉浮层/中栏浮层才是 z-40（球仍在其上，落定后不会被顶栏盖住）。
@@ -26,6 +29,7 @@ import { resolveRenderParams, resolveRenderShape } from '../../shared/ballParams
 import { effectiveMaterialSlots, type MaterialSlots } from '../logic/materialBall'
 import { currentMotionProfile } from '../logic/motionProfile'
 import type { StagePhase } from '../logic/ballStage'
+import { Z_STAGE_BALL, Z_STAGE_FLYING } from '../logic/zStack'
 import { MaterialBall, type MaterialBallApi } from './MaterialBall'
 
 /** 组件内在画布边长（与 MaterialBall 内 SIZE 对齐的取景框；与真实渲染分辨率无关） */
@@ -654,9 +658,21 @@ export function MaterialStage({
         width: LOCAL,
         height: LOCAL,
         transformOrigin: '0 0',
-        // = Z_STAGE_BALL（logic/zStack.ts）：低于所有弹窗（≥50）、高于所有内容层（≤40）。
-        // 写成字面量而不是常量引用，是因为源码守卫测试要能直接 grep 到这个数（见 tests/zStack.test.ts）。
-        zIndex: 45,
+        // 层级按相位取（常量见 logic/zStack.ts）：
+        // - 静止（idle / active）与 opening：Z_STAGE_BALL = 45 → 低于所有弹窗（≥50），
+        //   打开设置/自定义渲染/HDR 预览/分类选择器时球被遮罩完全盖住（0.7.8 T-ZSTACK 口径）；
+        // - **在飞的三个阶段都抬**到 Z_STAGE_FLYING = 90：
+        //   · handoff  —— 球从顶栏槽位飞**进**弹窗（起点舞台、终点弹窗球外接框）；
+        //   · handback —— 球从弹窗位置飞**回**顶栏槽位（关「自定义渲染」弹窗时走这条）；
+        //   · closing  —— 球从弹窗位置 / 顶栏飞**回网格卡片**，随后回到 idle。
+        //   三段都是**舞台球自己**在飞。45 会被弹窗遮罩盖住 → 用户看到的就是
+        //   「球飞进弹窗的动画没了」（0.7.9 的真实回归）。
+        //   ⚠️ handback 与 closing 是**两个方向、两个终点**，不能互相替代：handback 的终点是
+        //   顶栏槽位（结束后 active、球仍可见），closing 的终点是 originRect 卡片（结束后 idle、
+        //   球收起来）。所以这里两个都得列，少一个就有一段回程被遮罩吞掉。
+        //   opening 不抬：那时还没有弹窗，抬了没意义，反而可能盖住顶栏浮层。
+        // 90 只是视觉层级：容器始终 pointerEvents:'none'，飞行途中不会挡住弹窗里的控件。
+        zIndex: phase === 'handoff' || phase === 'handback' || phase === 'closing' ? Z_STAGE_FLYING : Z_STAGE_BALL,
         opacity: 0,
         pointerEvents: 'none',
         willChange: 'transform, opacity'
