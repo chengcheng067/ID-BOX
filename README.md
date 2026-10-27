@@ -8,8 +8,8 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-007AFF)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F)
-![Version](https://img.shields.io/badge/version-0.8.1-4B5563)
-![Tests](https://img.shields.io/badge/tests-2909%20passed-30A46C)
+![Version](https://img.shields.io/badge/version-0.8.2-4B5563)
+![Tests](https://img.shields.io/badge/tests-2985%20passed-30A46C)
 ![Status](https://img.shields.io/badge/status-Preview-7A5AF8)
 
 </div>
@@ -55,6 +55,7 @@
 - **递归下钻**：压缩包套一层 `attachment_xxxx/` 目录也能找到真正的模型
 - **原包去向可选**：保留原位 / 移入系统回收站 / 彻底删除（默认移入回收站）
 - **`.skp` 内嵌预览图提取**，无封面时也能立刻看到是什么东西
+- **3DMAX（`.max`）支持**：与 SKP 同管线导入归档，卡片显示专属 "3DS" 徽标（无内嵌预览，图标占位兜底）
 
 ### 2 · 自动分类（不另造分类体系）
 
@@ -66,6 +67,8 @@
 - **词表纪律**：词条只能来自站方原始抄录（`docs/05`、`docs/07`）。缺的类目先补抄录，不靠猜
 - 可选**模型 API 兜底**：只在词表完全命中不了时调用，自己填地址/密钥/模型名，默认关闭，
   且**绝不覆盖**已有分类
+- **用户自定义词条**：一级 / 二级分类都允许新增自定义词（覆盖模型 / 材质 / HDR），
+  自动分类仍只认站方词表；被资产使用的自定义词条不可删除
 
 ### 3 · 浏览与整理
 
@@ -118,7 +121,7 @@
 | 本地库 | Dexie（IndexedDB） |
 | 3D | three.js（材质球、HDR 环境光、PMREM） |
 | 构建 | electron-vite + electron-builder |
-| 测试 | Vitest（纯逻辑层 + 源码守卫，**2909 条**；带真机 7-Zip 为 2913 条） |
+| 测试 | Vitest（纯逻辑层 + 源码守卫，**2985 条**；带真机 7-Zip 为 2987 条） |
 
 设计原则：**本地优先**。素材、缩略图、索引全在本机，删除软件不删你的文件。
 
@@ -133,7 +136,7 @@ npm install
 
 npm run dev       # 开发（HMR）
 npm run build     # 编译到 out/
-npm run test      # 2909 条测试
+npm run test      # 2985 条测试
 npm run typecheck:node && npm run typecheck:web
 ```
 
@@ -177,7 +180,7 @@ src/
 ├─ renderer/      React UI：组件 / 逻辑（纯函数，可单测）/ 样式 token
 └─ shared/        主进程与渲染层共用：类型、分类词表、自动分类、命名与别名规则
 
-docs/             29 篇工程文档（PRD、架构、分类体系、变更设计、测试报告、性能诊断…）
+docs/             32 篇工程文档（PRD、架构、分类体系、变更设计、测试报告、性能诊断…）
 tests/            Vitest 用例（纯逻辑 + 源码守卫）
 build/            应用图标
 resources/        打包资源（品牌素材、拖拽图标）
