@@ -14,6 +14,7 @@ import type {
 } from '../../shared/types'
 import { COLOR_TAGS, COLOR_TAG_LABEL } from '../../shared/types'
 import { formatDate } from '../../shared/format'
+import { getModelFormat, MODEL_FORMAT_BADGE_LABEL, type ModelFormat } from '../../shared/modelFormat'
 import {
   KIND_FOLDER,
   KIND_LABEL,
@@ -111,6 +112,17 @@ export interface Filters {
    * 切过去必须被 `sanitizeFiltersForKind` 清掉，否则网格空着而用户找不到原因。
    */
   minResolution: ResolutionBucket | null
+  /**
+   * 模型格式（2026-10「3DMAX 支持」）：`null` = 不限；`'skp'` / `'max'` 单选。
+   *
+   * 判定是**纯函数派生**（`shared/modelFormat.getModelFormat`，按资产文件扩展名），
+   * 不落库、不迁移。语义是「只对 kind=model 的资产生效」：非模型资产不受此条件约束
+   * （在「全部」视图筛 3DMAX，贴图 / HDR 照常显示）。
+   *
+   * ⚠️ 只在模型视图开放（能力表 `KIND_FILTER_CAPS.modelFormat`）→
+   * 切到材质 / HDR / 其他视图时被 `sanitizeFiltersForKind` 清掉。
+   */
+  modelFormat: ModelFormat | null
   query: string
   sort: SortKey
 }
@@ -130,6 +142,7 @@ export const DEFAULT_FILTERS: Filters = {
   importedAfter: null,
   importedBefore: null,
   minResolution: null,
+  modelFormat: null,
   query: '',
   sort: 'recent'
 }
@@ -405,6 +418,9 @@ export function sanitizeFiltersForKind(f: Filters): Filters {
     next.minResolution = null
   }
   if (!capsOfFilter(f.kind, 'style')) next.styles = []
+  // 模型格式维度与分辨率同一套机制：入口消失（材质 / HDR / 其他视图）→ 值清掉，
+  // 否则「切到材质视图后网格里模型少了」且用户找不到原因。
+  if (!capsOfFilter(f.kind, 'modelFormat')) next.modelFormat = null
   return next
 }
 
@@ -545,6 +561,11 @@ export function matchesFilters(
   }
   // 0.6.0 分辨率：任一图片文件长边达标即出；未知尺寸不进这两档（见 matchesResolution）
   if (!matchesResolution(a, f.minResolution)) return false
+  // 模型格式（2026-10）：**只约束 kind=model 的资产**——非模型资产不受影响
+  //（「全部」视图筛 3DMAX，贴图 / HDR 照常显示）。格式由文件扩展名纯函数派生。
+  if (f.modelFormat && a.kind === 'model' && getModelFormat(a.files) !== f.modelFormat) {
+    return false
+  }
   // v0.4 导入时间区间（**含等号**：正好等于阈值的资产要被命中）
   const importedRange = activeImportedRange(f)
   if (importedRange) {
@@ -617,6 +638,7 @@ export interface ActiveFilterDimension {
     | 'size'
     | 'importedAt'
     | 'resolution'
+    | 'modelFormat'
     | 'query'
   /** UI 展示用的中文维度名 */
   label: string
@@ -637,6 +659,7 @@ const DIMENSION_LABEL: Record<ActiveFilterDimension['key'], string> = {
   size: '体积',
   importedAt: '导入时间',
   resolution: '分辨率',
+  modelFormat: '模型格式',
   query: '搜索词'
 }
 
@@ -660,6 +683,7 @@ export function activeFilterDimensions(f: Filters): ActiveFilterDimension[] {
   const timeText = describeImported(f, Date.now())
   if (timeText) push('importedAt', timeText)
   if (f.minResolution) push('resolution', RESOLUTION_LABEL[f.minResolution])
+  if (f.modelFormat) push('modelFormat', MODEL_FORMAT_BADGE_LABEL[f.modelFormat])
   if (f.tag) push('tag', f.tag)
   if (f.source) push('source', f.source)
   if (f.suVersion) push('suVersion', f.suVersion)
@@ -799,6 +823,7 @@ export function snapshotFilters(f: Filters): Record<string, unknown> {
     importedAfter: f.importedAfter,
     importedBefore: f.importedBefore,
     minResolution: f.minResolution,
+    modelFormat: f.modelFormat,
     query: f.query,
     sort: f.sort
   }
@@ -835,6 +860,8 @@ export function filtersFromSavedView(
     typeof raw.minResolution === 'string' && VALID_RESOLUTIONS.has(raw.minResolution)
       ? (raw.minResolution as ResolutionBucket)
       : null
+  next.modelFormat =
+    raw.modelFormat === 'skp' || raw.modelFormat === 'max' ? raw.modelFormat : null
   next.query = typeof raw.query === 'string' ? raw.query : ''
   // 排序：`SavedView.sort` 优先；它非法时退回快照里的 sort；都不合法才用默认
   if (typeof view.sort === 'string' && VALID_SORTS.has(view.sort)) {

@@ -14,7 +14,7 @@ import {
   walkFiles,
   STAGING_DIR
 } from './fsutil'
-import { kindFolder, kindOfExt, pickCover, primaryKind } from '../shared/classify'
+import { kindFolder, kindOfExt, isCoverAssetImage, pickCover, primaryKind } from '../shared/classify'
 import { isHdrExt, panoramaNoteFromName } from '../shared/hdrExts'
 import {
   composeRelFolder,
@@ -872,9 +872,12 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
     // 让它参与「±2K 贴图」判定会把模型资产误算进高清档。
     await fillImageSizes(target, files)
 
-    // ── 封面优先级（P0-8 + P1-2 升级）─────────────────────────
+    // ── 封面优先级（P0-8 + P1-2 升级 + 2026-10 裁定 cover > preview）──
     // ① skp 内嵌预览图（提取落盘成资产内文件，coverSource='embedded'）
-    // ② 包内预览图（pickCover 四级回退：named → root → embedded → largest）
+    // ①′ 包内已带 `<资产名>.cover.jpg/png`（知末主图 / 用户拍照）→ 顶掉内嵌预览。
+    //     与 pickCover 的候选排序同口径（cover > preview）：重装重扫走 rescan→pickCover
+    //     会选中封面文件，导入路径必须一致，否则同一套资产"导入时"与"重扫后"封面翻面。
+    // ② 包内预览图（pickCover 排序：cover → named → root → embedded → largest）
     // ③ 都没有 → placeholder（渲染层出类型占位图标；用户可随后手动贴封面）
     let cover: string | undefined
     let coverSource: CoverSource = 'placeholder'
@@ -895,6 +898,20 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
             size: pst.size,
             kind: 'texture'
           })
+        }
+      }
+    }
+    if (cover) {
+      // 只有包内真的带封面文件时才让 pickCover 顶掉内嵌预览：
+      // 其余情况保持 coverSource='embedded'（材质球通道对 named/embedded 的处理不同，
+      // 无谓改源会改变既有导入结果的语义）。
+      const hasCoverFile = files.some((f) => !f.rel.includes('/') && isCoverAssetImage(f.name))
+      if (hasCoverFile) {
+        const coverPick = pickCover(files)
+        // 封面文件在根目录层 → pickCover 必然命中它（①级）；防御性判空而已
+        if (coverPick) {
+          cover = coverPick.rel
+          coverSource = coverPick.source
         }
       }
     }

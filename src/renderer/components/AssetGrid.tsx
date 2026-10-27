@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useVault, useVisibleAssets, noteVisibleAssets } from '../store'
 import { KIND_LABEL } from '../../shared/classify'
+import { getModelFormat, MODEL_FORMAT_BADGE_LABEL } from '../../shared/modelFormat'
 import { formatBytes, formatDate, thumbVaultUrl, vaultUrl } from '../../shared/format'
 import {
   EMPTY_ALIASES,
@@ -267,6 +268,52 @@ function isSketchUpAsset(asset: Asset): boolean {
 }
 
 /**
+ * 3ds Max 风格应用图标占位（2026-10「3DMAX 支持」，与 IconSketchUp 同族）。
+ *
+ * 自绘 SVG 几何抽象——**不引用任何官方 logo 文件**（规避商标风险）：
+ * 3ds Max 品牌红 #B3453B 圆角底（品牌辅色；主色 #2E2E2E 深灰在深色主题卡片上
+ * 会糊进背景，故取红作底）+ 白色等距立方体（与 SU 图标同一几何，家族一致）+
+ * 底部白色 "3DS" 字样（用户原话：模型卡片上写上 "3DS"）。
+ */
+function Icon3dsMax(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg viewBox="0 0 48 48" width="48" height="48" fill="none" {...props}>
+      <rect x="0" y="0" width="48" height="48" rx="11" fill="#B3453B" />
+      {/* 等距立方体三面（顶 / 右 / 左，明暗递减） */}
+      <path d="M24 8.5 32.9 13.5 24 18.5 15.1 13.5Z" fill="#fff" fillOpacity="0.95" />
+      <path d="M32.9 13.5 32.9 23.5 24 28.5 24 18.5Z" fill="#fff" fillOpacity="0.62" />
+      <path d="M15.1 13.5 15.1 23.5 24 28.5 24 18.5Z" fill="#fff" fillOpacity="0.4" />
+      {/* 外轮廓 + 内部三条棱 */}
+      <path
+        d="M24 8.5 32.9 13.5 32.9 23.5 24 28.5 15.1 23.5 15.1 13.5Z"
+        stroke="#fff"
+        strokeOpacity="0.9"
+        strokeWidth="1.1"
+        strokeLinejoin="round"
+      />
+      <path d="M24 18.5 32.9 13.5M24 18.5 15.1 13.5M24 18.5 24 28.5" stroke="#fff" strokeOpacity="0.55" strokeWidth="0.9" />
+      <text
+        x="24"
+        y="41"
+        textAnchor="middle"
+        fontSize="10.5"
+        fontWeight="800"
+        letterSpacing="0.4"
+        fill="#fff"
+        fontFamily="'Sarasa Gothic SC','Microsoft YaHei',sans-serif"
+      >
+        3DS
+      </text>
+    </svg>
+  )
+}
+
+/** 是否 3ds Max 模型（格式纯函数判 'max'；skp 优先级更高，双格式包不会走到这里） */
+function is3dsMaxAsset(asset: Asset): boolean {
+  return getModelFormat(asset.files) === 'max'
+}
+
+/**
  * 卡片封面：**只准读缩略图**。
  * `thumbStatus === 'ready'` → `vault://thumb/<缓存文件名>`；
  * 否则按类型走占位：**SU 模型用 SketchUp 风格应用图标**（第二级兜底，用户拍板），
@@ -316,6 +363,25 @@ function Cover({ asset, name }: { asset: Asset; name: string }) {
         <div className="flex h-full w-full items-center justify-center">
           <div className="aspect-square h-[62%] drop-shadow-[0_2px_6px_rgba(230,46,46,.35)]">
             <IconSketchUp className="h-full w-full" />
+          </div>
+        </div>
+        {fileName && (
+          <div className="absolute inset-x-0 bottom-0 bg-black/55 px-2 pb-1.5 pt-5 text-center text-[10px] font-medium text-white">
+            <span className="block truncate">{fileName}</span>
+          </div>
+        )}
+      </div>
+    )
+  }
+  // 第二级兜底（2026-10「3DMAX 支持」）：.max 模型无缩略图 → 3DS 品牌图标占位。
+  // .max 是 OLE 复合文档，没有可提取的内嵌预览图（本批明确不做），
+  // 无封面时用这个占位区分「这是 3DMAX」，用户可随后手动贴封面。
+  if (asset.kind === 'model' && !isSketchUpAsset(asset) && is3dsMaxAsset(asset)) {
+    return (
+      <div className="relative h-full w-full bg-canvas">
+        <div className="flex h-full w-full items-center justify-center">
+          <div className="aspect-square h-[62%] drop-shadow-[0_2px_6px_rgba(179,69,59,.35)]">
+            <Icon3dsMax className="h-full w-full" />
           </div>
         </div>
         {fileName && (
@@ -619,6 +685,30 @@ function FileCover({ asset, row }: { asset: Asset; row: FileRow }) {
             fill="currentColor"
           >
             SU
+          </text>
+        </svg>
+      </div>
+    )
+  }
+  // ── .max 专属封面（2026-10「3DMAX 支持」，与上面 .skp 同族）──────────────
+  // 口径：3ds Max 红棕 tint 底板 + 居中大号 "3DS"。只对「模型类 + 扩展名 max」生效；
+  // 色走 `--brand-max-bg / --brand-max-text` token（styles.css 注释里有色值与用途），
+  // 字号/字重/字距与 SU 完全一致（家族一致，只换色与字）。
+  if (row.kind === 'model' && row.ext.toLowerCase() === 'max') {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-brand-max text-brand-max">
+        <svg viewBox="0 0 100 100" className="h-full w-full" aria-hidden="true" focusable="false">
+          <text
+            x="50"
+            y="50"
+            textAnchor="middle"
+            dominantBaseline="central"
+            fontSize="38"
+            fontWeight="700"
+            letterSpacing="-0.02em"
+            fill="currentColor"
+          >
+            3DS
           </text>
         </svg>
       </div>
@@ -2295,6 +2385,23 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
             >
               {KIND_LABEL[a.kind]}
             </span>
+            {/* 模型格式徽标（2026-10「3DMAX 支持」，用户原话「模型卡片上写上 3DS」）：
+                kind=model 且能从文件列表判出格式时显示 —— SU 走 SketchUp 红系
+                （.badge-su），3DS 走 3ds Max 红棕系（.badge-max，用户拍板「偏 3DMAX 的颜色」）。
+                判定走 shared/modelFormat 纯函数（skp > max），其余模型格式（fbx 等）不显示。 */}
+            {a.kind === 'model' &&
+              (() => {
+                const fmt = getModelFormat(a.files)
+                if (!fmt) return null
+                return (
+                  <span
+                    className={`badge ${fmt === 'skp' ? 'badge-su' : 'badge-max'}`}
+                    title={fmt === 'skp' ? 'SketchUp 模型' : '3ds Max 模型'}
+                  >
+                    {MODEL_FORMAT_BADGE_LABEL[fmt]}
+                  </span>
+                )
+              })()}
             {a.kind === 'texture' && dataChannelLabel(a.files) && (
               <span className="badge" title={`这张图是${dataChannelLabel(a.files)}通道图，不上球预览`}>
                 {dataChannelLabel(a.files)}

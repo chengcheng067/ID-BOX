@@ -26,6 +26,9 @@ import { normalizeUndoGraceMs } from '../../shared/undoGrace'
 // 与 `store.runZhimoCategoryReclass` 完全同一口径（渲染层不另写一套判定）。
 // 备份前缀只从常量取（`'zhimo-reclass-'`），绝不在 UI 里手抄字符串 —— 抄一份就会漂移。
 import { ZHIMO_RECLASS_BACKUP_PREFIX, isZhimoReclassCandidate } from '../logic/zhimoReclass'
+// 一键重扫 · 从知末获取封面：候选筛选与 store 完全同一口径（渲染层不另写一套判定）。
+import { isZhimoCoverBackfillCandidate } from '../logic/zhimoCover'
+import type { ZhimoCoverBackfillSummary } from '../store'
 // DEF-19-3：库目录被改过 / 搬过之后，老资产的 folder 不在新根下 → 主进程的
 // probeSizes 守卫会一律拒绝（这是对的），但"整库尺寸补不上"必须在界面上有解释。
 // 判据是纯函数，和分辨率浮层的就近提示**共用同一份**（两套判据必然漂移）。
@@ -1175,6 +1178,24 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     restored: number
     failed: number
   } | null>(null)
+  /**
+   * 一键重扫 · 从知末获取封面（「数据与备份」tab，2026-10 用户拍板）。
+   *
+   * 候选数在**渲染层**算（`isZhimoCoverBackfillCandidate` 纯函数，与 store 同一口径），
+   * 只用于按钮文案 + 置灰；真正跑的时候 store 会自己再筛一遍（索引可能刚变过），
+   * 且每一条在写入锁内还会重查（期间被手动接管 / 已补上的按 skipped 跳过）。
+   */
+  const zhimoCoverBackfill = useVault((s) => s.zhimoCoverBackfill)
+  const runZhimoCoverBackfill = useVault((s) => s.runZhimoCoverBackfill)
+  const cancelZhimoCoverBackfill = useVault((s) => s.cancelZhimoCoverBackfill)
+  const zhimoBackfillCandidateCount = useMemo(
+    () => allAssets.filter(isZhimoCoverBackfillCandidate).length,
+    [allAssets]
+  )
+  const [zhimoBackfillResult, setZhimoBackfillResult] =
+    useState<ZhimoCoverBackfillSummary | null>(null)
+  // 本轮是否被用户主动取消（store 的 cancelRequested 结束时会复位，读不到历史）
+  const [zhimoBackfillCancelled, setZhimoBackfillCancelled] = useState(false)
   // AI 辅助分类（docs/15 §7）：表单先本地编辑，失焦/切换时落库（避免每敲一个字符写一次 settings.json）
   const aiSettings: AiClassifySettings = settings?.aiClassify ?? {
     enabled: false,
@@ -2539,6 +2560,95 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </button>
           }
         />
+      </SettingsCard>
+
+      {/* 一键重扫 · 从知末获取封面（2026-10 用户拍板）：只补没有 cover 文件的资产，
+          已有的一律不重抓；抓取复用既有 IPC 链路（重试/超时/限速都在主进程既有实现里），
+          抓取是后置任务，不阻塞导入；逐个请求自带 250ms 节流，不打站方。 */}
+      <SettingsCard title="封面">
+        <SettingsRow
+          title="一键重扫 · 从知末获取封面"
+          desc={
+            <>
+              对<span className="text-secondary">没有 cover 文件</span>的模型资产，从知末详情页抓主图存为
+              资产同名 cover 文件 · 当前{' '}
+              <b className="font-semibold text-primary">{zhimoBackfillCandidateCount}</b> 个可补
+            </>
+          }
+          actions={
+            <button
+              className="btn !py-1 text-xs"
+              disabled={zhimoCoverBackfill.running || zhimoBackfillCandidateCount === 0}
+              onClick={() => {
+                setZhimoBackfillResult(null)
+                setZhimoBackfillCancelled(false)
+                void runZhimoCoverBackfill().then((r) => setZhimoBackfillResult(r))
+              }}
+              title="只补没有 cover 文件的资产；已有封面（含你手动设置的一律不动，绝不重抓）"
+            >
+              <IconRefresh />
+              {zhimoCoverBackfill.running
+                ? '处理中…'
+                : `开始补抓（${zhimoBackfillCandidateCount} 个）`}
+            </button>
+          }
+        />
+        {zhimoCoverBackfill.running && (
+          <div className="mt-2 flex flex-wrap items-center gap-3 rounded-lg border border-line bg-canvas px-3 py-2">
+            <span className="text-[11px] text-secondary">
+              已完成 <span className="font-semibold text-primary">{zhimoCoverBackfill.done}</span> / 共{' '}
+              {zhimoCoverBackfill.total}
+            </span>
+            <button
+              className="btn !py-1 text-xs"
+              disabled={zhimoCoverBackfill.cancelRequested}
+              onClick={() => {
+                setZhimoBackfillCancelled(true)
+                cancelZhimoCoverBackfill()
+              }}
+            >
+              {zhimoCoverBackfill.cancelRequested ? '正在停止…' : '取消'}
+            </button>
+            <span className="text-[10px] text-muted">
+              取消只是不再抓新记录；
+              <span className="text-secondary">已抓到的封面照常落库</span>。
+            </span>
+          </div>
+        )}
+        {zhimoBackfillResult && !zhimoCoverBackfill.running && (
+          <div className="mt-2 rounded-lg border border-line bg-canvas px-3 py-2 text-[11px] leading-relaxed text-secondary">
+            <div>
+              {zhimoBackfillCancelled ? (
+                <>
+                  已取消：本轮处理{' '}
+                  {zhimoBackfillResult.ok +
+                    zhimoBackfillResult.failed +
+                    zhimoBackfillResult.skipped}{' '}
+                  / 共 {zhimoBackfillResult.total} 个候选，剩余未跑。
+                </>
+              ) : (
+                <>上次补抓完成。</>
+              )}
+            </div>
+            <div className="mt-1">
+              成功 <span className="font-semibold text-primary">{zhimoBackfillResult.ok}</span> ·
+              失败{' '}
+              <span
+                className={
+                  zhimoBackfillResult.failed > 0
+                    ? 'font-semibold text-danger'
+                    : 'font-semibold'
+                }
+              >
+                {zhimoBackfillResult.failed}
+              </span>
+              {zhimoBackfillResult.skipped > 0 && (
+                <> · 跳过 {zhimoBackfillResult.skipped}（已有封面/手动封面）</>
+              )}
+              。
+            </div>
+          </div>
+        )}
       </SettingsCard>
 
       <SettingsCard

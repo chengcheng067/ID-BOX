@@ -131,7 +131,7 @@ describe('logic/fileView · 排序', () => {
     expect(rows.map((r) => r.kind)).toEqual(['model', 'image', 'image', 'image', 'other'])
   })
 
-  it('典型知末包：.skp 排在 .max 与自动生成的 .preview.jpg 之前（用户第一条反馈的原场景）', () => {
+  it('典型知末包：.skp 与 .max 并列第一档、按文件名序，.preview.jpg 在后（2026-10 扩展口径）', () => {
     const rows = buildFileRows({
       folder: FOLDER,
       files: [
@@ -140,14 +140,28 @@ describe('logic/fileView · 排序', () => {
         file('衣柜.max', 1024 * 1024 * 9, 'model')
       ]
     })
-    // 模型组内 .skp 是次级排序键的第一档（用户原话：「SKP 后缀的这一个文件应该排在第一位」）
-    expect(rows.map((r) => r.name)).toEqual(['衣柜.skp', '衣柜.max', '衣柜.preview.jpg'])
+    // 2026-10「3DMAX 支持」扩展口径：max 与 skp 并列第一档，档内按文件名自然序
+    //（衣柜.max < 衣柜.skp），不再设 skp 优先；图片仍不得出现在模型之前
+    expect(rows.map((r) => r.name)).toEqual(['衣柜.max', '衣柜.skp', '衣柜.preview.jpg'])
     expect(rows[0]!.kind).toBe('model')
-    expect(rows[0]!.ext).toBe('skp')
     // 断言口径本身：图片不得出现在模型之前
     const firstImage = rows.findIndex((r) => r.kind === 'image')
     const lastModel = rows.map((r) => r.kind).lastIndexOf('model')
     expect(firstImage).toBeGreaterThan(lastModel)
+  })
+
+  it('并列第一档只含 skp/max：.fbx 落在第一档之后、图片之前（「模型文件排第一」）', () => {
+    const rows = buildFileRows({
+      folder: FOLDER,
+      files: [
+        file('b.fbx', 10, 'model'),
+        file('贴图.png', 20),
+        file('z.max', 30, 'model'),
+        file('a.skp', 40, 'model')
+      ]
+    })
+    // 第一档（skp/max）内按文件名：a.skp < z.max；fbx 是模型但不在第一档
+    expect(rows.map((r) => r.name)).toEqual(['a.skp', 'z.max', 'b.fbx', '贴图.png'])
   })
 
   it('两个 .skp：同扩展名内仍按自然序（次级键没有把顺序写乱）', () => {

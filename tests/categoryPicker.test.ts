@@ -180,14 +180,15 @@ describe('二级联动：换 UI 承载，规则一行未改', () => {
 
   it('二级仍在「一级/二级」成对显示（重名二级不会选错）', () => {
     const src = codeOf(read(PICKER))
-    expect(src).toContain('label: `${level1}/${v}`')
+    expect(src).toContain('label: `${level1}/${it.value}`')
   })
 
   it('一级=未分类 时二级锁定、无词表时自由输入 —— 两条老分支都还在', () => {
     const src = codeOf(read(PICKER))
     expect(src).toContain('{level1 === UNCLASSIFIED ? (')
     expect(src).toContain('className="input opacity-50" value="未分类" disabled')
-    expect(src).toContain(') : l2Options === null ? (')
+    // 自定义词表（2026-10）：预设与自定义都没有词条时才走自由输入（l2HasPanel 收口）
+    expect(src).toContain(') : !l2HasPanel ? (')
     expect(src).toContain('placeholder="该一级分类无级联词表，可自由输入，留空则归入「未分类」"')
     expect(src).toContain('placeholder="可自由输入，留空则归入「未分类」"')
   })
@@ -195,15 +196,18 @@ describe('二级联动：换 UI 承载，规则一行未改', () => {
   it('词表外的既有值只标注不改写（原 __custom__ 语义：绝不静默丢值）', () => {
     const src = codeOf(read(PICKER))
     expect(count(src, '（词表外）')).toBe(2)
-    expect(src).toContain('const l1OutOfVocab = level1 !== UNCLASSIFIED && !l1Options.includes(level1)')
+    // 2026-10 自定义词表：判定域从"预设"扩成"预设 + 自定义"（自定义词条不得标成词表外）
     expect(src).toContain(
-      'const l2OutOfVocab = l2Options !== null && level2 !== UNCLASSIFIED && !l2Options.includes(level2)'
+      'l1HasPanel && level1 !== UNCLASSIFIED && !l1Items.some((it) => it.value === level1)'
+    )
+    expect(src).toContain(
+      'l2HasPanel && level2 !== UNCLASSIFIED && !l2Merged.some((it) => it.value === level2)'
     )
   })
 
   it('「未分类」哨兵仍是首行（一级 / 二级各一次）', () => {
     const src = codeOf(read(PICKER))
-    expect(count(src, '{ value: UNCLASSIFIED, label: UNCLASSIFIED }')).toBe(2)
+    expect(count(src, '{ value: UNCLASSIFIED, label: UNCLASSIFIED, custom: false }')).toBe(2)
   })
 
   it('提交逻辑（清空兜底 / 跨大类禁用 / assignCategory）原样保留', () => {

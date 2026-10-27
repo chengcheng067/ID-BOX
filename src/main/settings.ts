@@ -15,6 +15,7 @@ import {
 import { DEFAULT_LIBRARY_DIR } from './paths'
 import { freeBytesOf } from './disk'
 import { DEFAULT_UNDO_GRACE_MS, normalizeUndoGraceMs } from '../shared/undoGrace'
+import { normalizeCustomTaxonomy } from '../shared/customTaxonomy'
 
 /** 首次运行选盘时的最低可用空间门槛（U3） */
 export const MIN_FREE_BYTES_FOR_LIBRARY = 20 * 1024 * 1024 * 1024
@@ -178,6 +179,13 @@ export const SettingsSchema = z.object({
     .catch([]),
   /** 批量重命名默认模板（0.6.0）；缺键 / 脏值回落 `{name}`（= 不改名） */
   renameTemplate: z.string().optional().catch('{name}'),
+  /**
+   * 用户自定义分类词表（2026-10）。schema 层放行任意形状（`z.unknown()`），
+   * 逐条清洗 / 去重 / 剔除与预设撞名统一交给 `normalizeCustomTaxonomy`
+   * （在 migrateSettings / normalizeSettings 两处收口）——脏词条只丢词条，
+   * 绝不让整份 settings.json 回落默认。
+   */
+  customTaxonomy: z.unknown().optional(),
   /** @deprecated 旧档迁移用 */
   trashArchiveAfterImport: z.boolean().optional()
 })
@@ -369,7 +377,9 @@ export function migrateSettings(raw: RawSettings): Settings {
     renameTemplate:
       typeof raw.renameTemplate === 'string' && raw.renameTemplate.trim()
         ? raw.renameTemplate
-        : DEFAULT_SETTINGS.renameTemplate
+        : DEFAULT_SETTINGS.renameTemplate,
+    // 自定义分类词表（2026-10）：旧档缺键 → 空词表；脏词条逐条清洗丢弃
+    customTaxonomy: normalizeCustomTaxonomy(raw.customTaxonomy)
   }
   delete next.trashArchiveAfterImport
   return next
@@ -472,6 +482,8 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   merged.aiClassify = normalizeAiClassify(merged.aiClassify)
   // 诊断日志详细级别：只认严格 true（"true"、1 之类脏值一律关闭，避免无意刷盘）
   merged.verboseLogging = merged.verboseLogging === true
+  // 自定义分类词表（2026-10）：单条新增也可能带脏值，写档前再统一清洗一遍
+  merged.customTaxonomy = normalizeCustomTaxonomy(merged.customTaxonomy)
   delete merged.trashArchiveAfterImport
   return merged
 }

@@ -125,14 +125,22 @@ export function kindFilterLabel(f: KindFilter): string {
 export interface KindFilterCaps {
   resolution: boolean
   style: boolean
+  /**
+   * 模型格式维度（2026-10「3DMAX 支持」）：只有 `model` 视图开放
+   * （全部 / SU / 3DMAX 单选）。材质 / HDR / 其他视图入口不渲染，
+   * 且 `sanitizeFiltersForKind` 会把残留值清掉（与分辨率同一套机制）。
+   * 「全部」视图取并集 → true：格式条件只对 kind=model 的资产生效，
+   * 在「全部」里筛 3DMAX 仍能看到其它大类资产。
+   */
+  modelFormat: boolean
 }
 
 export const KIND_FILTER_CAPS: Record<AssetKind, KindFilterCaps> = {
-  model: { resolution: false, style: true },
-  texture: { resolution: true, style: false },
-  material: { resolution: true, style: false },
-  hdri: { resolution: true, style: false },
-  other: { resolution: false, style: false }
+  model: { resolution: false, style: true, modelFormat: true },
+  texture: { resolution: true, style: false, modelFormat: false },
+  material: { resolution: true, style: false, modelFormat: false },
+  hdri: { resolution: true, style: false, modelFormat: false },
+  other: { resolution: false, style: false, modelFormat: false }
 }
 
 const ALL_ASSET_KINDS = Object.keys(KIND_FILTER_CAPS) as AssetKind[]
@@ -278,6 +286,21 @@ export const PRIMARY_MODEL_EXTS = ['skp', 'max', 'fbx', 'obj', '3ds'] as const
 export const PREVIEW_NAME_RE =
   /预览|效果|主图|封面|展图|晒图|thumbnail|preview|cover|render|poster/i
 
+/**
+ * 资产封面文件的文件名判定（**纯函数**）：`<资产名>.cover.jpg/png`。
+ *
+ * 落盘来源都走 `main/coverImage.ts#coverFileName` 的同族命名：
+ * - 知末抓取的主图（`main/zhimoCover.ts` → `<资产名>.cover.jpg`）；
+ * - 用户「截图替换封面」拍照保存（`<资产名>.cover.png`）。
+ *
+ * 只认 `.cover.` 这个受控后缀、不认"名字里带 cover"：后者已经被
+ * `PREVIEW_NAME_RE` 的预览词阶段覆盖（cover 也是预览词之一），
+ * 两个阶段分开判定才能表达「主图 > 预览词」的优先级。
+ */
+export function isCoverAssetImage(name: string): boolean {
+  return /\.cover\.(jpe?g|png)$/i.test(name)
+}
+
 export function kindOfExt(ext: string): AssetKind {
   return EXT_KIND[ext.toLowerCase().replace(/^\./, '')] ?? 'other'
 }
@@ -311,12 +334,21 @@ export interface PickCoverOptions {
 }
 
 /**
- * 封面四级回退（P0-8 / C3）：
- * ① `named` 根目录层名字命中预览词
- * ② `root` 根目录层首张图片
- * ③ `embedded` 内嵌缩略图（P1-2 预留）
- * ④ `largest` 全资产最大图
- * ⑤ `null` → UI 用类型占位图标（`placeholder`）
+ * 封面候选排序（P0-8 / C3 四级回退 + 2026-10 用户裁定：**cover > preview**）：
+ * ① `cover` 根目录层 `<资产名>.cover.jpg/png`（知末抓的主图 / 用户拍照保存）
+ * ② `named` 根目录层名字命中预览词（含 `*.preview.*` —— SKP 内嵌提取图落的就是这个名）
+ * ③ `root` 根目录层首张图片
+ * ④ `embedded` 内嵌缩略图（P1-2 预留）
+ * ⑤ `largest` 全资产最大图
+ * ⑥ `null` → UI 用类型占位图标（`placeholder`）
+ *
+ * 为什么加 ①：重装 ID BOX 后模型重扫，库里同时躺着 `*.cover.jpg`（知末主图）与
+ * `*.preview.jpg`（SKP 内嵌提取图）—— 两者都命中预览词，旧实现取 `find()` 的第一个，
+ * 结果跟着 readdir 顺序漂移，经常选中内嵌灰图。裁定：**有 cover 就用 cover，
+ * 没有才用 preview**。①② 落库都用既有 `coverSource='named'`，**不改 schema**。
+ *
+ * ⚠️ 本函数只服务"自动候选"。用户手动设置（`coverSource='manual'`）与知末已抓
+ * （`'zhimo'`）的封面由渲染层 rescan 合并的 `keepStickyCover` 守卫，不会被本函数顶掉。
  */
 export function pickCover(files: AssetFile[], opts?: PickCoverOptions): CoverPick | null {
   const images = files.filter((f) => f.kind === 'texture' || f.kind === 'hdri')
@@ -324,6 +356,14 @@ export function pickCover(files: AssetFile[], opts?: PickCoverOptions): CoverPic
 
   // 根目录层 = rel 中不含 '/'（contentRoot 剥离后，根目录层就是资产自己的一层）
   const rootImages = images.filter((f) => !f.rel.includes('/'))
+
+  // ① 封面文件最优先（cover > preview，2026-10 裁定）。
+  //    按 rel 字典序取第一个：同时存在 .cover.jpg 与 .cover.png 时结果确定，
+  //    不吃 readdir 顺序（预览词阶段的老毛病不能再犯一遍）。
+  const coverFile = rootImages
+    .filter((f) => isCoverAssetImage(f.name))
+    .sort((a, b) => a.rel.localeCompare(b.rel))[0]
+  if (coverFile) return { rel: coverFile.rel, source: 'named' }
 
   const named = rootImages.find((f) => PREVIEW_NAME_RE.test(f.name))
   if (named) return { rel: named.rel, source: 'named' }

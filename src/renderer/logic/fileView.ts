@@ -109,7 +109,8 @@ export const FILE_ROW_KIND_LABEL: Record<FileRowKind, string> = {
  * 组内再按文件名**自然序**（`img2` 排在 `img10` 前面），比纯字节序符合文件管理器习惯。
  *
  * ⚠️ 只改这里的权重，**不要动 `fileRowKindOf` 的判定口径**（图标 / 其它模块依赖它）。
- * 另有第二条次级键：模型组内 `.skp` 优先（见 `buildFileRows` 的排序链，用户 2026-10-22 口径）。
+ * 另有第二条次级键：模型组内 `.skp` / `.max` 并列第一档（见 `buildFileRows` 的排序链，
+ * 2026-10「3DMAX 支持」扩展口径）。
  */
 const KIND_ORDER: Record<FileRowKind, number> = { model: 0, image: 1, other: 2 }
 
@@ -131,6 +132,16 @@ export function extLabelOf(ext: string): string {
   // 超长「扩展名」多半是文件名里带点（`v1.2.final`），截断避免撑破行
   return e.toUpperCase().slice(0, 6)
 }
+
+/**
+ * 模型组的「第一档」扩展名（2026-10 扩展口径）。
+ *
+ * 沿革：用户 2026-10-22 原话「SKP 后缀的这一个文件应该排在第一位」→ 只有 `.skp`；
+ * 2026-10「3DMAX 支持」拍板扩展为「模型文件排第一」——`.max` 与 `.skp` **并列第一档**，
+ * 档内按文件名自然序（不设 skp > max 的优先级，用户原话是"并列"）。
+ * 其余模型扩展名（.fbx / .obj …）仍在这一档之后、图片之前。
+ */
+const LEAD_MODEL_EXTS: ReadonlySet<string> = new Set(['skp', 'max'])
 
 /**
  * `Asset.files` → 文件行列表（**已排序**，纯函数、零 IO）。
@@ -163,20 +174,19 @@ export function buildFileRows(asset: Pick<Asset, 'folder' | 'files'>): FileRow[]
     const byKind = KIND_ORDER[a.kind] - KIND_ORDER[b.kind]
     if (byKind !== 0) return byKind
     /**
-     * 同属模型组：`.skp` 优先。
+     * 同属模型组：`.skp` 与 `.max` **并列第一档**，档内按文件名自然序。
      *
-     * 用户原话（2026-10-22 追加口径）：「**SKP 后缀的这一个文件应该排在第一位**」——
-     * 字面就是 skp 最前，不是"模型组最前"。一个包里同时有 `.max` / `.skp` 时，
-     * 把 `.max` 排第一会被用户当成"没改"。
+     * 沿革：用户 2026-10-22 原话「SKP 后缀的这一个文件应该排在第一位」→ 只有 skp；
+     * 2026-10「3DMAX 支持」拍板扩展为「模型文件排第一，max 与 skp 并列第一组内按文件名」
+     * ——不再设 skp > max 的优先级（`衣柜.max` 与 `衣柜.skp` 谁前谁后由文件名定）。
      *
      * ⚠️ 只对 `model` 组加这一档次级键，**image / other 组保持原有自然序**；
-     * 也**不要**推广成"所有模型扩展名的优先级表"（`.skp > .max > .obj …` ——
-     * 用户只点名了 SKP，多排一档等于替他做决定）。
-     * `ext` 在映射阶段已小写化，这里直接比 `'skp'`。
+     * 其余模型扩展名（.fbx / .obj …）仍在这一档之后、图片之前（"模型文件排第一"）。
+     * `ext` 在映射阶段已小写化，这里直接查表。
      */
     if (a.kind === 'model') {
-      const bySkp = Number(b.ext === 'skp') - Number(a.ext === 'skp')
-      if (bySkp !== 0) return bySkp
+      const byLead = Number(LEAD_MODEL_EXTS.has(b.ext)) - Number(LEAD_MODEL_EXTS.has(a.ext))
+      if (byLead !== 0) return byLead
     }
     const byName = NAME_COLLATOR.compare(a.name, b.name)
     if (byName !== 0) return byName

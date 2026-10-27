@@ -49,6 +49,7 @@ import { formatBytes } from '../shared/format'
 import { resolveTheme } from '../shared/theme'
 import { displayName } from '../shared/naming'
 import { capsOfFilter, kindFilterLabel, kindsOfFilter } from '../shared/classify'
+import { MODEL_FORMAT_OPTIONS } from '../shared/modelFormat'
 import { UNCLASSIFIED } from '../shared/taxonomy'
 import {
   SIZE_PRESET_BYTES,
@@ -88,8 +89,8 @@ import { IconDownload, IconEmptyLibrary, IconPlus } from './icons'
  */
 type QuickPanel = 'size' | 'time' | 'color' | null
 
-/** 0.6.0 新增的中栏头浮层（分辨率 / 存为集合；null = 收起） */
-type ExtraPanel = 'resolution' | 'save' | null
+/** 0.6.0 新增的中栏头浮层（分辨率 / 存为集合；2026-10 再加「模型格式」；null = 收起） */
+type ExtraPanel = 'resolution' | 'save' | 'format' | null
 
 /**
  * 中栏头快速筛选的选项表（单选）。
@@ -664,6 +665,9 @@ export default function App() {
    * `tests/filterCaps.test.ts` 有源码守卫盯着）。
    */
   const showResolutionEntry = capsOfFilter(filters.kind, 'resolution')
+  /** 模型格式（全部 / SU / 3DMAX）：只有模型视图开放（能力表唯一判定，与分辨率同一机制） */
+  const showModelFormatEntry = capsOfFilter(filters.kind, 'modelFormat')
+  const modelFormatFilterActive = filters.modelFormat !== null
   const showStyleEntry =
     capsOfFilter(filters.kind, 'style') && (styleCounts.length > 0 || filters.styles.length > 0)
   /** 风格是多选维度：只要有选中就算激活，chip 上带数量（与色标同规矩） */
@@ -683,7 +687,9 @@ export default function App() {
    */
   useEffect(() => {
     if (!showResolutionEntry) setExtraPanel((p) => (p === 'resolution' ? null : p))
-  }, [showResolutionEntry])
+    // 模型格式浮层同理：切到材质 / HDR / 其他视图时收起（筛选值由 store 归一化清掉）
+    if (!showModelFormatEntry) setExtraPanel((p) => (p === 'format' ? null : p))
+  }, [showResolutionEntry, showModelFormatEntry])
 
   // ── 排序胶囊（自绘浮层）────────────────────────────────────────────
   /** 胶囊上显示的当前排序名；`SORT_OPTIONS` 与 `SortKey` 同源，兜底防止脏值留下空白胶囊 */
@@ -916,6 +922,29 @@ export default function App() {
                           onClick={toggleExtraPanel('resolution')}
                         >
                           分辨率
+                        </button>
+                      )}
+                      {/* 模型格式（2026-10「3DMAX 支持」）：全部 / SU / 3DMAX 单选。
+                          与分辨率同一族（单选、点完即收起），只对 kind=model 的资产生效；
+                          材质 / HDR / 其他视图不渲染（能力表 `capsOfFilter`），
+                          切走时残留值由 store 的 `sanitizeFiltersForKind` 清掉。 */}
+                      {showModelFormatEntry && (
+                        <button
+                          className={`${modelFormatFilterActive ? 'chip-accent' : 'chip-ghost'} shrink-0 ${
+                            trashMode ? 'cursor-not-allowed opacity-40' : ''
+                          }`}
+                          disabled={trashMode}
+                          aria-pressed={modelFormatFilterActive}
+                          aria-haspopup="dialog"
+                          aria-expanded={extraPanel === 'format'}
+                          title={
+                            trashMode
+                              ? '回收站不支持模型格式筛选（返回资产视图后可用）'
+                              : '按模型格式筛选（SU / 3DMAX；只对模型资产生效）'
+                          }
+                          onClick={toggleExtraPanel('format')}
+                        >
+                          格式
                         </button>
                       )}
                       {/* 色标（2026-10-25 反馈：从侧栏移到中栏头，与体积 / 时间同一视觉族）。
@@ -1160,11 +1189,46 @@ export default function App() {
                           }`}
                           style={{ left: quickPos.left, top: quickPos.top }}
                           role="dialog"
-                          aria-label={extraPanel === 'save' ? '存为智能集合' : '按分辨率筛选'}
+                          aria-label={
+                            extraPanel === 'save'
+                              ? '存为智能集合'
+                              : extraPanel === 'format'
+                                ? '按模型格式筛选'
+                                : '按分辨率筛选'
+                          }
                         >
                           <div className="px-2 pb-1 pt-1 text-[10px] text-tertiary">
-                            {extraPanel === 'save' ? '存为智能集合' : resolutionPanelTitle(filters.kind)}
+                            {extraPanel === 'save'
+                              ? '存为智能集合'
+                              : extraPanel === 'format'
+                                ? '模型格式'
+                                : resolutionPanelTitle(filters.kind)}
                           </div>
+
+                          {/* 模型格式：与分辨率面板同构（单选、点完即收起、active 高亮同色）。
+                              选项表在 `shared/modelFormat`（全部 / SU / 3DMAX），
+                              与卡片徽标文案同源。 */}
+                          {extraPanel === 'format' &&
+                            MODEL_FORMAT_OPTIONS.map((opt) => {
+                              const active = filters.modelFormat === opt.value
+                              return (
+                                <button
+                                  key={opt.label}
+                                  className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
+                                    active
+                                      ? 'bg-accent-tint font-medium text-accent-text'
+                                      : 'text-secondary hover:bg-elevated/60'
+                                  }`}
+                                  aria-pressed={active}
+                                  onClick={() => {
+                                    setFilter({ modelFormat: opt.value })
+                                    setExtraPanel(null)
+                                  }}
+                                >
+                                  {opt.label}
+                                </button>
+                              )
+                            })}
 
                           {/* 分辨率：与体积面板**完全同构**（单选、点完即收起、active 高亮同色）。
                               选项表**按视图分**：材质族 2K/4K；HDR 4K/8K/16K（全景宽度）。 */}

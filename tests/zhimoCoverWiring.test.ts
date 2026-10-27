@@ -130,10 +130,11 @@ describe('设置页：两个 Toggle、patch 键名、子项置灰不改值', () 
 describe('store：commitCover 三处共用 / rescan 保活 / 自动任务静默', () => {
   const src = readSrc('../src/renderer/store.ts')
 
-  it('commitCover 被定义一次、调用三处（setCover / setCoverFromImage / zhimo 队列）', () => {
+  it('commitCover 被定义一次、调用四处（setCover / setCoverFromImage / zhimo 队列 / 封面补抓）', () => {
     const calls = src.match(/commitCover\(/g) ?? []
-    // 1 处定义 + 3 处调用：手动 zhimo 已改为复用 runZhimoCovers（DEF-Z1），不再有第四份落库逻辑
-    expect(calls.length).toBe(4)
+    // 1 处定义 + 4 处调用：手动 zhimo 已改为复用 runZhimoCovers（DEF-Z1），不再有第四份落库逻辑；
+    // 2026-10「一键重扫 · 从知末获取封面」（runZhimoCoverBackfill）复用同一落库路径，是第四处调用
+    expect(calls.length).toBe(5)
     expect(src).toContain("() => commitCover(id, rel, 0, 'manual')")
     expect(src).toContain("await commitCover(id, res.rel, res.size, 'manual')")
     expect(src).toContain("await commitCover(t.id, res.rel, res.size, 'zhimo')")
@@ -174,11 +175,11 @@ describe('store：commitCover 三处共用 / rescan 保活 / 自动任务静默'
     expect(manual).not.toContain('commitCover(')
   })
 
-  it('DEF-Z8：四条写入路径都在按资产锁内', () => {
-    // 三处真实调用：setCover / setCoverFromImage / zhimo 的 fetchOne
-    //（手动 zhimo 复用 fetchOne，自然继承同一把锁）
+  it('DEF-Z8：五条写入路径都在按资产锁内', () => {
+    // 四处真实调用：setCover / setCoverFromImage / zhimo 的 fetchOne / 封面补抓的 fetchOne
+    //（手动 zhimo 复用 fetchOne 自然继承同一把锁；补抓通道 2026-10 新增，同样走 fetchOne 锁）
     const hits = src.match(/withAssetCoverLock\(/g) ?? []
-    expect(hits.length).toBe(3)
+    expect(hits.length).toBe(4)
     expect(src).toContain("from './logic/coverLock'")
 
     const setCoverBody = sliceBetween(src, 'async setCover(id, rel)', 'async setCoverFromImage(')

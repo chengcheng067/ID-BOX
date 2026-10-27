@@ -41,6 +41,11 @@ import { toDeleteTargets, type DeleteTarget } from './logic/deleteFlow'
 // `graceMs` 已是 `pendingDelete` 的字段，所以这里只负责**取值**，纯函数的默认参数
 // （`DELETE_GRACE_MS`）保持不动，避免既有 import 炸掉。
 import { normalizeUndoGraceMs } from '../shared/undoGrace'
+import {
+  countCustomUsage,
+  sanitizeCustomTerm
+} from '../shared/customTaxonomy'
+import type { CustomTaxonomy } from '../shared/types'
 import { isLegacyLayout, planLegacyMoves, categoriesOf } from './logic/category'
 import { reconcile, type ReconcileReport } from './logic/reconcile'
 import {
@@ -61,9 +66,12 @@ import {
 } from '../shared/ballParams'
 import { withAssetCoverLock } from './logic/coverLock'
 import {
+  hasCoverAssetFile,
+  isZhimoCoverBackfillCandidate,
   pickZhimoCoverTargets,
   runZhimoCoverQueue,
   zhimoCoverFailText,
+  zhimoCoverIdOf,
   type ZhimoCoverQueueResult,
   type ZhimoCoverTarget
 } from './logic/zhimoCover'
@@ -578,6 +586,50 @@ const IDLE_ZHIMO_RECLASS_STATE: ZhimoReclassState = {
   cancelRequested: false
 }
 
+/**
+ * 「一键重扫 · 从知末获取封面」的进度状态（设置页显示 / 取消按钮）。
+ *
+ * 形态与 `ZhimoReclassState` 一致但**单独命名**：两条通道各自独立计数与取消，
+ * 复用同一个类型会让人误以为状态互通。
+ */
+export interface ZhimoCoverBackfillState {
+  running: boolean
+  /** 已处理条数（含成功 / 失败 / 跳过），单调递增 */
+  done: number
+  /** 本次候选总数 */
+  total: number
+  /** 用户点了取消（停止发新请求；已抓到的封面照常落库） */
+  cancelRequested: boolean
+}
+
+/** `runZhimoCoverBackfill()` 的可选参数 */
+export interface RunZhimoCoverBackfillOptions {
+  /**
+   * 节流 sleep 的注入点（**仅供单测**传即时桩，运行时不传）。
+   * 与 `runZhimoCoverQueue({ sleep })` 同款，避免用例真等 N×250ms。
+   */
+  sleep?: (ms: number) => Promise<void>
+}
+
+/** `runZhimoCoverBackfill()` 的返回（队列计数 + 本轮候选总数） */
+export interface ZhimoCoverBackfillSummary {
+  /** 抓取成功（落盘成功）的条数 */
+  ok: number
+  /** 失败条数（任何 reason） */
+  failed: number
+  /** 锁内重查发现"已有封面 / 手动封面"而主动跳过的条数 */
+  skipped: number
+  /** true = 被取消叫停，剩余条目没有发请求 */
+  stopped: boolean
+  /** 本次启动时的候选总数 */
+  total: number
+}
+
+/**
+ * 并发保护：封面补抓同一时刻只允许一个在跑（模块级布尔，理由同 `zhimoReclassRunning`）。
+ */
+let zhimoCoverBackfillRunning = false
+
 /** `runZhimoCategoryReclass()` 的可选参数 */
 export interface RunZhimoCategoryReclassOptions {
   /**
@@ -898,6 +950,8 @@ interface VaultState {
    * 本项按**知末站方分类**重判，两者是不同通道（备份前缀也不同）。
    */
   zhimoReclass: ZhimoReclassState
+  /** 「一键重扫 · 从知末获取封面」进度（设置页「数据与备份」tab；与 `zhimoReclass` 互不互通） */
+  zhimoCoverBackfill: ZhimoCoverBackfillState
   /** CategoryPicker 当前打开的目标 id 集合；null = 关闭（详情面板 / 右键菜单 / 批量栏共用） */
   categoryPickerIds: string[] | null
   /**
@@ -1188,6 +1242,24 @@ interface VaultState {
   refreshZhimoCover: (id: string) => Promise<FetchZhimoCoverResult>
   saveSettings: (patch: Partial<Settings>) => Promise<void>
   /**
+   * 新增一条自定义分类词条（2026-10）。`level: 'level2'` 时 `parent` = 所属一级名。
+   *
+   * 清洗 / 去重 / 与预设撞名剔除都在 `sanitizeCustomTerm` + 归一化里收口；
+   * 清洗后为空或已存在（含预设同名）→ 返回 false（调用方无需提示，词条本来就在）。
+   * 走既有 `saveSettings` 落档（主进程 normalizeSettings 再洗一遍，双保险）。
+   */
+  addCustomCategory: (level: 'level1' | 'level2', parent: string | null, name: string) => Promise<boolean>
+  /**
+   * 删除一条自定义分类词条（删除保护在 store 层）：
+   * 已被任何资产使用 → 拒绝并返回使用数（调用方拿去拼提示），**不改任何资产与目录**。
+   * 不做"删除并搬目录"语义（需批量改 relFolder，风险大，用户明确要求前不实现）。
+   */
+  removeCustomCategory: (
+    level: 'level1' | 'level2',
+    parent: string | null,
+    name: string
+  ) => Promise<{ ok: boolean; used: number }>
+  /**
    * AI 辅助分类（docs/15 §7，可选功能，默认关闭）。
    *
    * 只处理 `未分类/未分类` 的资产：按名字分批（20 个/批）→ 主进程发请求 →
@@ -1244,6 +1316,26 @@ interface VaultState {
    * 停止的是"发新请求"；已抓到的命中仍会落库（见 `runZhimoCategoryReclass` 注释）。
    */
   cancelZhimoCategoryReclass: () => void
+  /**
+   * 一键重扫 · 从知末获取封面（设置页「数据与备份」tab 的手动动作，2026-10 用户拍板）。
+   *
+   * 场景：重装 ID BOX 后模型重扫，卡片封面选的是 `*.preview.jpg`（SKP 内嵌提取图）；
+   * 库内**没有 cover 文件**的资产可以批量重走「知末详情页 → 主图抓取 →
+   * 落盘 `<资产名>.cover.jpg`」链路。抓取完全复用既有 IPC `fetchZhimoCover`
+   * （`main/zhimoCover.ts` 的重试/超时/限速一律不动），落库复用 `commitCover`。
+   *
+   * 候选范围（用户裁定）：只补 `isZhimoCoverBackfillCandidate` 命中的资产 ——
+   * 已有 cover 文件的一律不重抓；`coverSource='manual'` 的资产永不参与。
+   *
+   * 与 `runZhimoCovers` 的关系：同一队列形态（`runZhimoCoverQueue`）+ 同一把按资产的
+   * 写入锁（DEF-Z1/Z8），但不经过 `zhimoCoverRunning` 互斥与 pending 队列 ——
+   * 本动作是全库维度的存量补齐，进度/取消/汇总都独立（`zhimoCoverBackfill`）。
+   */
+  runZhimoCoverBackfill: (
+    opts?: RunZhimoCoverBackfillOptions
+  ) => Promise<ZhimoCoverBackfillSummary>
+  /** 取消正在跑的封面补抓：置 `zhimoCoverBackfill.cancelRequested = true`（已抓到的照常落库） */
+  cancelZhimoCoverBackfill: () => void
   /**
    * 撤销**最近一次**重跑分类：把备份里的资产按原 `category1/category2` 搬回。
    *
@@ -2069,6 +2161,7 @@ export const useVault = create<VaultState>((set, get) => ({
   reclassifyBackupCount: 0,
   zhimoReclassBackupCount: 0,
   zhimoReclass: { ...IDLE_ZHIMO_RECLASS_STATE },
+  zhimoCoverBackfill: { running: false, done: 0, total: 0, cancelRequested: false },
   categoryPickerIds: null,
   renameIds: null,
   folderViewAssetId: null,
@@ -3918,6 +4011,59 @@ export const useVault = create<VaultState>((set, get) => ({
     }
   },
 
+  async addCustomCategory(level, parent, name) {
+    const cur = get().settings?.customTaxonomy
+    const term = sanitizeCustomTerm(name)
+    if (!term) return false
+    const base: CustomTaxonomy = cur ?? { level1: [], level2: {} }
+    if (level === 'level1') {
+      if (base.level1.includes(term)) return false
+      const next: CustomTaxonomy = { level1: [...base.level1, term], level2: { ...base.level2 } }
+      await get().saveSettings({ customTaxonomy: next })
+      return true
+    }
+    const p = sanitizeCustomTerm(parent)
+    if (!p) return false
+    const list = base.level2[p] ?? []
+    if (list.includes(term)) return false
+    const next: CustomTaxonomy = {
+      level1: [...base.level1],
+      level2: { ...base.level2, [p]: [...list, term] }
+    }
+    await get().saveSettings({ customTaxonomy: next })
+    return true
+  },
+
+  async removeCustomCategory(level, parent, name) {
+    const assets = get().assets
+    const used = countCustomUsage(assets, { level, parent: parent ?? undefined, name })
+    if (used > 0) return { ok: false, used }
+    const cur = get().settings?.customTaxonomy
+    if (!cur) return { ok: false, used }
+    const term = sanitizeCustomTerm(name)
+    if (!term) return { ok: false, used }
+    let next: CustomTaxonomy
+    if (level === 'level1') {
+      if (!cur.level1.includes(term)) return { ok: false, used }
+      // 连带语义：删一级时其名下的自定义二级一并失锚 → 同步移除（二级词条本身没有资产使用才会走到这里）
+      const level2: Record<string, string[]> = { ...cur.level2 }
+      delete level2[term]
+      next = { level1: cur.level1.filter((v) => v !== term), level2 }
+    } else {
+      const p = sanitizeCustomTerm(parent)
+      if (!p) return { ok: false, used }
+      const list = cur.level2[p]
+      if (!list || !list.includes(term)) return { ok: false, used }
+      const remain = list.filter((v) => v !== term)
+      const level2: Record<string, string[]> = { ...cur.level2 }
+      if (remain.length > 0) level2[p] = remain
+      else delete level2[p]
+      next = { level1: [...cur.level1], level2 }
+    }
+    await get().saveSettings({ customTaxonomy: next })
+    return { ok: true, used: 0 }
+  },
+
   /**
    * AI 辅助分类（docs/15 §7）——**词表优先、模型兜底**。
    *
@@ -4284,6 +4430,142 @@ export const useVault = create<VaultState>((set, get) => ({
 
   cancelZhimoCategoryReclass() {
     set((s) => ({ zhimoReclass: { ...s.zhimoReclass, cancelRequested: true } }))
+  },
+
+  /**
+   * 一键重扫 · 从知末获取封面（存量补齐，2026-10 用户拍板）。
+   *
+   * 候选 = `isZhimoCoverBackfillCandidate`（与单测同一口径；真正跑的时候队列里
+   * 每一条还会在**锁内重查**：排队期间被用户手动接管 / 被其它通道补上的按 skipped 跳过，
+   * 绝不写盘 —— `writeCoverImageInto()` 会删同族文件，顶掉用户封面是 0.7.2 修过的
+   * 那类事故，不能在这里复发）。
+   *
+   * 进度：`fetchOne` 的 `finally` 里逐条 +1（成功/失败/跳过/异常都不漏），
+   * 设置页实时可见；取消语义与重排一致：只停"发新请求"，已抓到的照常落库。
+   */
+  async runZhimoCoverBackfill(opts) {
+    const idle: ZhimoCoverBackfillSummary = {
+      ok: 0,
+      failed: 0,
+      skipped: 0,
+      stopped: false,
+      total: 0
+    }
+    if (zhimoCoverBackfillRunning) return idle
+
+    const targets: ZhimoCoverTarget[] = []
+    for (const asset of get().assets) {
+      if (!isZhimoCoverBackfillCandidate(asset)) continue
+      const zhimoId = zhimoCoverIdOf(asset)
+      // `isZhimoCoverBackfillCandidate` 已保证非 null；这里只是类型收窄 + 防御
+      if (!zhimoId) continue
+      targets.push({ id: asset.id, zhimoId })
+    }
+    if (targets.length === 0) {
+      set({ notice: '没有需要从知末补封面的资产（已有 cover 文件的一律不重抓）' })
+      return idle
+    }
+
+    zhimoCoverBackfillRunning = true
+    set({
+      zhimoCoverBackfill: {
+        running: true,
+        done: 0,
+        total: targets.length,
+        cancelRequested: false
+      }
+    })
+    const summary: ZhimoCoverBackfillSummary = { ...idle, total: targets.length }
+    try {
+      const out = await runZhimoCoverQueue(targets, {
+        fetchOne: async (t) => {
+          try {
+            return await withAssetCoverLock(
+              t.id,
+              async () => {
+                const asset = get().assets.find((a) => a.id === t.id)
+                // 排队期间被删 / 被 rescan 换掉 → 不抓（按失败计，不影响整批）
+                if (!asset) {
+                  return { ok: false, reason: 'no-id' } satisfies FetchZhimoCoverResult
+                }
+                // 锁内重查（TOCTOU 闸门，同 runZhimoCovers）：用户刚手动设了封面 /
+                // 已有 cover 文件（别的通道先抓到了）→ 跳过
+                if (asset.coverSource === 'manual') {
+                  return { skipped: true, reason: 'manual' } as const
+                }
+                if (hasCoverAssetFile(asset.files)) {
+                  return { skipped: true, reason: 'zhimo' } as const
+                }
+                const res = await window.modvault
+                  .fetchZhimoCover({ folder: asset.folder, id: t.zhimoId })
+                  .catch(() => ({ ok: false, reason: 'network' }) as FetchZhimoCoverResult)
+                if (res.ok && res.rel && typeof res.size === 'number') {
+                  await commitCover(t.id, res.rel, res.size, 'zhimo')
+                  // 风格来自同一次详情页 GET：只补空 / 只认词表 / 只对 model
+                  await applyZhimoStyle(t.id, res.style)
+                }
+                return res
+              },
+              coverLockWaitOptions()
+            )
+          } finally {
+            // 进度：每处理完一条都 +1（取消与异常也不漏，否则进度条会停在半路）
+            set((s) => ({
+              zhimoCoverBackfill: {
+                ...s.zhimoCoverBackfill,
+                done: s.zhimoCoverBackfill.done + 1
+              }
+            }))
+          }
+        },
+        shouldStop: () => get().zhimoCoverBackfill.cancelRequested,
+        // 仅单测注入（运行时不传 → 队列用真实 setTimeout 节流）
+        sleep: opts?.sleep
+      })
+      summary.ok = out.ok
+      summary.failed = out.failed
+      summary.skipped = out.skipped
+      summary.stopped = out.stopped
+    } catch {
+      // 后台动作兜底：未预期异常静默降级（单条失败已由队列计入），不冒泡到 UI
+      summary.failed += 1
+    } finally {
+      zhimoCoverBackfillRunning = false
+      set((s) => ({
+        zhimoCoverBackfill: {
+          ...s.zhimoCoverBackfill,
+          running: false,
+          cancelRequested: false
+        }
+      }))
+    }
+
+    try {
+      window.modvault?.reportLog?.({
+        level: 'info',
+        message: 'zhimo:cover-backfill',
+        context: {
+          total: summary.total,
+          ok: summary.ok,
+          failed: summary.failed,
+          skipped: summary.skipped,
+          cancelled: summary.stopped
+        }
+      })
+    } catch {
+      /* 日志失败绝不影响结果 */
+    }
+
+    const skippedNote =
+      summary.skipped > 0 ? ` · 跳过 ${summary.skipped}（已有封面/手动封面）` : ''
+    set({
+      notice: `知末封面补抓${summary.stopped ? '（已取消）' : ''}：成功 ${summary.ok} / 失败 ${summary.failed}${skippedNote}`
+    })
+    return summary
+  },
+
+  cancelZhimoCoverBackfill() {
+    set((s) => ({ zhimoCoverBackfill: { ...s.zhimoCoverBackfill, cancelRequested: true } }))
   },
 
   /**

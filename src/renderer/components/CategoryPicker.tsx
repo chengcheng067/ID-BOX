@@ -3,6 +3,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useVault } from '../store'
 import { KIND_LABEL, kindFolder } from '../../shared/classify'
 import { UNCLASSIFIED } from '../../shared/taxonomy'
+import { customLevel1Of, customLevel2Of, mergeVocab, sanitizeCustomTerm } from '../../shared/customTaxonomy'
 import { level1OptionsFor, level2OptionsFor } from '../logic/category'
 import { useEscLayer } from '../logic/escLayer'
 import { Modal } from './Modal'
@@ -39,10 +40,11 @@ const CATEGORY_PANEL_CHROME = 34
 /** 浮层与窗口边缘的最小留白（与排序浮层的 `Math.max(8, …)` 一致） */
 const CATEGORY_PANEL_MARGIN = 8
 
-/** 浮层里的一行：`value` 写回分类字段，`label` 只用于展示 */
+/** 浮层里的一行：`value` 写回分类字段，`label` 只用于展示；`custom` = 用户自定义词条（尾部画角标） */
 interface CategoryOption {
   value: string
   label: string
+  custom: boolean
 }
 
 /** 浮层坐标（`fixed`）：`left/top` 是面板左上角，`listMaxHeight` 给选项列表封顶 */
@@ -73,6 +75,12 @@ export function CategoryPicker() {
   const assets = useVault((s) => s.assets)
   const close = useVault((s) => s.closeCategoryPicker)
   const assignCategory = useVault((s) => s.assignCategory)
+  const settings = useVault((s) => s.settings)
+  const addCustomCategory = useVault((s) => s.addCustomCategory)
+  const removeCustomCategory = useVault((s) => s.removeCustomCategory)
+  const setNotice = useVault((s) => s.setNotice)
+  /** 用户自定义词表（settings 未加载时按空表——预设词条照常可用） */
+  const customTax = settings?.customTaxonomy
 
   const targets = pickerIds ? assets.filter((a) => pickerIds.includes(a.id)) : []
   const kind = targets[0]?.kind
@@ -90,6 +98,10 @@ export function CategoryPicker() {
   const [l1Cursor, setL1Cursor] = useState(0)
   const [l2Cursor, setL2Cursor] = useState(0)
 
+  /** 「＋ 新增自定义」行展开状态与草稿（一级 / 二级各一套，两处浮层互斥所以不同时出现） */
+  const [addingFor, setAddingFor] = useState<'level1' | 'level2' | null>(null)
+  const [draft, setDraft] = useState('')
+
   const l1Ref = useRef<HTMLDivElement | null>(null)
   const l1ButtonRef = useRef<HTMLButtonElement | null>(null)
   const l2Ref = useRef<HTMLDivElement | null>(null)
@@ -102,6 +114,8 @@ export function CategoryPicker() {
       setLevel2(targets[0].category2 || UNCLASSIFIED)
     }
     setOpenField(null) // 换了目标集合 → 任何展开中的浮层都要收起（坐标已失效）
+    setAddingFor(null)
+    setDraft('')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pickerIds])
 
@@ -154,25 +168,40 @@ export function CategoryPicker() {
   const l2Options = level2OptionsFor(level1) // null = 自由输入；[] = 锁定为未分类
   const multi = targets.length > 1
 
-  /** 一级：词表 + 「未分类」哨兵（哨兵恒在首行，与原下拉顺序一致） */
+  // ── 自定义词表（2026-10）：与预设词条并列展示，`custom: true` 的行尾部画「自定义」角标 ──
+  const l1Custom = customLevel1Of(customTax)
+  const l2Custom = customLevel2Of(customTax, level1)
+
+  /** 一级：词表 + 自定义 + 「未分类」哨兵（哨兵恒在首行，与原下拉顺序一致） */
   const l1Items: readonly CategoryOption[] = [
-    { value: UNCLASSIFIED, label: UNCLASSIFIED },
-    ...l1Options.filter((v) => v !== UNCLASSIFIED).map((v) => ({ value: v, label: v }))
+    { value: UNCLASSIFIED, label: UNCLASSIFIED, custom: false },
+    ...mergeVocab(l1Options.filter((v) => v !== UNCLASSIFIED), l1Custom).map((it) => ({
+      value: it.value,
+      label: it.value,
+      custom: it.custom
+    }))
   ]
-  /** 一级当前值不在词表里：只在触发件上标注「词表外」，**不新增可选行**（原值不会被改写） */
-  const l1OutOfVocab = level1 !== UNCLASSIFIED && !l1Options.includes(level1)
+  /** 一级浮层是否可用（预设词表为空的大类有自定义词条时也走浮层，否则保留自由输入） */
+  const l1HasPanel = l1Options.length > 0 || l1Custom.length > 0
+  /** 一级当前值不在任何词表里：只在触发件上标注「词表外」，**不新增可选行**（原值不会被改写） */
+  const l1OutOfVocab =
+    l1HasPanel && level1 !== UNCLASSIFIED && !l1Items.some((it) => it.value === level1)
   const l1Display = l1OutOfVocab ? `${level1}（词表外）` : level1
 
   /**
    * 二级：`level2OptionsFor` 已保证「一级/二级」成对显示（不同一级下会有同名二级，
    * 只写二级名容易选错）；一级是「未分类」时该分支根本不渲染。
+   * 自定义二级挂在所属一级名下，与预设二级并列展示。
    */
+  const l2Merged = mergeVocab((l2Options ?? []).filter((v) => v !== UNCLASSIFIED), l2Custom)
   const l2Items: readonly CategoryOption[] = [
-    { value: UNCLASSIFIED, label: UNCLASSIFIED },
-    ...(l2Options ?? []).filter((v) => v !== UNCLASSIFIED).map((v) => ({ value: v, label: `${level1}/${v}` }))
+    { value: UNCLASSIFIED, label: UNCLASSIFIED, custom: false },
+    ...l2Merged.map((it) => ({ value: it.value, label: `${level1}/${it.value}`, custom: it.custom }))
   ]
-  /** 二级当前值不在词表里：同样只在触发件上标注，不改写原值 */
-  const l2OutOfVocab = l2Options !== null && level2 !== UNCLASSIFIED && !l2Options.includes(level2)
+  /** 二级浮层是否可用：预设或自定义任一有词条就走浮层；都没有 → 自由输入（原分支保留） */
+  const l2HasPanel = l2Merged.length > 0
+  /** 二级当前值不在任何词表里：同样只在触发件上标注，不改写原值（自由输入分支不标注） */
+  const l2OutOfVocab = l2HasPanel && level2 !== UNCLASSIFIED && !l2Merged.some((it) => it.value === level2)
   const l2Display =
     level2 === UNCLASSIFIED ? UNCLASSIFIED : `${level1}/${level2}${l2OutOfVocab ? '（词表外）' : ''}`
 
@@ -182,6 +211,7 @@ export function CategoryPicker() {
     if (!pos) return
     setPanelPos(pos)
     setL1Cursor(cursor ?? Math.max(0, l1Items.findIndex((it) => it.value === level1)))
+    setAddingFor(null)
     setOpenField('level1')
   }
 
@@ -210,6 +240,7 @@ export function CategoryPicker() {
     if (!pos) return
     setPanelPos(pos)
     setL2Cursor(cursor ?? Math.max(0, l2Items.findIndex((it) => it.value === level2)))
+    setAddingFor(null)
     setOpenField('level2')
   }
 
@@ -271,11 +302,63 @@ export function CategoryPicker() {
     }
   }
 
+  /**
+   * 提交「＋ 新增自定义」：清洗后写入词表并选中该词条。
+   * 输入与预设同名 → `addCustomCategory` 幂等返回 false，照常选中（那是预设项，不是自定义）。
+   */
+  const commitAdd = async (field: 'level1' | 'level2'): Promise<void> => {
+    const term = sanitizeCustomTerm(draft)
+    setAddingFor(null)
+    setDraft('')
+    if (!term) return
+    if (field === 'level1') {
+      await addCustomCategory('level1', null, term)
+      setLevel1(term)
+      setLevel2(UNCLASSIFIED)
+    } else {
+      await addCustomCategory('level2', level1, term)
+      setLevel2(term)
+    }
+    setOpenField(null)
+  }
+
+  /**
+   * 删除自定义词条（删除保护在 store 层）：已被任何资产使用 → 拒绝并提示数量；
+   * 删除的是当前选中值时把选择落回「未分类」（词表里已经没有这一行了）。
+   */
+  const deleteCustom = async (field: 'level1' | 'level2', name: string): Promise<void> => {
+    const res = await removeCustomCategory(field, field === 'level2' ? level1 : null, name)
+    if (!res.ok && res.used > 0) {
+      setNotice(`「${name}」已被 ${res.used} 个资产使用，无法删除`)
+      return
+    }
+    if (field === 'level1' && level1 === name) {
+      setLevel1(UNCLASSIFIED)
+      setLevel2(UNCLASSIFIED)
+    } else if (field === 'level2' && level2 === name) {
+      setLevel2(UNCLASSIFIED)
+    }
+  }
+
   const confirm = async () => {
     if (busy || crossKind) return
     setBusy(true)
     const c1 = level1.trim() || UNCLASSIFIED
     const c2 = c1 === UNCLASSIFIED ? UNCLASSIFIED : level2.trim() || UNCLASSIFIED
+    // 自定义词条落档（2026-10）：输入值不在预设也不在自定义词表 → 记为自定义词条。
+    // 自由输入分支（无词表大类 / 无级联词表的一级）打上来的值由此进词表，下次直接可选；
+    // 枚举浮层里的既有词条不重复登记（addCustomCategory 内部再兜一道幂等）。
+    if (c1 !== UNCLASSIFIED && !l1Options.includes(c1) && !l1Custom.includes(c1)) {
+      await addCustomCategory('level1', null, c1)
+    }
+    if (
+      c1 !== UNCLASSIFIED &&
+      c2 !== UNCLASSIFIED &&
+      !(l2Options ?? []).includes(c2) &&
+      !l2Custom.includes(c2)
+    ) {
+      await addCustomCategory('level2', c1, c2)
+    }
     await assignCategory(targets.map((t) => t.id), c1, c2).catch(() => undefined)
     setBusy(false)
     close()
@@ -294,9 +377,9 @@ export function CategoryPicker() {
         </div>
       )}
 
-      {/* 一级分类 */}
+      {/* 一级分类（预设词表为空的大类有自定义词条时也走浮层，否则保留自由输入） */}
       <div className="mb-1 text-[12px] font-medium">一级分类</div>
-      {l1Options.length > 0 ? (
+      {l1HasPanel ? (
         <div ref={l1Ref} onKeyDown={onLevel1KeyDown}>
           <button
             ref={l1ButtonRef}
@@ -329,27 +412,76 @@ export function CategoryPicker() {
                 {l1Items.map((opt, i) => {
                   const active = opt.value === level1
                   return (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      role="option"
-                      aria-selected={active}
-                      title={opt.label}
-                      // 选中态**只用一个指示**（与排序浮层同款 accent-tint），不再叠勾号
-                      className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
-                        active
-                          ? 'bg-accent-tint font-medium text-accent-text'
-                          : i === l1Cursor
-                            ? 'bg-elevated/60 text-secondary'
-                            : 'text-secondary hover:bg-elevated/60'
-                      }`}
-                      onClick={() => applyLevel1(opt.value)}
-                    >
-                      <span className="min-w-0 truncate">{opt.label}</span>
-                    </button>
+                    <div key={opt.value} className="group relative">
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={active}
+                        title={opt.label}
+                        // 选中态**只用一个指示**（与排序浮层同款 accent-tint），不再叠勾号
+                        className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
+                          active
+                            ? 'bg-accent-tint font-medium text-accent-text'
+                            : i === l1Cursor
+                              ? 'bg-elevated/60 text-secondary'
+                              : 'text-secondary hover:bg-elevated/60'
+                        }`}
+                        onClick={() => applyLevel1(opt.value)}
+                      >
+                        <span className="min-w-0 truncate">{opt.label}</span>
+                        {opt.custom && (
+                          <span className="ml-auto shrink-0 pl-1 text-[9px] text-tertiary group-hover:hidden">
+                            自定义
+                          </span>
+                        )}
+                      </button>
+                      {opt.custom && (
+                        <span
+                          role="button"
+                          tabIndex={-1}
+                          aria-label={`删除自定义一级分类 ${opt.value}`}
+                          title="删除该自定义分类（已被资产使用时无法删除）"
+                          className="absolute right-1 top-1/2 hidden -translate-y-1/2 cursor-pointer px-1 text-[10px] leading-none text-tertiary hover:text-danger group-hover:block"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void deleteCustom('level1', opt.value)
+                          }}
+                        >
+                          ×
+                        </span>
+                      )}
+                    </div>
                   )
                 })}
               </div>
+
+              {/* ＋ 新增自定义一级分类（浮层底部固定一行；Enter 提交并选中，Esc 收回输入行） */}
+              {addingFor === 'level1' ? (
+                <input
+                  autoFocus
+                  className="input mt-0.5 h-7 text-[12px]"
+                  placeholder="新的一级分类名，Enter 添加"
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    // 不冒泡进浮层键盘导航：↑↓ 会移动高亮、Enter 会误选高亮项。
+                    // Esc 不在这里拦：交给 useEscLayer 统一收起浮层（输入行随浮层一起消失）。
+                    e.stopPropagation()
+                    if (e.key === 'Enter') void commitAdd('level1')
+                  }}
+                />
+              ) : (
+                <button
+                  type="button"
+                  className="mt-0.5 flex h-7 w-full items-center gap-1 rounded-nav px-2 text-left text-[11px] text-tertiary transition hover:bg-elevated"
+                  onClick={() => {
+                    setDraft('')
+                    setAddingFor('level1')
+                  }}
+                >
+                  ＋ 新增自定义一级分类
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -369,7 +501,7 @@ export function CategoryPicker() {
       <div className="mb-1 mt-3 text-[12px] font-medium">二级分类</div>
       {level1 === UNCLASSIFIED ? (
         <input className="input opacity-50" value="未分类" disabled title="未指派一级分类时，二级强制为「未分类」" />
-      ) : l2Options === null ? (
+      ) : !l2HasPanel ? (
         <input
           className="input"
           value={level2 === UNCLASSIFIED ? '' : level2}
@@ -409,26 +541,73 @@ export function CategoryPicker() {
                 {l2Items.map((opt, i) => {
                   const active = opt.value === level2
                   return (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      role="option"
-                      aria-selected={active}
-                      title={opt.label}
-                      className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
-                        active
-                          ? 'bg-accent-tint font-medium text-accent-text'
-                          : i === l2Cursor
-                            ? 'bg-elevated/60 text-secondary'
-                            : 'text-secondary hover:bg-elevated/60'
-                      }`}
-                      onClick={() => applyLevel2(opt.value)}
-                    >
-                      <span className="min-w-0 truncate">{opt.label}</span>
-                    </button>
+                    <div key={opt.value} className="group relative">
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={active}
+                        title={opt.label}
+                        className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
+                          active
+                            ? 'bg-accent-tint font-medium text-accent-text'
+                            : i === l2Cursor
+                              ? 'bg-elevated/60 text-secondary'
+                              : 'text-secondary hover:bg-elevated/60'
+                        }`}
+                        onClick={() => applyLevel2(opt.value)}
+                      >
+                        <span className="min-w-0 truncate">{opt.label}</span>
+                        {opt.custom && (
+                          <span className="ml-auto shrink-0 pl-1 text-[9px] text-tertiary group-hover:hidden">
+                            自定义
+                          </span>
+                        )}
+                      </button>
+                      {opt.custom && (
+                        <span
+                          role="button"
+                          tabIndex={-1}
+                          aria-label={`删除自定义二级分类 ${opt.value}`}
+                          title="删除该自定义分类（已被资产使用时无法删除）"
+                          className="absolute right-1 top-1/2 hidden -translate-y-1/2 cursor-pointer px-1 text-[10px] leading-none text-tertiary hover:text-danger group-hover:block"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void deleteCustom('level2', opt.value)
+                          }}
+                        >
+                          ×
+                        </span>
+                      )}
+                    </div>
                   )
                 })}
               </div>
+
+              {/* ＋ 新增自定义二级分类（挂在当前一级名下） */}
+              {addingFor === 'level2' ? (
+                <input
+                  autoFocus
+                  className="input mt-0.5 h-7 text-[12px]"
+                  placeholder={`「${level1}」下新的二级分类名，Enter 添加`}
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    e.stopPropagation()
+                    if (e.key === 'Enter') void commitAdd('level2')
+                  }}
+                />
+              ) : (
+                <button
+                  type="button"
+                  className="mt-0.5 flex h-7 w-full items-center gap-1 rounded-nav px-2 text-left text-[11px] text-tertiary transition hover:bg-elevated"
+                  onClick={() => {
+                    setDraft('')
+                    setAddingFor('level2')
+                  }}
+                >
+                  ＋ 新增自定义二级分类
+                </button>
+              )}
             </div>
           )}
         </div>

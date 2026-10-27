@@ -537,6 +537,23 @@ export interface ImportConflictExpired {
   requestId: string
 }
 
+/**
+ * 用户自定义分类词表（2026-10 用户需求：「无论模型还是材质还是 HDR，
+ * 文件的一级分类和二级分类都允许用户增加自定义」）。
+ *
+ * 两层词表的**用户层**：预设词表（`shared/taxonomy.ts`）只读不动，
+ * 自定义词条存这里（settings.json）。结构：
+ * - `level1`：自定义一级分类，全局一册（各大类的选择器里并列展示）；
+ * - `level2`：自定义二级分类，键 = 所属一级分类名。
+ *
+ * ⚠️ 自定义词条**不参与**任何自动分类匹配（`autoClassify` / 知末映射只认预设词表），
+ * 它们只出现在选择器与侧栏（跟随资产落盘出现）里。
+ */
+export interface CustomTaxonomy {
+  level1: string[]
+  level2: Record<string, string[]>
+}
+
 export interface Settings {
   /** 库根目录 */
   libraryDir: string
@@ -666,6 +683,11 @@ export interface Settings {
    * `{name}` 原名 / `{c1}` 一级分类 / `{c2}` 二级分类 / `{n}` 序号 / `{ext}` 扩展名。
    */
   renameTemplate: string
+  /**
+   * 用户自定义分类词表（2026-10）。默认全空 = 行为与没有该功能时完全一致。
+   * 归一化入口在 `shared/customTaxonomy.ts`（清洗规则与落盘目录段同源）。
+   */
+  customTaxonomy: CustomTaxonomy
   /** @deprecated 仅用于读取旧 settings.json，读到后映射为 archiveDisposal */
   trashArchiveAfterImport?: boolean
 }
@@ -718,7 +740,9 @@ export const DEFAULT_SETTINGS: Settings = {
   // 0.6.0：别名表 / 智能集合默认空（= 行为与 0.5.x 一致），模板给一个保守默认
   aliases: [],
   savedViews: [],
-  renameTemplate: '{name}'
+  renameTemplate: '{name}',
+  // 自定义分类词表默认全空（= 与没有该功能时行为一致；词条由用户在分类选择器里新增）
+  customTaxonomy: { level1: [], level2: {} }
 }
 
 // ── T06 分类体系 IPC 载荷（shared 定义，main 与 preload 共用，避免 preload 反向 import main） ──

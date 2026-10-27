@@ -22,8 +22,10 @@
  *   用户关掉后保留包内图（`M10` 验收点）。
  */
 
-import type { Asset, FetchZhimoCoverResult, ZhimoCoverFailReason } from '../../shared/types'
+import type { Asset, AssetFile, FetchZhimoCoverResult, ZhimoCoverFailReason } from '../../shared/types'
 import { zhimoIdOf } from '../../shared/naming'
+import { isCoverAssetImage } from '../../shared/classify'
+import { isDeletedAsset } from './trashView'
 
 /** 单批最多抓多少个（docs/24 口径 #7：单批上限 50，超出留给下一批） */
 export const ZHIMO_COVER_MAX_BATCH = 50
@@ -109,6 +111,52 @@ export function pickZhimoCoverTargets(
     out.push({ id: asset.id, zhimoId })
   }
   return out
+}
+
+// ── 一键重扫 · 从知末获取封面（2026-10 用户拍板的存量补齐通道） ──────────
+
+/**
+ * 资产文件夹**根层**是否已有 `<x>.cover.jpg/png` 封面文件。
+ *
+ * 判定基于索引里的 `files`（与 rescan 的 walkFiles 视图一致，不再额外 stat 磁盘）。
+ * 只看根层：封面文件由 `writeCoverImageInto()` 落在资产文件夹根部，
+ * 子目录里的同名巧合文件不是本通道的产物，不算"已有"。
+ */
+export function hasCoverAssetFile(files: readonly Pick<AssetFile, 'rel'>[]): boolean {
+  return files.some((f) => !f.rel.includes('/') && isCoverAssetImage(f.rel))
+}
+
+/**
+ * 一个资产可用于查知末的 ID（**与 `pickZhimoCoverTargets` 的取值口径逐字一致**，
+ * 抽成具名函数供补抓通道复用，防止两处口径漂移）：
+ * `asset.zhimoId`（导入时从压缩包名算好落库）优先，空串 / 纯空白 / 非字符串才退回
+ * `zhimoIdOf(asset.name)`。
+ */
+export function zhimoCoverIdOf(asset: Pick<Asset, 'name' | 'zhimoId'>): string | null {
+  const storedId = typeof asset.zhimoId === 'string' ? asset.zhimoId.trim() : ''
+  return storedId || zhimoIdOf(asset.name)
+}
+
+/**
+ * 「一键重扫 · 从知末获取封面」的候选（范围裁定：**只补没有 cover 文件的资产**，
+ * 已有的一律不重抓）。五道过滤（AND）：
+ *
+ * ① 非软删记录 —— 回收站里的目录已进 `.trash/`，抓了也写不回原位；
+ * ② `kind === 'model'` —— 知末详情页是 SU 模型页（`su.znzmo.com/sumoxing/{ID}.html`），
+ *    材质/贴图没有对应页面（与自动任务 `pickZhimoCoverTargets` 同口径）；
+ * ③ `coverSource !== 'manual'` —— 用户亲手设的封面绝不被批量任务顶掉
+ *    （manual 的 cover 文件可以不是 `.cover.` 命名，④ 判不出来，必须单独挡）；
+ * ④ 根层没有任何 `<x>.cover.(jpg|png)` 文件 —— 有的一律不重抓（用户裁定）；
+ * ⑤ 能取到知末 ID。
+ *
+ * 纯函数：只读入参，不做 IO（`files` 来自索引，rescan 后与磁盘一致）。
+ */
+export function isZhimoCoverBackfillCandidate(asset: Asset): boolean {
+  if (isDeletedAsset(asset)) return false
+  if (asset.kind !== 'model') return false
+  if (asset.coverSource === 'manual') return false
+  if (hasCoverAssetFile(asset.files)) return false
+  return zhimoCoverIdOf(asset) !== null
 }
 
 // ── 队列 ────────────────────────────────────────────────────────────────

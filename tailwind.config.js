@@ -61,6 +61,16 @@ export default {
         /** 顶栏「Preview」测试版徽标专用（用户指定紫色，不参与功能语义） */
         preview: token('--preview'),
         'preview-tint': token('--preview-tint'),
+        /**
+         * 模型格式品牌色（2026-10「3DMAX 支持」）：
+         * - `su` / `su-tint`：SketchUp 红系（品牌红 #E62E2E 的 tint 档）——格式徽标「SU」用；
+         * - `max` / `max-tint`：3ds Max 红棕系（品牌红 #B3453B 的 tint 档）——徽标「3DS」用。
+         * 色值与用途注释见 styles.css 的 token 定义（浅 / 深主题各一档）。
+         */
+        'su-tint': token('--brand-su-bg'),
+        su: token('--brand-su-text'),
+        'max-tint': token('--brand-max-bg'),
+        max: token('--brand-max-text'),
         /** 顶栏视图分段控件选中段底（§3.1：浅 #FFFFFF / 深 #2C2C2E，规范原文给值） */
         'seg-active': token('--seg-active'),
         /** 多选操作条底（§3.3：浅白卡 / 深 #242428） */

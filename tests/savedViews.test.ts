@@ -36,6 +36,7 @@ describe('snapshotFilters', () => {
       importedAfter: 1700000000000,
       importedBefore: null,
       minResolution: '4k',
+      modelFormat: null,
       query: '椅子',
       sort: 'size'
     })
@@ -55,6 +56,7 @@ describe('snapshotFilters', () => {
       importedAfter: 1700000000000,
       importedBefore: null,
       minResolution: '4k',
+      modelFormat: null,
       query: '椅子',
       sort: 'size'
     })

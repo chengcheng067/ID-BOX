@@ -422,6 +422,7 @@ export function clearFilterPatch(f: Filters): Partial<Filters> {
     importedAfter: null,
     importedBefore: null,
     minResolution: null,
+    modelFormat: null,
     query: ''
   }
 }
