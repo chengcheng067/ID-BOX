@@ -172,22 +172,39 @@ export function QuickLookOverlay({ asset, onClose }: QuickLookOverlayProps) {
         <IconClose />
       </button>
 
-      {/* 主视图：居中大图（max-h 80vh + object-contain，不裁剪）。
-          无图 / 加载失败 → 类型占位，绝不抛。 */}
+      {/* 主视图：**固定画框**（尺寸不随图片大小变化），细节见下面那段注释。 */}
       <div
         className="flex min-h-0 w-full max-w-[min(92vw,1100px)] flex-col items-center justify-center"
         onPointerDown={(e) => e.stopPropagation()}
       >
-        <div className="flex max-h-[80vh] w-full items-center justify-center">
+        {/* 主视图：**固定画框**（用户 2026-10-28 反馈：「不清晰的图片显示的小一些，清晰的图片显示的
+            大一些，在 UI 上看着很不统一」）。
+
+            做法：画框尺寸**恒定**（父级已限宽 min(92vw,1100px)，这里钉高 min(76vh,720px)），
+            图片 `h-full w-full object-contain` —— 小于画框的等比放大、大于画框的等比缩小，
+            **框永远是同一个**。信息行与底部提示因此也永远落在同一高度，这才是"统一"的实感，
+            不只是图大小一致。
+
+            ⛔ 不要退回 `max-h-[80vh] max-w-full` + 自然尺寸那种写法：那样每张图各占各的大小，
+            小图和 4K 主图在屏幕上差几十倍，按 ←/→ 翻页时整块版面跟着跳。
+            放大换来的模糊是可接受代价（真实资产 ≥256px，720 高最多约 2.8×）；
+            **版面跳动**才是不可接受的。 */}
+        <div
+          data-quicklook-stage="1"
+          className="flex h-[min(76vh,720px)] w-full items-center justify-center overflow-hidden rounded-card border border-line bg-panel"
+        >
           {url && brokenSrc !== url ? (
             <img
+              data-quicklook-image="1"
               src={url}
               alt={asset.name}
               onError={() => setBrokenSrc(url)}
-              className="max-h-[80vh] max-w-full rounded-card bg-panel object-contain"
+              className="h-full w-full object-contain"
             />
           ) : (
-            <div className="flex aspect-square h-[45vh] items-center justify-center rounded-card bg-panel text-tertiary">
+            // 无图 / 加载失败：占位**也吃同一个画框** —— 否则「有图 / 无图」两种资产尺寸不同，
+            // 翻到无封面那条时版面又会跳一下。图标居中，色取 tertiary。
+            <div className="flex h-full w-full items-center justify-center text-tertiary">
               <Icon width={64} height={64} />
             </div>
           )}

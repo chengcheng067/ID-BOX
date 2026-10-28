@@ -6,6 +6,8 @@ declare global {
     modvault: ModVaultApi
   }
 }
+import fs from 'node:fs'
+import path from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ModVaultApi } from '../src/preload/index'
 import { DEFAULT_SETTINGS, type Asset } from '../src/shared/types'
@@ -538,5 +540,49 @@ describe('decideEsc · close-quick-look 优先级', () => {
     expect(decideEsc(IDLE)).toBe('none')
     expect(decideEsc({ ...IDLE, hasSelection: true })).toBe('clear-selection')
     expect(decideEsc({ ...IDLE, pendingDelete: true, quickLookOpen: true })).toBe('close-quick-look')
+  })
+})
+
+// ── ⑦ 画框尺寸守卫：图片大小不能影响画框（用户 2026-10-28 反馈） ──────────
+
+describe('Quick Look · 固定画框（源码守卫）', () => {
+  /**
+   * 用户原话：「Quick look 的预览弹出窗口应该给图片限制一个合适的大小。因为现在的逻辑是，
+   * 不清晰的图片显示的就小一些，清晰的图片显示的就大一些，这在 UI 上看着很不统一。」
+   *
+   * 口径：**画框尺寸恒定**（高 min(76vh,720px)），图片 `h-full w-full object-contain`
+   * 等比填充。这样小图被放大、大图被缩小，框永远是同一个 —— 信息行与底部提示也不会跳。
+   *
+   * 环境约束：vitest 是 `environment: 'node'`（没有 jsdom），渲染不出 DOM，
+   * 所以这里用**源码守卫**钉住"画框是钉死尺寸的"，并用真机 CDP 断言实测 rect（docs/08 §23.9）。
+   */
+  const src = fs.readFileSync(
+    path.join(process.cwd(), 'src/renderer/components/QuickLookOverlay.tsx'),
+    'utf-8'
+  )
+
+  it('画框高度是固定值（min(76vh,720px)），不是跟着图片走的 max-h', () => {
+    expect(src).toContain('h-[min(76vh,720px)]')
+    // 反向断言：旧的"自然尺寸 + max-h"写法不许回来（那样 8×8 的图和 4K 主图差几十倍）
+    expect(src).not.toContain('className="max-h-[80vh] max-w-full')
+  })
+
+  it('图片占满画框（h-full w-full object-contain）—— 小图才可能被放大', () => {
+    expect(src).toContain('className="h-full w-full object-contain"')
+    // 只给 max-w/max-h 不会放大图片：那是本次要修的病根
+    expect(src).not.toMatch(/<img[\s\S]{0,400}?max-h-\[/)
+  })
+
+  it('画框带圆角与内底色（bg-panel + border-line），letterbox 区域才读作一个"框"', () => {
+    expect(src).toMatch(/h-\[min\(76vh,720px\)\][\s\S]{0,200}rounded-card/)
+    expect(src).toMatch(/h-\[min\(76vh,720px\)\][\s\S]{0,200}bg-panel/)
+    expect(src).toMatch(/h-\[min\(76vh,720px\)\][\s\S]{0,200}border-line/)
+  })
+
+  it('无图 / 加载失败也吃同一个画框（占位不能另给尺寸，否则翻页时版面又会跳）', () => {
+    // 占位分支不许出现自己的一套宽高（历史上是 aspect-square + h-[45vh]）
+    expect(src).not.toContain('aspect-square h-[45vh]')
+    expect(src).toContain('data-quicklook-stage="1"')
+    expect(src).toContain('data-quicklook-image="1"')
   })
 })
