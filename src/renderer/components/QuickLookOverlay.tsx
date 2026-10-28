@@ -25,15 +25,19 @@
  *
  * ## 主题
  *
+ * 键位（用户 2026-10-28 口径）：空格打开；**空格或 Esc 关闭**；←/→ 换图。
+ * 关浮层不清选中（第二次 Esc 才清选中），判据见 `logic/quickLook.ts::decideQuickLookKey`。
+ *
  * 浮层跟随应用主题（不强制深色）：浅色主题浅底深字、深色主题暗底浅字。深色底必须是
  * **中性黑灰**（UI 规范 §1：全局禁用橙/棕/紫），强调色只用系统蓝。
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useVault, useVisibleAssets } from '../store'
-import { useEscLayer } from '../logic/escLayer'
+import { getEscLayerDepth, useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
 import {
+  decideQuickLookKey,
   quickLookImageUrl,
   quickLookIndexInSequence,
   quickLookSequence,
@@ -116,18 +120,34 @@ export function QuickLookOverlay({ asset, onClose }: QuickLookOverlayProps) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (typingKeyGuard(e)) return
-      if (e.key === 'ArrowRight') {
-        e.preventDefault()
+      // 键位判据全部在 `logic/quickLook.ts::decideQuickLookKey`（纯函数、可单测）：
+      // 空格 / `Spacebar` = 关闭（用户 2026-10-28 口径：开也空格、关也空格/Esc），
+      // ←/→ = 换图；`repeat` / 修饰键 / 非栈顶一律让路。这里只做 dispatch。
+      const action = decideQuickLookKey({
+        key: e.key,
+        typing: isTypingTarget(e.target),
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        altKey: e.altKey,
+        repeat: e.repeat,
+        layerDepth: getEscLayerDepth()
+      })
+      if (action === 'none') return
+      // 三个动作都要吃掉浏览器默认行为：空格会滚动画布、方向键会滚容器
+      e.preventDefault()
+      if (action === 'close') {
+        // 关浮层**不清选中**（与 Esc 同一语义，第二次 Esc 才清选中）
+        e.stopPropagation()
+        onClose()
+      } else if (action === 'next') {
         step(1)
-      } else if (e.key === 'ArrowLeft') {
-        e.preventDefault()
+      } else {
         step(-1)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [step])
+  }, [step, onClose])
 
   const category = categoriesOf(asset)
   const Icon = KIND_ICON[asset.kind] ?? IconOther
@@ -193,7 +213,7 @@ export function QuickLookOverlay({ asset, onClose }: QuickLookOverlayProps) {
 
         {/* 底部提示行：n / m 只在"序列来自选中集（≥2）"时出现 */}
         <div className="mt-3 flex items-center justify-center gap-3 text-[11px] text-tertiary">
-          <span>← → 切换 · Esc 退出</span>
+          <span>← → 切换 · 空格 / Esc 退出</span>
           {sequence.length >= 2 && position >= 0 && (
             <span className="tabular-nums">
               {position + 1} / {sequence.length}
@@ -203,10 +223,4 @@ export function QuickLookOverlay({ asset, onClose }: QuickLookOverlayProps) {
       </div>
     </div>
   )
-}
-
-/** 方向键守卫：输入框里不抢按键，带修饰键的交给别的层（与全局快捷键的判据一致） */
-function typingKeyGuard(e: KeyboardEvent): boolean {
-  if (e.ctrlKey || e.metaKey || e.altKey) return true
-  return isTypingTarget(e.target)
 }

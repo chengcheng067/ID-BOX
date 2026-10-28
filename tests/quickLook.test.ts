@@ -11,6 +11,7 @@ import type { ModVaultApi } from '../src/preload/index'
 import { DEFAULT_SETTINGS, type Asset } from '../src/shared/types'
 import { DEFAULT_FILTERS } from '../src/renderer/logic/filters'
 import {
+  decideQuickLookKey,
   quickLookImageFile,
   quickLookImageUrl,
   quickLookIndexInSequence,
@@ -332,6 +333,49 @@ describe('Quick Look · 封面取图（原图 → peek → 缩略图 → 占位�
   it('缩略图未就绪 + 无封面 → null（组件必须显示占位，不崩不抛）', () => {
     const a = fixture({ cover: undefined, coverSource: undefined, files: [], thumbPath: undefined, thumbStatus: 'none' })
     expect(quickLookImageUrl(a)).toBeNull()
+  })
+})
+
+// ── ④b 键位：空格开、空格或 Esc 关；←/→ 换图（用户 2026-10-28 口径） ──────
+
+describe('Quick Look · 浮层键位（decideQuickLookKey）', () => {
+  it('空格 = 关闭（同一颗键，开也它关也它）', () => {
+    expect(decideQuickLookKey({ key: ' ' })).toBe('close')
+    // 老浏览器 / 部分 IME 的别名
+    expect(decideQuickLookKey({ key: 'Spacebar' })).toBe('close')
+  })
+
+  it('← / → = 换图，不受 repeat 影响（按住连翻是合意行为）', () => {
+    expect(decideQuickLookKey({ key: 'ArrowLeft' })).toBe('prev')
+    expect(decideQuickLookKey({ key: 'ArrowRight' })).toBe('next')
+    expect(decideQuickLookKey({ key: 'ArrowRight', repeat: true })).toBe('next')
+  })
+
+  it('按住空格产生的重复事件不能关浮层（否则"刚打开就没了"）', () => {
+    expect(decideQuickLookKey({ key: ' ', repeat: true })).toBe('none')
+  })
+
+  it('带修饰键让路：Ctrl/Cmd/Alt + 空格留给别的层（卡片多选 / 系统菜单）', () => {
+    expect(decideQuickLookKey({ key: ' ', ctrlKey: true })).toBe('none')
+    expect(decideQuickLookKey({ key: ' ', metaKey: true })).toBe('none')
+    expect(decideQuickLookKey({ key: ' ', altKey: true })).toBe('none')
+  })
+
+  it('输入框里不抢按键（搜索框里空格就是空格）', () => {
+    expect(decideQuickLookKey({ key: ' ', typing: true })).toBe('none')
+    expect(decideQuickLookKey({ key: 'ArrowLeft', typing: true })).toBe('none')
+  })
+
+  it('非栈顶让路：上面还有弹窗时，空格不能越过它关掉底下那层预览', () => {
+    expect(decideQuickLookKey({ key: ' ', layerDepth: 2 })).toBe('none')
+    // 只有自己一层时才是栈顶
+    expect(decideQuickLookKey({ key: ' ', layerDepth: 1 })).toBe('close')
+  })
+
+  it('其它键一律不管（Esc 走 useEscLayer，不在这里重复处理）', () => {
+    expect(decideQuickLookKey({ key: 'Escape' })).toBe('none')
+    expect(decideQuickLookKey({ key: 'a' })).toBe('none')
+    expect(decideQuickLookKey({ key: 'Enter' })).toBe('none')
   })
 })
 

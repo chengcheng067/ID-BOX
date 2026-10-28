@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-007AFF)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F)
 ![Version](https://img.shields.io/badge/version-0.8.3-4B5563)
-![Tests](https://img.shields.io/badge/tests-3070%20passed-30A46C)
+![Tests](https://img.shields.io/badge/tests-3077%20passed-30A46C)
 ![Status](https://img.shields.io/badge/status-Preview-7A5AF8)
 
 </div>
@@ -91,7 +91,7 @@
 - **材质球**：`three.js` 离屏渲染 PBR 材质球（单图 / 多图 PBR 贴图集），可调反光、凹凸、UV 重复，
   「保存」直接变成卡片封面
 - **Quick Look（空格）**：选中卡片按空格 → 全屏快览，`←`/`→` 在**当前视图序列**里切上一张/下一张，
-  `Esc` 退出且**不清选中**；纯预览不带编辑控件，比素材时不必进详情面板
+  **空格或 `Esc` 关闭**且**不清选中**；纯预览不带编辑控件，比素材时不必进详情面板
 - **HDR 全景预览**：`.hdr` 入库后在**主进程流式降采样**（16384×8192 的文件直接喂 GPU 必然 OOM），
   预览里是「HDR 当背景 + 白球（看光分布）+ 银球（看环境反射）」，可 0–360° 旋转、可拍照当封面
 
@@ -124,7 +124,7 @@
 | 本地库 | Dexie（IndexedDB） |
 | 3D | three.js（材质球、HDR 环境光、PMREM） |
 | 构建 | electron-vite + electron-builder |
-| 测试 | Vitest（纯逻辑层 + 源码守卫，**3070 条**；带真机 7-Zip 为 3074 条） |
+| 测试 | Vitest（纯逻辑层 + 源码守卫，**3077 条**；带真机 7-Zip 为 3081 条） |
 
 设计原则：**本地优先**。素材、缩略图、索引全在本机，删除软件不删你的文件。
 
@@ -139,7 +139,7 @@ npm install
 
 npm run dev       # 开发（HMR）
 npm run build     # 编译到 out/
-npm run test      # 3070 条测试
+npm run test      # 3077 条测试
 npm run typecheck:node && npm run typecheck:web
 ```
 

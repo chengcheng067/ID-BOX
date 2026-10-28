@@ -634,7 +634,10 @@ export default function App() {
         if (typing) return
         if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return
         const st = useVault.getState()
-        // 浮层已经开着：←/→ 由浮层自己处理（`QuickLookOverlay`），这里不能重入
+        // 浮层已经开着：**空格在这里不动作**，交给 `QuickLookOverlay` 自己处理 ——
+        // 它认得空格（关闭）、←/→（换图），判据在 `logic/quickLook.ts::decideQuickLookKey`。
+        // 为什么必须由浮层自己关：App 这条监听比浮层的先注册（先到先得），若这里也关，
+        // 就会和浮层的 `preventDefault`/`onClose` 抢同一次按键，出现"关两次"的不确定行为。
         if (st.quickLookAssetId) return
         // 上面还有别的层（弹窗层 / HDR 预览）：空格不该越过它们
         if (hasEscLayer() || st.hdrPreviewAssetId) return

@@ -122,6 +122,55 @@ export function stepSequence(seq: readonly string[], i: number, delta: number): 
   return seq[next]
 }
 
+/** 浮层键位判定结果：`prev` / `next` = 换图，`close` = 关闭，`none` = 不管 */
+export type QuickLookKeyAction = 'prev' | 'next' | 'close' | 'none'
+
+/** `decideQuickLookKey` 的输入（全部由调用方现取，本函数不读任何全局状态） */
+export interface QuickLookKeyInput {
+  /** `KeyboardEvent.key` */
+  key: string
+  /** 焦点是否在可输入控件里（`INPUT` / `TEXTAREA` / `contentEditable`） */
+  typing?: boolean
+  /** 带修饰键：交给别的层（Ctrl+Space 仍是卡片多选切换） */
+  ctrlKey?: boolean
+  metaKey?: boolean
+  altKey?: boolean
+  /** 按住不放产生的重复事件（打开浮层那一下的 keydown 后续重复不能再关掉它） */
+  repeat?: boolean
+  /** 当前 Esc 层栈总深度（>1 = 上面还有别的层，空格不能越过它） */
+  layerDepth?: number
+}
+
+/**
+ * 浮层键位：**空格开、空格或 Esc 关**（用户 2026-10-28 口径）＋ 左右换图。
+ *
+ * 为什么抽成纯函数：`QuickLookOverlay` 只能靠源码守卫测（vitest environment 是 `node`，
+ * 没有 jsdom），而"哪个键干什么"恰恰是本功能最容易回归的部分（0.8.3 首版就把空格
+ * 交给了 App 单侧 dispatch，浮层自己不认识空格）。判据留在这里可以被逐条钉住。
+ *
+ * 三条纪律：
+ * ① **`repeat` 必须让路**：按住空格不放时，打开浮层那一下的 keydown 之后还会有重复事件，
+ *    不拦就会"刚打开又立刻关掉"（用户体感是"空格没反应"）。
+ * ② **带修饰键让路**：`Ctrl/Cmd/Shift+Space` 是卡片多选（PRD P1-9 改判后的保留例外）、
+ *    `Alt` 留给系统菜单，都不能当成关闭。
+ * ③ **非栈顶让路**：`layerDepth > 1`（上面还有弹窗）时空格不属于浮层 —— 与 Esc 的
+ *    "栈顶优先"同一条规则，否则会出现"空格把底下那层预览关掉、上面的弹窗还开着"。
+ */
+export function decideQuickLookKey(input: QuickLookKeyInput): QuickLookKeyAction {
+  if (!input) return 'none'
+  if (input.typing) return 'none'
+  if (input.ctrlKey || input.metaKey || input.altKey) return 'none'
+  const key = input.key ?? ''
+  if (key === 'ArrowRight') return 'next'
+  if (key === 'ArrowLeft') return 'prev'
+  if (key === ' ' || key === 'Spacebar') {
+    if (input.repeat) return 'none'
+    if ((input.layerDepth ?? 1) > 1) return 'none'
+    return 'close'
+  }
+  return 'none'
+}
+
 /**
  * 可作大图展示的源文件：优先封面文件本身，其次资产里第一张图片。
  *
