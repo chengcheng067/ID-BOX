@@ -425,6 +425,19 @@
   [data-theme='dark'] .dialog-scrim {
     background: rgba(0, 0, 0, 0.6);
   }
+  /* ── Quick Look 全屏快览浮层（0.8.3，docs/32 §4）──
+   * `.dialog-scrim` 打底（提供"压住底层网格"的基础浓度），`.quicklook-scrim` 在此基础上
+   * 加浓一档：Quick Look 是全屏单图，背景必须比弹窗遮罩更实，否则大图边缘和卡片糊成一片。
+   * ⚠️ 两个主题都必须中性（禁橙/棕/紫、禁玻璃拟态与渐变）：
+   *    浅色 = 中性浅灰白底 + 深字；深色 = 中性黑灰底（照 --bg-canvas 的 #111113 那一档）+ 浅字。
+   * ⚠️ 不加 `backdrop-filter`：半透明 + blur 是玻璃拟态，规范 §1 明令禁用，而且全屏 blur
+   *    在 4K 屏上会掉帧（性能陷阱 C4）。层级由 `logic/zStack.ts` 算，这里不写 z-index。 */
+  .quicklook-scrim {
+    background: rgba(248, 250, 252, 0.86);
+  }
+  [data-theme='dark'] .quicklook-scrim {
+    background: rgba(17, 17, 19, 0.88);
+  }
   /* ── 卡片选中徽章（§3.3）：22×22 蓝底白勾，白描边 2px（深色用深底描边）── */
   .check-badge {
     box-shadow: 0 0 0 2px #ffffff;

@@ -18,6 +18,7 @@ import { canStage, stageController } from './logic/stageController'
 import { setMotionQuality } from './logic/motionProfile'
 import { decideEsc } from './logic/escPriority'
 import { hasEscLayer } from './logic/escLayer'
+import { resolveQuickLookTarget } from './logic/quickLook'
 // DEF-19-3：库目录漂移体检。与设置页的警示条**共用同一个纯函数** ——
 // 两处各写一套"路径在不在库内 / 缺不缺尺寸"的判据，迟早会给出两个数字。
 import { planLibraryDrift, resolutionDriftHint } from './logic/libraryDrift'
@@ -45,6 +46,15 @@ const MaterialStageLazy = lazy(() =>
  */
 const HdrPreviewDialogLazy = lazy(() =>
   import('./components/HdrPreviewDialog').then((m) => ({ default: m.HdrPreviewDialog }))
+)
+
+/**
+ * Quick Look 全屏快览浮层（0.8.3，docs/32 §4）：同样懒加载（首次按空格才拉这个块）。
+ * store 的 `quickLookAssetId` 是唯一真相，浮层**只在这里挂一次** —— 挂两个实例会出现
+ * 两个 Esc 层（层栈里占两格），关掉一个后另一个还在应答，表现成"按一次 Esc 没反应"。
+ */
+const QuickLookOverlayLazy = lazy(() =>
+  import('./components/QuickLookOverlay').then((m) => ({ default: m.QuickLookOverlay }))
 )
 import { formatBytes } from '../shared/format'
 import { resolveTheme } from '../shared/theme'
@@ -581,6 +591,7 @@ export default function App() {
           categoryPickerOpen: !!st.categoryPickerIds,
           settingsOpen,
           folderViewOpen: !!st.folderViewAssetId,
+          quickLookOpen: !!st.quickLookAssetId,
           hasSelection: !!selectedId || selectedIds.length > 0
         })
         switch (action) {
@@ -599,6 +610,9 @@ export default function App() {
           case 'close-folder-view':
             closeFolderView()
             break
+          case 'close-quick-look':
+            st.closeQuickLook()
+            break
           case 'clear-selection':
             select(null)
             break
@@ -606,6 +620,34 @@ export default function App() {
             // 'none'：弹窗 / HDR 预览自己处理这次 Esc（或没有任何可关的东西）
             break
         }
+        return
+      }
+      // 0.8.3 Quick Look（docs/32 §4）：空格 = 全屏快览浮层，作用对象 = 当前选中资产。
+      //
+      // 事件先后：React 的合成事件挂在 **root container**（冒泡路径上比 window 更早），
+      // 所以卡片自己的 `onKeyDown` 先跑。AssetGrid 里已经改成"纯空格不在卡片处理"
+      // （只有 Ctrl/Cmd/Shift+空格仍走多选），于是纯空格原样冒泡到这里 —— 两处不能都
+      // 处理，否则一次按键既选中又开浮层。反过来，window **捕获**阶段的 Esc 层监听
+      // （`logic/escLayer.ts`）比 React 合成事件更早，这是 Esc 必须走层栈、而空格
+      // 只能在这里 dispatch 的原因。
+      if (e.key === ' ' || e.key === 'Spacebar') {
+        if (typing) return
+        if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return
+        const st = useVault.getState()
+        // 浮层已经开着：←/→ 由浮层自己处理（`QuickLookOverlay`），这里不能重入
+        if (st.quickLookAssetId) return
+        // 上面还有别的层（弹窗层 / HDR 预览）：空格不该越过它们
+        if (hasEscLayer() || st.hdrPreviewAssetId) return
+        const target = resolveQuickLookTarget({
+          focusId: selectedId,
+          selectedIds,
+          folderViewAssetId: st.folderViewAssetId,
+          visibleOrder: assets.map((a) => a.id)
+        })
+        if (!target) return
+        // 空格在浏览器里有默认行为（滚动页面），必须吃掉
+        e.preventDefault()
+        st.openQuickLook(target)
         return
       }
       // P0-16：Delete/Backspace 只触发 requestDelete（二次确认 + 5 秒撤销），
@@ -624,7 +666,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [selectedId, selectedIds, select, requestDelete, undoDelete, closeFolderView, settingsOpen])
+  }, [selectedId, selectedIds, select, requestDelete, undoDelete, closeFolderView, settingsOpen, assets])
 
   const totalSize = assets.reduce((s, a) => s + a.size, 0)
   // 用户反馈第 5 条：全局空态（拖包 + 导入 CTA）只在**库真为空**时出现。
@@ -654,6 +696,15 @@ export default function App() {
   const closeHdrPreview = useVault((s) => s.closeHdrPreview)
   const hdrPreviewAsset = hdrPreviewAssetId
     ? (allAssets.find((a) => a.id === hdrPreviewAssetId) ?? null)
+    : null
+
+  // ── Quick Look（0.8.3）：store 里的 id → 真实资产；store 的 5 个清理站点（硬删 / 软删 /
+  //      彻底删除 / rescan / 进回收站）都会把 id 置 null，这里再兜一次：万一浮层打开后资产
+  //      在别处被搬走，宁可整层消失，也不要显示一个指向已不存在资产的浮层。 ──
+  const quickLookAssetId = useVault((s) => s.quickLookAssetId)
+  const closeQuickLook = useVault((s) => s.closeQuickLook)
+  const quickLookAsset = quickLookAssetId
+    ? (allAssets.find((a) => a.id === quickLookAssetId) ?? null)
     : null
 
   // A 线 T-03：舞台单例（球从卡片飞进顶栏）。状态机在 logic/ballStage.ts，这里只做订阅。
@@ -1594,6 +1645,13 @@ export default function App() {
       {hdrPreviewAsset && (
         <Suspense fallback={null}>
           <HdrPreviewDialogLazy asset={hdrPreviewAsset} onClose={closeHdrPreview} />
+        </Suspense>
+      )}
+      {/* 0.8.3 Quick Look（docs/32 §4）：空格全屏快览，纯预览无编辑控件。
+          全应用只挂这一个实例；关闭即卸载，Esc 层随之出栈。 */}
+      {quickLookAsset && (
+        <Suspense fallback={null}>
+          <QuickLookOverlayLazy asset={quickLookAsset} onClose={closeQuickLook} />
         </Suspense>
       )}
       {/* 规范 §3.5：底部合并 toast（左=轻提示 / 右=删除撤销条），替代原 NoticeToast+UndoToast 两个浮窗 */}

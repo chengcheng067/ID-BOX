@@ -13,6 +13,7 @@ import { decideEsc, type EscContext } from '../src/renderer/logic/escPriority'
 const IDLE: EscContext = {
   modalOpen: false,
   hdrPreviewOpen: false,
+  quickLookOpen: false,
   pendingDelete: false,
   renameOpen: false,
   categoryPickerOpen: false,
@@ -44,6 +45,14 @@ describe('decideEsc：栈顶优先', () => {
 
   it('文件视图：Esc 退回网格，选中态保留', () => {
     expect(decideEsc({ ...IDLE, folderViewOpen: true, hasSelection: true })).toBe('close-folder-view')
+  })
+
+  it('Quick Look 开着 + 有选中：只关浮层，**不清选中**（退回时选中态要留着）', () => {
+    expect(decideEsc({ ...IDLE, quickLookOpen: true, hasSelection: true })).toBe('close-quick-look')
+  })
+
+  it('Quick Look 开着 + 弹窗开着：App 不动（弹窗层是栈顶，浮层自己不该被连带关掉）', () => {
+    expect(decideEsc({ ...IDLE, quickLookOpen: true, modalOpen: true, hasSelection: true })).toBe('none')
   })
 
   it('弹窗层在场时 App 一律不动（Modal 已在捕获阶段处理，双保险）', () => {
@@ -78,6 +87,7 @@ describe('decideEsc：栈顶优先', () => {
     const all: EscContext = {
       modalOpen: false,
       hdrPreviewOpen: false,
+      quickLookOpen: false,
       pendingDelete: true,
       renameOpen: true,
       categoryPickerOpen: true,

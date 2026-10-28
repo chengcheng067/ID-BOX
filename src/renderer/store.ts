@@ -1111,6 +1111,20 @@ interface VaultState {
   /** 打开 HDR 预览（非 `kind==='hdri'` 的 id 静默忽略，避免弹出一个必然失败的窗） */
   openHdrPreview: (id: string) => void
   closeHdrPreview: () => void
+  /**
+   * Quick Look（空格全屏快览浮层，0.8.3，docs/32 §4）的目标资产 id（null = 未打开）。
+   *
+   * 与 `hdrPreviewAssetId` 同一模式：**唯一真相**，弹窗本体只在 `App.tsx` 挂一次，
+   * 组件里不再各复制一份 open state。空格的作用对象由 `logic/quickLook.ts` 的
+   * `resolveQuickLookTarget` 决定（纯函数可测），这里只负责"目标是否真实存在"。
+   *
+   * ⚠️ 关闭浮层**不清空选中**（用户口径：退回时选中态要留着）。第二次 Esc 才走
+   * 原有 `clear-selection`（见 `logic/escPriority.ts` 的顺序与理由）。
+   */
+  quickLookAssetId: string | null
+  /** 打开 Quick Look（不在索引里的 id 静默忽略：空格可能命中刚被 rescan 丢弃的陈旧 DOM 节点） */
+  openQuickLook: (id: string) => void
+  closeQuickLook: () => void
   openCategoryPicker: (ids: string[]) => void
   closeCategoryPicker: () => void
   // ── 0.6.0 批量重命名（docs/22 §3.4） ────────────────────────
@@ -2291,6 +2305,7 @@ export const useVault = create<VaultState>((set, get) => ({
   renameIds: null,
   folderViewAssetId: null,
   hdrPreviewAssetId: null,
+  quickLookAssetId: null,
   dupOnly: false,
   libraryView: 'assets',
   conflictAsk: null,
@@ -2537,6 +2552,9 @@ export const useVault = create<VaultState>((set, get) => ({
         selectedIds: [],
         lastClickedId: null,
         folderViewAssetId: null,
+        // 切视图（含进入回收站）关闭 Quick Look：浮层是"当前视图序列"上的快览，
+        // 视图一换序列就变了，留着浮层会让 ←/→ 跳到另一个视图的对象上。
+        quickLookAssetId: null,
         dupOnly: view === 'trash' ? false : s.dupOnly
       })
     ),
@@ -2774,6 +2792,9 @@ export const useVault = create<VaultState>((set, get) => ({
           // 正看着的资产被删掉了 → 退回网格，否则中栏会停在「找不到该资产」的空视图
           folderViewAssetId:
             s.folderViewAssetId && removedIds.has(s.folderViewAssetId) ? null : s.folderViewAssetId,
+          // 快览浮层正显示的被删 → 关闭（与文件视图同一判据：目标不存在时浮层必然空转）
+          quickLookAssetId:
+            s.quickLookAssetId && removedIds.has(s.quickLookAssetId) ? null : s.quickLookAssetId,
           notice:
             failed.length > 0
               ? `已删除 ${removed.length} 个；${failed.length} 个失败（文件可能被占用），已保留`
@@ -2822,6 +2843,10 @@ export const useVault = create<VaultState>((set, get) => ({
         selectedIds: s.selectedIds.filter((id) => !movedIds.has(id)),
         folderViewAssetId:
           s.folderViewAssetId && movedIds.has(s.folderViewAssetId) ? null : s.folderViewAssetId,
+        // 快览目标被软删 → 关闭：它已不在当前视图序列里，浮层继续显示会停在
+        // 「找不到该资产」的空态（与文件视图同一判据）
+        quickLookAssetId:
+          s.quickLookAssetId && movedIds.has(s.quickLookAssetId) ? null : s.quickLookAssetId,
         notice:
           res.failed.length > 0
             ? `已移入「最近删除」${updated.length} 项；${res.failed.length} 项失败（文件可能被占用），已保留在原位置`
@@ -2926,6 +2951,8 @@ export const useVault = create<VaultState>((set, get) => ({
         selectedIds: s.selectedIds.filter((id) => !gone.has(id)),
         folderViewAssetId:
           s.folderViewAssetId && gone.has(s.folderViewAssetId) ? null : s.folderViewAssetId,
+        quickLookAssetId:
+          s.quickLookAssetId && gone.has(s.quickLookAssetId) ? null : s.quickLookAssetId,
         notice:
           failedIds.size > 0
             ? `已彻底删除 ${purgedIds.length} 项；${failedIds.size} 项失败（文件可能被占用），可重试`
@@ -3365,6 +3392,15 @@ export const useVault = create<VaultState>((set, get) => ({
   },
   closeHdrPreview: () => set({ hdrPreviewAssetId: null }),
 
+  openQuickLook(id) {
+    // 只对索引里真实存在的资产生效：空格可能命中刚被 rescan 丢弃的陈旧 DOM 节点
+    // （与 openHdrPreview / openFolderView 同一守卫），不在索引里就静默忽略。
+    if (!get().assets.some((a) => a.id === id)) return
+    set({ quickLookAssetId: id })
+  },
+  // 关闭只撤浮层，**不动选中**（用户口径：退回网格时选中态要留着，第二次 Esc 才清）
+  closeQuickLook: () => set({ quickLookAssetId: null }),
+
   openCategoryPicker(ids) {
     if (ids.length === 0) return
     set({ categoryPickerIds: ids })
@@ -3709,11 +3745,15 @@ export const useVault = create<VaultState>((set, get) => ({
     const rescanBackupCount = (await listRescanBackups()).length
     // 文件视图看着的资产可能在重扫中消失（目录被删 / 被重建换 UUID）→ 退回网格
     const viewedId = get().folderViewAssetId
+    // 快览浮层同理：重扫可能丢弃正在显示的那条记录 → 关闭浮层（与文件视图同一判据）
+    const quickLookId = get().quickLookAssetId
     set(
       withPickerClosed({
         assets: merged,
         rescanBackupCount,
-        folderViewAssetId: viewedId && merged.some((a) => a.id === viewedId) ? viewedId : null
+        folderViewAssetId: viewedId && merged.some((a) => a.id === viewedId) ? viewedId : null,
+        quickLookAssetId:
+          quickLookId && merged.some((a) => a.id === quickLookId) ? quickLookId : null
       })
     )
     // ── T-PRUNE ④：prune 白名单必须是**库里写入后的真实 id 集合** ──────────

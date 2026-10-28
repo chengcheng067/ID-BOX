@@ -2344,10 +2344,23 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
         {...hoverProps(a)}
         onContextMenu={(e) => onContextMenu(e, a)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
+          // 0.8.3 Quick Look 改判：卡片只保留 Enter 的原语义（选中），**纯空格不再在这里处理** ——
+          // 空格归 App 的全局分支（打开 Quick Look 浮层）。这里必须显式放行，否则事件会被吃掉：
+          // React 的事件挂在 root container 上，而 App 的键盘监听挂在 window 冒泡阶段 →
+          // root container 比 window 更早拿到事件（焦点在卡内元素上时，事件从卡内向上冒泡，
+          // 先经过 React 的 root container，再到 window）。卡片里 `preventDefault` 或不 return
+          // 都会让浮层打不开，表现成"按空格没反应，选中却变了"。
+          // 带 Ctrl/Meta/Shift 的空格仍按 PRD P1-9 原口径处理（多选切换）—— 这是改判后保留的唯一例外。
+          if (e.key === 'Enter') {
             e.preventDefault()
             if (e.ctrlKey || e.metaKey) toggleSelect(a.id)
             else select(a.id)
+            return
+          }
+          if (e.key === ' ' || e.key === 'Spacebar') {
+            if (!(e.ctrlKey || e.metaKey || e.shiftKey)) return // 放行给 App 的 Quick Look 分支
+            e.preventDefault()
+            toggleSelect(a.id)
           }
         }}
         // 反馈 6a：`card-hover` 提供上浮 2px + 专属 transition（浅色投影 / 深色提亮底色）。
