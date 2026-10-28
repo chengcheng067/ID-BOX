@@ -29,6 +29,24 @@
  * - **canvas 被 taint**（跨源图片没有 CORS）→ `toBlob` 抛 `SecurityError`；
  * - `toBlob` 返回 null（内存不足 / 尺寸为 0）。
  *
+ * ## 0.8.3 竞态钉死：「写完才发」的契约（P0 崩溃修复）
+ *
+ * 外部用户实锤崩溃（v0.8.2）：主进程 `startDrag` 内部对 Temp 临时图路径
+ * `createFromPath` 读成空图直接 throw（杀软对刚落盘文件的瞬时独占扫描锁）。
+ * 渲染层这边的职责是把「**交给主进程的字节永远是完整的**」钉死：
+ *
+ * 1. **完整才入缓存**：`cacheDragCard` 只在预热链路的最后一步被调用 ——
+ *    `canvas.toBlob` 完整回调出全部 PNG 字节之后；编码半途失败返回 null、不入缓存。
+ *    所以缓存里**不存在半张卡**。
+ * 2. **dragstart 同步读缓存，绝不等待**：命中 = 拿到的一定是完整 PNG；未命中 =
+ *    立刻传 `null` 走主进程的缩略图 / 内嵌降级。dragstart 是同步事件，这里
+ *    **绝不 await、绝不现画**（等待会把拖拽手势丢掉）——「写图慢于拖拽」的场景
+ *    永远以无图降级收场，拖拽可用性优先于卡片观感，0ms 阻塞预算。
+ * 3. **Temp 临时文件由主进程写**：渲染层只经一次 IPC（结构化克隆，原子）发完整
+ *    字节；落盘发生在主进程 dragStart 处理器内部、`startDrag` 之前 —— 渲染层
+ *    不存在「写了一半的临时文件」可以被发出去，主进程侧的路径加载失败由
+ *    `dragIconGuard` 的 isEmpty 降级兜底（不 throw）。
+ *
  * ⚠️ 不要用 `setDragImage`：这条拖拽已被 `beginSystemDrag` 的 `preventDefault()` 取消，
  * 渲染进程根本没有 HTML5 拖拽会话可挂 drag image。
  */
@@ -341,7 +359,14 @@ export function cachedDragCard(assetId: string): Uint8Array | null {
   return hit
 }
 
-/** 写缓存（空数据忽略；超上限淘汰最久未使用的一条） */
+/**
+ * 写缓存（0.8.3 契约的入口）：**只有完整渲染出的 PNG 才允许进来**。
+ *
+ * 调用时机 = 预热链路的最后一步（`renderDragCard` / `renderWithPreview` 的 Promise
+ * resolve 之后），所以 dragstart 同步读到的命中值必然是完整字节；空数据 / null
+ * （编码失败等）一律拒收，调用方 dragstart 时自然走「未命中 → 传 null」的无图降级。
+ * 超上限淘汰最久未使用的一条。
+ */
 export function cacheDragCard(assetId: string, png: Uint8Array | null): void {
   if (!assetId || !png || png.byteLength === 0) return
   cardCache.delete(assetId)

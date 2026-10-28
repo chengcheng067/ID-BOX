@@ -1036,8 +1036,15 @@ export async function refreshZhimoCoverInto(
       // 风格随封面一起回给渲染层（**未过滤**原始词）；写不写由 `logic/zhimoStyle.ts` 判定
       style: outcome.style
     }
-  } catch {
+  } catch (err) {
     // 目录不存在 / 权限不足 / 路径非法 —— 一律转成 reason，绝不抛给 IPC 层
+    // 0.8.3：补一条带 folder 的 WARN（写盘 ENOENT 的取证通道 —— DB folder 与磁盘
+    // 脱同步时，只有这里同时知道 folder 与失败原因；重试无意义，日志必须可定位）
+    console.warn(
+      '[idbox] zhimo:cover-write-failed',
+      folder,
+      err instanceof Error ? err.message : err
+    )
     return { ok: false, reason: 'write-failed' }
   }
 }

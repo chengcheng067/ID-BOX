@@ -54,6 +54,7 @@ import {
   testAiConnection
 } from './aiClassify'
 import { findSevenZip, thumbsDir } from './paths'
+import { guardDragIconPath } from './dragIconGuard'
 import { fetchLatestRelease } from './updateCheck'
 import { freeBytesOf } from './disk'
 import { deleteThumb, deleteOneThumb, ensureThumb, ensurePreview, clearThumbs, listThumbFiles, pruneThumbs, thumbStats } from './thumb'
@@ -505,9 +506,13 @@ export interface DragIconResolution {
   icon: string | NativeImage
   /** 缩略图 / resources 兜底 / 内嵌 base64 / 渲染层预热的卡片位图 */
   kind: 'thumb' | 'fallback' | 'embedded' | 'card'
-  /** 图标来源文件路径（embedded / card 档为 null：图标来自内存） */
+  /**
+   * 图标来源文件路径；embedded 档为 null（图标来自内存）。
+   * card 档是主进程刚落盘的 Temp 文件路径（Windows 只认「icon 为路径」那条分支），
+   * 交给 startDrag 前必须先过 `guardDragIconPath` 自验（见 dragStart 处理器内注释）。
+   */
   path: string | null
-  /** 来源文件是否真的存在于磁盘（embedded / card 档恒为 false） */
+  /** 来源文件是否真的存在于磁盘（embedded 档恒为 false） */
   exists: boolean
 }
 
@@ -1384,6 +1389,12 @@ ipcMain.handle(IPC.sevenZipPath, () => settings.sevenZipPath ?? findSevenZip())
  *   - `drag:start:returned` → native 调用**返回之后**（同步调用，只是下一行代码）
  * 只有 before 没有 returned = 进程死在 `event.sender.startDrag()` 内部（native/Chromium 层），
  * 不是 JS 异常（JS 异常会被 uncaughtException 记下来且进程继续活着）。
+ *
+ * ⚠️ 0.8.3（P0 崩溃修复）：`startDrag` 收到字符串 icon 路径时，native 内部读成空图会
+ * **直接 throw**（"Failed to load image from path"，杀软对 Temp 新落盘 PNG 的瞬时
+ * 独占扫描锁所致，间歇性发作）。所以 icon 路径交给 startDrag 前必须先过
+ * `guardDragIconPath` 自验降级（card → thumb → 内嵌），startDrag 本身也要 try/catch
+ * 兜底 —— 本处理器任何分支都不允许把异常抛成 uncaughtException。
  */
 ipcMain.on(IPC.dragStart, (event, filePath: string, thumbName?: string | null, cardPng?: Uint8Array | null) => {
   if (!filePath) {
@@ -1403,7 +1414,7 @@ ipcMain.on(IPC.dragStart, (event, filePath: string, thumbName?: string | null, c
   // 埋点 ①：native drag 之前的现场。这里必须把可能影响 startDrag 的东西都记下来。
   // v0.5.4：优先用渲染层 hover 预热好的卡片位图；没有/解码失败才回退缩略图 → resources → 内嵌。
   const card = resolveDragCard(cardPng)
-  const icon = card ?? resolveDragIcon(thumbName)
+  let icon = card ?? resolveDragIcon(thumbName)
   logInfo('drag:start', {
     abs,
     fileName: path.basename(abs),
@@ -1421,8 +1432,57 @@ ipcMain.on(IPC.dragStart, (event, filePath: string, thumbName?: string | null, c
   // 就永远写不进磁盘，取证直接失效。这里多花不到 1ms，换"崩溃前现场一定在"。
   flushLogsSync()
 
-  // 同步发起拖拽：若进程崩在 native 内部，下面这行之后的日志永远不会出现
-  event.sender.startDrag({ file: abs, icon: icon.icon })
+  // ── 0.8.3 P0 兜底：图标路径先自验，绝不让 startDrag 替我们 throw ─────────
+  //
+  // 外部用户崩溃实锤（v0.8.2，2026-10-28 07:27:40 UTC）：
+  //   Error: Failed to load image from path 'C:\...\Temp\idbox-drag-card.png'
+  //     at IpcMainImpl.<anonymous>
+  //
+  // `startDrag` 收到**字符串路径**时会在 native 内部自己 `createFromPath`，
+  // 读成空图直接 throw → 从本处理器冒出去就成了 uncaughtException。而刚写进
+  // 系统 Temp 的 PNG 可能被杀软（Defender 等）以独占锁瞬时扫描，间歇性读成空图
+  // （同一用户 6 秒后重拖即成功 = 典型的瞬时锁竞态，不是确定性 bug）。
+  //
+  // 所以在同步段**自己先读一遍**（决策逻辑抽在 `dragIconGuard.ts`，可单测）：
+  // 读得出来才把路径交给 startDrag；读不出来按档位降级（card → thumb → 内嵌），
+  // 文件本体照拖 —— 任何时序下都不许崩。
+  const dragIconDeps = {
+    loadFromPath: (p: string) => nativeImage.createFromPath(p),
+    isEmpty: (img: NativeImage) => img.isEmpty(),
+    makeEmbedded: (): NativeImage =>
+      nativeImage.createFromBuffer(Buffer.from(EMBEDDED_DRAG_ICON_BASE64, 'base64'))
+  }
+  let guard = guardDragIconPath(icon.icon, dragIconDeps)
+  if (guard.degraded) {
+    logWarn('drag:icon-missing', { kind: icon.kind, path: icon.path, reason: guard.reason })
+    if (icon.kind === 'card') {
+      // 卡片档挂了先降一档试缩略图（对用户更有用）；缩略图档自身再挂才走内嵌图。
+      // 降级后的路径同样要过一遍守卫 —— 杀软的瞬时锁也可能正好锁着 thumbs 文件。
+      icon = resolveDragIcon(thumbName)
+      guard = guardDragIconPath(icon.icon, dragIconDeps)
+      if (guard.degraded) {
+        logWarn('drag:icon-missing', { kind: icon.kind, path: icon.path, reason: guard.reason })
+      }
+    }
+    if (guard.degraded) {
+      // 最后一级：内嵌 NativeImage（内存图，startDrag 不存在路径加载失败这条失败模式）
+      icon = { ...icon, icon: guard.icon, kind: 'embedded', path: null, exists: false }
+    }
+  }
+
+  // 最后防线：即便如此 native 层仍拒绝发起，也只记日志返回，绝不把异常抛成 uncaughtException
+  try {
+    // 同步发起拖拽：若进程崩在 native 内部，下面这行之后的日志永远不会出现
+    event.sender.startDrag({ file: abs, icon: icon.icon })
+  } catch (err) {
+    logWarn('drag:start:throw', {
+      abs,
+      iconKind: icon.kind,
+      error: err instanceof Error ? err.message : String(err)
+    })
+    flushLogsSync()
+    return
+  }
 
   // 埋点 ②：native 调用已返回（同步调用，能走到这里说明 JS 侧没有抛错）
   logInfo('drag:start:returned', {

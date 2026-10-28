@@ -35,6 +35,7 @@ import {
 import { dedupeIds, pruneToVisible, selectRangeIds } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
 import { planDuplicateCleanup, planThumbPresenceRepair } from './logic/recordHygiene'
+import { planCoverSelfHeal } from './logic/coverSelfHeal'
 import { assetFileAbs } from './logic/assetPath'
 import { toDeleteTargets, type DeleteTarget } from './logic/deleteFlow'
 // 删除撤销期三档（0 / 3000 / 5000）：用户可在设置·数据与备份里改。
@@ -1942,6 +1943,130 @@ async function repairThumbPresence(): Promise<void> {
   }
 }
 
+/**
+ * init 里的「封面死锁自愈」（0.8.3，外部用户 v0.8.2 实测反馈）。
+ *
+ * ## 修的是什么
+ *
+ * 0.8.1 重扫入库的资产：盘上根层明明有 `<x>.cover.jpg`（知末抓的主图），
+ * 但当时 `pickCover` 还不认 cover 文件 → 索引 `cover` 没指向它 → 卡片缺图；
+ * 而 0.8.2 的补抓候选规则④（`hasCoverAssetFile`）见到"已有 cover 文件"又一律
+ * 不重抓 → **补抓永远跳过这批资产**，手动单个取又走 `force` 能成 ——
+ * 用户看到的就是"一键重扫没效果、按钮坏了"。
+ *
+ * ## 两段（计划由 `logic/coverSelfHeal.planCoverSelfHeal` 纯函数算出）
+ *
+ * - **A 重指**：`coverSource` 不是 manual/zhimo、根层有 cover 文件、`cover` 未指向它
+ *   → 改指该文件、`coverSource='named'`（与 `pickCover` ① 对 cover 文件同口径），
+ *   缩略图置 `none` 交给既有补齐队列重生（**不新造队列**，同 `repairThumbPresence` 的做法）；
+ * - **C folder 重建**：`folder` 与 `libraryDir + relFolder` 脱同步（重排/去重改名后
+ *   folder 字段未同步的存量，外部日志实锤 `cover:write-failed … ENOENT`）
+ *   → 按 `relFolder` 重建绝对路径；落库前用 `probeSizes` 探一张索引内图片核实
+ *   重建路径真的在盘上，探不到记一条带 folder 的 WARN 并跳过（宁可不修也不写错）。
+ *
+ * ## 顺序与静默
+ *
+ * 在 `repairThumbPresence()` 之后、`ensureMissingThumbs()` 之前（置 none 正好是
+ * 队列的候选判据）；整段包 try/catch：修数据的版本绝不能因为修数据本身打不开，
+ * 失败静默，下次启动重算（幂等：重指后条件不再成立、重建后字符串相等）。
+ */
+async function selfHealCoverIndex(): Promise<void> {
+  try {
+    const state = useVault.getState()
+    const plan = planCoverSelfHeal(state.assets, { libraryDir: state.settings?.libraryDir ?? null })
+    if (plan.repoints.length === 0 && plan.folderResyncs.length === 0) return
+
+    // ── A：cover 重指（定向 modify，不整对象 put —— 仓库既有纪律） ──
+    const repointById = new Map(plan.repoints.map((r) => [r.id, r]))
+    for (const item of plan.repoints) {
+      await db.assets
+        .where('id')
+        .equals(item.id)
+        .modify((a: Asset) => {
+          a.cover = item.rel
+          a.coverSource = item.source
+          // 封面换了 salt（thumbFileSalt 含 cover 路径）→ 旧缩略图作废，
+          // 置 none 让 `ensureMissingThumbs` 按新封面重生
+          delete a.thumbPath
+          a.thumbStatus = 'none'
+          a.updatedAt = Date.now()
+        })
+      // 本会话可能已为它试过一次（HMR / init 重复调用）→ 解除一次性封锁
+      thumbAttempted.delete(item.id)
+    }
+
+    // ── C：folder 重建（落库前先核实重建路径在盘上） ────────────────────
+    // 同一重建路径只探一次（多个资产同 folder 时去重）
+    const probeOk = new Map<string, boolean>()
+    const appliedFolders = new Map<string, string>()
+    for (const item of plan.folderResyncs) {
+      let ok: boolean
+      if (item.probeRel) {
+        const cached = probeOk.get(item.folder)
+        ok =
+          cached ??
+          (await window.modvault
+            .probeSizes(item.folder, [item.probeRel])
+            .then((r) => r.length > 0)
+            .catch(() => false))
+        probeOk.set(item.folder, ok)
+      } else {
+        // 索引里没有图片可探：按 relFolder 口径直接重建。relFolder 与 folder 由
+        // 同一套改名/指派流程一起维护，脱同步只发生在"单边写失败"的存量上，
+        // 盲建的风险远小于放着不管（放着它连知末封面都写不进去）。
+        ok = true
+      }
+      if (!ok) {
+        // 重建路径也不在盘上 = 整棵子树没了（真漂移），不是字段脱同步 → WARN 跳过
+        console.info(`[coverSelfHeal] folder 重建路径在盘上不存在，跳过：${item.folder}`)
+        try {
+          window.modvault?.reportLog?.({
+            level: 'warn',
+            message: 'cover:folder-resync-missing',
+            context: { id: item.id, folder: item.folder }
+          })
+        } catch {
+          /* 日志失败绝不影响自愈 */
+        }
+        continue
+      }
+      await db.assets
+        .where('id')
+        .equals(item.id)
+        .modify((a: Asset) => {
+          a.folder = item.folder
+        })
+      appliedFolders.set(item.id, item.folder)
+    }
+
+    // ── 内存态同步（一次 setState 合并 A + C，保持原顺序不错位） ─────────
+    if (appliedFolders.size > 0 || repointById.size > 0) {
+      useVault.setState((s) => ({
+        assets: s.assets.map((a) => {
+          const rp = repointById.get(a.id)
+          const nf = appliedFolders.get(a.id)
+          if (!rp && !nf) return a
+          const next: Asset = { ...a }
+          if (rp) {
+            next.cover = rp.rel
+            next.coverSource = rp.source
+            next.thumbStatus = 'none'
+            delete next.thumbPath
+            next.updatedAt = Date.now()
+          }
+          if (nf) next.folder = nf
+          return next
+        })
+      }))
+    }
+    console.info(
+      `[coverSelfHeal] 重指封面 ${plan.repoints.length} 条，重建 folder ${appliedFolders.size}/${plan.folderResyncs.length} 条`
+    )
+  } catch {
+    // 失败静默：修数据不能阻塞启动；下次启动会重新计算（幂等）
+  }
+}
+
 // ── 重跑自动分类：移动前备份（v1.0.13） ─────────────────────────────
 
 /**
@@ -2198,6 +2323,12 @@ export const useVault = create<VaultState>((set, get) => ({
     // 顺序：救援之后（先让它把盘上真实存在的图挂回去）、补齐队列之前（置成 none
     // 正好是队列的候选判据）。静默执行：用户只需要看到卡片自己恢复。
     await repairThumbPresence()
+
+    // ── ②b 封面死锁自愈（0.8.3，A 重指 + C folder 重建）──────────────────
+    // 同样卡在"救援之后、补齐队列之前"：重指后的 cover 置 none，正好交给下面的
+    // `ensureMissingThumbs` 按新封面重生；folder 先修好，缩略图生成才不会对着
+    // 失效路径空跑。静默执行，幂等。
+    await selfHealCoverIndex()
 
     // 知末 ID 一次性回填（0.6.3）：老索引记录没有 `zhimoId` → 从资产名/包内文件补算。
     // 纯幂等：算不出就不写库，已回填过的记录下次启动直接跳过。失败不影响启动（catch 吞掉）。
@@ -4476,6 +4607,11 @@ export const useVault = create<VaultState>((set, get) => ({
       }
     })
     const summary: ZhimoCoverBackfillSummary = { ...idle, total: targets.length }
+    // 跳过原因分票（0.8.3）：队列只有一个 skipped 总数，但用户反馈"跳过"被误解成
+    // 按钮坏了 —— 文案必须能区分"已有 cover 文件"（本次自愈的目标人群，看到它
+    // 说明启动自愈该接管了）与"手动封面"（用户自己设的，本来就不该动）。
+    let skippedCoverFile = 0
+    let skippedManual = 0
     try {
       const out = await runZhimoCoverQueue(targets, {
         fetchOne: async (t) => {
@@ -4491,9 +4627,11 @@ export const useVault = create<VaultState>((set, get) => ({
                 // 锁内重查（TOCTOU 闸门，同 runZhimoCovers）：用户刚手动设了封面 /
                 // 已有 cover 文件（别的通道先抓到了）→ 跳过
                 if (asset.coverSource === 'manual') {
+                  skippedManual += 1
                   return { skipped: true, reason: 'manual' } as const
                 }
                 if (hasCoverAssetFile(asset.files)) {
+                  skippedCoverFile += 1
                   return { skipped: true, reason: 'zhimo' } as const
                 }
                 const res = await window.modvault
@@ -4503,6 +4641,19 @@ export const useVault = create<VaultState>((set, get) => ({
                   await commitCover(t.id, res.rel, res.size, 'zhimo')
                   // 风格来自同一次详情页 GET：只补空 / 只认词表 / 只对 model
                   await applyZhimoStyle(t.id, res.style)
+                } else if (!res.ok && res.reason === 'write-failed') {
+                  // 写盘失败的 WARN 必须带 folder（0.8.3 C 段的取证通道）：
+                  // DB folder 与磁盘脱同步时，这条日志是"写的哪个目录、为何 ENOENT"
+                  // 的唯一线索（main 侧 catch 只有 reason，folder 只有渲染层有）。
+                  try {
+                    window.modvault?.reportLog?.({
+                      level: 'warn',
+                      message: 'zhimo:cover-write-failed',
+                      context: { id: t.id, folder: asset.folder, name: asset.name }
+                    })
+                  } catch {
+                    /* 日志失败绝不影响结果 */
+                  }
                 }
                 return res
               },
@@ -4556,8 +4707,12 @@ export const useVault = create<VaultState>((set, get) => ({
       /* 日志失败绝不影响结果 */
     }
 
-    const skippedNote =
-      summary.skipped > 0 ? ` · 跳过 ${summary.skipped}（已有封面/手动封面）` : ''
+    // 跳过明细分票展示（0.8.3）：「已有 cover 文件」单列 —— 用户按外部教程把
+    // cover 图放回盘上后，看到这句就知道"软件认到了"，而不是按钮坏了。
+    const skipNotes: string[] = []
+    if (skippedCoverFile > 0) skipNotes.push(`跳过 ${skippedCoverFile}（已有 cover 文件）`)
+    if (skippedManual > 0) skipNotes.push(`跳过 ${skippedManual}（手动封面）`)
+    const skippedNote = skipNotes.length > 0 ? ` · ${skipNotes.join('，')}` : ''
     set({
       notice: `知末封面补抓${summary.stopped ? '（已取消）' : ''}：成功 ${summary.ok} / 失败 ${summary.failed}${skippedNote}`
     })

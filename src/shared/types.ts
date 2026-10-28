@@ -688,6 +688,15 @@ export interface Settings {
    * 归一化入口在 `shared/customTaxonomy.ts`（清洗规则与落盘目录段同源）。
    */
   customTaxonomy: CustomTaxonomy
+  /**
+   * 左右侧边栏折叠（0.8.3，用户 2026-10-28 反馈「左右侧边栏都需要能够被折叠」）。
+   *
+   * `true` = 该侧边栏完全隐藏（不是收成窄条），中栏对应边缘出现竖向唤出按钮。
+   * 默认 `false` = 展开态，老用户升级后无感知。归一化方向与 `materialStage` 一致：
+   * 只认严格 `true`（缺键 / 脏值一律展开），且单项降级不拖垮整份 settings.json。
+   */
+  sidebarLeftCollapsed: boolean
+  sidebarRightCollapsed: boolean
   /** @deprecated 仅用于读取旧 settings.json，读到后映射为 archiveDisposal */
   trashArchiveAfterImport?: boolean
 }
@@ -742,7 +751,10 @@ export const DEFAULT_SETTINGS: Settings = {
   savedViews: [],
   renameTemplate: '{name}',
   // 自定义分类词表默认全空（= 与没有该功能时行为一致；词条由用户在分类选择器里新增）
-  customTaxonomy: { level1: [], level2: {} }
+  customTaxonomy: { level1: [], level2: {} },
+  // 左右侧边栏默认展开（0.8.3 折叠功能；false = 展开态，升级无感）
+  sidebarLeftCollapsed: false,
+  sidebarRightCollapsed: false
 }
 
 // ── T06 分类体系 IPC 载荷（shared 定义，main 与 preload 共用，避免 preload 反向 import main） ──

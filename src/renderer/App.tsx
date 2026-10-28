@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import type { ReactNode, SVGProps } from 'react'
 import { useVault, useVisibleAssets, SAVED_VIEW_LIMIT } from './store'
 import { Sidebar } from './components/Sidebar'
 import { Toolbar } from './components/Toolbar'
@@ -124,6 +125,108 @@ const SORT_PANEL_WIDTH = 176
  * 面板内容仍是「标题 + 可换行的风格 chip」，248 与之前顶栏那颗面板同一数值。
  */
 const STYLE_PANEL_WIDTH = 248
+
+// ── 左右侧边栏折叠（0.8.3，用户 2026-10-28 反馈）─────────────────────────
+//
+// 形态（已拍板）：折叠 = **完全隐藏**（不是收成窄条）+ 中栏对应边缘的竖向唤出按钮。
+// 宽度过渡走 CSS transition（ease），内容保持固定宽（不做挤压变形），动画结束后
+// 才把内容 visibility:hidden（折叠方向延迟到动画结束，展开方向立即可见 → 两个方向都平滑）。
+
+/** 左栏宽（与 `Sidebar.tsx` 的 `w-[216px]` 必须一致：动画两端都要对齐它） */
+const SIDEBAR_W = 216
+/** 右栏宽（与 `DetailPanel.tsx` 的 `w-[300px]` 必须一致） */
+const DETAIL_W = 300
+/** 宽度过渡时长（ms，规范口径 150-200ms ease） */
+const SIDEBAR_COLLAPSE_MS = 180
+/** 中栏边缘竖向唤出按钮的宽（px）；高度 56 居中，hover 走 tint */
+const EDGE_TOGGLE_W = 16
+
+/**
+ * chevron 箭头（本地定义：`icons.tsx` 没有方向箭头，且不在本批文件边界内）。
+ * 规格照抄 `icons.tsx` 的 Base 约定：24×24 viewBox、stroke currentColor、
+ * strokeWidth 2.25（16px 渲染尺寸 = 视觉 1.5）、round cap/join。
+ */
+const IconChevronLeft = (p: SVGProps<SVGSVGElement>) => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <path d="M14.5 5l-7 7 7 7" />
+  </svg>
+)
+const IconChevronRight = (p: SVGProps<SVGSVGElement>) => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" {...p}>
+    <path d="M9.5 5l7 7-7 7" />
+  </svg>
+)
+
+/**
+ * 可折叠侧栏的包裹层：外层动画宽度 + 裁切，内层（children）保持固定宽 ——
+ * 内容永不挤压变形；完全折叠后 `visibility:hidden` 把它从焦点 / 无障碍树里拿掉。
+ */
+function CollapsibleColumn({
+  id,
+  collapsed,
+  width,
+  children
+}: {
+  id: string
+  collapsed: boolean
+  width: number
+  children: ReactNode
+}) {
+  return (
+    <div
+      id={id}
+      className="flex shrink-0 overflow-hidden"
+      style={{
+        width: collapsed ? 0 : width,
+        visibility: collapsed ? 'hidden' : 'visible',
+        // 折叠：内容滑出的 180ms 里保持可见，动画结束才隐藏；展开：立即可见随宽度滑入
+        transition: collapsed
+          ? `width ${SIDEBAR_COLLAPSE_MS}ms ease, visibility 0s linear ${SIDEBAR_COLLAPSE_MS}ms`
+          : `width ${SIDEBAR_COLLAPSE_MS}ms ease, visibility 0s`
+      }}
+      aria-hidden={collapsed || undefined}
+    >
+      {children}
+    </div>
+  )
+}
+
+/**
+ * 中栏边缘的竖向唤出 / 收起按钮（折叠后唯一的入口，展开时可点它收起）。
+ * 视觉极简：透明底 + tertiary 色 chevron；hover 才出现 tint（bg-elevated）与提亮，
+ * 色值全部来自设计规范既有 token（不新造颜色）。
+ */
+function SidebarEdgeToggle({
+  side,
+  collapsed,
+  onToggle
+}: {
+  side: 'left' | 'right'
+  collapsed: boolean
+  onToggle: () => void
+}) {
+  const label = `${collapsed ? '展开' : '折叠'}${side === 'left' ? '左侧栏' : '右侧栏'}`
+  return (
+    <button
+      type="button"
+      className="flex h-14 shrink-0 cursor-pointer self-center items-center justify-center rounded-md text-tertiary transition hover:bg-elevated/60 hover:text-secondary"
+      style={{ width: EDGE_TOGGLE_W }}
+      aria-label={label}
+      aria-expanded={!collapsed}
+      aria-controls={side === 'left' ? 'sidebar-left' : 'detail-panel'}
+      title={label}
+      onClick={onToggle}
+    >
+      {side === 'left' ? (
+        collapsed ? <IconChevronRight /> : <IconChevronLeft />
+      ) : collapsed ? (
+        <IconChevronLeft />
+      ) : (
+        <IconChevronRight />
+      )}
+    </button>
+  )
+}
 
 export default function App() {
   const init = useVault((s) => s.init)
@@ -365,6 +468,20 @@ export default function App() {
   useEffect(() => {
     setMotionQuality(motionQuality)
   }, [motionQuality])
+
+  // ── 左右侧边栏折叠（0.8.3）：状态在 Settings 里持久化，切换即时落库 ──────
+  // 订阅写法与 theme / motionQuality 同款（订阅字段，不能用一次性读）。
+  // 文件视图 / 舞台球飞行**不改**折叠状态（各有布局，互不干扰）；折叠后
+  // 拖卡片到左栏归类自然不可用（展开即恢复），无需额外处理。
+  const saveSettings = useVault((s) => s.saveSettings)
+  const sidebarLeftCollapsed = useVault((s) => s.settings?.sidebarLeftCollapsed ?? false)
+  const sidebarRightCollapsed = useVault((s) => s.settings?.sidebarRightCollapsed ?? false)
+  const toggleLeftSidebar = (): void => {
+    void saveSettings({ sidebarLeftCollapsed: !sidebarLeftCollapsed })
+  }
+  const toggleRightSidebar = (): void => {
+    void saveSettings({ sidebarRightCollapsed: !sidebarRightCollapsed })
+  }
 
   useEffect(() => {
     void init()
@@ -762,7 +879,12 @@ export default function App() {
       <Toolbar view={view} onView={setView} />
 
       <div className="flex min-h-0 flex-1">
-        <Sidebar onOpenSettings={() => setSettingsOpen(true)} />
+        {/* 0.8.3 左栏折叠：包裹层动画宽度 + 裁切，Sidebar 内容保持 216 固定宽不变形 */}
+        <CollapsibleColumn id="sidebar-left" collapsed={sidebarLeftCollapsed} width={SIDEBAR_W}>
+          <Sidebar onOpenSettings={() => setSettingsOpen(true)} />
+        </CollapsibleColumn>
+        {/* 左栏折叠后的唤出按钮（展开时可点它收起），位于中栏最左缘 */}
+        <SidebarEdgeToggle side="left" collapsed={sidebarLeftCollapsed} onToggle={toggleLeftSidebar} />
 
         {/* 2026-10：中栏 + 右栏包一层 `relative`，用来挂舞台遮罩（`#stage-veil`）。
             flex 分配不变 —— wrapper 接管中栏原来的 `min-w-0 flex-1`，内部再分给中栏与右栏。
@@ -1411,7 +1533,12 @@ export default function App() {
           )}
         </div>
 
-        <DetailPanel />
+        {/* 0.8.3 右栏折叠：与左栏同构（动画宽度 + 固定 300 内容宽 + visibility 收尾） */}
+        <CollapsibleColumn id="detail-panel" collapsed={sidebarRightCollapsed} width={DETAIL_W}>
+          <DetailPanel />
+        </CollapsibleColumn>
+        {/* 右栏折叠后的唤出按钮，位于中栏最右缘（与左缘对称） */}
+        <SidebarEdgeToggle side="right" collapsed={sidebarRightCollapsed} onToggle={toggleRightSidebar} />
 
         {/* 舞台遮罩（2026-10）：双击出球时盖住中栏+右栏，随球落地淡出 →
             「内容逐渐浮现」。`opacity:0` 是**静止值**；动画由 MaterialStage 用 WAAPI

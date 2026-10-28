@@ -186,6 +186,14 @@ export const SettingsSchema = z.object({
    * 绝不让整份 settings.json 回落默认。
    */
   customTaxonomy: z.unknown().optional(),
+  /**
+   * 左右侧边栏折叠（0.8.3，默认 **false** = 展开态）。
+   * `.catch(false)`：**单项降级** —— 脏值（`'yes'` / `1` / `null`）只让这一项回落展开，
+   * 不拖垮整份 settings.json（否则 libraryDir 一起丢，库会"消失"）。
+   * 方向与 `materialStage` 一致：只有严格 `true` 才折叠，缺键 / 脏值一律展开。
+   */
+  sidebarLeftCollapsed: z.boolean().optional().catch(false),
+  sidebarRightCollapsed: z.boolean().optional().catch(false),
   /** @deprecated 旧档迁移用 */
   trashArchiveAfterImport: z.boolean().optional()
 })
@@ -379,7 +387,11 @@ export function migrateSettings(raw: RawSettings): Settings {
         ? raw.renameTemplate
         : DEFAULT_SETTINGS.renameTemplate,
     // 自定义分类词表（2026-10）：旧档缺键 → 空词表；脏词条逐条清洗丢弃
-    customTaxonomy: normalizeCustomTaxonomy(raw.customTaxonomy)
+    customTaxonomy: normalizeCustomTaxonomy(raw.customTaxonomy),
+    // 左右侧边栏折叠（0.8.3）：旧档缺键 → 展开；只认严格 true（zod 侧脏值已 catch 成 false，
+    // 这里再收口一次保证返回的 Settings 是完整布尔对象）
+    sidebarLeftCollapsed: raw.sidebarLeftCollapsed === true,
+    sidebarRightCollapsed: raw.sidebarRightCollapsed === true
   }
   delete next.trashArchiveAfterImport
   return next
@@ -484,6 +496,9 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   merged.verboseLogging = merged.verboseLogging === true
   // 自定义分类词表（2026-10）：单条新增也可能带脏值，写档前再统一清洗一遍
   merged.customTaxonomy = normalizeCustomTaxonomy(merged.customTaxonomy)
+  // 左右侧边栏折叠（0.8.3）：只认严格 true（缺键 / 'yes' / 1 之类脏值一律展开）
+  merged.sidebarLeftCollapsed = merged.sidebarLeftCollapsed === true
+  merged.sidebarRightCollapsed = merged.sidebarRightCollapsed === true
   delete merged.trashArchiveAfterImport
   return merged
 }

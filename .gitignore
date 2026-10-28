@@ -42,3 +42,6 @@ qa-settings-tmp/
 #    已实测 0.7.9 包 2130 条目里 qa-*/docs/src/tests 全为 0。
 #    但若有人把 files 改成"全包含 + 排除法"，这些 qa-*-tmp/（真机证据，数 MB）就会被塞进 asar。
 #    → 改 files 写法时，必须同步把 qa-*-tmp/ 与 docs/ 排除掉。
+
+# qa-083 真机验收临时产物（截图/脚本/userdata，不入库）
+qa-083-tmp/
