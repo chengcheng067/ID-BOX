@@ -665,6 +665,11 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
       // 不在这里再写一张表（两处表必然漂移）。
       return importMediaOne(src, st, deps, kindOfExt(ext), batch)
     }
+    // 单文件模型（0.8.4）：孤零零一个 .skp / .max / .obj / .fbx …
+    // 旧实现会掉进下面的 extractArchive 被判「不是压缩包」→ 用户拖进去像没反应。
+    // 现在走 `importModelOne`：建资产文件夹 + **复制**（源工程文件原地不动）+ 补封面。
+    // kind 判定用同一张 EXT_KIND（含 40+ 模型扩展名），别在这里列白名单。
+    if (kindOfExt(ext) === 'model') return importModelOne(src, st, deps, batch)
   }
 
   // ── P0-3 磁盘空间预检：不足直接拒绝，**不建 staging、不产生半成品** ──
@@ -1337,6 +1342,273 @@ async function importMediaOne(
   } catch {
     /* 处置失败 → 保留源图，不阻断导入 */
   }
+
+  const message = doneMessage(decision, placement.replace)
+  const conflict = decision
+    ? conflictNote(decision, decision.resolution, isDegradedOverwrite(decision, placement.replace))
+    : undefined
+  deps.emit({
+    item: src,
+    itemName,
+    status: 'done',
+    asset,
+    ...(conflict ? { conflict } : {}),
+    ...(message ? { message } : {})
+  })
+  return asset
+}
+
+/**
+ * 单文件模型直导（0.8.4，用户 2026-10-28 拍板「同意复制保留」）。
+ *
+ * ## 解决什么
+ *
+ * 用户在别处已经整理过的工程文件（很常见：一个目录里孤零零一个 `.skp` / `.max`），
+ * 旧实现会掉进 `extractArchive` → 被判「不是压缩包」→ 拖进去没反应；
+ * 就算落了库（文件夹路径），也只有「一个 SketchUp 框框 + 没有预览图」。
+ *
+ * 本函数把「单个模型文件」当成一个**单文件资产包**处理：建 `大类/一级/二级/名`，
+ * 把文件复制进去，再按封面优先级补一张图。
+ *
+ * ## 两条已拍板口径（不要自行改）
+ *
+ * 1. **源文件一律保留**：只复制，绝不 `rename` / 绝不进回收站 / 绝不删。
+ *    `.skp` 是客户的工程文件，不是一次性下载包；设置里的「原包处置」三档是为压缩包
+ *    设计的，套到工程文件上风险太大 —— 删掉的可能是他唯一的原件。
+ *    所以本函数**不调用** `disposeArchive`。
+ * 2. **封面优先级**：知末主图（文件名里有 `ID_<数字>`，由批次结束后的既有抓取任务补，
+ *    见 `docs/24`）> `.skp` 内嵌预览（本地立刻可用，`coverSource='embedded'`）> 类型占位。
+ *    `.max` / `.obj` 这类没有可提取预览的，先给占位，等知末那张图到了自然覆盖。
+ *
+ * ## 与其它两条路径的口径一致性（别在这里另立一套）
+ *
+ * - 资产名：`sanitizeName(stripNoise(文件名去扩展名))`（与单图路径逐字相同）；
+ * - 分类：`classifyAssetName` + `resolveCategorySegments`（与压包/单图共用唯一实现，DEF-14）；
+ * - 判重：`dedupeKeyOf(assetName, kind)` + `zhimoId`（D16，与单图完全一致）；
+ * - 落盘大类：`kindFolder(kind)`（不是 `KIND_LABEL`，docs/14 §0.1-1）；
+ * - 覆盖档：沿用 `replaceAssetFolder` 三步（挪旧 → 落新 → 销毁旧），不另写。
+ */
+async function importModelOne(
+  src: string,
+  st: Awaited<ReturnType<typeof fs.stat>>,
+  deps: ImportDeps,
+  batch: ImportBatch
+): Promise<Asset | null> {
+  const itemName = path.basename(src)
+  const ext = path.extname(itemName).slice(1).toLowerCase()
+  const kind = kindOfExt(ext)
+  const folderName = kindFolder(kind)
+  const assetName = sanitizeName(stripNoise(path.basename(itemName, path.extname(itemName))))
+
+  // P0-3 空间预检：必须早于任何 mkdir（与另外两条路径同一条纪律）
+  const space = await checkSpaceFor(src, deps.libraryDir, {
+    sevenZipPath: deps.sevenZipPath,
+    maxBytesForJsFallback: deps.maxBytesForJsFallback,
+    safetyFactor: deps.spaceSafetyFactor
+  })
+  if (!space.ok) {
+    deps.emit({
+      item: src,
+      itemName,
+      status: 'error',
+      message: `磁盘空间不足：可用 ${humanGB(space.freeBytes)} / 需要 ${humanGB(space.requiredBytes)}。请在设置里「更改库目录」或清理磁盘后重试`,
+      needBytes: space.requiredBytes,
+      freeBytes: space.freeBytes
+    })
+    return null
+  }
+
+  deps.emit({
+    item: src,
+    itemName,
+    status: 'organizing',
+    message: '正在为单个工程文件建资产文件夹…'
+  })
+
+  const { category1, category2 } = classifyAssetName(assetName, [itemName], kind)
+  const { cat1Seg, cat2Seg } = resolveCategorySegments(category1, category2)
+
+  // 判重点与单图/压包同口径（D16）：`dedupeKey` 用**改名前**的 assetName
+  const zhimoId = zhimoIdFromSources(itemName, assetName, [itemName])
+  const decision = await resolveConflict(batch, deps, {
+    item: src,
+    itemName,
+    assetName,
+    kind,
+    size: Number(st.size),
+    zhimoId
+  })
+  if (decision?.resolution === 'skip') {
+    // 跳过 = 源文件绝不处置（D09）：本函数本来就不处置源文件，这条只是显式表达语义
+    emitSkipped(deps, { item: src, itemName }, decision)
+    return null
+  }
+
+  interface ModelPlacement {
+    id: string
+    finalName: string
+    target: string
+    relFolder: string
+    replace: ReplaceResult | null
+    inheritFrom: ImportDedupeEntry | null
+  }
+
+  let placement: ModelPlacement
+  const overwriteMatch = decision?.resolution === 'overwrite' ? decision.match.existing : null
+  const overwriteOk =
+    overwriteMatch !== null && (await checkOverwriteTarget(deps, overwriteMatch, kind)) === 'ok'
+
+  if (overwriteOk && overwriteMatch) {
+    // 覆盖：与单图路径同构（不是 moveDir 而是「mkdir 旧路径 + copyFile」）
+    const target = overwriteMatch.folder
+    const relFolder =
+      overwriteMatch.relFolder || composeRelFolder(folderName, cat1Seg, cat2Seg, overwriteMatch.name)
+    const replace = await replaceAssetFolder(target, overwriteMatch.id, deps, async (t) => {
+      await fs.mkdir(t)
+      try {
+        await fs.copyFile(src, path.join(t, itemName))
+      } catch (err) {
+        await fs.rm(t, { recursive: true, force: true }).catch(() => {})
+        throw err
+      }
+    })
+    placement = {
+      id: overwriteMatch.id,
+      finalName: overwriteMatch.name,
+      target,
+      relFolder,
+      replace,
+      inheritFrom: overwriteMatch
+    }
+  } else {
+    const cat2Dir = path.join(deps.libraryDir, folderName, cat1Seg, cat2Seg)
+    await fs.mkdir(cat2Dir, { recursive: true })
+
+    // 防重名 + 并发安全：mkdir（非 recursive）当占位锁（与单图路径逐字同款）
+    const taken = batch.ledger.namesOf(cat2Dir)
+    try {
+      for (const name of await fs.readdir(cat2Dir)) taken.add(name)
+    } catch {
+      /* 目录刚建 */
+    }
+    let finalName = uniqueName(assetName, taken)
+    let target = path.join(cat2Dir, finalName)
+    for (;;) {
+      try {
+        await fs.mkdir(target)
+        break
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+        taken.add(finalName)
+        finalName = uniqueName(assetName, taken)
+        target = path.join(cat2Dir, finalName)
+      }
+    }
+    batch.ledger.claim(cat2Dir, finalName)
+
+    // ⚠️ 复制，不是移动：源工程文件**原地不动**（本函数头注①，用户拍板）
+    try {
+      await fs.copyFile(src, path.join(target, itemName))
+    } catch (err) {
+      // 复制失败 = 该条失败：撤掉占位目录，不留空壳（此刻源文件一个字节都没被碰）
+      await fs.rm(target, { recursive: true, force: true }).catch(() => {})
+      batch.ledger.release(cat2Dir, finalName)
+      throw err
+    }
+    placement = {
+      id: overwriteMatch ? overwriteMatch.id : randomUUID(),
+      finalName,
+      target,
+      relFolder: composeRelFolder(folderName, cat1Seg, cat2Seg, finalName),
+      replace: null,
+      inheritFrom: null
+    }
+  }
+
+  const { id, finalName, target, relFolder } = placement
+  const destFile = path.join(target, itemName)
+
+  const file: AssetFile = {
+    rel: itemName,
+    name: itemName,
+    ext,
+    size: Number(st.size),
+    kind
+  }
+  const files: AssetFile[] = [file]
+
+  // ── 封面：`.skp` 有内嵌预览就立刻用（本地可用），其它格式先占位 ──
+  // 知末那张主图由批次结束后的既有任务补（`fetchZhimoCover`），这条路径不联网。
+  let cover: string | undefined
+  let coverSource: CoverSource = 'placeholder'
+  if (ext === 'skp') {
+    const previewRel = await writeSkpPreviewInto(destFile, target, itemName)
+    if (previewRel) {
+      cover = previewRel
+      coverSource = 'embedded'
+      // 预览图是真实文件 → 必须进 files，否则 rescan 的 walkFiles 视图里没有它，
+      // 重扫后 `cover` 会指向一个 files 里不存在的文件（与压包路径同一条纪律）
+      const pst = await fs.stat(path.join(target, previewRel)).catch(() => null)
+      if (pst) {
+        files.push({
+          rel: previewRel,
+          name: path.basename(previewRel),
+          ext: previewRel.slice(previewRel.lastIndexOf('.') + 1),
+          size: pst.size,
+          kind: 'texture'
+        })
+      }
+    }
+  }
+
+  // P0-9 缩略图（注入，失败只降级不阻断）
+  let thumbPath: string | undefined
+  let thumbStatus: ThumbStatus = 'none'
+  if (deps.ensureThumb && cover) {
+    try {
+      const cached = await deps.ensureThumb(id, path.join(target, cover))
+      if (cached) {
+        thumbPath = cached
+        thumbStatus = 'ready'
+      }
+    } catch {
+      thumbStatus = 'failed'
+    }
+  }
+
+  const now = Date.now()
+  const fresh: Asset = {
+    id,
+    name: finalName,
+    kind,
+    source: deps.defaultSource,
+    folder: target,
+    relFolder,
+    cover,
+    coverSource,
+    thumbPath,
+    thumbStatus,
+    files,
+    size: Number(st.size),
+    suVersion: undefined,
+    suMajor: undefined,
+    mojibake: false,
+    category1: cat1Seg,
+    category2: cat2Seg,
+    styles: [],
+    materialMeta: undefined,
+    tags: [],
+    note: '',
+    favorite: false,
+    rating: 0,
+    colorTag: null,
+    zhimoId,
+    dedupeKey: dedupeKeyOf(assetName, kind),
+    importedAt: now,
+    updatedAt: now
+  }
+
+  const asset = placement.inheritFrom ? applyOverwriteInherit(fresh, placement.inheritFrom) : fresh
 
   const message = doneMessage(decision, placement.replace)
   const conflict = decision

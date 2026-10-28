@@ -455,7 +455,10 @@ describe('源码守卫：dedupeKey 的写入点', () => {
     )
     expect(src).not.toContain('dedupeKeyOf(finalName')
     const hits = src.match(/dedupeKey: dedupeKeyOf\(assetName, kind\)/g) ?? []
-    expect(hits.length).toBe(2)
+    // 0.8.4 起多一条「单文件模型直导」（importModelOne），所以 2 → 3 处：
+    // 压缩包 / 单图 / 单文件模型。这条计数的意义是"新增写入点必须回来确认用的是
+    // `assetName` 而不是 `finalName`"，不是把 2 当成永久契约。
+    expect(hits.length).toBe(3)
   })
 
   it('rescan 用 baseNameOf 剥自动序号后再算 key', async () => {
