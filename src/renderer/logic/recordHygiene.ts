@@ -299,17 +299,24 @@ function thumbNameOf(thumbPath: string): string {
  */
 export function planThumbPresenceRepair(
   assets: Asset[],
-  diskThumbNames: string[]
+  /**
+   * 盘上缩略图文件名清单。**`null` = 列不出来**（IPC 失败），与 `[]`（真的一个都没有）语义不同：
+   * - `null` → 不知道盘上有什么，一张都不动（防"一次读盘失败把全库标成缺图"）；
+   * - `[]`   → 这是一条**合法事实**：重装 / 换 userData 后 thumbs 缓存目录就是空的
+   *            （2026-10-28 真机实测：清空 thumbs 后 4 张卡片全变图标、30 秒不恢复，
+   *             根因就是旧实现把空名单也当成"读盘失败"直接跳过 → 记录永远停在
+   *             `ready`，而补齐队列只接 `thumbStatus !== 'ready'` 的活）。
+   */
+  diskThumbNames: string[] | null
 ): ThumbPresenceRepair[] {
   if (!Array.isArray(assets) || assets.length === 0) return []
-  if (!Array.isArray(diskThumbNames) || diskThumbNames.length === 0) return []
+  // 列不出来 ≠ 盘上没有：只有"明确知道是空的"才允许把记录标成缺图
+  if (diskThumbNames === null || !Array.isArray(diskThumbNames)) return []
 
   const present = new Set<string>()
   for (const n of diskThumbNames) {
     if (typeof n === 'string' && n.trim() !== '') present.add(n)
   }
-  // 全是空白串 = 等价于空名单（同上：不动作）
-  if (present.size === 0) return []
 
   const plan: ThumbPresenceRepair[] = []
   for (const a of assets) {

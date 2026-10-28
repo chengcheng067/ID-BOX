@@ -178,8 +178,13 @@ export function planThumbRescue(
     if (!list || list.length === 0) continue
 
     // ② 显式偏好（静态表点名）：优先于 mtime，也是下面两道门的唯一例外
+    //
+    // ⚠️ 但"已经挂着的就是偏好那张、且已是 ready"必须早退（0.8.3 真机 + 单测一起抓到）：
+    // 否则健康库里每张带偏好条目的资产每次启动都会重写一遍同样的值 + 写一份快照，
+    // 违背本模块"正常库每次启动零成本"的纪律。
     const preferredName = prefer[id]
     if (preferredName) {
+      if (asset.thumbPath === preferredName && asset.thumbStatus === 'ready') continue
       const hit = list.find((f) => f.name === preferredName)
       if (hit) {
         seen.add(id)

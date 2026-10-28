@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-007AFF)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F)
 ![Version](https://img.shields.io/badge/version-0.8.3-4B5563)
-![Tests](https://img.shields.io/badge/tests-3081%20passed-30A46C)
+![Tests](https://img.shields.io/badge/tests-3085%20passed-30A46C)
 ![Status](https://img.shields.io/badge/status-Preview-7A5AF8)
 
 </div>
@@ -124,7 +124,7 @@
 | 本地库 | Dexie（IndexedDB） |
 | 3D | three.js（材质球、HDR 环境光、PMREM） |
 | 构建 | electron-vite + electron-builder |
-| 测试 | Vitest（纯逻辑层 + 源码守卫，**3081 条**；带真机 7-Zip 为 3085 条） |
+| 测试 | Vitest（纯逻辑层 + 源码守卫，**3085 条**；带真机 7-Zip 为 3089 条） |
 
 设计原则：**本地优先**。素材、缩略图、索引全在本机，删除软件不删你的文件。
 
@@ -139,7 +139,7 @@ npm install
 
 npm run dev       # 开发（HMR）
 npm run build     # 编译到 out/
-npm run test      # 3081 条测试
+npm run test      # 3085 条测试
 npm run typecheck:node && npm run typecheck:web
 ```
 

@@ -341,11 +341,18 @@ describe('planThumbPresenceRepair', () => {
     expect(planThumbPresenceRepair([none, failed], disk)).toEqual([])
   })
 
-  it('空名单 → 全部不命中（一次读盘失败绝不能把全库标成缺图）', () => {
+  it('清单为 null（读盘失败）→ 全部不命中（一次失败绝不能把全库标成缺图）', () => {
     const ready = asset({ id: 'a', thumbStatus: 'ready', thumbPath: 'missing.jpg' })
-    expect(planThumbPresenceRepair([ready], [])).toEqual([])
-    // 全是空白串等价于空名单
-    expect(planThumbPresenceRepair([ready], ['  ', ''])).toEqual([])
+    expect(planThumbPresenceRepair([ready], null)).toEqual([])
+  })
+
+  it('清单是**真空**（重装后 thumbs 目录为空）→ 全部命中，交给补齐队列重生', () => {
+    // 2026-10-28 真机实测的根因：旧实现把 `[]` 也当成读盘失败直接跳过，
+    // 于是重装（thumbs 缓存被清）后记录永远停在 ready，卡片一直只有图标。
+    const ready = asset({ id: 'a', thumbStatus: 'ready', thumbPath: 'missing.jpg' })
+    expect(planThumbPresenceRepair([ready], [])).toEqual([{ id: 'a' }])
+    // 全是空白串同样是"没有有效文件"
+    expect(planThumbPresenceRepair([ready], ['  ', ''])).toEqual([{ id: 'a' }])
   })
 
   it('软删记录不处理（其缩略图归回收站流程管）', () => {
@@ -662,7 +669,7 @@ describe('store.init —— 重复记录清理与缩略图存在性修复的接�
     expect(useVault.getState().notice).toBeNull()
   })
 
-  it('listThumbs 返回空（读盘失败/无缓存）→ 一条都不改（绝不全库标缺图）', async () => {
+  it('listThumbs 抛错（列不出来）→ 一条都不改（绝不全库标缺图）', async () => {
     const maybeFine = asset({
       id: 'fine-1',
       files: [],
@@ -671,11 +678,30 @@ describe('store.init —— 重复记录清理与缩略图存在性修复的接�
       thumbPath: 'fine-1-deadbeef.jpg'
     })
     rows = [maybeFine]
-    modvault.listThumbs.mockResolvedValue([])
+    modvault.listThumbs.mockRejectedValue(new Error('ipc down'))
 
     await useVault.getState().init()
 
     expect(rows[0]!.thumbStatus).toBe('ready')
     expect(rows[0]!.thumbPath).toBe('fine-1-deadbeef.jpg')
+  })
+
+  it('listThumbs 返回空数组（重装后 thumbs 缓存清空）→ 置 none 交给补齐队列', async () => {
+    // 0.8.3 真机实测：清空 userData/thumbs 后 4 张卡片全变图标、30 秒不恢复。
+    // 旧实现把空名单当成读盘失败跳过 → 记录永远停在 ready，队列不接。
+    const lost = asset({
+      id: 'lost-1',
+      files: [],
+      cover: 'a.jpg',
+      thumbStatus: 'ready',
+      thumbPath: 'lost-1-deadbeef.jpg'
+    })
+    rows = [lost]
+    modvault.listThumbs.mockResolvedValue([])
+
+    await useVault.getState().init()
+
+    expect(rows[0]!.thumbStatus).toBe('none')
+    expect(rows[0]!.thumbPath).toBeUndefined()
   })
 })

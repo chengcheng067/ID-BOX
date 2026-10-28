@@ -327,6 +327,20 @@ const thumbAttempted = new Set<string>()
 const ENSURE_THUMB_BATCH = 120
 
 /**
+ * 补齐队列最多连续跑几轮（0.8.3，用户 2026-10-28 追问「重装后扫描预览图」时发现）。
+ *
+ * 病根：`ENSURE_THUMB_BATCH` 只是**单轮**上限，但 0.8.3 之前跑完一轮就收工、没有接力。
+ * 重装 / 首次扫描后一次可能缺几百张缩略图（`thumbStatus` 全被重置成 none），
+ * 于是第 121 张之后就一直停在图标占位，用户看到的是"预览图只补了一部分"——
+ * 表现和"没修好"一模一样。
+ *
+ * 为什么不会死循环：每张进过队列的 id 都写进 `thumbAttempted`（成功的写 ready 后
+ * 不再进候选，失败的本会话不再重试），所以候选集**单调收缩**；再加一条"本轮一张都
+ * 没补上就收手"，以及 20 轮（= 2400 张）的硬上限兜住病态数据。
+ */
+const ENSURE_THUMB_MAX_ROUNDS = 20
+
+/**
  * `init()` 的重入闸门（模块级，与 `conflictUnsubscribers` 同一种守卫）。
  *
  * 用户 2026-10-26 点名：「init() 一次加载跑两次」。真实来源是 React 18 StrictMode
@@ -1921,12 +1935,13 @@ async function cleanupDuplicateRecords(assets: Asset[]): Promise<Asset[]> {
 async function repairThumbPresence(): Promise<void> {
   try {
     const assets = useVault.getState().assets
-    // 必须 catch：`listThumbs` 失败返回空数组，而空名单本身会被 plan 整体跳过
-    const files = await window.modvault.listThumbs().catch(() => [])
-    const plan = planThumbPresenceRepair(
-      assets,
-      files.map((f) => f.name)
+    // ⚠️ 失败必须传 **null**，不能传空数组：`[]` 现在是一条合法事实（重装后 thumbs 目录就是空的），
+    // 把"列不出来"也传成 `[]` 会让重装后整库缩略图被标成缺图 —— 反过来传 null 才是安全的那一侧。
+    const files = await window.modvault.listThumbs().then(
+      (r) => r,
+      () => null
     )
+    const plan = planThumbPresenceRepair(assets, files === null ? null : files.map((f) => f.name))
     if (plan.length === 0) return
 
     for (const item of plan) {
@@ -5540,7 +5555,26 @@ export async function repairStaleBallThumbs(): Promise<number> {
  * 运行时调用路径不变（init / rescan 仍是 `void ensureMissingThumbs()`）。
  */
 export async function ensureMissingThumbs(): Promise<void> {
+  // 一轮只处理 120 条（防打爆 IPC），但**跑完要接力**：直到没有候选或本轮零进展。
+  // 见 `ENSURE_THUMB_MAX_ROUNDS` 的注释（重装后几百张缺图不该只补前 120 张）。
+  for (let round = 0; round < ENSURE_THUMB_MAX_ROUNDS; round += 1) {
+    const fixed = await runThumbBatch()
+    if (fixed === 0) return
+    // 让出主线程再跑下一轮：一轮 120 张的解码已经够久，别把首屏交互堵住
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 16)
+    })
+  }
+}
+
+/**
+ * 补齐队列的**一轮**：返回本轮真正写成 `ready` 的条数（0 = 没有候选 / 全失败）。
+ *
+ * 拆出来只为让 `ensureMissingThumbs` 能判断"要不要接力"，判据不重复写两遍。
+ */
+async function runThumbBatch(): Promise<number> {
   const store = useVault
+  let fixed = 0
   const candidates = store
     .getState()
     .assets.filter(
@@ -5572,5 +5606,7 @@ export async function ensureMissingThumbs(): Promise<void> {
     }
     void db.assets.put(updated)
     store.setState({ assets: state.assets.map((x) => (x.id === a.id ? updated : x)) })
+    if (updated.thumbStatus === 'ready') fixed += 1
   }
+  return fixed
 }

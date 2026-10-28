@@ -316,7 +316,10 @@ describe('init · 救援接线', () => {
         renderParams: { roughness: 1, bump: 1, uv: 3.1, light: 1, metal: 0, alpha: 1 }
       })
     ]
-    modvault.listThumbs.mockImplementation(async () => [])
+    // ⚠️ 0.8.3 语义变更：`[]` 不再表示"读盘失败"，而是"thumbs 缓存真的空了"——
+    // 那会让存在性修复把这条 ready 记录置成 none（重装场景的正确行为）。
+    // 本用例要测的是"健康库零写入"，所以盘上必须**真有**这张缩略图。
+    modvault.listThumbs.mockImplementation(async () => [{ name: GOOD, size: 4096, mtimeMs: 9000 }])
 
     await useVault.getState().init()
 

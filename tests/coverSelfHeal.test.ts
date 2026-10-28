@@ -228,7 +228,11 @@ const modvault = {
   ensureThumb: vi.fn(),
   deleteThumb: vi.fn(),
   deleteOneThumb: vi.fn(async () => true),
-  listThumbs: vi.fn(async () => []),
+  // 盘上缩略图清单：按当前 rows 的 thumbPath 回（0.8.3 起 `[]` = "缓存真空"，
+  // 会让存在性修复把 ready 记录置 none —— 本文件的用例都假设"缩略图还在"）。
+  listThumbs: vi.fn(async () =>
+    rows.filter((r) => r.thumbPath).map((r) => ({ name: r.thumbPath as string, size: 4096, mtimeMs: 0 }))
+  ),
   probeSizes: vi.fn(),
   saveBallThumb: vi.fn(async () => null),
   fetchZhimoCover: vi.fn(),
