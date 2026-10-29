@@ -22,7 +22,7 @@
  *   用户关掉后保留包内图（`M10` 验收点）。
  */
 
-import type { Asset, AssetFile, FetchZhimoCoverResult, ZhimoCoverFailReason } from '../../shared/types'
+import type { Asset, AssetFile, AssetKind, FetchZhimoCoverResult, ZhimoCoverFailReason } from '../../shared/types'
 import { zhimoIdOf } from '../../shared/naming'
 import { isCoverAssetImage } from '../../shared/classify'
 import { isDeletedAsset } from './trashView'
@@ -46,6 +46,25 @@ export interface ZhimoCoverTarget {
   zhimoId: string
 }
 
+/**
+ * **哪些资产类型能走知末封面通道**（唯一口径，2026-10 增 `cad`）。
+ *
+ * - `model`：知末 SU 模型页（`su.znzmo.com/sumoxing/{ID}.html`）；
+ * - `cad`：知末 CAD 页走**同一个 URL 模板** —— `sumoxing/{ID}.html` 对 CAD ID
+ *   直接 301 到 `sgt.znzmo.com/sgt/{ID}.html`，`__NEXT_DATA__` 的字段名与模型页
+ *   完全同构（`listImageUrl` = 400×300 无水印，可直接当封面）。抓取核心在
+ *   `main/zhimoCover.ts`，**一行都不用改**（sgt 频道已被覆盖）。
+ * - `texture` / `material` / `hdri` / `other`：不做 —— 材质/贴图本地就带
+ *   `.cover.jpg`（1K 级贴图本体），HDR 是全景图，其它类型没有对应页面。
+ *
+ * ⚠️ **抽成具名函数是有原因的**（本文件里原本有两处裸写的类型门槛，
+ * 加 `cad` 时差点只改一处）：三处调用点（自动入队 / 手动按钮 / 存量补抓）
+ * 必须永远同口径，否则会出现"按钮能点、后台却不抓"的半边功能。
+ */
+export function isZhimoCoverKind(kind: AssetKind): boolean {
+  return kind === 'model' || kind === 'cad'
+}
+
 export interface PickZhimoCoverOptions {
   /** `settings.zhimoCoverReplacePacked`：包内已有预览图（named/root/largest）时是否也替换 */
   replacePacked: boolean
@@ -55,8 +74,8 @@ export interface PickZhimoCoverOptions {
   limit?: number
   /**
    * 手动路径：绕过「已有 manual/zhimo 封面」与 `replacePacked` 两道过滤。
-   * ⚠️ 只跳过这两道 —— `kind === 'model'` 与「能取到 ID（`asset.zhimoId` 优先，
-   * 回退名字解析）」是硬前提，`force` 也不放宽。
+   * ⚠️ 只跳过这两道 —— `isZhimoCoverKind()`（model / cad）与「能取到 ID
+   * （`asset.zhimoId` 优先，回退名字解析）」是硬前提，`force` 也不放宽。
    */
   force?: boolean
 }
@@ -65,7 +84,8 @@ export interface PickZhimoCoverOptions {
  * 选出本次要抓的资产（**顺序 = 入参顺序**，便于"先导入先抓"）。
  *
  * 五道过滤（顺序无关，都是 AND）：
- * ① `kind === 'model'` —— 材质/贴图不做（本地 `.cover.jpg` 就是 1K 级贴图本体）；
+ * ① `isZhimoCoverKind()`（model / cad）—— 材质/贴图不做（本地 `.cover.jpg`
+ *    就是 1K 级贴图本体）；CAD 走同一个 URL 模板（见 `isZhimoCoverKind` 注释）；
  * ② 能取到知末 ID：**优先 `asset.zhimoId`**（导入时从压缩包名/资产名/包内文件名算好落库），
  *    为空再退回 `zhimoIdOf(asset.name)`；
  * ③ `coverSource ∈ {manual, zhimo}` 跳过（`force` 时跳过本道）；
@@ -87,7 +107,7 @@ export function pickZhimoCoverTargets(
   const out: ZhimoCoverTarget[] = []
   for (const asset of assets) {
     if (out.length >= limit) break
-    if (asset.kind !== 'model') continue
+    if (!isZhimoCoverKind(asset.kind)) continue
     if (wanted && !wanted.has(asset.id)) continue
 
     // 知末 ID（0.6.3）：优先用**落库时算好的** `asset.zhimoId` —— 知末有大量包只在
@@ -142,8 +162,9 @@ export function zhimoCoverIdOf(asset: Pick<Asset, 'name' | 'zhimoId'>): string |
  * 已有的一律不重抓）。五道过滤（AND）：
  *
  * ① 非软删记录 —— 回收站里的目录已进 `.trash/`，抓了也写不回原位；
- * ② `kind === 'model'` —— 知末详情页是 SU 模型页（`su.znzmo.com/sumoxing/{ID}.html`），
- *    材质/贴图没有对应页面（与自动任务 `pickZhimoCoverTargets` 同口径）；
+ * ② `isZhimoCoverKind()`（model / cad）—— 知末详情页对 CAD ID 与模型 ID 是同一套
+ *    URL 模板（301 到 `sgt.znzmo.com/sgt/{ID}.html`），材质/贴图没有对应页面
+ *    （与自动任务 `pickZhimoCoverTargets` 同口径）；
  * ③ `coverSource !== 'manual'` —— 用户亲手设的封面绝不被批量任务顶掉
  *    （manual 的 cover 文件可以不是 `.cover.` 命名，④ 判不出来，必须单独挡）；
  * ④ 根层没有任何 `<x>.cover.(jpg|png)` 文件 —— 有的一律不重抓（用户裁定）；
@@ -153,7 +174,7 @@ export function zhimoCoverIdOf(asset: Pick<Asset, 'name' | 'zhimoId'>): string |
  */
 export function isZhimoCoverBackfillCandidate(asset: Asset): boolean {
   if (isDeletedAsset(asset)) return false
-  if (asset.kind !== 'model') return false
+  if (!isZhimoCoverKind(asset.kind)) return false
   if (asset.coverSource === 'manual') return false
   if (hasCoverAssetFile(asset.files)) return false
   return zhimoCoverIdOf(asset) !== null

@@ -61,10 +61,12 @@ describe('IPC 三处接线：通道名一致', () => {
 describe('详情面板：按钮只对 model、无 ID 禁用、不受开关约束', () => {
   const src = readSrc('../src/renderer/components/DetailPanel.tsx')
 
-  it('引入 zhimoIdOf，并在 kind === \'model\' 时才渲染按钮', () => {
+  it('引入 zhimoIdOf，并在 isZhimoCoverKind（model / cad）时才渲染按钮', () => {
     expect(src).toContain("from '../../shared/naming'")
     expect(src).toContain('zhimoIdOf(asset.name)')
-    expect(src).toContain("asset.kind === 'model'")
+    // 2026-10：门槛从裸的 `kind === 'model'` 收进 `isZhimoCoverKind()`（CAD 也能抓）
+    expect(src).toContain('isZhimoCoverKind(asset.kind)')
+    expect(src).not.toContain("asset.kind === 'model'")
     expect(src).toContain('从知末取封面')
   })
 
@@ -258,9 +260,11 @@ describe('store：commitCover 三处共用 / rescan 保活 / 自动任务静默'
     expect(src.match(/scheduleZhimoPipeline\(\)/g)?.length ?? 0).toBeGreaterThanOrEqual(3)
   })
 
-  it('pending 只收 model + 有 ID（材质/贴图不做）', () => {
+  it('pending 只收 model / cad + 有 ID（材质/贴图不做）', () => {
     const enqueue = sliceBetween(src, 'function enqueueZhimoCover(', 'function emptyZhimoResult')
-    expect(enqueue).toContain("asset.kind !== 'model'")
+    // 2026-10 增 cad：这里曾经是第三处裸判断，必须与另外两处同走口径函数
+    expect(enqueue).toContain('isZhimoCoverKind(asset.kind)')
+    expect(enqueue).not.toContain("asset.kind !== 'model'")
     expect(enqueue).toContain('zhimoIdOf(asset.name)')
   })
 

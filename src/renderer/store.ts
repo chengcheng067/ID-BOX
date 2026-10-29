@@ -71,6 +71,7 @@ import { withAssetCoverLock } from './logic/coverLock'
 import {
   hasCoverAssetFile,
   isZhimoCoverBackfillCandidate,
+  isZhimoCoverKind,
   pickZhimoCoverTargets,
   runZhimoCoverQueue,
   zhimoCoverFailText,
@@ -527,7 +528,7 @@ let aiClassifyRunning = false
  * 必须在 `set()` 之前就能拦住重入（state 读取有微任务间隙）。
  *
  * `zhimoCoverRunning`：同一时刻只允许一个抓取流程（自动 / 手动都算）；
- * `pendingZhimoIds`：本次导入批次里**可能是目标**的资产 id（只收 model + 能取到知末 ID 的：
+ * `pendingZhimoIds`：本次导入批次里**可能是目标**的资产 id（只收 model / cad 里能取到知末 ID 的：
  * `asset.zhimoId` 优先，为空回退 `zhimoIdOf(asset.name)`）。
  * 收在模块级而不是 state：它是短暂的过程量，不需要触发渲染，也不该被组件读到。
  */
@@ -543,7 +544,10 @@ const pendingZhimoIds: string[] = []
  * 那里是"慢"，不是"丢"。
  */
 function enqueueZhimoCover(asset: Asset): void {
-  if (asset.kind !== 'model') return
+  // 与 `pickZhimoCoverTargets` / `isZhimoCoverBackfillCandidate` 同一个口径函数：
+  // 曾经这里是第三处裸的 `kind !== 'model'`，2026-10 加 `cad` 时差点漏掉 →
+  // 那样会出现"手动按钮点了能抓、导完自动任务却不抓"的静默失效。
+  if (!isZhimoCoverKind(asset.kind)) return
   // 知末 ID 口径（0.6.3）：**优先落库的 `asset.zhimoId`**，为空才回退名字解析。
   // ⚠️ 这一处曾漏改：ID 只在**压缩包名**上的资产（`现代壁灯ID_1232108421.rar`）
   // 手动按钮能点、自动任务却永远不入队 → 默认开启的「导入后自动补封面」对它们静默失效。

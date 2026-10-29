@@ -21,6 +21,7 @@ import { undoGraceHint, undoGraceSuffix } from '../logic/graceText'
 import { DEFAULT_UNDO_GRACE_MS } from '../../shared/undoGrace'
 import { EMPTY_ALIASES, aliasIndexOf, resolveAssetDisplayName } from '../logic/aliasIndex'
 import { zhimoIdOf } from '../../shared/naming'
+import { isZhimoCoverKind } from '../logic/zhimoCover'
 import { CoverPicker } from './CoverPicker'
 import { DuplicateCompareDialog } from './DuplicateCompareDialog'
 import { PurgeConfirmDialog } from './PurgeConfirmDialog'
@@ -506,12 +507,13 @@ export function DetailPanel() {
             更换封面 · 粘贴 / 拖图 / 选文件
           </button>
         )}
-        {/* docs/24 §5.4：从知末取封面（仅 model）。
+        {/* docs/24 §5.4：从知末取封面（model / cad，口径见 `isZhimoCoverKind`）。
+            CAD 与模型走同一个 URL 模板（301 到 sgt 频道），字段完全同构。
             ⚠️ **不受** zhimoCover / zhimoCoverReplacePacked 两个开关约束：
                 那两个只约束"导入后自动抓"，用户手动点就是要。
             无 ID → disabled + title 说明（不弹提示，避免一点就报错）。
             抓取中 → 文案切 loading 并禁用重复点击。 */}
-        {!deleted && asset.kind === 'model' && (
+        {!deleted && isZhimoCoverKind(asset.kind) && (
           <button
             className="mt-1.5 flex h-[28px] w-full items-center justify-center rounded-coverbar bg-sidebar text-[11px] text-secondary transition hover:bg-elevated hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-sidebar disabled:hover:text-secondary"
             disabled={!zhimoId || zhimoCoverBusy}

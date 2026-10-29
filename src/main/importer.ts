@@ -33,6 +33,7 @@ import { IMAGE_FILE_EXTS } from '../shared/imageExts'
 import { readHeadForSize } from './probeSizes'
 import { parseMaterialMetaJsonText } from './materialMeta'
 import { writeSkpPreviewInto } from './skpPreview'
+import { writeDwgPreviewInto } from './dwgPreview'
 import { humanGB } from '../shared/space'
 import {
   BatchLedger,
@@ -892,9 +893,18 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
     // ③ 都没有 → placeholder（渲染层出类型占位图标；用户可随后手动贴封面）
     let cover: string | undefined
     let coverSource: CoverSource = 'placeholder'
+    // 封面主文件：skp 优先。顺序靠 `??` 链写死 —— 两种扩展名**不要塞进同一个
+    // find 的合取条件**：skp+dwg 混合包的主类型按 `pickPrimaryFile` 的
+    // KIND_PRIORITY 判 model，封面必须跟主类型走；用合取条件的话遍历顺序一旦是
+    // dwg 在前就会抢封面。
+    // `.dwg`（CAD 封面来源 M2）：与单文件路径同一套 `<主名>.preview.png` 落盘规则。
     const skp = files.find((f) => f.ext === 'skp')
-    if (skp) {
-      const previewRel = await writeSkpPreviewInto(safeJoin(target, skp.rel), target, skp.rel)
+    const master = skp ?? files.find((f) => f.ext === 'dwg')
+    if (master) {
+      const previewRel =
+        master.ext === 'skp'
+          ? await writeSkpPreviewInto(safeJoin(target, master.rel), target, master.rel)
+          : await writeDwgPreviewInto(safeJoin(target, master.rel), target, master.rel)
       if (previewRel) {
         cover = previewRel
         coverSource = 'embedded'
@@ -1543,27 +1553,33 @@ async function importModelOne(
   }
   const files: AssetFile[] = [file]
 
-  // ── 封面：`.skp` 有内嵌预览就立刻用（本地可用），其它格式先占位 ──
+  // ── 封面：`.skp` / `.dwg` 有内嵌预览就立刻用（本地可用），其它格式先占位 ──
   // 知末那张主图由批次结束后的既有任务补（`fetchZhimoCover`），这条路径不联网。
+  //
+  // `.dwg`（CAD 封面来源 M2，2026-10）：DWG 头 `0x0D` 处的 image seeker 指向一段
+  // 缩略图记录（DIB 裸位图或 PNG），提取后**统一转 PNG** 落成 `<主名>.preview.png`。
+  // 实测命中率 78%（178 个真实样本：AC1032 全有 / AC1027 全无 / AC1018 96%），
+  // 分辨率很小（184×78 ~ 512×215）——只当"这是什么图"的占位封面，不是图纸预览。
+  // 没命中就保持 placeholder，渲染层出 CAD 图标。
   let cover: string | undefined
   let coverSource: CoverSource = 'placeholder'
-  if (ext === 'skp') {
-    const previewRel = await writeSkpPreviewInto(destFile, target, itemName)
-    if (previewRel) {
-      cover = previewRel
-      coverSource = 'embedded'
-      // 预览图是真实文件 → 必须进 files，否则 rescan 的 walkFiles 视图里没有它，
-      // 重扫后 `cover` 会指向一个 files 里不存在的文件（与压包路径同一条纪律）
-      const pst = await fs.stat(path.join(target, previewRel)).catch(() => null)
-      if (pst) {
-        files.push({
-          rel: previewRel,
-          name: path.basename(previewRel),
-          ext: previewRel.slice(previewRel.lastIndexOf('.') + 1),
-          size: pst.size,
-          kind: 'texture'
-        })
-      }
+  let previewRel: string | null = null
+  if (ext === 'skp') previewRel = await writeSkpPreviewInto(destFile, target, itemName)
+  else if (ext === 'dwg') previewRel = await writeDwgPreviewInto(destFile, target, itemName)
+  if (previewRel) {
+    cover = previewRel
+    coverSource = 'embedded'
+    // 预览图是真实文件 → 必须进 files，否则 rescan 的 walkFiles 视图里没有它，
+    // 重扫后 `cover` 会指向一个 files 里不存在的文件（与压包路径同一条纪律）
+    const pst = await fs.stat(path.join(target, previewRel)).catch(() => null)
+    if (pst) {
+      files.push({
+        rel: previewRel,
+        name: path.basename(previewRel),
+        ext: previewRel.slice(previewRel.lastIndexOf('.') + 1),
+        size: pst.size,
+        kind: 'texture'
+      })
     }
   }
 
