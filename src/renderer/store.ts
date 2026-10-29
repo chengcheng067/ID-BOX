@@ -29,11 +29,13 @@ import {
   normalizeRating,
   sanitizeFiltersForKind,
   snapshotFilters,
+  sortAssets,
   type Filters,
   type LibraryView
 } from './logic/filters'
 import { dedupeIds, pruneToVisible, selectRangeIds } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
+import { buildTriageQueue } from './logic/triageFlow'
 import { planDuplicateCleanup, planThumbPresenceRepair } from './logic/recordHygiene'
 import { planCoverSelfHeal } from './logic/coverSelfHeal'
 import { assetFileAbs } from './logic/assetPath'
@@ -1189,6 +1191,41 @@ interface VaultState {
   /** 打开 Quick Look（不在索引里的 id 静默忽略：空格可能命中刚被 rescan 丢弃的陈旧 DOM 节点） */
   openQuickLook: (id: string) => void
   closeQuickLook: () => void
+  // ── P2 未分类整理流水线（键盘驱动的串行整理）──────────────────
+  /**
+   * 整理模式是否开启；`true` 时 `App` 挂一个 `TriageOverlay`。
+   *
+   * 存**布尔**而不是"当前资产 id"：待办集的游标（当前第几张 / 跳过集）是**会话内**
+   * 状态，关掉就该丢（需求：跳过"关闭浮层后不保留状态 —— 不做持久化"）。
+   * 把它放进 store 只会让"哪些字段要跟着清理"变成一堆额外案件；浮层内部用
+   * `logic/triageFlow.ts` 的 `TriageCursor` 自己管，store 只回答"开没开"。
+   *
+   * ## 悬空问题怎么解（**与 `quickLookAssetId` 的 5 个清理站点不同的做法**）
+   *
+   * Quick Look 存的是「当前那张的 id」，所以每个会删资产的地方都得自己判一句
+   * "删的是不是它"。整理模式**不**这样：浮层每帧用 `applyFilters(assets, filters, view)`
+   * 现算待办集，再用 `reconcileTriage(cursor, queue)` 稳游标 ——
+   * - 当前那张被删 → 落到它原来的下标位置（下一张接位），用户看到的是"这张没了，下一张顶上来"；
+   * - 整个待办集空 → `currentId = null` → 浮层自己关闭并发收尾提示。
+   *
+   * 好处是不会漏站点：本批之后**任何**新的删资产路径（或归类路径、筛选变化、排序变化）
+   * 都自动被覆盖，不需要回来补第 6 个、第 7 个清理点。代价是浮层要做一次
+   * `applyFilters`（已 memo、1 万条 2.6ms），而它一屏只渲一张、每次操作才重算一次。
+   *
+   * 唯一仍要显式清理的是**切视图**（`setLibraryView` 里置 false）：那时待办集的
+   * 语义整个换了（比如进回收站），继续整理没有意义。
+   */
+  triageActive: boolean
+  /**
+   * 打开整理模式。
+   *
+   * 待办集为空时**不打开**、只给一条 notice（需求：「进入时若待办集为空，不要开浮层」）。
+   * 判据走 `logic/triageFlow.ts::buildTriageQueue`（与浮层内部同一份实现）。
+   *
+   * @returns 是否真的打开了（调用方一般不用，测试与排障用）
+   */
+  openTriage: () => boolean
+  closeTriage: () => void
   openCategoryPicker: (ids: string[]) => void
   closeCategoryPicker: () => void
   // ── 0.6.0 批量重命名（docs/22 §3.4） ────────────────────────
@@ -2371,6 +2408,7 @@ export const useVault = create<VaultState>((set, get) => ({
   folderViewAssetId: null,
   hdrPreviewAssetId: null,
   quickLookAssetId: null,
+  triageActive: false,
   dupOnly: false,
   libraryView: 'assets',
   conflictAsk: null,
@@ -2629,6 +2667,9 @@ export const useVault = create<VaultState>((set, get) => ({
         // 切视图（含进入回收站）关闭 Quick Look：浮层是"当前视图序列"上的快览，
         // 视图一换序列就变了，留着浮层会让 ←/→ 跳到另一个视图的对象上。
         quickLookAssetId: null,
+        // 整理模式同理，而且更严格：待办集就是"当前视图里双未分类的"，
+        // 视图一换待办集整个换掉，留着会让用户对着另一批资产继续按确认。
+        triageActive: false,
         dupOnly: view === 'trash' ? false : s.dupOnly
       })
     ),
@@ -3474,6 +3515,47 @@ export const useVault = create<VaultState>((set, get) => ({
   },
   // 关闭只撤浮层，**不动选中**（用户口径：退回网格时选中态要留着，第二次 Esc 才清）
   closeQuickLook: () => set({ quickLookAssetId: null }),
+
+  // ── P2 未分类整理流水线 ─────────────────────────────────────
+
+  /**
+   * 打开整理模式。
+   *
+   * 待办集口径与 `useTriageQueue()` **完全一致**：全库（只滤软删）+ 当前排序 + 双未分类。
+   * 不套 `filters` 的理由见那个函数的注释（全库口径才能和侧栏数字对上）。
+   *
+   * 两个**不做**的动作，理由写在下面：
+   * - **不改 `libraryView`**：用户可能正停在「最近删除」里点侧栏的整理按钮
+   *   （那个视图里侧栏分类树仍在）。待办集本身是全库的，与视图无关；切视图会顺手关掉
+   *   `quickLookAssetId` / `folderViewAssetId` / 清选中，用户还没开始就被清了状态。
+   * - **不改筛选**：待办集不套 filters，所以改了也没意义；而且会打乱用户正在看的视图。
+   *
+   * @returns 是否真的打开了
+   */
+  openTriage() {
+    const st = get()
+    // 已开着就别重开会话（会把跳过集清空、游标重置，用户会莫名其妙回到第一张）
+    if (st.triageActive) return true
+    const live = st.assets.filter((a) => !isDeletedAsset(a))
+    const queue = buildTriageQueue(sortAssets(live, st.filters.sort))
+    if (queue.length === 0) {
+      // 需求：「进入时若待办集为空，不要开浮层，直接给一条 notice」
+      set({ notice: '没有未分类的资产' })
+      return false
+    }
+    // 进入时把焦点落到待办集第一张：关闭后选中态要落回"最后整理的那张"（需求 7），
+    // 而最后整理的那张是从这一张开始走的 —— 先把起点选上，即使中途一张都没归类就退出，
+    // 选中态也是用户刚看到的那张（与 Quick Look 的"关浮层不清选中"同精神）。
+    set({ triageActive: true, selectedId: queue[0].id, selectedIds: [queue[0].id] })
+    return true
+  },
+
+  /**
+   * 关闭整理模式。**不动选中**（保留"最后整理的那张"，与 `closeQuickLook` 同口径）。
+   *
+   * 收尾提示由浮层自己发（它才知道本次会话结束后的真实剩余数），这里只撤标志。
+   */
+  closeTriage: () => set({ triageActive: false }),
 
   openCategoryPicker(ids) {
     if (ids.length === 0) return
@@ -5019,6 +5101,38 @@ export const useVault = create<VaultState>((set, get) => ({
     enqueueBallThumb(updated)
   }
 }))
+
+/**
+ * 整理模式的待办集（派生数据，**不是 store 状态**）。
+ *
+ * ## 口径：**全库**的双未分类资产（不是"当前筛选结果"）
+ *
+ * 需求原文是「待办集 = **当前库中** `category1 === 未分类 && category2 === 未分类`
+ * 且未软删的资产」。所以这里**不套 `filters`**（搜索词 / 大类 / 分类 / 各种 chip 都不参与）：
+ * - 用户点整理时可能正搜着 "wood" 或筛着某个大类，把待办集缩成那几条会让他误以为
+ *   "就剩这么点没分类"，整理完一退回来发现还有几百张；
+ * - 侧栏「未分类」那个数字本身也是全库口径（`Sidebar` 的 `activeAssets` 只滤软删、
+ *   不套筛选）→ 数字与待办集数量必须对得上，否则点进去就看到两个不同的数。
+ *
+ * **但顺序跟随当前排序**（需求 2「复用既有排序结果，不要自己另排」）：用 `sortAssets`
+ * 走同一份 `filters.sort`，用户在中栏头选的是"按体积"，整理模式下"下一张"也按体积走。
+ *
+ * ## 为什么每帧现算而不是进 store
+ *
+ * 待办集会随 `assets`（归类 / 删除 / rescan）与 `filters.sort` **任何一个**变化，
+ * 把结果缓存进 store 就要在每一处写"更新它"，漏一处就是悬空。现算的代价是
+ * `filter + sort`（1 万条约 3ms），而整理浮层一屏只渲一张、每次用户操作才重算一次。
+ */
+export function useTriageQueue(): Asset[] {
+  const assets = useVault((s) => s.assets)
+  const sort = useVault((s) => s.filters.sort)
+  return useMemo(() => {
+    // 软删过滤走 `isDeletedAsset`（与 `activeAssets` / `applyFilters` 同一个判据来源，
+    // 不在这里另写 `deletedAt` 判断）
+    const live = assets.filter((a) => !isDeletedAsset(a))
+    return buildTriageQueue(sortAssets(live, sort))
+  }, [assets, sort])
+}
 
 /** 过滤 + 排序（派生数据，纯函数内核在 logic/filters.ts，可单测） */
 export function useVisibleAssets(): Asset[] {

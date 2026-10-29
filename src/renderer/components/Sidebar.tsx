@@ -161,6 +161,8 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   // ── 反馈 6d：拖拽归类（拖卡片上的「归类抓手」→ 松手在分类节点上） ──
   const assignCategoryWithUndo = useVault((s) => s.assignCategoryWithUndo)
   const setNotice = useVault((s) => s.setNotice)
+  /** P2 整理流水线入口（待办集为空时自己给 notice、不开浮层） */
+  const openTriage = useVault((s) => s.openTriage)
   /** 当前高亮的投放节点 key（`l1:<大类>:<一级>` / `l2:<大类>:<一级>/<二级>`）；null = 无 */
   const [dropKey, setDropKey] = useState<string | null>(null)
 
@@ -490,8 +492,17 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                   const l1Key = `l1:${node}:${n.value}`
                   return (
                     <div key={n.value}>
+                      {/* 一级节点行：主按钮 + （未分类时的）整理入口。
+                          ⚠️ 整理按钮**不能**塞进主按钮内部 —— `<button>` 里套 `<button>`
+                          是非法 HTML（浏览器会把它提出去，点击区域错乱）。
+                          所以这一行是 `relative` 容器 + 主按钮 + 绝对定位的小按钮，
+                          主按钮右侧额外留出 `pr-9` 给整理按钮腾位。 */}
+                      <div className="group relative">
                       <button
-                        className={itemCls(l1Active, 'accent', dropKey === l1Key)}
+                        className={`${itemCls(l1Active, 'accent', dropKey === l1Key)}${
+                          // 未分类行有整理按钮 → 数字前面多留一点，避免被按钮压住
+                          n.value === UNCLASSIFIED && n.count > 0 ? ' pr-9' : ''
+                        }`}
                         {...dropProps(l1Key, node, n.value)}
                         onClick={() => {
                           // 一级分类：退出文件视图 → 退出回收站 → 筛选到「大类 + 一级」，再点同一节点折叠
@@ -512,6 +523,25 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                         </span>
                         <span className={countCls}>{n.count}</span>
                       </button>
+                      {/* 「整理」入口（P2）：只在**未分类且有资产**时出现（需求 1）。
+                          常显而不是 hover 才现 —— 它是这一行的**主行动**，用户找不到入口
+                          这功能就等于不存在；hover 才现只适合次要操作。
+                          走 `openTriage()` —— 待办集为空时它自己给 notice 且不开浮层。 */}
+                      {n.value === UNCLASSIFIED && n.count > 0 && (
+                        <button
+                          type="button"
+                          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-[6px] border border-line bg-card px-1.5 py-[2px] text-[10px] text-secondary transition hover:border-accent/50 hover:bg-accent-tint hover:text-accent-text"
+                          title="一键整理：一屏一张，选完分类自动跳到下一张"
+                          onClick={(e) => {
+                            // 不能冒泡到主按钮（那会顺手筛选到「未分类」并折叠树）
+                            e.stopPropagation()
+                            openTriage()
+                          }}
+                        >
+                          整理
+                        </button>
+                      )}
+                      </div>
 
                       {l1Open &&
                         openL1 === n.value &&

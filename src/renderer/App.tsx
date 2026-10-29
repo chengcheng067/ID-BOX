@@ -56,6 +56,16 @@ const HdrPreviewDialogLazy = lazy(() =>
 const QuickLookOverlayLazy = lazy(() =>
   import('./components/QuickLookOverlay').then((m) => ({ default: m.QuickLookOverlay }))
 )
+
+/**
+ * 未分类整理流水线浮层（P2）：同样懒加载。
+ *
+ * 与 Quick Look 相同的一条纪律：**只在这里挂一次**。挂两个实例会有两个 Esc 层、
+ * 两个 keydown 监听，一次确认会归类两次。
+ */
+const TriageOverlayLazy = lazy(() =>
+  import('./components/TriageOverlay').then((m) => ({ default: m.TriageOverlay }))
+)
 import { formatBytes } from '../shared/format'
 import { resolveTheme } from '../shared/theme'
 import { displayName } from '../shared/naming'
@@ -709,6 +719,15 @@ export default function App() {
   const quickLookAsset = quickLookAssetId
     ? (allAssets.find((a) => a.id === quickLookAssetId) ?? null)
     : null
+
+  /**
+   * 整理流水线（P2）：只读一个布尔。
+   *
+   * 这里**不做**"当前资产还在不在"的兜底 —— 那个判断在浮层内部（`useTriageQueue`
+   * + `reconcileTriage`）：待办集每帧现算，当前项没了就接位，整集空了就自己关闭。
+   * 在 App 里再判一次会变成第二套真相，而且 App 不知道"跳过集"，判不准。
+   */
+  const triageActive = useVault((s) => s.triageActive)
 
   // A 线 T-03：舞台单例（球从卡片飞进顶栏）。状态机在 logic/ballStage.ts，这里只做订阅。
   const stageState = useSyncExternalStore(
@@ -1655,6 +1674,14 @@ export default function App() {
       {quickLookAsset && (
         <Suspense fallback={null}>
           <QuickLookOverlayLazy asset={quickLookAsset} onClose={closeQuickLook} />
+        </Suspense>
+      )}
+      {/* P2 未分类整理流水线：键盘驱动的串行整理（一屏一张 / 确认即归类并前进）。
+          与 Quick Look 一样只挂一个实例 —— 两个实例会有两个 Esc 层和两个 keydown，
+          一次 Enter 会归类两次。 */}
+      {triageActive && (
+        <Suspense fallback={null}>
+          <TriageOverlayLazy />
         </Suspense>
       )}
       {/* 规范 §3.5：底部合并 toast（左=轻提示 / 右=删除撤销条），替代原 NoticeToast+UndoToast 两个浮窗 */}
