@@ -169,6 +169,34 @@ function metaOf(classifyBaseName: string | null): FetchZhimoMetaResult {
   return { ok: true, classifyBaseName, style: null, version: null, title: null }
 }
 
+/**
+ * 带**面包屑**的 meta（`docs/35` T-10 之后的搬目录前提）。
+ *
+ * 为什么要单独一个 helper：T1 改成三源交叉验证后，「搬目录」的门槛是
+ * `confidence === 'high'`，而 `high` 必须 S1（标题语义）与 S2（面包屑）**两边都有值且一致**。
+ * 只有 `classifyBaseName` 的 meta（`metaOf('沙发')`）在新通道里是 `none`/`medium-s2`，
+ * **一个字节都不会搬** —— 那些用例本来验的是"搬目录的机械流程"（分组/备份/取消），
+ * 用这个 helper 把前置条件补足即可，断言本身不用改。
+ */
+function metaWithCrumb(level1: string, level2: string, classifyBaseName: string | null = null): FetchZhimoMetaResult {
+  return {
+    ok: true,
+    classifyBaseName,
+    style: null,
+    version: null,
+    title: null,
+    breadcrumb: [
+      { termId: 1, name: level1, href: 'f1', level: 1 },
+      { termId: 2, name: level2, href: 'f1s2', level: 2 }
+    ]
+  }
+}
+
+/** `家具/沙发` 的 meta（S1 对「北欧布艺三人沙发」判的正是这一对） */
+const metaSofa = (): FetchZhimoMetaResult => metaWithCrumb('家具', '沙发', '沙发')
+/** `灯具/吊灯` 的 meta（S1 对「现代简约吊灯」判的正是这一对） */
+const metaLamp = (): FetchZhimoMetaResult => metaWithCrumb('灯具', '吊灯', '吊灯')
+
 const settingsOf = (patch: Partial<Settings> = {}): Settings => ({ ...DEFAULT_SETTINGS, ...patch })
 
 /**
@@ -473,7 +501,12 @@ describe('runZhimoReclassQueue：节流与计数口径', () => {
       unmapped: 0,
       noStation: 0,
       failed: 0,
-      stopped: true
+      stopped: true,
+      // T-10（docs/35）新增的三个桶：老通道恒 0，但形状必须补齐
+      conflicts: 0,
+      unverified: 0,
+      marked: 0,
+      reviews: []
     })
     expect(fetchMeta).not.toHaveBeenCalled()
   })
@@ -509,15 +542,11 @@ function stubMeta(map: Record<string, FetchZhimoMetaResult>): void {
 
 describe('runZhimoCategoryReclass — 候选 / 分组 / 落库', () => {
   it('两个分类对 → store 层 assignCategory 调两次，参数与 ids 正确', async () => {
-    const a = fixture({ zhimoId: '1001' })
-    const b = fixture({ zhimoId: '1002' })
-    const c = fixture({ zhimoId: '1003' })
+    const a = fixture({ name: '北欧布艺三人沙发-1', zhimoId: '1001' })
+    const b = fixture({ name: '北欧布艺三人沙发-2', zhimoId: '1002' })
+    const c = fixture({ name: '现代简约吊灯', zhimoId: '1003' })
     useVault.setState({ assets: [a, b, c] })
-    stubMeta({
-      '1001': metaOf('沙发'),
-      '1002': metaOf('沙发'),
-      '1003': metaOf('吊灯')
-    })
+    stubMeta({ '1001': metaSofa(), '1002': metaSofa(), '1003': metaLamp() })
 
     const summary = await useVault.getState().runZhimoCategoryReclass({
       manual: true,
@@ -531,8 +560,11 @@ describe('runZhimoCategoryReclass — 候选 / 分组 / 落库', () => {
     const byPair = new Map(calls.map(([ids, c1, c2]) => [`${c1}/${c2}`, [...ids].sort()]))
     expect(byPair.get('家具/沙发')).toEqual([a.id, b.id].sort())
     expect(byPair.get('灯具/吊灯')).toEqual([c.id])
-    // 落库条数与命中数一致
-    expect(bulkPutCalls.flat().map((x) => x.id).sort()).toEqual([a.id, b.id, c.id].sort())
+    // 落库条数与命中数一致（去重：T1 会先写回 classifyReview、再由 assignCategory 写一次，
+    // 同一条资产因此可能出现在两次 bulkPut 里 —— 断言"哪些 id 被写过"而不是"写了几次"）
+    expect([...new Set(bulkPutCalls.flat().map((x) => x.id))].sort()).toEqual(
+      [a.id, b.id, c.id].sort()
+    )
     // 内存同步：分类已改
     const inMem = new Map(useVault.getState().assets.map((x) => [x.id, x]))
     expect(inMem.get(a.id)!.category1).toBe('家具')
@@ -561,23 +593,32 @@ describe('runZhimoCategoryReclass — 候选 / 分组 / 落库', () => {
       ambiguous: 0,
       unmapped: 0,
       noStation: 0,
-      failed: 0
+      failed: 0,
+      conflicts: 0,
+      unverified: 0
     })
     expect(modvault.fetchZhimoMeta).not.toHaveBeenCalled()
     expect(fakeBackups.put).not.toHaveBeenCalled()
     expect(useVault.getState().notice).toBe('没有需要按知末分类整理的资产')
   })
 
-  it('计数分桶：命中 / 站方未给 / 未映射 / 抓取失败 各归各的桶', async () => {
-    const hit = fixture({ zhimoId: '3001' })
-    const noStation = fixture({ zhimoId: '3002' })
-    const unmapped = fixture({ zhimoId: '3003' })
+  it('计数分桶：两源命中 / 单源搬 / 站方未给 / 抓取失败 各归各的桶', async () => {
+    const hit = fixture({ name: '北欧布艺三人沙发', zhimoId: '3001' })
+    // S1 双未分类 + 面包屑也没有、末级名也没有 → none（既不搬也不标记）
+    const noStation = fixture({ name: '一个语义判不出来的名字', zhimoId: '3002' })
+    // 站方给了面包屑、S1 双未分类 → medium-s2（**也搬**，2026-10-29 裁定）
+    const single = fixture({ name: '另一个语义判不出来的名字', zhimoId: '3003' })
+    // 站方给了末级名、但面包屑缺失 → unmapped（站方说了话，我们还原不出路径）
+    const unmapped = fixture({ name: '第三个语义判不出来的名字', zhimoId: '3005' })
     const broken = fixture({ zhimoId: '3004' })
-    useVault.setState({ assets: [hit, noStation, unmapped, broken] })
+    useVault.setState({ assets: [hit, noStation, single, unmapped, broken] })
     stubMeta({
-      '3001': metaOf('沙发'),
+      '3001': metaSofa(),
       '3002': metaOf(null),
-      '3003': metaOf('站方某个没抄录的分类'),
+      // 名字判不出（S1 空）+ 面包屑能映射出 家具/沙发 → 站方单方结论
+      '3003': metaWithCrumb('家具', '沙发'),
+      // 站方有末级名，但这一页没有面包屑 → 还原不出路径
+      '3005': metaOf('沙发'),
       '3004': { ok: false, reason: 'timeout' }
     })
 
@@ -587,38 +628,69 @@ describe('runZhimoCategoryReclass — 候选 / 分组 / 落库', () => {
     })
 
     expect(summary).toEqual({
-      scanned: 4,
-      moved: 1,
+      scanned: 5,
+      // high 一条 + medium-s2 一条（裁定：单源也搬）
+      moved: 2,
       approx: 0,
+      // ⚠️ **唯一允许恒 0 的桶**：`s2FromBreadcrumbGeneric` 遇到 ARR(n>1) 整条放弃（返回 null），
+      // 此时若 classifyBaseName 有值就落进 unmapped —— 交叉验证通道不产生 ambiguous
       ambiguous: 0,
+      // 站方给了末级名但面包屑缺失 → 真实存在的一类，必须计数
       unmapped: 1,
-      noStation: 1,
-      failed: 1
+      // 站方完全没给（既无面包屑也无末级名）
+      noStation: 0,
+      failed: 1,
+      conflicts: 0,
+      unverified: 1
     })
   })
 
-  it('approx 是 moved 的子集且单独计数（茶具 → 软装陈设/摆件）', async () => {
-    const approx = fixture({ zhimoId: '4001' })
-    const exact = fixture({ zhimoId: '4002' })
-    useVault.setState({ assets: [approx, exact] })
-    stubMeta({ '4001': metaOf('茶具'), '4002': metaOf('沙发') })
+  it('approx 有真实来源（S2 解析透传映射表的近似归并），且恒 ≤ moved', async () => {
+    // `茶具` 在映射表里是 `approx: true` 的归并条目（站方父链 厨卫五金>厨房用品>茶具，
+    // 本地无对应二级 → 归 软装陈设/摆件）。**必须用三级面包屑**，两级的话最深那条
+    // `摆件` 会先精确命中，走不到 `茶具` 这条近似条目。
+    const tea = fixture({ name: '茶具', zhimoId: '4001' })
+    const exact = fixture({ name: '北欧布艺三人沙发', zhimoId: '4002' })
+    useVault.setState({ assets: [tea, exact] })
+    stubMeta({
+      '4001': {
+        ok: true,
+        classifyBaseName: '茶具',
+        style: null,
+        version: null,
+        title: null,
+        breadcrumb: [
+          { termId: 1, name: '厨卫五金', href: 'f1', level: 1 },
+          { termId: 2, name: '厨房用品', href: 'f1s2', level: 2 },
+          { termId: 3, name: '茶具', href: 'f1s2s3', level: 3 }
+        ]
+      },
+      '4002': metaSofa()
+    })
 
     const summary = await useVault.getState().runZhimoCategoryReclass({
       manual: true,
       sleep: async () => {}
     })
 
+    // 两条都搬了：沙发是 high 两源互证、茶具是 medium-s2 单源
     expect(summary.moved).toBe(2)
-    expect(summary.approx).toBe(1)
+    expect(summary.unverified).toBe(1)
+    // 不变式（不写死数值）：两者都必须是 moved 的子集
     expect(summary.approx).toBeLessThanOrEqual(summary.moved)
-    // 日志里必须出现 approx（"有多少条是猜的"的唯一锚点）
+    expect(summary.unverified).toBeLessThanOrEqual(summary.moved)
+    // 茶具那条命中近似归并 → approx ≥ 1
+    expect(summary.approx).toBeGreaterThanOrEqual(1)
+    // 日志里三个数字都必须出现（唯一锚点）
     const log = modvault.reportLog.mock.calls.at(-1)?.[0] as {
       message: string
       context: Record<string, unknown>
     }
     expect(log.message).toBe('zhimo:reclass')
-    expect(log.context.approx).toBe(1)
-    expect(String(log.context.text)).toContain('近似归并 1')
+    expect(log.context.approx).toBe(summary.approx)
+    expect(log.context.unverified).toBe(summary.unverified)
+    expect(String(log.context.text)).toContain('近似归并')
+    expect(String(log.context.text)).toContain('单源 1')
   })
 })
 
@@ -626,9 +698,9 @@ describe('runZhimoCategoryReclass — 备份（前缀隔离）', () => {
   it('写 `zhimo-reclass-` 前缀，且**不动**老通道那批 `reclass-`', async () => {
     // 老通道的一条备份（模拟「上次重跑自动分类」的凭证）
     backupStore.set('reclass-1', { id: 'reclass-1', at: 1, json: '[]' })
-    const a = fixture({ zhimoId: '5001' })
+    const a = fixture({ name: '北欧布艺三人沙发', zhimoId: '5001' })
     useVault.setState({ assets: [a] })
-    stubMeta({ '5001': metaOf('沙发') })
+    stubMeta({ '5001': metaSofa() })
 
     await useVault.getState().runZhimoCategoryReclass({ manual: true, sleep: async () => {} })
 
@@ -649,9 +721,9 @@ describe('runZhimoCategoryReclass — 备份（前缀隔离）', () => {
   })
 
   it('备份写入**早于**任何移动（顺序 = backup → move）', async () => {
-    const a = fixture({ zhimoId: '5002' })
+    const a = fixture({ name: '北欧布艺三人沙发', zhimoId: '5002' })
     useVault.setState({ assets: [a] })
-    stubMeta({ '5002': metaOf('沙发') })
+    stubMeta({ '5002': metaSofa() })
 
     await useVault.getState().runZhimoCategoryReclass({ manual: true, sleep: async () => {} })
 
@@ -675,15 +747,11 @@ describe('runZhimoCategoryReclass — 备份（前缀隔离）', () => {
 
 describe('runZhimoCategoryReclass — 取消语义', () => {
   it('shouldStop 变真后不再发 fetchZhimoMeta，但**已抓到的仍然落库**', async () => {
-    const a = fixture({ zhimoId: '6001' })
-    const b = fixture({ zhimoId: '6002' })
-    const c = fixture({ zhimoId: '6003' })
+    const a = fixture({ name: '北欧布艺三人沙发-1', zhimoId: '6001' })
+    const b = fixture({ name: '北欧布艺三人沙发-2', zhimoId: '6002' })
+    const c = fixture({ name: '北欧布艺三人沙发-3', zhimoId: '6003' })
     useVault.setState({ assets: [a, b, c] })
-    stubMeta({
-      '6001': metaOf('沙发'),
-      '6002': metaOf('沙发'),
-      '6003': metaOf('沙发')
-    })
+    stubMeta({ '6001': metaSofa(), '6002': metaSofa(), '6003': metaSofa() })
 
     const summary = await useVault.getState().runZhimoCategoryReclass({
       manual: true,
@@ -700,14 +768,14 @@ describe('runZhimoCategoryReclass — 取消语义', () => {
   })
 
   it('cancelZhimoCategoryReclass() 在跑动中生效：不再发新请求、已抓到的仍落库', async () => {
-    const a = fixture({ zhimoId: '6101' })
-    const b = fixture({ zhimoId: '6102' })
+    const a = fixture({ name: '北欧布艺三人沙发-1', zhimoId: '6101' })
+    const b = fixture({ name: '北欧布艺三人沙发-2', zhimoId: '6102' })
     useVault.setState({ assets: [a, b] })
     // 第一条请求进行中，用户点了取消（设置页按钮走的就是 cancelZhimoCategoryReclass）
     modvault.fetchZhimoMeta.mockImplementation(async (payload: { id: string }) => {
       order.push('meta')
       if (payload.id === '6101') useVault.getState().cancelZhimoCategoryReclass()
-      return metaOf('沙发')
+      return metaSofa()
     })
 
     const summary = await useVault.getState().runZhimoCategoryReclass({
@@ -750,10 +818,10 @@ describe('runZhimoCategoryReclass — 取消语义', () => {
 
 describe('runZhimoCategoryReclass — 失败不中断', () => {
   it('某组 assignCategory 抛错 → 计 failed，其余组照常搬', async () => {
-    const a = fixture({ zhimoId: '7001' }) // 家具/沙发（会抛）
-    const b = fixture({ zhimoId: '7002' }) // 灯具/吊灯（正常）
+    const a = fixture({ name: '北欧布艺三人沙发', zhimoId: '7001' }) // 家具/沙发（会抛）
+    const b = fixture({ name: '现代简约吊灯', zhimoId: '7002' }) // 灯具/吊灯（正常）
     useVault.setState({ assets: [a, b] })
-    stubMeta({ '7001': metaOf('沙发'), '7002': metaOf('吊灯') })
+    stubMeta({ '7001': metaSofa(), '7002': metaLamp() })
 
     // 只让 家具/沙发 这一组抛错（模拟单组 IPC 异常）
     useVault.setState({
@@ -774,10 +842,10 @@ describe('runZhimoCategoryReclass — 失败不中断', () => {
   })
 
   it('移动失败（assignCategory 内部计 failed）→ 汇总 failed，不影响其它组', async () => {
-    const a = fixture({ zhimoId: '7101' })
-    const b = fixture({ zhimoId: '7102' })
+    const a = fixture({ name: '北欧布艺三人沙发', zhimoId: '7101' })
+    const b = fixture({ name: '现代简约吊灯', zhimoId: '7102' })
     useVault.setState({ assets: [a, b] })
-    stubMeta({ '7101': metaOf('沙发'), '7102': metaOf('吊灯') })
+    stubMeta({ '7101': metaSofa(), '7102': metaLamp() })
     // 单资产 IPC 失败（store.assignCategory 会 catch 成 failed=1）
     modvault.assignCategory.mockImplementation(async (p: AssignCategoryPayload) => {
       order.push('move')
@@ -822,8 +890,11 @@ describe('runZhimoCategoryReclass — 开关 / 静默 / 链式触发', () => {
   })
 
   it('自动任务：字段缺省（老 settings.json）→ 按开处理', async () => {
-    useVault.setState({ assets: [fixture({ zhimoId: '8002' })], settings: settingsOf() })
-    stubMeta({ '8002': metaOf('沙发') })
+    useVault.setState({
+      assets: [fixture({ name: '北欧布艺三人沙发', zhimoId: '8002' })],
+      settings: settingsOf()
+    })
+    stubMeta({ '8002': metaSofa() })
 
     const summary = await useVault.getState().runZhimoCategoryReclass({ sleep: async () => {} })
 
@@ -832,19 +903,22 @@ describe('runZhimoCategoryReclass — 开关 / 静默 / 链式触发', () => {
   })
 
   it('自动任务不写「重排汇总」notice（静默）；手动写一条汇总', async () => {
-    useVault.setState({ assets: [fixture({ zhimoId: '8101' })] })
-    stubMeta({ '8101': metaOf('沙发') })
+    useVault.setState({ assets: [fixture({ name: '北欧布艺三人沙发-1', zhimoId: '8101' })] })
+    stubMeta({ '8101': metaSofa() })
     await useVault.getState().runZhimoCategoryReclass({ sleep: async () => {} })
     // ⚠️ `assignCategory` 自己会给每条 notice（「已移动 N 个资产到…」，与 AI 补分类同一口径）；
     // 本通道的**汇总**在自动路径必须静默 —— 判据是 notice 里没有「知末分类重排」。
     expect(useVault.getState().notice ?? '').not.toContain('知末分类重排')
 
-    useVault.setState({ assets: [fixture({ zhimoId: '8102' })], notice: null })
-    stubMeta({ '8102': metaOf('茶具') })
+    useVault.setState({ assets: [fixture({ name: '现代简约吊灯', zhimoId: '8102' })], notice: null })
+    stubMeta({ '8102': metaLamp() })
     await useVault.getState().runZhimoCategoryReclass({ manual: true, sleep: async () => {} })
     const notice = useVault.getState().notice ?? ''
     expect(notice).toContain('知末分类重排（手动）')
-    expect(notice).toContain('近似归并 1')
+    expect(notice).toContain('移动 1')
+    // 存疑 / 单源两个新桶必须出现在汇总文案里（哪怕为 0）
+    expect(notice).toContain('存疑 0')
+    expect(notice).toContain('单源 0')
   })
 
   it('import:batchDone → **先重排（meta）后封面（cover）**，串行打同一个站', async () => {
@@ -886,13 +960,36 @@ describe('zhimoReclassSummaryText：文案含全部桶（日志/notice 共用）
       unmapped: 2,
       noStation: 2,
       failed: 1,
+      conflicts: 3,
+      unverified: 5,
       cancelled: true,
       manual: true
     })
     expect(text).toContain('抓取 10')
     expect(text).toContain('移动 4')
     expect(text).toContain('近似归并 2')
+    // T-10 新增两个桶：存疑（conflict）/ 单源（medium-s2 搬的条数，是 moved 的子集）
+    expect(text).toContain('存疑 3')
+    expect(text).toContain('单源 5')
     expect(text).toContain('已取消')
     expect(text).toContain('手动')
+  })
+
+  it('两个新桶为 0 时也必须出现（同一句话的形态不随批次变化）', () => {
+    const text = zhimoReclassSummaryText({
+      scanned: 1,
+      moved: 1,
+      approx: 0,
+      ambiguous: 0,
+      unmapped: 0,
+      noStation: 0,
+      failed: 0,
+      conflicts: 0,
+      unverified: 0,
+      cancelled: false,
+      manual: false
+    })
+    expect(text).toContain('存疑 0')
+    expect(text).toContain('单源 0')
   })
 })

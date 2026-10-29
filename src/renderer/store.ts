@@ -83,8 +83,9 @@ import { resolveZhimoStyle } from './logic/zhimoStyle'
 import {
   ZHIMO_RECLASS_BACKUP_PREFIX,
   groupByCategoryPair,
-  isZhimoReclassCandidate,
+  isZhimoVerifyCandidate,
   parseCategoryPairKey,
+  planZhimoVerify,
   runZhimoReclassQueue,
   zhimoReclassIdOf,
   zhimoReclassSummaryText,
@@ -597,30 +598,49 @@ const EMPTY_RECLASSIFY_SUMMARY: ReclassifySummary = { moved: 0, missed: 0, faile
  * 知末「站方分类」重排的结果计数（`runZhimoCategoryReclass`）。
  *
  * 为什么有这么多桶：站方分类的失败**不是一种**。
- * - `noStation`：站方根本没给分类（`classifyBaseName === null`）→ 正常结果，不是故障；
- * - `unmapped`：站方给了，但映射表没有（本地词表缺口 / 该频道未抄录）；
- * - `ambiguous`：映射表返回候选数组（筛不出唯一）→ 按纪律不猜；
- * - `failed`：详情页请求失败 + `assignCategory` 移动失败。
- * 合成一个 "missed" 会让"站方覆盖不全"和"网络挂了"永远分不清。
+ * - `noStation`：站方根本没给分类（`ok:false` 或 `classifyBaseName` 空且无面包屑）
+ *   → 正常结果，不是故障；
+ * - `unmapped`：**站方说了话但我们还原不出路径** —— 有 `classifyBaseName`、
+ *   面包屑却缺失（实测约 20%）或映射不出来。与 `noStation` 必须分开：
+ *   合成一个会让"站方覆盖不全"和"我们的词表有缺口"永远分不清；
+ * - `ambiguous`：**恒 0（老通道语义）** —— 映射表返回候选数组（筛不出唯一）。
+ *   交叉验证通道**不产生这个桶**：`s2FromBreadcrumbGeneric` 遇到 `ARR(n>1)` 直接
+ *   整条 S2 放弃（返回 null），此时若 `classifyBaseName` 有值就落进 `unmapped`。
+ *   这是**唯一允许恒 0 的桶**，见 2026-10-29 裁定；
+ * - `failed`：详情页请求失败 + `assignCategory` 移动失败；
+ * - `conflicts`：S1 与 S2 冲突 → 进待确认队列，等用户裁定（R-05：绝不自动消歧）。
+ *   这类**不搬**；
+ * - `unverified`：**`moved` 的子集** —— 其中"站方单源（`medium-s2`）"搬了多少条。
+ *   语义与 `approx` 同角色：一个"这批里有多少条是没被第二源验证过就搬了"的锚点。
+ *
+ * ⚠️ 2026-10-29：门槛从「只搬 high」改为「**high 或 medium-s2 都搬**」，
+ * 所以 `moved` 现在包含单源搬运；`unverified` 因此从"只标记不搬的计数"
+ * 变成"单源搬的计数"。**结果弹窗的文案要等 T-14 统一改，本批先保证数字正确**
+ * （`SettingsDialog.tsx:1321` 仍按老口径展示 `approx/ambiguous/unmapped`）。
  */
 export interface ZhimoReclassSummary {
   /** 实际发出详情页请求的条数（含失败；取消时为已发出的部分） */
   scanned: number
-  /** 真实移动了目录的资产数 */
+  /** 真实移动了目录的资产数（含 `high` 两源互证 + `medium-s2` 站方单源） */
   moved: number
   /**
-   * ⚠️ `moved` 的**子集**：其中"按相近类目归并"（映射表 `approx: true`）的条数。
-   * 这是"有多少条是猜的"的唯一锚点，必须单独计数并写日志。
+   * ⚠️ `moved` 的**子集**：其中"按相近类目归并"的条数。
+   * 来源是 `S2Parsed.approx` 的透传（映射表里 `approx: true` 的条目，如 `茶具`）；
+   * CAD 通道不做近似归并，恒 0。这是"有多少条是猜的"的唯一锚点。
    */
   approx: number
-  /** 映射表返回候选数组（不猜）而跳过的条数 */
+  /** ⚠️ **恒 0**（老通道语义，交叉验证通道不产生；详见接口注释） */
   ambiguous: number
-  /** 映射表里没有该站方名而跳过的条数 */
+  /** 站方给了末级名但还原不出路径（面包屑缺失 / 映射不出来）的条数 */
   unmapped: number
-  /** 站方没给分类（正常结果）而跳过的条数 */
+  /** 站方完全没给分类（正常结果）而跳过的条数 */
   noStation: number
   /** 详情页请求失败 + 移动失败的条数 */
   failed: number
+  /** 交叉验证判为 conflict 的条数（进待确认队列，不搬目录） */
+  conflicts: number
+  /** ⚠️ `moved` 的**子集**：其中站方单源（`medium-s2`）搬的条数 */
+  unverified: number
 }
 
 const EMPTY_ZHIMO_RECLASS_SUMMARY: ZhimoReclassSummary = {
@@ -630,7 +650,9 @@ const EMPTY_ZHIMO_RECLASS_SUMMARY: ZhimoReclassSummary = {
   ambiguous: 0,
   unmapped: 0,
   noStation: 0,
-  failed: 0
+  failed: 0,
+  conflicts: 0,
+  unverified: 0
 }
 
 /**
@@ -4600,10 +4622,26 @@ export const useVault = create<VaultState>((set, get) => ({
   },
 
   /**
-   * 按**知末站方分类**重排（`未分类/未分类` → 站方分类）—— 与 `reclassifyUnclassified`
-   * 的关键差别：判定依据不是本地词表，而是**知末详情页**（只 GET 详情页、不下图片）。
+   * 按**知末站方分类**重排（`未分类/未分类` → 站方分类）。
    *
-   * 为什么必须"先全部抓完、再统一搬"（顺序不可调换）：
+   * ## ⚠️ 2026-10-29 语义变化（读这里再改代码）
+   *
+   * 本函数从「按站方**末级名单源**搬」改成「按 **S1×S2 两源交叉验证**搬」：
+   *
+   * | | 改造前 | 改造后 |
+   * |---|---|---|
+   * | 判定依据 | `classifyBaseName` + `mapZhimoCategory` 单源 | 标题语义（S1）× 面包屑（S2），末级名只做旁证 |
+   * | 会搬 | 站方给了映射得上的名字就搬 | `high`（两源互证）**或** `medium-s2`（站方单源） |
+   * | 不搬 | 映射不上 / 多候选 | `conflict`（进待确认队列）· `medium-s1` · `none` |
+   *
+   * **对已经用过这个按钮的人：N 会变小。** 因为 `conflict` 那部分（两源打架）从
+   * "按站方搬"变成"交用户裁定"，不再自动搬。对新用户没有感知差异（按钮文案仍是
+   * 「按站方分类重排」，`SettingsDialog` 的文案统一由 T-14 处理）。
+   *
+   * `medium-s2` 仍然搬的理由见 `planZhimoVerify()` 的函数头（导入链路现状本来就按
+   * 文件名匹配直接落盘，站方单源不比它差；不搬会让"自动采用"变成空话）。
+   *
+   * ## 为什么必须"先全部抓完、再统一搬"（顺序不可调换）
    * ① 备份必须在**任何移动之前**写完 —— 否则搬了一半崩了就没有还原凭证；
    * ② 抓取是慢活（站点限流），先攒命中再一次落库，备份只需写一条、日志只有一个总数；
    * ③ 取消时**已抓到的仍然落库**：用户点取消是"别再打站了"，不是"把已拿到的结果丢掉"。
@@ -4624,8 +4662,8 @@ export const useVault = create<VaultState>((set, get) => ({
       return EMPTY_ZHIMO_RECLASS_SUMMARY
     }
 
-    // ① 候选：非软删 + 双未分类 + 能取到知末 ID（判定全在纯函数里，与单测同一口径）
-    const candidates = get().assets.filter(isZhimoReclassCandidate)
+    // ① 候选：非软删 + 能取到知末 ID + 未被用户定案（判定全在纯函数里，与单测同一口径）
+    const candidates = get().assets.filter(isZhimoVerifyCandidate)
     if (candidates.length === 0) {
       if (manual) set({ notice: '没有需要按知末分类整理的资产' })
       return EMPTY_ZHIMO_RECLASS_SUMMARY
@@ -4634,7 +4672,7 @@ export const useVault = create<VaultState>((set, get) => ({
     const targets: ZhimoReclassTarget[] = []
     for (const asset of candidates) {
       const zhimoId = zhimoReclassIdOf(asset)
-      // `isZhimoReclassCandidate` 已保证非 null；这里只是类型收窄 + 防御
+      // `isZhimoVerifyCandidate` 已保证非 null；这里只是类型收窄 + 防御
       if (!zhimoId) continue
       targets.push({ id: asset.id, zhimoId, kind: asset.kind, name: asset.name })
     }
@@ -4642,6 +4680,12 @@ export const useVault = create<VaultState>((set, get) => ({
       if (manual) set({ notice: '没有需要按知末分类整理的资产' })
       return EMPTY_ZHIMO_RECLASS_SUMMARY
     }
+
+    // 判定用的**实时**查找（不是抓取开始时的快照）：抓一轮可能几分钟，
+    // 期间用户完全可能手工把某条拖到别的分类 / 删掉它。用快照判定会让门槛②
+    // （落点 ≠ 当前磁盘分类）失去意义 —— 那正是它存在的原因：**别把用户刚分的类再搬一次**。
+    const liveAssetOf = (id: string): Asset | undefined =>
+      get().assets.find((a) => a.id === id)
 
     zhimoReclassRunning = true
     set({
@@ -4656,6 +4700,14 @@ export const useVault = create<VaultState>((set, get) => ({
           window.modvault
             .fetchZhimoMeta({ id: target.zhimoId })
             .catch(() => ({ ok: false, reason: 'network' }) as FetchZhimoMetaResult),
+        // 判定走交叉验证（docs/35 §5）：S1（资产名/文件名语义）× S2（面包屑）× S3（旁证）。
+        // 取不到资产（抓取期间被删）→ 按"站方没给"跳过，绝不凭空造一个落点。
+        decide: (target, meta) => {
+          const asset = liveAssetOf(target.id)
+          // 抓取期间资产被删 / 被 rescan 换掉 → 没有可判对象，什么都不做
+          if (!asset) return { kind: 'untouched', reason: 'gone' } as const
+          return planZhimoVerify({ asset, meta, now: Date.now() })
+        },
         onProgress: (progress) => {
           set((s) => ({
             zhimoReclass: { ...s.zhimoReclass, done: progress.done, total: progress.total }
@@ -4674,6 +4726,28 @@ export const useVault = create<VaultState>((set, get) => ({
       summary.unmapped = out.unmapped
       summary.noStation = out.noStation
       summary.failed = out.failed
+      summary.conflicts = out.conflicts
+
+      // ③ 写回「不搬目录」那两种的 `classifyReview`（conflict / 落点相同）。
+      //    这批条目**完全不动磁盘**，所以先写它们、再搬目录，两条路径互不干扰。
+      //    ⚠️ 写回一律"整条记录覆盖式 bulkPut"，所以必须用**当下**的 `get().assets`
+      //    （不是抓取开始时的快照）—— 否则会把别人刚改的 field 冲掉。
+      if (out.reviews.length > 0) {
+        const byIdNow = new Map(get().assets.map((a) => [a.id, a]))
+        const pending: Asset[] = []
+        for (const item of out.reviews) {
+          const asset = byIdNow.get(item.id)
+          if (!asset) continue
+          // 用户/上一轮在此期间已定案 → 不覆盖（同门槛③，这里是最后一道闸）
+          if (typeof asset.classifyReview?.decidedAt === 'number') continue
+          pending.push({ ...asset, classifyReview: item.review, updatedAt: Date.now() })
+        }
+        if (pending.length > 0) {
+          await db.assets.bulkPut(pending)
+          const byId = new Map(pending.map((a) => [a.id, a]))
+          set((s) => ({ assets: s.assets.map((a) => byId.get(a.id) ?? a) }))
+        }
+      }
 
       if (out.hits.length > 0) {
         // 抓取期间资产可能被删 / 被 rescan 换掉 → 落库前按 id 重查（找不到计入失败）
@@ -4702,6 +4776,13 @@ export const useVault = create<VaultState>((set, get) => ({
           // ③ 备份（**早于任何移动**；前缀区分通道，见 ZHIMO_RECLASS_BACKUP_PREFIX 注释）
           await backupReclassMoves(records, ZHIMO_RECLASS_BACKUP_PREFIX)
 
+          /** 每条命中的置信度（从要落库的 `review` 反查，见下方注释） */
+          const reviewConfidenceOf = new Map(
+            kept
+              .filter((h) => h.review !== undefined)
+              .map((h) => [h.id, h.review!.confidence] as const)
+          )
+
           // ④ 按分类对分组：一次 assignCategory 只接受一个分类对
           const groups = groupByCategoryPair(
             kept.map((h) => ({ id: h.id, category1: h.category1, category2: h.category2 }))
@@ -4710,15 +4791,52 @@ export const useVault = create<VaultState>((set, get) => ({
           for (const [key, ids] of groups) {
             const pair = parseCategoryPairKey(key)
             const groupApprox = ids.reduce((n, id) => n + (approxIds.has(id) ? 1 : 0), 0)
+            /**
+             * 这一组里**站方单源**（`medium-s2`）搬的条数。
+             *
+             * 从 `hit.review.confidence` 反查（不是从判定结果另存一份）：`review` 是**要落库的
+             * 真值**，用它当唯一来源就不会出现"计数说 medium-s2、库里写的是 high"这种漂移。
+             */
+            const groupUnverified = ids.reduce(
+              (n, id) => n + (reviewConfidenceOf.get(id) === 'medium-s2' ? 1 : 0),
+              0
+            )
             try {
               const assigned = await get().assignCategory(ids, pair.category1, pair.category2)
               summary.moved += assigned.moved
               summary.failed += assigned.failed
-              // approx 必须是 moved 的**子集**：按该组真实移动数封顶（个别资产失败时不虚报）
+              // approx / unverified 都必须是 moved 的**子集**：按该组真实移动数封顶
+              // （个别资产失败时不虚报 —— 没搬成功的既不算"猜的"也不算"单源搬的"）
               summary.approx += Math.min(groupApprox, assigned.moved)
+              summary.unverified += Math.min(groupUnverified, assigned.moved)
             } catch {
               // 单组异常（不该发生：assignCategory 内部已逐条 catch）→ 计失败，继续下一组
               summary.failed += ids.length
+            }
+          }
+
+          // ⑤ 已搬的条目：写回 `classifyReview`（`decidedAt` 是"已定案"的凭据，
+          //    写早了会在移动失败时把这条永久钉死 → 必须**移动之后**、且**只对真正落到目标
+          //    分类的那些**写。没搬成功的保持原样，下一批还会再试。
+          const plannedReview = new Map(
+            kept.filter((h) => h.review !== undefined).map((h) => [h.id, h.review!])
+          )
+          if (plannedReview.size > 0) {
+            const byIdAfter = new Map(get().assets.map((a) => [a.id, a]))
+            const moved: Asset[] = []
+            for (const hit of kept) {
+              const review = plannedReview.get(hit.id)
+              if (!review) continue
+              const asset = byIdAfter.get(hit.id)
+              if (!asset) continue
+              const cur = categoriesOf(asset)
+              if (cur.category1 !== hit.category1 || cur.category2 !== hit.category2) continue
+              moved.push({ ...asset, classifyReview: review, updatedAt: Date.now() })
+            }
+            if (moved.length > 0) {
+              await db.assets.bulkPut(moved)
+              const byId2 = new Map(moved.map((a) => [a.id, a]))
+              set((s) => ({ assets: s.assets.map((a) => byId2.get(a.id) ?? a) }))
             }
           }
         }
@@ -4742,6 +4860,8 @@ export const useVault = create<VaultState>((set, get) => ({
       unmapped: summary.unmapped,
       noStation: summary.noStation,
       failed: summary.failed,
+      conflicts: summary.conflicts,
+      unverified: summary.unverified,
       cancelled,
       manual
     }
