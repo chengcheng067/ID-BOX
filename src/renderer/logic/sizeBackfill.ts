@@ -17,8 +17,8 @@
  *
  * ## 七条硬约束
  *
- * 1. **候选**只认 `jpg/jpeg/png/hdr/exr`：webp/bmp/tif/gif 我们的解析器本来就不认，
- *    放进来会每轮都失败、永久占住队列头；
+ * 1. **候选**只认 `jpg/jpeg/png/webp/tif/tiff/hdr/exr`：这几种 `imageSizeOf` /
+ *    `hdrSizeOf` 真能解析。bmp / gif 解析器不认，放进来会每轮都失败、永久占住队列头；
  * 2. **只补"分辨率有意义"的大类**：`KIND_FILTER_CAPS[kind].resolution === true`
  *    （texture / material / hdri）。model / other 的入场筛选里**没有分辨率入口**，
  *    给它们逐文件读头是纯浪费 —— 模型目录里每个都有 SKP 内嵌预览 + 多张 jpg。
@@ -41,13 +41,26 @@ import type { ProbedImageSize } from '../../shared/imageSize'
 import { KIND_FILTER_CAPS } from '../../shared/classify'
 
 /**
- * 允许回填的扩展名（**刻意收窄**，写死五条）。
+ * 允许回填的扩展名（**刻意收窄**）。
  *
- * 只收"我们的解析器真能读"的格式：`imageSizeOf` 认 PNG/JPEG，`hdrSizeOf` 认
- * Radiance/EXR。`IMAGE_FILE_EXTS` 里的 webp/bmp/tif/gif 解析器不认 —— 收进来
- * 只会让它们每轮都进候选、每次都探测失败，白白占掉 60 个名额里的位置。
+ * 只收"我们的解析器真能读"的格式：`imageSizeOf` 认 PNG/JPEG/WEBP/TIFF，`hdrSizeOf` 认
+ * Radiance/EXR。`IMAGE_FILE_EXTS` 里的 bmp/gif 解析器不认 —— 收进来只会让它们每轮都进
+ * 候选、每次都探测失败，白白占掉 60 个名额里的位置。
+ *
+ * `webp` / `tif` / `tiff` 之前在这张表外（当时解析器不认），2026-10 `imageSizeOf`
+ * 补上 WEBP（VP8/VP8L/VP8X）与 TIFF（大小端）后一并收进来，否则这两类资产的
+ * 「按分辨率筛选」仍然是恒假 —— 与 0.7.x 修的材质/HDR 失效是同一类缺陷。
  */
-export const SIZE_BACKFILL_EXTS: ReadonlySet<string> = new Set(['jpg', 'jpeg', 'png', 'hdr', 'exr'])
+export const SIZE_BACKFILL_EXTS: ReadonlySet<string> = new Set([
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'tif',
+  'tiff',
+  'hdr',
+  'exr'
+])
 
 /** 单轮最多处理的资产数（每个资产一次 IPC） */
 export const BACKFILL_MAX_ASSETS = 60

@@ -5,7 +5,7 @@ import { displayName } from '../../shared/naming'
 import { IconClose } from '../icons'
 import { useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
-import type { Asset } from '../../shared/types'
+import type { Asset, BallRenderShape } from '../../shared/types'
 import type { MaterialSlots } from '../logic/materialBall'
 import { renderActionPlan, type RenderAction } from '../logic/materialBall'
 import { stageController } from '../logic/stageController'
@@ -20,6 +20,26 @@ import type { MaterialBallApi } from './MaterialBall'
  * （拖完滑块点遮罩 → 参数丢失）。
  */
 const PARAM_PERSIST_DEBOUNCE_MS = 400
+
+/**
+ * 形态分段的展示顺序与文案（2026-10「材质球形态入口」）。
+ *
+ * ⚠️ **不要**从 `MaterialBall.tsx` import 它的 `SHAPE_LABEL`：那个模块会静态拉起
+ * three.js，而本文件刻意用 `lazy()` 延后到弹窗打开时才加载（见下面 `MaterialBall` 的
+ * 注释）。为了一个三字文案把 three 拖回主 chunk 不值得，所以这里独立一份。
+ * 真正决定"什么是合法形态"的仍是 `shared/types.ts` 的 `BallRenderShape` 与
+ * `resolveRenderShape()`，不是这张表。
+ */
+const SHAPE_OPTIONS: ReadonlyArray<{ value: BallRenderShape; label: string; title: string }> = [
+  { value: 'sphere', label: '球', title: '球面：看整体质感与光照反射（默认）' },
+  { value: 'plane', label: '平面', title: '平面：平铺贴图，看接缝与四方连续' },
+  { value: 'roundedBox', label: '圆角盒', title: '圆角盒：看棱角处的拉伸与法线表现' }
+]
+
+/** 允许切换形态的大类：只有这两类的卡片上会出现球图（与 `ballThumbTarget` 同口径） */
+function shapeSwitchableKind(kind: Asset['kind']): boolean {
+  return kind === 'texture' || kind === 'material'
+}
 
 /**
  * three.js 惰性加载：MaterialBall / renderBallToJpeg 只在弹窗真正打开时才进网络
@@ -67,6 +87,35 @@ export function CustomRenderDialog({
    */
   const [busy, setBusy] = useState<RenderAction | null>(null)
   const renderable = useMemo(() => !!slots.albedo, [slots])
+
+  /**
+   * 形态（2026-10「材质球形态入口」）。
+   *
+   * 初值读该资产已记住的形态（`resolveRenderShape`：缺省/脏值一律球面），
+   * **受控**而不是让 `MaterialBall` 自己管：切换后要立刻重渲 + 落库，两件事都发生在
+   * 本组件（组件层不写库，是既有纪律 —— 见 `MaterialBall.onShapeChange` 的注释）。
+   *
+   * 为什么改一个 prop 就能换几何体：`MaterialBall` 里 `useEffect([defaultShape])`
+   * 会 `setShape()`，而 `BallScene.setShape()` **只换 geometry、不重建 WebGL 上下文**
+   * （相机会按形态给默认机位）。所以这里不需要 `apiRef.setShape`，也不需要重挂组件。
+   */
+  const [shape, setShape] = useState<BallRenderShape>(() => resolveRenderShape(asset))
+  /** 该大类是否显示形态控件：只有 texture / material 的卡片上有球图（模型 / HDR 不显示） */
+  const showShapeSwitch = shapeSwitchableKind(asset.kind)
+
+  /**
+   * 切换形态：① 立刻换预览（setState → `defaultShape` prop → 场景只换几何体）；
+   * ② 落库 + 入队重渲。
+   *
+   * 球图缓存名含形态（`ballHash` 的 `shapeHashKey`），所以换形态 = 换期望名，
+   * `setRenderShape` 内部会把旧图登记到 `ballStaleNames` 后按「先建新、再删旧」替换
+   * —— 不需要在这里手动清任何缓存。切回球面时缓存名与历史默认**逐字符一致**，
+   * 因此那一路通常直接命中已有缓存、不重渲（这是 `shapeHashKey` 的刻意设计）。
+   */
+  const changeShape = (next: BallRenderShape): void => {
+    setShape(next)
+    void useVault.getState().setRenderShape(asset.id, next)
+  }
 
   // 防抖落库（§5.1）：滑块停下 400ms 才写库 + 入队重渲。
   // 必须在 `if (!renderable) return null` 之前声明——hook 顺序不能随分支变化。
@@ -229,8 +278,10 @@ export function CustomRenderDialog({
           './MaterialBall'
         )
         // 形态必须跟着"用户正看着的那颗球"（2026-10 缓存策略）：用户看到平面却渲出球，
-        // 封面就和预览不一致。`getShape()` 拿的是场景当前形态；API 还没就绪时回落到资产记忆值。
-        const shape = ballApiRef.current?.getShape() ?? resolveRenderShape(asset)
+        // 封面就和预览不一致。`getShape()` 拿的是场景当前形态；API 还没就绪时回落到
+        // **本组件的受控 state**（不是 `resolveRenderShape(asset)`：store 的写入是 async，
+        // 用户切完形态立刻点"设为封面"时 asset 可能还是旧值 → 封面临时渲成上一个形态）。
+        const shapeNow = ballApiRef.current?.getShape() ?? shape
         // 2026-10-23 用户拍板：**封面文件用透明 PNG**（"不需要是 JPG"）。
         // 这样 `manual` 封面 → 缩略图（`toPNG()` 保 alpha）→ 卡片透出画布色，
         // 「保存封面后出现一块方底」从根上消失，也不需要为渲图单开一个 coverSource。
@@ -240,7 +291,7 @@ export function CustomRenderDialog({
         const blob = await renderBallToPng(asset.relFolder, slots, {
           size: DEFAULT_BALL_CANVAS_WIDTH,
           params: scales,
-          shape
+          shape: shapeNow
         })
         const base64 = await blobToBase64(blob)
         if (!base64) throw new Error('离屏渲染读帧失败')
@@ -324,10 +375,15 @@ export function CustomRenderDialog({
                     showShapeSwitch={false}
                     enableParamPanel={false}
                     // 形态是球图身份的一部分（2026-10 缓存策略）：卡片上的球图按
-                    // `resolveRenderShape(asset)` 渲，弹窗这颗必须同形态，否则图文不一致。
-                    // 当前资产永远是 'sphere'（全仓没有形态 UI），这两行先让契约闭环。
-                    defaultShape={resolveRenderShape(asset)}
-                    onShapeChange={(s) => void useVault.getState().setRenderShape(asset.id, s)}
+                    // `asset.renderShape` 渲，弹窗这颗必须同形态，否则图文不一致。
+                    // 传的是本组件的受控 state（不是直接 resolveRenderShape(asset)）：
+                    // 用户切形态后 store 的写入是 async 的，直接读 asset 会滞后一帧，
+                    // 而预览必须**立刻**跟着换。
+                    defaultShape={shape}
+                    // 组件内部自己 map 的形态按钮已关掉（`showShapeSwitch={false}`），
+                    // 唯一入口是本弹窗右栏那组分段控件；这里保留回调让 MaterialBall
+                    // 未来若有内嵌入口也不会漏落库（幂等：同值写入 `setRenderShape` 直接 return）。
+                    onShapeChange={changeShape}
                     params={scales}
                     apiRef={ballApiRef}
                     className="!bg-transparent"
@@ -341,6 +397,52 @@ export function CustomRenderDialog({
           {/* 右：六个滑块（0.6.9：光线强度 / 反光强度 / 凹凸强度 / 金属度 / 透明度 / UV 大小）
               + 底部保存。滑块区可滚动：六块内容比原来的三块高，收起时不留滚动条，超出才有。 */}
           <div className="flex min-w-0 flex-1 flex-col">
+            {/* ── 形态分段控件（2026-10）────────────────────────────────
+                位置：滑块组**上方**、不在滚动区里。理由有两个：
+                ① 它是"换一颗球"的入口，比逐个拖滑块更前置、点击频率更高（先选形态、再调参）；
+                ② 滚动区里六块滑块本来就比面板高，把切换器放进去会跟着滚出视野，
+                   用户想换形态还得往回滚。
+                只对 texture / material 显示：模型 / HDR 的卡片上没有球图，
+                给它们一个"切了也没人看"的控件是纯噪音（且 setRenderShape 对它们无意义）。 */}
+            {showShapeSwitch && (
+              <div className="mb-3 shrink-0">
+                <div className="mb-1.5 text-[13px] text-secondary">形态</div>
+                {/* 与设置页 4 处分段控件同一套 class 片段（`SettingsDialog` 的
+                    `SEG_GROUP_CLASS` / `segItemClass`）：不自造尺寸与色值，
+                    两处看起来要是同一个控件。差别只有选中态用 `bg-accent-tint`
+                    （设置页用 `bg-seg-active`）—— 因为这里的选中项要表达"当前预览形态"，
+                    与左栏分类树的选中态同语义。 */}
+                <div
+                  role="group"
+                  aria-label="材质球形态"
+                  className="inline-flex items-center gap-0.5 rounded-[9px] bg-pill p-0.5"
+                >
+                  {SHAPE_OPTIONS.map((opt) => {
+                    const active = shape === opt.value
+                    return (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        title={opt.title}
+                        aria-pressed={active}
+                        className={`rounded-[7px] px-3 py-[5px] text-[12px] transition ${
+                          active
+                            ? 'bg-accent-tint font-medium text-accent-text'
+                            : 'text-secondary hover:bg-elevated/60'
+                        }`}
+                        onClick={() => changeShape(opt.value)}
+                      >
+                        {opt.label}
+                      </button>
+                    )
+                  })}
+                </div>
+                <div className="mt-1 text-[11px] text-muted">
+                  切换只换几何体，不影响参数 · 卡片球图会跟着重渲
+                </div>
+              </div>
+            )}
+
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
               <label className="block">
                 <span className="flex items-baseline justify-between text-[13px] text-secondary">

@@ -87,6 +87,14 @@ const modvault = {
   importPaths: vi.fn(async () => [])
 }
 
+/**
+ * `onSettingsChanged`（DEF-22-1）：`store.init()` 会订阅设置广播，缺了它会直接抛错。
+ * 本文件不验这条回路（`tests/settingsBroadcast.test.ts` 专门验），只补个空实现。
+ * **必须挂在 `modvault` 对象本身上**，不能用 `{...modvault}` 展开：
+ * 下面几条用例会替换 `modvault.reportLog` 之类的属性，浅拷贝不会跟随。
+ */
+;(modvault as unknown as { onSettingsChanged: () => () => void }).onSettingsChanged = () =>
+  () => undefined
 ;(globalThis as unknown as { window: { modvault: ModVaultApi } }).window = {
   modvault: modvault as unknown as ModVaultApi
 }

@@ -106,6 +106,23 @@ const api = {
   getSettings: (): Promise<Settings> => ipcRenderer.invoke(IPC.getSettings),
   setSettings: (patch: Partial<Settings>): Promise<Settings> =>
     ipcRenderer.invoke(IPC.setSettings, patch),
+  /**
+   * 订阅「设置已被改写」（DEF-22-1）。
+   *
+   * Payload 是**归一化后的完整 `Settings`**：调用方直接 `set({settings})` 即可，
+   * 不要再发 `getSettings`（广播里已经带了对象，再读一次只是多一次 IPC，
+   * 且可能读到更晚的第三次写入，反而让界面跳一下）。
+   *
+   * 返回退订函数（与 `onImportEvent` 同款）—— `store.init()` 里由模块级守卫保证
+   * 只订阅一次；React StrictMode 会把它跑两遍，组件级订阅必须能退订。
+   */
+  onSettingsChanged: (cb: (s: Settings) => void): (() => void) => {
+    const handler = (_: unknown, s: Settings) => cb(s)
+    ipcRenderer.on(IPC.settingsChanged, handler)
+    return () => {
+      ipcRenderer.off(IPC.settingsChanged, handler)
+    }
+  },
   chooseLibrary: (): Promise<Settings | null> => ipcRenderer.invoke(IPC.chooseLibrary),
   pickArchives: (): Promise<string[]> => ipcRenderer.invoke(IPC.pickArchives),
   pickWatchDir: (): Promise<string | null> => ipcRenderer.invoke(IPC.pickWatchDir),

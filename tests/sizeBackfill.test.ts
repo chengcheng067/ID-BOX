@@ -139,17 +139,19 @@ function fakeLibrary(initial: Asset[]): {
 }
 
 describe('planBackfill —— 候选判定', () => {
-  it('只挑 jpg/jpeg/png/hdr/exr 且缺 w/h 的；webp/bmp/tif/gif 不进候选', () => {
+  it('只挑解析器认得出的扩展名且缺 w/h 的；bmp/gif 不进候选', () => {
     const assets: Asset[] = [
       candidateAsset('a-jpg'),
       asset('b-jpeg', [file('x.jpeg', 'jpeg')]),
       asset('c-png', [file('x.png', 'png', { w: 1024 })]), // 只有 w → 仍缺 h
       asset('d-hdr', [file('pano.hdr', 'hdr')]),
       asset('e-exr', [file('disp.exr', 'exr')]),
-      // 以下都不该进候选
+      // 2026-10 起 webp / tif / tiff 解析器认得出，应当进候选
       asset('f-webp', [file('x.webp', 'webp')]),
-      asset('g-bmp', [file('x.bmp', 'bmp')]),
       asset('h-tif', [file('x.tif', 'tif')]),
+      asset('h2-tiff', [file('x.tiff', 'tiff')]),
+      // 以下都不该进候选（解析器不认）
+      asset('g-bmp', [file('x.bmp', 'bmp')]),
       asset('i-gif', [file('x.gif', 'gif')]),
       asset('j-complete', [file('x.jpg', 'jpg', { w: 2048, h: 2048 })]),
       asset('k-deleted', [file('x.jpg', 'jpg')], { deletedAt: 1_700_000_000_000 }),
@@ -157,13 +159,16 @@ describe('planBackfill —— 候选判定', () => {
     ]
 
     const plan = planBackfill(assets, { now: FIXED_NOW, maxAssets: 100 })
-    expect(plan.total).toBe(5)
+    expect(plan.total).toBe(8)
     expect(plan.queue.map((a) => a.id).sort()).toEqual([
       'a-jpg',
       'b-jpeg',
       'c-png',
       'd-hdr',
-      'e-exr'
+      'e-exr',
+      'f-webp',
+      'h-tif',
+      'h2-tiff'
     ])
     expect(plan.queue.some((a) => a.id === 'k-deleted')).toBe(false)
   })
@@ -186,13 +191,21 @@ describe('planBackfill —— 候选判定', () => {
     const many: AssetFile[] = []
     for (let i = 0; i < 250; i += 1) many.push(file(`t${i}.png`, 'png'))
     many.push(file('done.jpg', 'jpg', { w: 1, h: 1 }))
-    many.push(file('x.webp', 'webp'))
+    many.push(file('x.bmp', 'bmp'))
 
     const rels = missingSizeRels(asset('m', many))
     expect(rels).toHaveLength(BACKFILL_PROBE_LIMIT)
     expect(rels[0]).toBe('t0.png')
     expect(rels).not.toContain('done.jpg')
-    expect(rels).not.toContain('x.webp')
+    expect(rels).not.toContain('x.bmp')
+  })
+
+  it('webp / tif 现在也算回填候选（解析器已支持）', () => {
+    expect(isBackfillCandidate(asset('w', [file('a.webp', 'webp')]))).toBe(true)
+    expect(isBackfillCandidate(asset('t', [file('a.tif', 'tif')]))).toBe(true)
+    expect(isBackfillCandidate(asset('t2', [file('a.TIFF', 'TIFF')]))).toBe(true)
+    expect(isBackfillCandidate(asset('b', [file('a.bmp', 'bmp')]))).toBe(false)
+    expect(isBackfillCandidate(asset('g', [file('a.gif', 'gif')]))).toBe(false)
   })
 
   it('渲染层的 PROBE 上限必须与主进程 PROBE_SIZES_MAX 一致（防两处漂移）', () => {

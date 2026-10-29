@@ -323,6 +323,34 @@ function emitImportEvent(ev: ImportEvent): void {
   }
 }
 
+/**
+ * 把（已写盘的）settings 推给**所有**窗口（DEF-22-1）。
+ *
+ * 为什么遍历 `getAllWindows()` 而不是只发 `win`：`win` 是主窗口句柄，未来一旦有
+ * 第二个窗口（对比窗 / 独立预览窗）它也必须跟着换主题，而漏发只会表现为"某个窗口
+ * 主题不跟着变"，很难在测试里发现。逐窗口 try/catch：销毁中的窗口抛错不能打断
+ * 其余窗口的广播，更不能让调用方的 IPC handler 变成 reject。
+ *
+ * @param next 要广播的 settings。**显式传参而不是读模块级 `settings`**：
+ *   所有写盘路径共用这一个出口，将来加第三条写入路径时漏发只有一处可见；
+ *   而且传参能保证"发出去的正是刚写盘的那一份"，不依赖调用时序。
+ *
+ * 调用方**必须**在 `saveSettings` 成功之后调（写盘失败要抛在广播之前，
+ * 否则界面说改了、重启又变回去）。当前两个调用点：`settings:set` 与 `chooseLibrary`。
+ */
+function broadcastSettingsChanged(next: Settings): void {
+  for (const target of BrowserWindow.getAllWindows()) {
+    if (target.isDestroyed() || target.webContents.isDestroyed()) continue
+    try {
+      target.webContents.send(IPC.settingsChanged, next)
+    } catch (err) {
+      logWarn('settings:broadcast-failed', {
+        error: err instanceof Error ? err.message : String(err)
+      })
+    }
+  }
+}
+
 // ── 导入重复处置（docs/27 T-05）────────────────────────────────────────
 //
 // 两个模块级状态：
@@ -991,6 +1019,12 @@ ipcMain.handle(IPC.setSettings, async (_e, patch: Partial<Settings>) => {
     verboseLogging: settings.verboseLogging
   })
   restartWatcher()
+  // ── 广播回路（DEF-22-1）──────────────────────────────────────────────
+  // 必须在 `saveSettings` **之后**：写盘失败会抛到这里之前，渲染层保持旧值
+  // （否则界面说改了、重启又变回去）。放在 `restartWatcher` 之后是刻意的：
+  // 渲染层收到广播时主进程侧副作用已经全部就位（watcher 已按新 watchDir 重启、
+  // verboseLogging 已生效），不会出现"UI 说改了、后台还是旧配置"的窗口期。
+  broadcastSettingsChanged(settings)
   return settings
 })
 
@@ -1000,9 +1034,16 @@ ipcMain.handle(IPC.chooseLibrary, async () => {
     title: '选择模型库目录',
     buttonLabel: '设为库目录'
   })
+  // 取消 / 没选目录 → 什么都没写，绝不能广播（否则渲染层会收到一份"没变"的
+  // settings 却以为变更已发生，未来一旦广播带副作用就会变成幽灵触发）。
   if (r.canceled || !r.filePaths[0]) return null
   settings = { ...settings, libraryDir: r.filePaths[0] }
   await saveSettings(settings)
+  // ── 同一条广播出口（DEF-22-1）──────────────────────────────────────
+  // `libraryDir` 是全库路径这种最重的设置，不一致的后果比主题不切换严重得多
+  // （卡片读的是旧库、扫描写的是新库）。与 `settings:set` 共用
+  // `broadcastSettingsChanged`，不在这里再抄一遍遍历窗口的循环。
+  broadcastSettingsChanged(settings)
   return settings
 })
 

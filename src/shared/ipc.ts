@@ -8,6 +8,19 @@ export const IPC = {
   importEvent: 'import:event',
   getSettings: 'settings:get',
   setSettings: 'settings:set',
+  /**
+   * 主进程 → 渲染进程：设置已被改写（DEF-22-1，2026-10 真机取证）。
+   *
+   * 存在的理由：`settings:set` 的 handler 只写主进程内存 + 磁盘，**不通知渲染层** →
+   * 通过 `window.modvault.setSettings({theme:'dark'})` 改设置后 `settings.json` 已是 dark，
+   * 但活实例的 `document.documentElement.dataset.theme` 仍是 light，界面不变、必须重启。
+   *
+   * Payload = **归一化后的完整 `Settings`**（不是 patch）：渲染层直接 `set({settings})`，
+   * 不需要再发一次 `getSettings`（多一次 IPC 且可能读到更晚的第三次写入）。
+   *
+   * ⚠️ 只在**写盘成功后**发。写盘失败时渲染层必须保持旧值，否则"界面说改了、重启又变回去"。
+   */
+  settingsChanged: 'settings:changed',
   chooseLibrary: 'settings:chooseLibrary',
   pickArchives: 'dialog:pickArchives',
   pickWatchDir: 'dialog:pickWatchDir',

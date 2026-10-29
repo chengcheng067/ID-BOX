@@ -174,7 +174,8 @@ describe('planLibraryDrift — 计数口径', () => {
             file('贴图/a.jpg', 'jpg'), // 缺 w/h → 数
             file('贴图/b.jpg', 'jpg', { w: 1024, h: 1024 }), // 已有尺寸 → 不数
             file('贴图/c.hdr', 'hdr'), // HDR 在回填白名单里，缺尺寸 → 数
-            file('贴图/d.webp', 'webp'), // 白名单外 → 不数
+            file('贴图/d.webp', 'webp'), // 2026-10 起解析器认 webp → 缺尺寸也数
+            file('贴图/e.bmp', 'bmp'), // 解析器不认 → 不数
             file('包/a.zip', 'zip'), // 非图片 → 不数
             file('说明.txt', 'txt') // 非图片 → 不数
           ]
@@ -183,7 +184,7 @@ describe('planLibraryDrift — 计数口径', () => {
       ROOT
     )
     expect(drift.outsideCount).toBe(1)
-    expect(drift.stalledFileCount).toBe(2)
+    expect(drift.stalledFileCount).toBe(3)
   })
 
   it('库内的资产即使缺尺寸也不计入 stalledFileCount', () => {

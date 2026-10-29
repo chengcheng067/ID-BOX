@@ -215,6 +215,53 @@ export function ensureConflictAskSubscribed(): void {
 }
 
 /**
+ * 设置广播（`settings:changed`）的**幂等订阅守卫**（DEF-22-1）。
+ *
+ * 与 `conflictUnsubscribers` 同一手法，但**必须独立**一个标志：两者生命周期不同
+ * （冲突询问的订阅一旦建立就永不需要重建；设置订阅同理，但绝不能因为
+ * 「冲突那条已经订阅过了」就把设置那条也跳过）。
+ *
+ * 为什么必须幂等：`init()` 有重入闸门，但闸门只挡「同时进行中的第二次调用」，
+ * 挡不住**跑完之后再跑**（rescan 重建、单测逐条 init、未来 HMR 重挂）。
+ * 每次 init 都 `ipcRenderer.on` 一次 → 主进程推来一条设置变更会被 N 个 handler 处理 N 次
+ * （`set({settings})` 是幂等的，所以用户看不出来；但订阅数会线性泄漏，
+ * 而单测里"广播只被处理一次"这条断言会直接钉住它）。
+ */
+let settingsChangedSubscribed = false
+
+/**
+ * 仅供单测：复位设置广播订阅守卫。
+ *
+ * ## 🚫 运行时**不允许**调用 —— 这是硬约束，不是建议
+ *
+ * 复位会把标志打回 false 但**不会**退订已注册的 handler（`off` 没保存）。
+ * 于是下一次 `init()` 会再挂一个 handler → 同一条广播被处理 N 次。
+ * `set({settings})` 恰好幂等，所以用户看不出来；但订阅数会随每次误用线性泄漏，
+ * 而且是**进程内不可回收**的（handler 挂在 ipcRenderer 上，没有引用就永远摘不掉）。
+ * 单测之所以能用，是因为每条用例都在同一个模块实例里重新建一个干净的桩、且用例之间
+ * 不共享真实 IPC（见 `tests/settingsBroadcast.test.ts` 的 `beforeEach`）。
+ *
+ * TODO（将来才需要动的场景）：若真的出现「主进程热重启 / 渲染进程不重载但 IPC 桥重建」
+ * 这类需要运行时重建订阅的路径，**不能**直接调本函数 —— 必须改成
+ * `ensureSettingsChangedSubscribed()` 保存返回的 `off`、由新的 reset 先 `off()` 再清标志，
+ * 否则就是上面说的泄漏。
+ */
+export function resetSettingsBroadcastForTests(): void {
+  settingsChangedSubscribed = false
+}
+
+/** 订阅「主进程改写了设置」。幂等 —— 进程内只注册一次。 */
+function ensureSettingsChangedSubscribed(): void {
+  if (settingsChangedSubscribed) return
+  settingsChangedSubscribed = true
+  window.modvault.onSettingsChanged((next) => {
+    // 直接落 store，**不重读盘**：广播携带的就是主进程写盘后归一化的那一份。
+    // 重读一次 getSettings 只会多一次 IPC，还可能读到更晚的第三次写入 —— 界面跳一下。
+    useVault.setState({ settings: next })
+  })
+}
+
+/**
  * 底部 toast 的展示时长，与 `NoticeToast.tsx` 的 `setTimeout(..., 4500)` 一致。
  * 只有"需要排队"时才会用到这个值（见 `enqueueNotice`）。
  */
@@ -2336,6 +2383,15 @@ export const useVault = create<VaultState>((set, get) => ({
       db.assets.toArray()
     ])
     set({ settings, assets, ready: true })
+
+    // ── 设置广播订阅（DEF-22-1）────────────────────────────────────────
+    // **必须在上面那次 `set` 之后**：`getSettings()` 是 await 的，若先订阅，
+    // 「init 还没跑完、用户从主进程改了设置 → 广播写入新值」随后会被这次
+    // `set({ settings })` 用**更早的快照**盖回去，用户看到的是"改了又弹回去"。
+    // 放这里之后最坏情况是漏掉"init 完成前这几十毫秒内的那次变更"，
+    // 而那种变更主进程已落盘、下一次 init / 重启必然生效（不会出现"永久不一致"）。
+    // 幂等由模块级 `settingsChangedSubscribed` 保证（StrictMode 双跑不会重复订阅）。
+    ensureSettingsChangedSubscribed()
 
     // ── ① 索引记录卫生：同 folder 重复记录先收掉（T-PRUNE 治本档 C 的存量迁移） ──
     // 必须在救援之前：后面每一步都以"索引记录"为准，12 份必然被删的副本先出局，
@@ -4926,9 +4982,22 @@ export const useVault = create<VaultState>((set, get) => ({
    * ② 全程**不**改 `thumbStatus`（§4.3 竞态：置非 ready 会被封面缩略图分支抢走）；
    * ③ 与已存形态相同直接 return（防无意义写库 / 重渲）。
    *
-   * `'sphere'` 与 `undefined` 等价（`resolveRenderShape` 的口径），所以"切回球面"
-   * 会删掉字段值语义上的差异吗？不会：这里写的是显式 `'sphere'`，两者 hash 相同，
-   * 因此**不触发**任何重渲（`ballThumbIsFresh` 仍是 true）——这是刻意的。
+   * ## 写回口径：切回球面时写**显式 `'sphere'`**，不清字段
+   *
+   * 二选一里选了「写 `'sphere'`」而不是「写回 `undefined`/删字段」，理由：
+   * ① `Asset.renderShape` 是可选字段，选 `undefined` 需要 `delete updated.renderShape`
+   *    或重建对象去掉键 —— 而 `commitAsset` / Dexie 的 `put` 对"键不存在"与"键为 undefined"
+   *    处理不一致（Dexie 会把 `undefined` 值当成缺省，但对象上仍带这个键，
+   *    调试时 `'renderShape' in asset === true` 却读不到值，排查极易误判）；
+   * ② 显式值让库里"用户选过球面"和"从没选过"在**调试/日志/导出**里可区分，
+   *    而二者在**渲染**上必须等价 —— 这一点由 hash 保证，不靠字段值为 None 来表达。
+   *
+   * 「从非球切回球」的缓存正确性是硬要求：`shapeHashKey()` 对 `'sphere'` 与 `undefined`
+   * 都返回空串，所以 `ballHash(slots, params, 'sphere') === ballHash(slots, params)`
+   * （`tests/ballShapeEntry.test.ts` 与 `tests/ballParams.test.ts` 各有一份 golden 钉住）。
+   * 即：切回球面后期的期望名**逐字符回到历史默认那个**，不会像 plane / roundedBox
+   * 那样额外多出一份同形态缓存；`ballStaleNames` 记下的是刚离开的 plane 名，
+   * 渲染完按「先建新、再删旧」清掉 → 库里最终只留球面那一份。
    */
   async setRenderShape(assetId, shape) {
     const asset = get().assets.find((a) => a.id === assetId)

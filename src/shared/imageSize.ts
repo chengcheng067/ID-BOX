@@ -3,10 +3,14 @@
  *
  * 设计口径（docs/22 §3.1）：
  * - **只解析文件头**，绝不解码整图（大库重扫时逐张解码会直接卡死主进程）；
- * - `imageSizeOf` 只认 PNG 与 JPEG —— 它们覆盖了贴图库的绝对多数，且头部格式固定；
- *   其余格式（webp / bmp / tga / exr / gif …）一律返回 `null`。
+ * - `imageSizeOf` 按魔数依次探测 **PNG → JPEG → WEBP → TIFF**，认得出就返回；
+ *   其余格式（bmp / tga / gif …）一律返回 `null`。
  *   「未知就是未知」：调用方据此把该资产排除在 2K / 4K 档之外，
  *   而不是按扩展名猜一个体积估值（猜错会让筛选结果不可信）。
+ *   **每种探测都先验魔数再解析**，魔数不匹配就当没这个格式、继续往下探（绝不猜）。
+ * - WEBP / TIFF 是 2026-10 补的（此前 webp / tif / tiff 在 `IMAGE_FILE_EXTS` 里可导入，
+ *   但尺寸永远探测不出 → 它们的「按分辨率筛选」恒为假，与 0.7.x 修过的
+ *   「材质/HDR 分辨率失效」是同一类缺陷，只是格式没覆盖）。
  * - HDR / EXR 走**另一个**入口 `hdrSizeOf`（2026-10「HDR 分辨率筛选」新增）。
  *   它们没并进 `imageSizeOf` / `IMAGE_FILE_EXTS`：那张白名单同时是材质球的兜底取图表，
  *   收进 `exr` 会让 `Displacement.exr` 被当 albedo 贴到球上（见 `shared/hdrExts.ts` 头注）。
@@ -141,17 +145,188 @@ function jpegSize(buf: Uint8Array): ImageSize | null {
   return null
 }
 
+/** 小端读 16 位 */
+function u16le(buf: Uint8Array, at: number): number {
+  return buf[at] | (buf[at + 1] << 8)
+}
+
+/** 小端读 24 位（WEBP VP8X 的画布宽高各 3 字节） */
+function u24le(buf: Uint8Array, at: number): number {
+  return buf[at] | (buf[at + 1] << 8) | (buf[at + 2] << 16)
+}
+
+/** 小端读 32 位（无符号） */
+function u32le(buf: Uint8Array, at: number): number {
+  return (buf[at] | (buf[at + 1] << 8) | (buf[at + 2] << 16) | (buf[at + 3] << 24)) >>> 0
+}
+
+/** WEBP 的 RIFF 容器头：`RIFF` + size(4, 不变) + `WEBP` = 12 字节，其后是第一个子块 */
+const WEBP_RIFF = 'RIFF'
+const WEBP_FORM = 'WEBP'
+
+/** VP8（有损）帧头里固定的关键帧起始码 */
+const VP8_START_CODE: readonly number[] = [0x9d, 0x01, 0x2a]
+
+/** VP8L（无损）载荷首字节的签名 */
+const VP8L_SIGNATURE = 0x2f
+
+/**
+ * WEBP —— RIFF 容器 + 三种编码子块（**三种都要覆盖**，只做一种是最常见的坑）。
+ *
+ * 容器结构（全部小端）：
+ * ```
+ * 0..3   'RIFF'      4..7  文件长度-8
+ * 8..11  'WEBP'     12..15 子块 FourCC   16..19 子块长度（含 1 字节填充对齐）
+ * 20..   子块载荷
+ * ```
+ *
+ * - `VP8 `（有损）：载荷 = 3 字节帧标签 + `9d 01 2a` 起始码 + 14 位宽 + 14 位高（各取低 14 位）；
+ * - `VP8L`（无损）：载荷首字节 `0x2f`，其后 32 位小端里装 **宽-1（14 位）+ 高-1（14 位）**——
+ *   两个都要 +1，忘了 +1 会让整库的 1K/2K 判定差 1 像素、4K 恰好落档外；
+ * - `VP8X`（扩展，可带 alpha / 动画 / ICC）：载荷 1 字节 flags + 3 字节保留 +
+ *   24 位宽-1 + 24 位高-1（同样都要 +1）。
+ *
+ * 其余子块（`ALPH` / `ANIM` / `ICCP` …）不是画布描述，直接判未知 ——
+ * 扩展格式的画布尺寸一律以 `VP8X` 为准，绝不去拼 `ALPH` + `VP8 ` 的尺寸（会漏掉偏移）。
+ */
+function webpSize(buf: Uint8Array): ImageSize | null {
+  // 20 = 8 RIFF 头 + 4 'WEBP' + 8 子块头（子块载荷从 20 开始）
+  if (buf.length < 20) return null
+  if (latin1(buf, 0, 4) !== WEBP_RIFF) return null
+  if (latin1(buf, 8, 12) !== WEBP_FORM) return null
+
+  const fourcc = latin1(buf, 12, 16)
+  // 子块声明长度（用于判"头部是否够本子块用"，不足即视为被截断）
+  const chunkSize = u32le(buf, 16)
+  const payload = 20
+  if (chunkSize < 4) return null // 任何合法子块都不少于 4 字节
+
+  if (fourcc === 'VP8 ') {
+    // 载荷 = 3 字节帧标签 + 3 字节起始码 + 4 字节宽高 = 最少 10 字节
+    if (chunkSize < 10) return null
+    if (buf.length < payload + 10) return null
+    // 载荷 = 3 字节帧标签，紧接 3 字节固定起始码
+    const sig = payload + 3
+    if (buf[sig] !== VP8_START_CODE[0] || buf[sig + 1] !== VP8_START_CODE[1] || buf[sig + 2] !== VP8_START_CODE[2]) {
+      return null
+    }
+    const w = u16le(buf, sig + 3) & 0x3fff
+    const h = u16le(buf, sig + 5) & 0x3fff
+    if (w === 0 || h === 0) return null
+    return { w, h }
+  }
+
+  if (fourcc === 'VP8L') {
+    // 载荷 = 1 字节签名 + 4 字节位域 = 最少 5 字节
+    if (chunkSize < 5) return null
+    if (buf.length < payload + 5) return null
+    if (buf[payload] !== VP8L_SIGNATURE) return null
+    const bits = u32le(buf, payload + 1)
+    const w = (bits & 0x3fff) + 1
+    const h = ((bits >>> 14) & 0x3fff) + 1
+    if (w === 0 || h === 0) return null
+    return { w, h }
+  }
+
+  if (fourcc === 'VP8X') {
+    // 载荷 = 1 flags + 3 保留 + 3 宽 + 3 高 = 最少 10 字节
+    if (chunkSize < 10) return null
+    if (buf.length < payload + 10) return null
+    const w = u24le(buf, payload + 4) + 1
+    const h = u24le(buf, payload + 7) + 1
+    if (w === 0 || h === 0) return null
+    return { w, h }
+  }
+
+  return null
+}
+
+/** TIFF 字节序标记：`II` = 小端（Intel），`MM` = 大端（Motorola） */
+const TIFF_LE = 'II'
+const TIFF_BE = 'MM'
+
+/** TIFF 版本魔数（BigTIFF 的 43 不支持 —— 那是另一套 IFD 结构，不猜） */
+const TIFF_MAGIC = 42
+
+/** TIFF 字段类型：3 = SHORT（2 字节），4 = LONG（4 字节） */
+const TIFF_TYPE_SHORT = 3
+const TIFF_TYPE_LONG = 4
+
+/** IFD entry 的固定长度 */
+const TIFF_ENTRY_SIZE = 12
+
+/**
+ * TIFF / TIF —— 读 IFD0 里的 `ImageWidth(0x0100)` 与 `ImageLength(0x0101)`。
+ *
+ * 结构：
+ * ```
+ * 0..1   'II' | 'MM'     2..3  42（按上面的字节序）
+ * 4..7   IFD0 偏移（按字节序）   8..  IFD0: 2 字节 entry 数 + N × 12 字节 entry
+ * entry: tag(2) type(2) count(4) value|offset(4)
+ * ```
+ * SHORT 且 count=1 时，值放在 value 字段的**前 2 字节**（不是后 2 字节，大端也一样）。
+ *
+ * 越界一律 `null`：IFD 偏移越界 / entry 越过缓冲区 / 宽高缺失 / 值为 0。
+ * `w/h` 缺失时不回落到 `StripOffsets` 之类的间接信息 —— 那是猜。
+ */
+function tiffSize(buf: Uint8Array): ImageSize | null {
+  if (buf.length < 8) return null
+  const order = latin1(buf, 0, 2)
+  if (order !== TIFF_LE && order !== TIFF_BE) return null
+  const le = order === TIFF_LE
+  const magic = le ? u16le(buf, 2) : u16be(buf, 2)
+  if (magic !== TIFF_MAGIC) return null
+
+  const ifd = le ? u32le(buf, 4) : u32be(buf, 4)
+  // IFD 至少要有 2 字节 entry 数
+  if (ifd < 8 || ifd + 2 > buf.length) return null
+
+  const count = le ? u16le(buf, ifd) : u16be(buf, ifd)
+  if (count === 0) return null
+  const first = ifd + 2
+  // 整张 entry 表必须在缓冲区里（截断的头部 → 不知道有没有宽高 → 未知）
+  if (first + count * TIFF_ENTRY_SIZE > buf.length) return null
+
+  let w: number | null = null
+  let h: number | null = null
+  for (let i = 0; i < count; i += 1) {
+    const at = first + i * TIFF_ENTRY_SIZE
+    const tag = le ? u16le(buf, at) : u16be(buf, at)
+    if (tag !== 0x0100 && tag !== 0x0101) continue
+    const type = le ? u16le(buf, at + 2) : u16be(buf, at + 2)
+    const valueAt = at + 8
+    let value: number | null = null
+    if (type === TIFF_TYPE_SHORT) {
+      // SHORT 的值占 value 字段的前 2 字节（两种字节序都是"值在高位端"）
+      value = le ? u16le(buf, valueAt) : u16be(buf, valueAt)
+    } else if (type === TIFF_TYPE_LONG) {
+      value = le ? u32le(buf, valueAt) : u32be(buf, valueAt)
+    }
+    if (value === null) continue
+    if (tag === 0x0100) w = value
+    else h = value
+  }
+
+  if (w === null || h === null) return null
+  if (!(w > 0) || !(h > 0)) return null
+  return { w, h }
+}
+
 /**
  * 从文件头字节里解析图片宽高。
  *
  * @param buf 文件**开头**的字节（建议 `IMAGE_SIZE_HEAD_BYTES`，少给也能解析小图）
- * @returns `{w,h}`；非 PNG/JPEG、头部不完整、尺寸为 0 或格式损坏 → `null`
+ * @returns `{w,h}`；非 PNG/JPEG/WEBP/TIFF、头部不完整、尺寸为 0 或格式损坏 → `null`
  */
 export function imageSizeOf(buf: Uint8Array): ImageSize | null {
   if (!(buf instanceof Uint8Array) || buf.length < 4) return null
   const png = pngSize(buf)
   if (png) return png
-  return jpegSize(buf)
+  const jpeg = jpegSize(buf)
+  if (jpeg) return jpeg
+  const webp = webpSize(buf)
+  if (webp) return webp
+  return tiffSize(buf)
 }
 
 // ── HDR / EXR（2026-10「分辨率筛选在材质与 HDR 都失效」的补采端） ──────────

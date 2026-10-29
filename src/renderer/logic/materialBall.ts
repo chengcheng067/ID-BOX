@@ -888,7 +888,7 @@ export interface TextureDecodeResult {
  * - 先读 64KB 文件头拿原始尺寸（`imageSizeOf`，实测 0.09–0.15ms）；
  * - 用**目标尺寸**（`planTextureDecode`）算缓存 key → 命中直接返回，**不解码**；
  * - 未命中 → 带 `resizeWidth/resizeHeight` 解一次 → 存进缓存；
- * - 解析不出尺寸（webp/bmp/tga…）→ 全尺寸解一次，由调用方用 canvas 再缩
+ * - 解析不出尺寸（bmp/tga…）→ 全尺寸解一次，由调用方用 canvas 再缩
  *   （canvas 缩放不解码；**不会**再调一次 `createImageBitmap`），**且不进缓存**；
  * - `fetch` 非 2xx → 返回 null（调用方退回 `TextureLoader`，绝不假装成功）。
  *

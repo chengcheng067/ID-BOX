@@ -92,28 +92,33 @@ describe('记住形状 · MaterialStage 必须跟随资产的形态', () => {
 describe('记住形状 · CustomRenderDialog 的契约闭环', () => {
   it('★弹窗球必须带 defaultShape + onShapeChange（落库由弹窗调 store）', () => {
     expect(DIALOG).toContain("import { resolveRenderParams, resolveRenderShape, type NormalizedBallParams } from '../../shared/ballParams'")
-    expect(DIALOG).toContain('defaultShape={resolveRenderShape(asset)}')
-    expect(DIALOG).toContain(
-      'onShapeChange={(s) => void useVault.getState().setRenderShape(asset.id, s)}'
-    )
+    // 2026-10「形态入口」：defaultShape 传的是**受控 state**（初值 resolveRenderShape(asset)），
+    // 不是直接读 asset —— store 写入是 async，直读 asset 会让预览滞后一帧。
+    expect(DIALOG).toContain('useState<BallRenderShape>(() => resolveRenderShape(asset))')
+    expect(DIALOG).toContain('defaultShape={shape}')
+    expect(DIALOG).toContain('onShapeChange={changeShape}')
+    // 切换必须真的写库（组件不写库，这里由弹窗调 store）
+    expect(DIALOG).toContain('useVault.getState().setRenderShape(asset.id, next)')
   })
 
   it('★「设为封面」渲图（透明 PNG）必须带场景当前形态（否则封面与预览不一致）', () => {
     const at = DIALOG.indexOf('renderBallToPng(asset.relFolder, slots, {')
     expect(at).toBeGreaterThan(-1)
     const body = DIALOG.slice(at, at + 260)
-    expect(DIALOG).toContain('ballApiRef.current?.getShape() ?? resolveRenderShape(asset)')
-    // 选项里必须有 shape（最后一个选项，可能没有尾逗号）
-    expect(body).toMatch(/shape\s*,?\s*\}\)/)
+    // 优先读场景；API 未就绪时回落到**受控 state**（不是 asset：切完立刻点按钮时 asset 还是旧值）
+    expect(DIALOG).toContain('ballApiRef.current?.getShape() ?? shape')
+    // 选项里必须有 shape
+    expect(body).toMatch(/shape\s*:\s*shapeNow\s*,?\s*\}\)/)
     // 2026-10-23：封面一律透明 PNG（用户拍板），不许接回 JPEG
     expect(DIALOG).not.toContain('renderBallToJpeg(')
   })
 
-  it('形态按钮对用户仍不可见（本批只让类型闭环，不加 UI）', () => {
-    // 弹窗显式关闭内嵌形态面板；舞台走 chrome="bare"（`!bare && showShapeSwitch` 直接挡掉）
+  it('形态入口：弹窗内嵌那组仍关闭，唯一入口是本弹窗右栏的分段控件', () => {
+    // 弹窗显式关闭 MaterialBall 内嵌形态面板；舞台走 chrome="bare"（`!bare && showShapeSwitch` 直接挡掉）
     expect(DIALOG).toContain('showShapeSwitch={false}')
     expect(STAGE).toContain('chrome="bare"')
-    // 全仓不得出现第三个形态入口（菜单 / 快捷键 / 设置项）
+    // 全仓仍只有一处「形态按钮 map」：MaterialBall 内嵌那组（本弹窗是另一份独立实现的
+    // SHAPE_OPTIONS，不走 SHAPE_ORDER.map，所以这条计数不变）
     expect(BALL.split('SHAPE_ORDER.map(').length - 1).toBe(1)
   })
 })
