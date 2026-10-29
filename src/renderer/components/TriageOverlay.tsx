@@ -23,9 +23,19 @@
  *
  * - 游标（第几张 / 跳过集）是**会话内**状态 → 组件 `useState`，关掉就丢（需求 6 明确
  *   "不做持久化"）。不放 store 的理由见 `store.ts` 的 `triageActive` 注释；
- * - 待办集每帧由 `useTriageQueue()` 现算（`applyFilters` 的可见顺序里挑双未分类的），
+ * - 待办集每帧由 `useActiveTriageQueue()` 现算（**按 store 的 `triageMode` 自动选**：
+ *   `unclassified` = 全库双未分类、`conflict` = 全库分类存疑，两者都只滤软删、都跟随当前排序），
  *   资产被删 / 被归类 / 排序变化都自动反映 —— 不需要在每个删除路径补清理点，
  *   也不会出现"整理中的那张已经不在库里，浮层还在显示它"。
+ *
+ * ## 两种模式（docs/35 §4.2 · R-10）
+ *
+ * 同一个浮层承载两种待办队列，只有 4 处与模式耦合：**队列来源**（`useActiveTriageQueue`）、
+ * **标题文案**、**收尾文案**、**右栏「来源对比」块**（只有 `conflict` 有）。
+ * 其余 30+ 条纪律（Esc 栈、`reconcileTriage` 接位、`busy` 防连按、`panelOpen` 让路、
+ * 选中态跟随）**两种模式共用一份**，所以复用一个组件而不是另起一个 —— 另起必然漂移。
+ *
+ * ⚠️ `unclassified` 的文案**一个字节都不能变**（既有测试与用户肌肉记忆都靠它）。
  *
  * ## 键位
  *
@@ -35,7 +45,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useTriageQueue, useVault } from '../store'
+import { useActiveTriageQueue, useVault, type TriageMode } from '../store'
 import { useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
 import { quickLookImageUrl } from '../logic/quickLook'
@@ -221,12 +231,142 @@ function CategoryCascade({
   )
 }
 
+/**
+ * 关闭整理浮层时的收尾提示（**按模式分叉**）。
+ *
+ * - `unclassified`：**逐字**沿用 `triageCloseNotice`（P2 既有文案，既有测试与用户肌肉记忆
+ *   都靠它，一个字节不改）；
+ * - `conflict`：同一句式换词 —— 用户点的是「待确认」，退出时听到「未分类」会以为点错了。
+ *
+ * 为什么不给 `triageCloseNotice` 加参数：`logic/triageFlow.ts` 是 `docs/35 §7.2` 明令
+ * **零改动**（R-10）的文件，而那句文案属于它的既有行为。
+ */
+function closeNoticeOf(mode: TriageMode | null, remaining: number): string {
+  if (mode !== 'conflict') return triageCloseNotice(remaining)
+  const n = Number.isFinite(remaining) ? Math.max(0, Math.trunc(remaining)) : 0
+  return n === 0 ? '待确认已清空' : `还有 ${n} 张待确认`
+}
+
+/**
+ * `conflict` 模式的右栏「来源对比」块（`docs/35 §4.2` 的三行 + 两个候选按钮）。
+ *
+ * ## 三行分别从哪来（**S1 不落库，所以不能从 `sources` 拿**）
+ *
+ * | 行 | 取值 |
+ * |---|---|
+ * | 语义判成 | `categoriesOf(asset)` —— 这就是 S1 当初给出的落点（当前分类） |
+ * | 站方判成 | `classifyReview.sources.s2.level1/level2` |
+ * | 站方另说 | `classifyReview.sources.s3`（有才渲染，没有这一行不出现） |
+ *
+ * `ClassifyReview.sources` 里**没有 `s1`** 是刻意的（R-13：`classifyAssetName` 是纯函数，
+ * 存进库只会随词表升级而腐坏）。别为了"三行对称"去补一个 s1 字段。
+ *
+ * ## `s2` 缺失时（数据被旧版本写坏的兜底）
+ *
+ * 只给一行「这一条的分类有争议，请手动选择」，**不裸访问** `s2.level1` —— conflict 理论上
+ * 必有 S2，但旧数据 / 手改库什么都可能，崩在这里是最没价值的失败方式。下方的分类级联本来
+ * 就在（它不依赖 s2），所以用户仍然能选。
+ */
+function ConflictSources({
+  asset,
+  busy,
+  onPick
+}: {
+  asset: Asset
+  busy: boolean
+  /** 选中候选：走**同一条**确认路径（`decideReview` + 前进），不另写一套 */
+  onPick: (category1: string, category2: string) => void
+}) {
+  const cat = categoriesOf(asset)
+  const s2 = asset.classifyReview?.sources?.s2
+  const s3 = asset.classifyReview?.sources?.s3
+  const rowCls = 'flex items-baseline gap-1.5 text-[11px] leading-relaxed'
+  const labelCls = 'w-[52px] shrink-0 text-tertiary'
+  const valueCls = 'min-w-0 flex-1 truncate text-primary'
+
+  if (!s2) {
+    return (
+      <div className="mb-3 rounded-btn border border-line bg-elevated/40 px-2 py-1.5 text-[11px] leading-relaxed text-secondary">
+        这一条的分类有争议，请手动选择
+      </div>
+    )
+  }
+
+  return (
+    <div className="mb-3 rounded-btn border border-line bg-elevated/40 px-2 py-2">
+      <div className="mb-1.5 text-[11px] font-medium text-secondary">来源对比</div>
+      <div className="flex flex-col gap-1">
+        <div className={rowCls}>
+          <span className={labelCls}>语义判成</span>
+          <span className={valueCls} title={`${cat.category1} / ${cat.category2}`}>
+            {cat.category1} / {cat.category2}
+          </span>
+        </div>
+        <div className={rowCls}>
+          <span className={labelCls}>站方判成</span>
+          <span className={valueCls} title={`${s2.level1} / ${s2.level2}`}>
+            {s2.level1} / {s2.level2}
+          </span>
+        </div>
+        {s3 && (
+          <div className={rowCls}>
+            <span className={labelCls}>站方另说</span>
+            <span className={valueCls} title={s3}>
+              {s3}
+            </span>
+          </div>
+        )}
+      </div>
+      <div className="mt-2 flex gap-1.5">
+        <button
+          type="button"
+          className="btn !h-7 !px-2 !text-[11px] disabled:opacity-40"
+          disabled={busy}
+          title={`用语义的结论：${cat.category1} / ${cat.category2}`}
+          onClick={() => onPick(cat.category1, cat.category2)}
+        >
+          用语义的
+        </button>
+        <button
+          type="button"
+          className="btn !h-7 !px-2 !text-[11px] disabled:opacity-40"
+          disabled={busy}
+          title={`用站方的结论：${s2.level1} / ${s2.level2}`}
+          onClick={() => onPick(s2.level1, s2.level2)}
+        >
+          用站方的
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export function TriageOverlay() {
-  const queue = useTriageQueue()
+  /**
+   * 队列来源：**按 `store.triageMode` 自动选**（`unclassified` → 双未分类批次，
+   * `conflict` → 分类存疑批次）。为什么不在组件里二选一：
+   * `triageMode === 'conflict' ? useReviewQueue() : useTriageQueue()` 是**非法**的
+   * （hooks 数量必须稳定），而"两个都调用再二选一"会让 `startTriage` 的惰性初始化
+   * 拿到错的那一批。选择逻辑下沉在 store（`useActiveTriageQueue`）。
+   */
+  const queue = useActiveTriageQueue()
+  const triageMode = useVault((s) => s.triageMode)
   const closeTriage = useVault((s) => s.closeTriage)
-  const assignCategory = useVault((s) => s.assignCategory)
+  /**
+   * ⚠️ 本浮层**不调 `assignCategory`**，只调 `decideReview`。
+   *
+   * 两者都搬目录，但 `decideReview` 额外负责「把 `classifyReview.reason` 清掉 + 写
+   * `decidedAt`」。少了这一步，用户确认完这条资产**仍在待确认队列里**（`reviewReasonOf`
+   * 第 2 条照样命中），下一轮 `reconcileTriage` 又把它排回来 —— 表现为"按了没反应"。
+   * 在 `unclassified` 模式下这是无害的多余动作（那些资产本来就没有 `reason`），
+   * 但为了不让两条路径行为分叉，**两种模式共用同一个入口**。
+   */
+  const decideReview = useVault((s) => s.decideReview)
   const setNotice = useVault((s) => s.setNotice)
   const select = useVault((s) => s.select)
+
+  /** `conflict` 模式：右栏多一块「来源对比」+ 标题/收尾文案分叉 */
+  const isConflict = triageMode === 'conflict'
 
   /**
    * 会话游标。
@@ -260,8 +400,8 @@ export function TriageOverlay() {
    */
   const requestClose = useCallback(() => {
     closeTriage()
-    setNotice(triageCloseNotice(queue.length))
-  }, [closeTriage, setNotice, queue.length])
+    setNotice(closeNoticeOf(triageMode, queue.length))
+  }, [closeTriage, setNotice, triageMode, queue.length])
 
   const escDepth = useEscLayer(requestClose, true)
 
@@ -296,17 +436,18 @@ export function TriageOverlay() {
   useEffect(() => {
     if (queue.length === 0) {
       closeTriage()
-      setNotice(triageCloseNotice(0))
+      setNotice(closeNoticeOf(triageMode, 0))
     }
-  }, [queue.length, closeTriage, setNotice])
+  }, [queue.length, closeTriage, setNotice, triageMode])
 
   /**
-   * 归类确认。
+   * 归类确认（**两种模式、三条路径共用这一份**）。
    *
    * 顺序（不可调换）：
    * ① 校验收敛：一级未分类时二级强制未分类（与 `normalizeCategoryPair` 同规则，
    *    避免把非法组合发下去再被改写）；
-   * ② `assignCategory`（真实搬目录 + 缩略图重生 + 写库）；
+   * ② `decideReview`（内部先 `assignCategory` 搬目录，成功后清 `classifyReview.reason`
+   *    并写 `decidedAt` —— 否则这条资产仍留在待确认队列里，见 store 的 action 注释）；
    * ③ **只有真的移动成功**（`moved > 0`）才前进 —— 需求 4 明确「成功才跳下一张
    *    （失败停在这张、给出错误提示，不要吞）」；
    * ④ 前进用 `advanceAfterAssign`（不写 skipped：那张已经归类走了，不该被记成跳过）。
@@ -315,11 +456,23 @@ export function TriageOverlay() {
    * 此时**也前进** —— 用户确认了"这张就该是这个分类"，而库里它已经在这了，
    * 停在这张只会让用户反复按确认（`assignCategory` 每次都判 skipped，永远不会动）。
    * 但这不是"成功移动"，所以给一条更准确的提示。
+   *
+   * ## 为什么带可选参数 `explicit`
+   *
+   * `conflict` 模式下的两个候选按钮（「用语义的」/「用站方的」）要落到**候选给的那对**，
+   * 而 `level1` / `level2` 是 setState —— 同一 tick 里 `setLevel1(...)` 之后 `confirm()`
+   * 读到的还是旧值。所以候选走 `confirm({ c1, c2 })` 直接传参，**不复制一份归类逻辑**
+   * （复制就会漏掉 moved/failed/skipped 三分支里的任何一处）。
+   * 不传参 = 用面板当前选择（Enter / 底部主按钮走这条，与 P2 行为逐字一致）。
    */
-  const confirm = useCallback(async () => {
+  const confirm = useCallback(async (explicit?: { c1: string; c2: string }) => {
     if (!current || busy) return
-    const c1 = level1.trim() || UNCLASSIFIED
+    // 一级：候选按钮给的那对优先（它们要落到候选本身的落点，而面板可能压根没被动过）
+    const picked1 = explicit ? explicit.c1 : level1
+    const c1 = picked1.trim() || UNCLASSIFIED
     const c2 = c1 === UNCLASSIFIED ? UNCLASSIFIED : level2.trim() || UNCLASSIFIED
+    // 二级同理：候选路径用候选给的二级（仍过同一套收敛规则，见下）
+    const t2 = explicit ? explicit.c2.trim() || UNCLASSIFIED : c2
     if (c1 === UNCLASSIFIED) {
       // 没选一级就确认 = 什么都没改。提示而不是静默（用户会以为键坏了）
       setNotice('请先选择一级分类')
@@ -327,7 +480,7 @@ export function TriageOverlay() {
     }
     setBusy(true)
     try {
-      const summary = await assignCategory([current.id], c1, c2)
+      const summary = await decideReview(current.id, c1, t2)
       if (summary.moved > 0) {
         // ④ 成功：前进（`assignCategory` 已经改了 store 的 assets → `queue` 会变，
         //     但这里立刻推进游标，避免"等 effect 追上"的那一帧停顿）
@@ -347,7 +500,7 @@ export function TriageOverlay() {
     } finally {
       setBusy(false)
     }
-  }, [current, busy, level1, level2, assignCategory, setNotice])
+  }, [current, busy, level1, level2, decideReview, setNotice])
 
   /**
    * 键盘：判据全在 `decideTriageKey`，这里只 dispatch。
@@ -405,7 +558,7 @@ export function TriageOverlay() {
       className={`dialog-scrim quicklook-scrim fixed inset-0 ${zClassForDepth(escDepth)} flex items-center justify-center p-6`}
       role="dialog"
       aria-modal="true"
-      aria-label={`整理未分类：${current.name}`}
+      aria-label={`${isConflict ? '确认分类（有争议）' : '整理未分类'}：${current.name}`}
       onPointerDown={(e) => {
         // 点遮罩关闭（本体 stopPropagation）
         if (e.target === e.currentTarget) requestClose()
@@ -450,13 +603,30 @@ export function TriageOverlay() {
         </div>
 
         {/* ── 右：常驻分类面板 + 操作 */}
-        <div className="flex w-[240px] shrink-0 flex-col">
+        {/* `min-h-0 overflow-y-auto`：`conflict` 模式多出「来源对比」那一块（约 110px），
+            矮屏 / 低分屏下右栏会超出父容器的 `max-h` 被裁掉下半截（确认按钮消失）。
+            `min-h-0` 是 flex 子项能真正收缩的前提（默认 `min-height: auto` 会撑开）；
+            `unclassified` 模式内容本就不超，不出现滚动条，视觉零变化。 */}
+        <div className="flex min-h-0 w-[240px] shrink-0 flex-col overflow-y-auto">
           <div className="mb-3 flex items-baseline justify-between">
-            <span className="text-[13px] font-medium text-primary">指派分类</span>
+            <span className="text-[13px] font-medium text-primary">
+              {isConflict ? '确认分类（有争议）' : '指派分类'}
+            </span>
             <span className="text-[11px] tabular-nums text-tertiary">
               {position >= 0 ? position + 1 : '?'} / {total}
             </span>
           </div>
+
+          {/* conflict 模式：先摆「为什么存疑」（三行来源对比 + 两个候选按钮），
+              再是常规级联 —— 用户看到争议的**依据**才会做选择，摆在级联后面只会被滚过去。
+              `s2` 缺失时该组件自己退化成一行提示（旧数据兜底，不崩、不留空行）。 */}
+          {isConflict && (
+            <ConflictSources
+              asset={current}
+              busy={busy}
+              onPick={(c1, c2) => void confirm({ c1, c2 })}
+            />
+          )}
 
           <CategoryCascade
             kind={current.kind}

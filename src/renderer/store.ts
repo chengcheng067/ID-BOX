@@ -5,6 +5,7 @@ import type {
   Asset,
   AssetFile,
   BallRenderShape,
+  ClassifyReview,
   ColorTag,
   CoverSource,
   FetchZhimoCoverResult,
@@ -126,6 +127,91 @@ let skippedInBatchCount = 0
 let overwrittenInBatchCount = 0
 /** 其中走了退化路径的条数（`ImportEvent.conflict.degraded === true`：旧版没进回收站） */
 let overwrittenDegradedCount = 0
+
+/**
+ * 本批**真正落库**的素材数（`status === 'done'` 的事件计数）。
+ *
+ * 只为批次汇总的文案（"本批 N 个素材"）服务：`import:event` 逐条到达时累加，
+ * 由 `reportReviewSummary()` **消费后归零**（消费型，与 `skippedInBatchCount` 同款）。
+ *
+ * ⚠️ **不在 `import:batchDone` 里复位**：那个回调正是知识末流水线的起点，
+ * 而汇总要等流水线跑完（几分钟）才发 —— 在批次边界清零会让 `N` 永远是 0。
+ */
+let importedInBatchCount = 0
+
+/**
+ * 本批交叉验证判为 `conflict` 的条数（消费型，见 `reportReviewSummary`）。
+ *
+ * 由 `runZhimoCategoryReclass` 的**自动路径**累加（手动重排的数字不属于"本批导入"）。
+ */
+let conflictsInBatchCount = 0
+
+/**
+ * 本批「站方单源」（`medium-s2`）已搬的条数（消费型）。
+ *
+ * 语义是 `ZhimoReclassSummary.unverified`：**`moved` 的子集**，回答"这批里有多少条
+ * 是没被第二源验证就搬了"。只在"本批没有存疑、但有单源搬运"时用于提示。
+ */
+let unverifiedInBatchCount = 0
+
+/**
+ * 正在跑（或排队中）的知末后置流水线条数。
+ *
+ * 只为一件事：让批次汇总（`reportReviewSummary`）**只由最后一条退出流水线的那次**发。
+ * 详见 `scheduleZhimoPipeline` 的注释 —— 无此计数时，被重入锁立刻挡掉的那一次会把
+ * 本批计数提前消费掉，用户永远看不到「本批 N 个分类存疑」。
+ */
+let pipelineInFlight = 0
+
+/**
+ * 批次级「分类存疑」汇总（`docs/35 §4.3 入口②` · R-11）。
+ *
+ * ## 为什么绝不可能逐包发（本函数存在的第一理由）
+ *
+ * 用户原话是"弹窗提示"，但一次拖 50 个包会弹 50 次。所以汇总点**只挂在
+ * `scheduleZhimoPipeline()` 的收尾**（批次级事件 `import:batchDone` 之后、流水线跑完），
+ * **绝不挂在 `onImportEvent` 的逐条回调里** —— 那是"拖 50 个包弹 50 次"的写法。
+ * 改这一处之前先读 `docs/35 §4.3 入口②` 与 R-11。
+ *
+ * ## 为什么不用全库数
+ *
+ * 全库的 conflict 数是用户历史上积压的，每次导入都报一遍会变成噪音（用户对
+ * 每条导入 toast 都读一次，久了就整体忽略）。所以三个数字都是**本批增量**：
+ * `importedInBatchCount` / `conflictsInBatchCount` / `unverifiedInBatchCount`。
+ *
+ * ## 为什么走 `enqueueNotice` 而不是新造 modal
+ *
+ * ① 模态阻断：用户批量导入 50 个包后可能立刻去干别的，一个必须点掉的 modal 是打扰；
+ * ② `enqueueNotice` 已经解决了"多条批次汇总互不吞并"（队列 + 逐条 4.5s），
+ *    另起一个弹窗等于把并发展示问题重写一遍；
+ * ③ 已有 Esc 层级栈（Quick Look / 整理浮层 / 分类弹窗）再加一层要重排优先级。
+ *
+ * ## 文案（`M` = 本批存疑，`K` = 本批站方单源搬的）
+ *
+ * | 情况 | 文案 |
+ * |---|---|
+ * | `M > 0` | `本批 N 个素材，其中 M 个分类存疑 → 点侧栏「待确认」处理` |
+ * | `M === 0 && K > 0` | `本批 N 个素材已分类，其中 K 个仅据知末分类` |
+ * | `M === 0 && K === 0`（或本批没有落库素材） | **不发** |
+ */
+function reportReviewSummary(): void {
+  const imported = importedInBatchCount
+  const conflicts = conflictsInBatchCount
+  const unverified = unverifiedInBatchCount
+  // 先消费再判断：无论发不发，这三个计数都只属于这一批
+  importedInBatchCount = 0
+  conflictsInBatchCount = 0
+  unverifiedInBatchCount = 0
+  // 本批没有素材落库（设置页手动重排 / 监控目录空扫描）→ 没什么可汇总的
+  if (imported <= 0) return
+  if (conflicts > 0) {
+    enqueueNotice(`本批 ${imported} 个素材，其中 ${conflicts} 个分类存疑 → 点侧栏「待确认」处理`)
+    return
+  }
+  if (unverified > 0) {
+    enqueueNotice(`本批 ${imported} 个素材已分类，其中 ${unverified} 个仅据知末分类`)
+  }
+}
 
 /**
  * 本批导入是否**已经**把视图从「最近删除」切回资产视图（**一批只切一次**）。
@@ -1232,6 +1318,31 @@ interface VaultState {
   emptyTrash: () => Promise<void>
   // ── 分类（T07）─────────────────────────────────────────────
   assignCategory: (ids: string[], category1: string, category2: string) => Promise<AssignSummary>
+  /**
+   * 用户在待确认浮层里**定案**（T2，`docs/35 §5.1` · `docs/35 §4.2`）。
+   *
+   * ## 为什么需要单独一个 action 而不是复用 `assignCategory`
+   *
+   * `assignCategory` 只搬目录、改 `category1/2`，**不碰 `classifyReview`**；而
+   * `classifyReview.reason === 'conflict'` 正是这条资产被排进待确认队列的理由
+   * （`logic/reviewFlow.ts::reviewReasonOf` 的第 2 条）。不清它，用户确认完下一轮
+   * `reconcileTriage` 又会被排回来 —— 表现为"确认了但队列长度纹丝不动"。
+   *
+   * ## `decidedAt` 的语义是「有人裁定过了」，不是「目录动了」
+   *
+   * 所以**分类未变（skipped）也要写**：用户点了「用站方的」而资产本来就在那个分类，
+   * 这是一次明确的裁定（"就该是这样"），队列该把他放走。若只在 `moved > 0` 时写，
+   * 那条资产会永远卡在待确认队列里，每轮都弹回给他。
+   *
+   * ## 但 `failed > 0` **绝不写**
+   *
+   * 移动失败 + 标记已定案 = 这条永远停在待确认队列且**不再重试**（`isZhimoVerifyCandidate`
+   * 会按 `decidedAt` 跳过它，`reviewReasonOf` 也会返回 null）。这与 `zhimoReclass.ts`
+   * 里"只在移动成功后写 `decidedAt`"是同一条理由。
+   *
+   * @returns `assignCategory` 的原始结果（调用方据此决定前进 / 留在当前张 / 报错）
+   */
+  decideReview: (id: string, category1: string, category2: string) => Promise<AssignSummary>
   /**
    * 拖拽归类（反馈 6d）：快照原分类 → 走既有 `assignCategory` → 成功后登记 5 秒撤销。
    *
@@ -2687,6 +2798,9 @@ export const useVault = create<VaultState>((set, get) => ({
         }
       }
       if (ev.status === 'done' && ev.asset) {
+        // 本批落库数：给批次汇总的"本批 N 个素材"用（消费型，见 `reportReviewSummary`）。
+        // ⚠️ 只累加、**绝不在这里发任何汇总** —— 那就是"拖 50 个包弹 50 次"。
+        importedInBatchCount += 1
         void db.assets.put(ev.asset)
         set((s) => ({ assets: upsert(s.assets, ev.asset!) }))
         // 导入完成后才渲球图（**不阻塞导入进度条**）：入队即返回，后台串行消费
@@ -3321,6 +3435,59 @@ export const useVault = create<VaultState>((set, get) => ({
     // changed=false 的幂等操作不提示（06 v1.0.3 §9.2 规则 6）；changed=true（非法字符/截断被改写）才提示
     if (pair.changed) notice += '。注意：输入的分类名已被规范化（非法字符清洗或超长截断）'
     set({ notice })
+    return summary
+  },
+
+  /**
+   * 待确认浮层里的**定案**（T2，`docs/35 §5.1`）。语义与两段式理由见接口注释。
+   *
+   * ## 两段式，顺序不可调换
+   *
+   * ① `assignCategory` —— 唯一搬盘入口（重名 `uniqueName` / 缩略图重生 / `dedupeKey` 重算 /
+   *    写库 / 内存同步全在它里面）。**不复制其中任何一段**，否则两边迟早漂移。
+   * ② 拿到 `summary` 之后再决定写不写 `decidedAt` —— 这正是"失败不写"能成立的前提：
+   *    若先写 `decidedAt` 再搬，搬失败就永久钉死（`reviewReasonOf` 与 `isZhimoVerifyCandidate`
+   *    都会按它跳过，用户再也看不到这条）。
+   *
+   * ## 哪些算"定案"
+   *
+   * - `moved > 0` → 搬成功了，用户的选择已落到磁盘；
+   * - `moved === 0 && failed === 0` → **skipped**（资产本来就在这个分类）。这**也是定案**：
+   *   用户点了「用站方的」而 S2 恰好等于当前分类，他表达的是"就该是这样"。
+   *   不写的话这条会永远卡在队列里，每轮都弹回给他（"队列纹丝不动"）。
+   * - `failed > 0` → **不写**（理由见上）。
+   *
+   * ## `reason` 必须**删掉**而不是置 undefined
+   *
+   * `reviewReasonOf` 判的是 `=== 'conflict'`，置 `undefined` 在本仓能工作；但 `ClassifyReview`
+   * 会进 Dexie / 进日志 JSON —— `{ reason: undefined }` 序列化后不但语义含混，还会让
+   * "字段存在与否"这类判据（比如 `'reason' in review`）得出反直觉的答案。用解构**真删**。
+   *
+   * `sources` **保留**：用户之后可能想看"当初为什么存疑"（`s2` / `s3` 是站方当时说的话，
+   * 重抓会变，所以它是唯一留痕）。
+   */
+  async decideReview(id, category1, category2) {
+    // ① 唯一搬盘入口。注意它内部会对"已在目标分类"判 skipped 并**不写库**，
+    //    所以下面那一步不能依赖"assignCategory 已经把新记录写进去了"。
+    const summary = await get().assignCategory([id], category1, category2)
+
+    // ② 失败一律不写 `decidedAt`（移动失败还标记已定案 = 这条永远停在队列且不再重试）
+    if (summary.failed > 0) return summary
+
+    // ③ 写库前**重查当下记录**：`assignCategory` 期间这条可能已被 rescan 换掉 / 被删除，
+    //    用旧快照会把它写回去（与 `runZhimoCategoryReclass` 的写回同一纪律）。
+    const asset = get().assets.find((a) => a.id === id)
+    if (!asset) return summary
+
+    const now = Date.now()
+    const old: ClassifyReview = asset.classifyReview ?? {}
+    // 显式解构删 `reason`（不是置 undefined，理由见函数头）
+    const { reason: _droppedReason, ...rest } = old
+    const review: ClassifyReview = { ...rest, confidence: 'high', decidedAt: now }
+
+    const updated: Asset = { ...asset, classifyReview: review, updatedAt: now }
+    await db.assets.put(updated)
+    set((s) => ({ assets: s.assets.map((a) => (a.id === id ? updated : a)) }))
     return summary
   },
 
@@ -5011,6 +5178,14 @@ export const useVault = create<VaultState>((set, get) => ({
     }
     // 自动任务静默（同封面：不 notice、不弹错）；手动才给汇总
     if (manual) set({ notice: zhimoReclassSummaryText(ctx) })
+    // ⑥ 批次汇总的两个增量（`docs/35 §4.3 入口②`）：**只累加自动路径**。
+    //    手动重排是用户在设置页主动点的，与"这一批导入"无关 —— 混进来会让下次导入的
+    //    汇总数字凭空变大（甚至在本批没有落库素材时也无处消费，一直挂到下一批）。
+    //    这两个计数由 `reportReviewSummary()` 消费后归零，**这里绝不发 notice**。
+    if (!manual) {
+      conflictsInBatchCount += summary.conflicts
+      unverifiedInBatchCount += summary.unverified
+    }
     return summary
   },
 
@@ -5555,17 +5730,39 @@ function zhimoAutoCategoryEnabled(settings: Settings | null): boolean {
  *
  * 双触发（`store.importPaths` 收尾 + main 的 `import:batchDone`）都走这里，
  * 由各自的模块级重入锁 + 消费型清单保证不会重复劳动。
+ *
+ * ## 为什么要 `pipelineInFlight`（不能两条都报汇总）
+ *
+ * 两个触发点几乎同时到：`importPaths` 返回后本函数排一条 `setTimeout(0)`，
+ * 紧接着 main 的 `import:batchDone` 又排一条。第一条**真的**去抓详情页（几分钟），
+ * 第二条被 `zhimoReclassRunning` / 封面锁**立刻挡掉**、几百毫秒就跑完了 ——
+ * 若它到了末尾也调 `reportReviewSummary()`，会在第一条还没累加 `conflicts` 时
+ * 就把本批计数**消费掉**（M/K 全是 0 → 不发），于是第一条跑完时已无数字可报，
+ * 用户永远看不到「本批 N 个素材，其中 M 个分类存疑」。这是必然路径，不是边角。
+ *
+ * 所以只让**最后一个退出流水线**的那次汇总（并发时提前退出的那次不报）。
  */
 function scheduleZhimoPipeline(): void {
   setTimeout(() => {
     void (async () => {
-      const state = useVault.getState()
-      if (zhimoAutoCategoryEnabled(state.settings)) {
-        // 永不抛错（内部兜底）；再 catch 一层只是防将来改坏
-        await state.runZhimoCategoryReclass().catch(() => undefined)
+      pipelineInFlight += 1
+      try {
+        const state = useVault.getState()
+        if (zhimoAutoCategoryEnabled(state.settings)) {
+          // 永不抛错（内部兜底）；再 catch 一层只是防将来改坏
+          await state.runZhimoCategoryReclass().catch(() => undefined)
+        }
+        // 重排结束后才抓封面（串行打站）；开关关闭时 runZhimoCovers 自己会早退
+        await useVault.getState().runZhimoCovers().catch(() => undefined)
+      } finally {
+        pipelineInFlight -= 1
       }
-      // 重排结束后才抓封面（串行打站）；开关关闭时 runZhimoCovers 自己会早退
-      await useVault.getState().runZhimoCovers().catch(() => undefined)
+      // ★ 批次级「分类存疑」汇总（docs/35 §4.3 入口② / R-11）。
+      //   必须在**流水线跑完**才汇总：conflict 只有抓完详情页（T1）之后才知道，
+      //   而 `import:batchDone` 在 T0 结束时就到了。
+      //   ⚠️ 也只在这里调 —— 挂到 `onImportEvent` 的逐条回调上就是"拖 50 个包弹 50 次"。
+      //   ⚠️ 且只在**最后一条**流水线退出时调（见函数头 `pipelineInFlight` 的理由）。
+      if (pipelineInFlight === 0) reportReviewSummary()
     })()
   }, 0)
 }

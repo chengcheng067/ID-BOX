@@ -15,6 +15,7 @@ import {
   nextExpandKind
 } from '../logic/filters'
 import { countDeletedAssets, isDeletedAsset } from '../logic/trashView'
+import { countPendingReview } from '../logic/reviewFlow'
 import { StarIcon } from './MarkControls'
 import {
   ASSET_DRAG_MIME,
@@ -22,7 +23,7 @@ import {
   parseDragIds,
   planDropAssign
 } from '../logic/dragAssign'
-import { IconBox, IconCad, IconDownload, IconFile, IconHdr, IconImage, IconMaterial, IconOther, IconSettings, IconTrash } from '../icons'
+import { IconAlert, IconBox, IconCad, IconDownload, IconFile, IconHdr, IconImage, IconMaterial, IconOther, IconSettings, IconTrash } from '../icons'
 import type { AssetKind } from '../../shared/types'
 import type { DragEvent } from 'react'
 
@@ -164,6 +165,8 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const setNotice = useVault((s) => s.setNotice)
   /** P2 整理流水线入口（待办集为空时自己给 notice、不开浮层） */
   const openTriage = useVault((s) => s.openTriage)
+  /** 待确认队列入口（`docs/35 §4.3 入口①`）：打开浮层的 `conflict` 模式 */
+  const openReview = useVault((s) => s.openReview)
   /** 当前高亮的投放节点 key（`l1:<大类>:<一级>` / `l2:<大类>:<一级>/<二级>`）；null = 无 */
   const [dropKey, setDropKey] = useState<string | null>(null)
 
@@ -243,8 +246,28 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
    */
   const showFavoritesEntry = settings?.showFavorites !== false
   const showDuplicatesEntry = settings?.showDuplicates !== false
-  /** 「整理」分组标题只在两项中至少一项可见时渲染（不留空标题） */
-  const showOrganizeGroup = showFavoritesEntry || showDuplicatesEntry
+  /**
+   * 「待确认」计数（`docs/35 §4.3 入口①`）：**全库口径**，不套筛选。
+   *
+   * 三个口径细节，缺一个就会与浮层对不上：
+   * ① 分母是 `activeAssets`（已滤软删）—— `countPendingReview` 自己**不滤软删**
+   *    （软删过滤的唯一实现点仍是 `isDeletedAsset`，见 `logic/reviewFlow.ts` 的调用约定）；
+   * ② 只取 `.conflict`，**不把 `.unclassified` 加进来**：后者已有「未分类」节点 +
+   *    「整理」按钮，混在一起会让两个数字互相污染（同一个资产只属于其中一个，
+   *    `reviewReasonOf` 的判定顺序保证互斥）；
+   * ③ 不套 `filters`：与侧栏「未分类」那个数字同源（`docs/25` 口径表 ① 号），
+   *    否则用户点进去看到的条数和徽标对不上（浮层队列也是全库口径）。
+   */
+  const conflictCount = useMemo(() => countPendingReview(activeAssets).conflict, [activeAssets])
+
+  /**
+   * 「整理」分组标题只在至少一项可见时渲染（不留空标题）。
+   *
+   * 「待确认」也参与判断：它没有设置开关（数据状态驱动），但**会占一行** ——
+   * 若用户把「收藏」「重复资产」两个开关都关掉而库里还有 conflict，
+   * 不把它算进来的话会出现一个**没有标题**的孤立行。
+   */
+  const showOrganizeGroup = showFavoritesEntry || showDuplicatesEntry || conflictCount > 0
 
   /** v0.4 收藏计数：空收藏也要能点进去看空态 → 不禁用，只显示 0 */
   const favoriteCount = useMemo(
@@ -654,6 +677,33 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
             <IconFile width={15} height={15} className="shrink-0 text-tertiary" />
             <span className="flex-1 text-left">重复资产</span>
             <span className={countCls}>{dupExtra}</span>
+          </button>
+        )}
+
+        {/* 「待确认」（docs/35 §4.3 入口①）：分类存在两源争议的资产（`reviewReasonOf === 'conflict'`）。
+            三条形态纪律，逐条都对得上设计文档：
+            · **0 时整行不渲染**（`conflictCount > 0 && (...)`）—— 不是 disabled、不是灰掉。
+              与「整理」按钮"只在有资产时出现"同一纪律；也与「重复资产」的 disabled 形态
+              刻意不同：那个是**常驻能力的入口**（用户要能知道它在哪），本行是**数据状态
+              的提示**（没有存疑数据时它就不该占位，否则是一个"点了没反应"的按钮）。
+            · 点击只 `openReview()` —— **不套筛选、不切视图**（与 `openTriage()` 的两条既有
+              纪律完全一致，见 `store.ts` 的 `openTriage` 注释）。待确认队列本身是全库口径，
+              套上筛选会让用户看到的条数与徽标对不上。
+            · **不冒泡**：本行虽然是独立按钮（不像「整理」那样嵌在一级分类行里），仍显式
+              `stopPropagation()` —— 侧栏的行级点击有历史包袱（`navTo` / 折叠树），
+              不让一次点击顺手触发第二个动作。 */}
+        {conflictCount > 0 && (
+          <button
+            className={itemCls(false, 'neutral')}
+            title={`分类存疑、等你裁定（${conflictCount} 个）：一屏一张，选完自动跳到下一张`}
+            onClick={(e) => {
+              e.stopPropagation()
+              openReview()
+            }}
+          >
+            <IconAlert width={15} height={15} className="shrink-0 text-tertiary" />
+            <span className="flex-1 text-left">待确认</span>
+            <span className={countCls}>{conflictCount}</span>
           </button>
         )}
 

@@ -249,7 +249,10 @@ describe('TriageOverlay · 源码守卫', () => {
     // 找到 confirm 的实现体
     const at = SRC.indexOf('const confirm = useCallback(')
     expect(at).toBeGreaterThan(-1)
-    const body = SRC.slice(at, SRC.indexOf('}, [current, busy, level1, level2, assignCategory, setNotice])'))
+    const body = SRC.slice(at, SRC.indexOf('}, [current, busy, level1, level2, decideReview, setNotice])'))
+    // 锚点必须真的命中：`indexOf` 返回 -1 时 `slice` 会一路切到文件末尾，
+    // 这条守卫就静默退化成"扫大半个文件"（真回归未必抓得住）。加一条显式断言兜住。
+    expect(body.length).toBeLessThan(SRC.length)
     // 成功分支：moved > 0 → 前进
     const okAt = body.indexOf('if (summary.moved > 0)')
     expect(okAt).toBeGreaterThan(-1)

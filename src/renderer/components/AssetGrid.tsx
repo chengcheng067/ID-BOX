@@ -31,6 +31,7 @@ import { peekPreviewUrl } from '../logic/previewThumb'
 import { isImageFileExt } from '../../shared/imageExts'
 import { DEFAULT_FILTERS, activeFilterDimensions, applyFilters } from '../logic/filters'
 import { isDeletedAsset, trashBadgeText } from '../logic/trashView'
+import { reviewReasonOf } from '../logic/reviewFlow'
 import { isHdrExt } from '../../shared/hdrExts'
 import { dataChannelLabel } from '../logic/materialBall'
 import { canStage, stageController } from '../logic/stageController'
@@ -1189,6 +1190,8 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
   const openFolderView = useVault((s) => s.openFolderView)
   /** HDR 预览入口（0.6.5）：网格双击 HDR 卡 → 直接进预览，不再进文件视图 */
   const openHdrPreview = useVault((s) => s.openHdrPreview)
+  /** 待确认队列入口（docs/35 §4.3 入口③）：卡片「存疑」徽标点它 */
+  const openReview = useVault((s) => s.openReview)
   /** 0.6.0 批量重命名：只做批量（单选走详情面板的单条改名，不在本功能范围） */
   const openRenameDialog = useVault((s) => s.openRenameDialog)
   const [menu, setMenu] = useState<{ x: number; y: number; ids: string[] } | null>(null)
@@ -2441,6 +2444,33 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
                   : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100'
               }
             />
+            {/* 「存疑」徽标（docs/35 §4.3 入口③）：分类存在两源争议、等用户裁定。
+                位置按设计定在 `SelectBox` 之后、`Flags`（收藏星 / 疑似乱码）**之前**。
+                判据用 `reviewReasonOf(a) === 'conflict'` 而**不是** `classifyReview.reason === 'conflict'`
+                —— 前者的第 1 条会把「已定案」（`decidedAt` 有值）判成 null，后者不会，
+                于是用户处理完的卡片会一直挂着徽标（点了还会进一个空队列）。
+                · 只渲染 conflict，**不渲染 unclassified**：未分类已有明显表达（分类为空 + 侧栏计数）；
+                · 复用既有 `.badge`（中性灰 tint），**不新造颜色 token**（docs/32 纪律）。
+                  与「疑似乱码」那个 danger 实底刻意不同：存疑不是错误，是待办；
+                · **回收站里不渲染**：已删资产的分类争议没有处理意义（文件不在原目录，
+                  归类必然失败），与 `GripHandle` 同一条纪律。
+                · 点击 = `stopPropagation` + `openReview()`：意图是「处理这个存疑」，
+                  不是「看它」——只筛到这张会让用户还得自己再找入口。
+                  选中态下不渲染：多选语境里卡片角的按钮不可点（与 `Flags` 同一让位规则）。 */}
+            {!trashMode && !selected && reviewReasonOf(a) === 'conflict' && (
+              <button
+                type="button"
+                className="badge cursor-pointer"
+                title="这一条的分类有争议，点这里去确认"
+                onClick={(e) => {
+                  // 卡片本体是 role="button"（点击 = 选中 / 双击 = 进文件视图）
+                  e.stopPropagation()
+                  openReview()
+                }}
+              >
+                存疑
+              </button>
+            )}
             {/* C 线「最近删除」：右上角剩余天数徽标（保留期按 Settings.trashRetention 算）。
                 在回收站里"还剩几天"比"收没收藏"重要得多。`recycle` 档没有软删记录，不渲染。 */}
             {!selected &&
