@@ -1,4 +1,5 @@
 import type { BallParamScales } from './ballParams'
+import type { ClassifyConfidence } from './classifyCrossCheck'
 
 /** 7-Zip 官方下载页（未就绪时给用户的可行动入口） */
 export const SEVEN_ZIP_DOWNLOAD_URL = 'https://7-zip.org/'
@@ -378,6 +379,20 @@ export interface Asset {
    */
   zhimoId?: string | null
   /**
+   * 分类可信度与待确认原因（2026-10 三源交叉验证，`docs/35`）。
+   *
+   * 为什么是**一个嵌套对象**而不是 4 个平铺字段：本项目的字段保全有**三处**必须同步
+   * （rescan 白名单 / `applyOverwriteInherit` / `mergeDuplicateGroup`），每多一个字段
+   * 就多三个漏点。2026-10 的 rescan 事故（143 条里 127 条的 `renderParams` 被抹）
+   * 就是"新字段忘了归类"的直接后果。
+   *
+   * `undefined` = 尚未经交叉验证（老记录 / 未抓过详情页）→ 行为与改造前完全一致。
+   *
+   * **非索引字段**：不参与筛选、不进 `.where()` → 不需要升 Dexie 版本
+   * （同 `materialMeta` / `renderParams` / `renderShape` / `zhimoId` 先例）。
+   */
+  classifyReview?: ClassifyReview
+  /**
    * 重复检测键 = `<kind>:<归一化后的**基础**资产名>`。
    *
    * ⚠️ 必须用 `uniqueName()` **之前**的原始资产名计算：第二次导入同名包会被
@@ -387,6 +402,36 @@ export interface Asset {
   dedupeKey: string
   importedAt: number
   updatedAt: number
+}
+
+/** 见 `Asset.classifyReview`。字段全部可选：任一缺失都不影响既有功能。 */
+export interface ClassifyReview {
+  /** 上一次判定的置信度（`docs/35 §2.3`）。`undefined` = 没有判定过 */
+  confidence?: ClassifyConfidence
+  /**
+   * **只有 `conflict` 才写**。
+   *
+   * ⚠️ `unclassified` 是**派生值**（走 `logic/triageFlow.ts` 的 `isUnclassified`），
+   * **不落库** —— 同一语义只能有一个存储点（`docs/25`「未分类有三种口径」的教训）。
+   */
+  reason?: 'conflict'
+  /**
+   * 判定依据。**只存不可重算的部分**：
+   * - `s1` 不存（`classifyAssetName` 纯函数可重算，且随词表升级会腐坏）；
+   * - `s2` / `s3` 存（站方随时会改，重抓拿到的是"今天的站方"）。
+   */
+  sources?: {
+    /**
+     * 精简版 `CrossS2`（`classifyCrossCheck.CrossS2`）：
+     * 去掉 `viaAlias`（判定当时的内部细节，事后无解释价值），
+     * 加上 `fromBaseName`（这条 S2 是面包屑解析来的还是末级名兜底来的 —— 两者可信度不同，
+     * 用户看队列时需要知道）。
+     */
+    s2?: { level1: string; level2: string; raw: string[]; fromBaseName: boolean }
+    s3?: string
+  }
+  /** 用户/自动**定案**的时间戳；有值 = 已定案 → `reviewReasonOf` 返回 null */
+  decidedAt?: number
 }
 
 /** 导入过程的进度事件（主进程 → 渲染进程） */
@@ -443,6 +488,14 @@ export interface ImportConflictInherit {
   /** 旧分类；双哨兵（未分类/未分类）= 用户从未指派 → 覆盖时改用新包预分类 */
   category1: string
   category2: string
+  /**
+   * 分类判定依据（`docs/35 §6.4`）：旧记录有就继承（同 `zhimoId` 的"本地优先"口径 ——
+   * 抓过一次的站方结论 / 用户定案时间戳，新包解不出同样的东西，丢了就得重抓）。
+   *
+   * 放在 `ImportConflictInherit` 而不只在 `ImportDedupeEntry` 上：这份快照是
+   * **主进程与渲染层共用的瘦投影**，字段必须在同一处声明，两端才能同时看到。
+   */
+  classifyReview?: ClassifyReview
 }
 
 /**

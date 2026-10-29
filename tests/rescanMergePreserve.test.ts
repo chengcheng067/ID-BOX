@@ -88,7 +88,9 @@ const LOCAL_PRESERVED = [
   'rating',
   'colorTag',
   'importedAt',
-  'updatedAt'
+  'updatedAt',
+  // 分类判定依据（docs/35 §6.3）：磁盘上没有"置信度"这种东西，rescan 无权改写
+  'classifyReview'
 ] as const
 
 /**
@@ -254,7 +256,7 @@ async function mergeOnce(local: Asset, scanned: Asset): Promise<Asset> {
   return merged[0]!
 }
 
-// ── ④ 归类完整性（运行时那半：互斥 + 不重复 + 覆盖全部 33 键） ──────────
+// ── ④ 归类完整性（运行时那半：互斥 + 不重复 + 覆盖全部 34 键） ──────────
 
 describe('Asset 字段归类表 —— 完整性', () => {
   it('两份名单互不重叠、各无重复，且并集覆盖 Asset 的全部字段', () => {
@@ -268,9 +270,10 @@ describe('Asset 字段归类表 —— 完整性', () => {
     const overlap = disk.filter((k) => (local as string[]).includes(k))
     expect(overlap).toEqual([])
     // 覆盖：编译期已经保证（UnclassifiedKey 必须是 never），这里钉住总数防手滑删行
-    expect(disk.length + local.length).toBe(33)
+    // 34 = 33（docs/35 之前）+ classifyReview（docs/35 R-13，只加一个嵌套字段而不是 4 个平铺）
+    expect(disk.length + local.length).toBe(34)
     expect(disk.length).toBe(17)
-    expect(local.length).toBe(16)
+    expect(local.length).toBe(17)
   })
 })
 

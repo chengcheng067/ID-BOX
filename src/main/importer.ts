@@ -28,6 +28,7 @@ import {
   zhimoIdFromSources
 } from '../shared/naming'
 import { classifyAssetName } from '../shared/classifyAsset'
+import { buildInitialClassifyReview } from '../shared/classifyCrossCheck'
 import { parseSkpVersion, SKP_HEAD_BYTES } from '../shared/skpVersion'
 import { IMAGE_FILE_EXTS } from '../shared/imageExts'
 import { readHeadForSize } from './probeSizes'
@@ -643,6 +644,16 @@ function applyOverwriteInherit(fresh: Asset, existing: ImportDedupeEntry): Asset
     note: meta.note || fresh.note,
     category1: meta.category1,
     category2: meta.category2,
+    // 分类判定依据（docs/35 §6.4）：旧记录有就继承 —— 同 `zhimoId` 的"本地优先"口径。
+    // 覆盖导入时新包只拿到磁盘上的目录名，拿不回"当时是谁判的 / 用户定过案没有"；
+    // 丢了它，T1 交叉验证会把用户已定案的记录重新当成"S1 猜的"并可能搬走目录。
+    //
+    // ⚠️ 顺序是 `旧 ?? 新` 而**不是** `新 ?? 旧`：T0 会给**每一条**新记录写初值
+    //    （`medium-s1` / `none`），`fresh` 永远非空 → 若让 `fresh` 优先，这条路就等于
+    //    "覆盖导入无条件把 `decidedAt` / `high` 重置成不用一分钟前刚猜的结论"，
+    //    继承整段失效。这与 §6.4 的"旧记录有就继承"原意一致（那里的 `fresh.classifyReview`
+    //    是 T0 写入之前写的形状）。
+    classifyReview: meta.classifyReview ?? fresh.classifyReview,
     zhimoId: fresh.zhimoId ?? existing.zhimoId,
     dedupeKey: dedupeKeyOf(existing.name, fresh.kind)
   }
@@ -1021,6 +1032,11 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
       colorTag: null,
       // 知末商品 ID（落盘**之前**就按原始资产名算好，见判重点的注释）
       zhimoId,
+      // T0（docs/35 §5.1）：此刻只有 S1，站方信息要等批次结束才拿得到。
+      // **必须用落盘的净化段**（`cat1Seg/cat2Seg`，= 磁盘目录段），不是词表原貌 ——
+      // 判空比的是 `UNCLASSIFIED`，词表原貌里含 `/` 的词条净化后仍是同一个非未分类值，
+      // 但用原貌会让"库里存的分类"与"判定依据"指向两个不同的字符串（第二套真相）。
+      classifyReview: buildInitialClassifyReview(cat1Seg, cat2Seg),
       // ⚠️ v0.4 缺陷修复：必须用 `uniqueName()` **之前**的 `assetName`。
       // 用 `finalName` 时第二个同名包叫「椅子-2」→ key 是 `model:椅子-2`，与
       // `model:椅子` 不相等 → 同一套模型导入两次永远检测不出重复。
@@ -1336,6 +1352,8 @@ async function importMediaOne(
     colorTag: null,
     // 同压缩包路径：源文件名优先，其次资产名（判重点已算好）
     zhimoId,
+    // T0 初始判定（docs/35 §5.1）：用落盘的净化段，与 `category1/2` 逐字一致
+    classifyReview: buildInitialClassifyReview(cat1Seg, cat2Seg),
     // 同压缩包路径：用 `uniqueName()` 之前的 `assetName`（见上方注释）
     dedupeKey: dedupeKeyOf(assetName, kind),
     importedAt: now,
@@ -1625,6 +1643,8 @@ async function importModelOne(
     rating: 0,
     colorTag: null,
     zhimoId,
+    // T0 初始判定（docs/35 §5.1）：用落盘的净化段，与 `category1/2` 逐字一致
+    classifyReview: buildInitialClassifyReview(cat1Seg, cat2Seg),
     dedupeKey: dedupeKeyOf(assetName, kind),
     importedAt: now,
     updatedAt: now

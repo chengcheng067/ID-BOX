@@ -253,6 +253,24 @@ describe('mergeDuplicateGroup —— 只补空、绝不覆盖', () => {
     expect(mergedOwn.renderShape).toBe('roundedBox')
   })
 
+  it('classifyReview 只在 undefined 时继承；已有判定不覆盖（不挑"更好的那个"）', () => {
+    const keeper = asset({ id: 'keep', thumbStatus: 'ready', thumbPath: 'k.jpg' })
+    const withReview = asset({ id: 'r', classifyReview: { confidence: 'high', decidedAt: 123 } })
+
+    const filled = mergeDuplicateGroup(keeper, [withReview])
+    expect(filled.classifyReview).toEqual({ confidence: 'high', decidedAt: 123 })
+
+    // 幸存者自己的判定依据是权威：哪怕别条是 high、自己是 conflict，也不许拿别条覆盖
+    const keepOwn = asset({
+      id: 'keep2',
+      thumbStatus: 'ready',
+      thumbPath: 'k2.jpg',
+      classifyReview: { confidence: 'conflict', reason: 'conflict' }
+    })
+    const mergedOwn = mergeDuplicateGroup(keepOwn, [withReview])
+    expect(mergedOwn.classifyReview).toEqual({ confidence: 'conflict', reason: 'conflict' })
+  })
+
   it('tags 取并集并去重（保持出现顺序）', () => {
     const keeper = asset({ id: 'keep', thumbStatus: 'ready', thumbPath: 'k.jpg', tags: ['a', 'b'] })
     const other = asset({ id: 'o', tags: ['b', 'c'] })

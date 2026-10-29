@@ -63,7 +63,11 @@ export function buildDedupeSnapshot(assets: readonly Asset[]): ImportDedupeEntry
         note: typeof a.note === 'string' ? a.note : '',
         // 缺省 = 双哨兵 = 用户从未指派过分类 → 覆盖时改用新包预分类
         category1: typeof a.category1 === 'string' && a.category1 ? a.category1 : UNCLASSIFIED,
-        category2: typeof a.category2 === 'string' && a.category2 ? a.category2 : UNCLASSIFIED
+        category2: typeof a.category2 === 'string' && a.category2 ? a.category2 : UNCLASSIFIED,
+        // 分类判定依据（docs/35 §6.4）：判重快照是主进程与渲染层共用的瘦投影，
+        // 覆盖导入要靠它把"当时是谁判的 / 用户定过案没有"带到新记录上。
+        // `undefined` 原样留空（不补默认值）—— 补了就等于替旧记录声称"判定过"。
+        classifyReview: a.classifyReview
       }
     })
   }

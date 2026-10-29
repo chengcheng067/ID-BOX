@@ -193,6 +193,13 @@ export function mergeDuplicateGroup(keeper: Asset, others: Asset[]): Asset {
     const withShape = others.find((a) => a.renderShape !== undefined)
     if (withShape) merged.renderShape = withShape.renderShape
   }
+  // 分类判定依据（docs/35 §6.4）：同 `renderParams/renderShape` 的"只补空"口径。
+  // **不挑"更好的那个"**（如 high 优于 conflict）：拿别条的判定依据覆盖幸存者，
+  // 是在没有依据的情况下替用户改结论（`compareSurvivor` 已让"用户字段多"的那条当幸存者）。
+  if (merged.classifyReview === undefined) {
+    const withReview = others.find((a) => a.classifyReview !== undefined)
+    if (withReview) merged.classifyReview = withReview.classifyReview
+  }
 
   if (!nonEmptyText(merged.cover)) {
     const withCover = others.find((a) => nonEmptyText(a.cover))

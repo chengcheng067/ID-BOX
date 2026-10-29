@@ -38,6 +38,7 @@
 
 import type { ClassifyOutcome } from './classifyAsset'
 import { UNCLASSIFIED } from './taxonomy'
+import type { ClassifyReview } from './types'
 
 /**
  * 哨兵：判不出分类时的两个字段值。**从 `taxonomy` 转出，不写死字符串** ——
@@ -292,4 +293,31 @@ function buildCandidates(p1: ClassifyOutcome, p2: ClassifyOutcome): CrossCandida
     out.push(c)
   }
   return out.slice(0, 3)
+}
+// ── 落库侧：把判定结果压成 `Asset.classifyReview`（docs/35 §6.1） ──────────
+//
+// ⚠️ 本段**仍然零 IO**：只是把内存对象拼出来，不读磁盘、不算哈希、不调 `Date.now()`
+//    （时间戳由调用方给）。`types.ts` 只被 `import type` 引用 → 编译后不留 require，
+//    也不会与 `types.ts` 形成运行时循环（`types.ts` 对 `classifyCrossCheck` 是纯类型依赖）。
+
+/**
+ * T0（导入落盘那一刻）的初始判定：**此时只有 S1**，站方信息要等批次结束才拿得到。
+ *
+ * 意义不在"分类对不对"，而在**留下"这个分类是谁给的"的痕迹**：
+ * T1 抓完详情页后，只有能区分「S1 猜的（可能错）」与「用户手工指的（不要动）」
+ * 才谈得上交叉验证。而这个区分**只能在 T0 写** —— T1 时原始分类已被覆盖。
+ *
+ * - S1 双未分类 → `{ confidence: 'none' }`（**不写 `reason`**：`unclassified` 是派生值）
+ * - S1 有值     → `{ confidence: 'medium-s1' }`
+ *
+ * 不存 `sources.s1`：S1 是可重算的纯函数，存进库只会随词表升级而腐坏（`docs/35` R-13）。
+ *
+ * ⚠️ 判空只看 `category1`：与 `decideClassify` 的 `isEmpty` 同口径 ——
+ * "二级未分类但一级有值"仍算 S1 给了结论（一级才是主判据）。
+ */
+export function buildInitialClassifyReview(category1: string, category2: string): ClassifyReview {
+  // `category2` 有意不参与判定（见上方"判空只看 category1"），但签名保留两级：
+  // 调用方传的是 `cat1Seg` / `cat2Seg` 这一对，签名收一个会让调用点看起来像传错了。
+  void category2
+  return category1 === UNCLASSIFIED ? { confidence: 'none' } : { confidence: 'medium-s1' }
 }
