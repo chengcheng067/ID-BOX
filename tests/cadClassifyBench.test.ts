@@ -177,12 +177,17 @@ function report(rows: LabelRow[], tag: string): void {
   console.log(
     `${pad('一级', 14)}${pad('条目数', 8)}${pad('占比', 8)}${pad('一级命中', 11)}${pad('二级命中', 11)}${pad('双未分类', 11)}落图种册`
   )
+  // v0.8.5 取舍标注：这两册退为兜底桶后是被**主动削**的，看表时别误以为退化
+  const SHRUNK: Record<string, string> = {
+    平立面系统图: ' ← 主动削（内容压图种），25.0% → 17.5%',
+    节点详图: ' ← 主动削（内容压图种），38.0% → 37.0%'
+  }
   for (const l1 of [...groups.keys()].sort((a, b) => groups.get(b)!.length - groups.get(a)!.length)) {
     const g = groups.get(l1)!
     console.log(
       `${pad(l1, 14)}${pad(String(g.length), 8)}${pad(pct(g.length, n), 8)}${pad(pct(g.filter(l1Ok).length, g.length), 11)}` +
         `${pad(pct(g.filter(l2Ok).length, g.length), 11)}${pad(pct(g.filter(bothMiss).length, g.length), 11)}` +
-        `${g.filter((r) => DRAWING_TYPE_SINKS.has(r.predicted.category1)).length}`
+        `${g.filter((r) => DRAWING_TYPE_SINKS.has(r.predicted.category1)).length}${SHRUNK[l1] ?? ''}`
     )
   }
 
@@ -300,6 +305,43 @@ function report(rows: LabelRow[], tag: string): void {
   )
   console.log('')
 }
+
+/**
+ * 「内容压图种」这笔取舍的**代价**，钉在这里。
+ *
+ * `CAD_DRAWING_TYPE_LEVEL1`（`平立面系统图` / `节点详图`）是主动退成兜底桶的那两个册：
+ * 两趟都命中时，内容册的答案优先。它净赚 14 条（救 13 / 伤 3），代价就是下面这 3 条 ——
+ * 真值本来就是 `平立面系统图`，但标题里出现了房间/空间内容词。
+ *
+ * 为什么必须写成测试：这是**我们主动削一个册**的产品取舍，不能只活在 commit message 里。
+ * 将来若有人把 `CAD_DRAWING_TYPE_LEVEL1` 置空（回退到 353 那版），这三条会立刻变绿，
+ * 而 13 条救回会变红 —— 一改就看得见。
+ */
+describe.skipIf(REAL_PATH === null)('内容压图种的代价（平立面系统图 组 25.0% → 17.5%）', () => {
+  it('★这三条真值是 平立面系统图，但被判进了内容册（已知取舍）', () => {
+    const cases: Array<[string, string, string]> = [
+      [
+        '家装立面图 客厅立面图 餐厅立面图 卧室立面图 厨房立面图 卫生间立面图 施工图',
+        '家装空间',
+        '卫生间' // 一包多房间立面图，站方归「卫生间」；我们取最后一个内容词
+      ],
+      ['展厅立面图 施工图', '工装空间', '展厅'],
+      ['145㎡咖啡厅平面图', '工装空间', '餐饮空间']
+    ]
+    for (const [title, c1, c2] of cases) {
+      expect(classifyAssetName(title, undefined, 'cad'), title).toEqual({ category1: c1, category2: c2 })
+    }
+  })
+
+  it('★但 `平立面系统图` 组不得被削到 15% 以下（防止将来词表一改把这组清零）', () => {
+    const rows = load(REAL_PATH!).filter((r) => r.level1 === '平立面系统图')
+    const hit = rows.filter((r) => isL2Hit(r, classifyAssetName(r.title, undefined, 'cad'))).length
+    console.log(`
+[平立面系统图组] ${hit}/${rows.length} = ${pct(hit, rows.length)}（v0.8.5 取舍后基线 17.5%，取舍前 25.0%）`)
+    expect(rows.length, '真值里应有一批平立面系统图的行').toBeGreaterThan(10)
+    expect(hit / rows.length, '平立面系统图 组被削过头了 —— 检查 CAD_DRAWING_TYPE_LEVEL1').toBeGreaterThanOrEqual(0.15)
+  })
+})
 
 describe.skipIf(REAL_PATH === null)('CAD 分类基准台 · 站方真值（labeled-titles.json）', () => {
   it('量现状 + 三个上限（打表，不做断言）', () => {
