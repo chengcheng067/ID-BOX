@@ -352,11 +352,13 @@ describe.skipIf(REAL_PATH === null)('CAD 分类基准台 · 站方真值（label
   /**
    * 验收线（不是精确值，留余量防脆）。
    *
-   * 这三条守的是 v0.8.5 两个改动的**净收益**与**不再回流**：
-   * - 剥离图种尾词 + 文件名只兜底 → 二级严格命中 30.8% → 34% 上下
-   * - 双未分类 52.2% → 47% 上下
-   * - 反向：给每条都配 `60 1F-2F立面图.dwg`，二级命中不得低于 30%
+   * 这三条守的是**净收益**与**不再回流**：
+   * - 剥离图种尾词 + 文件名只兜底 → 二级严格命中 30.8% → 33.6%
+   * - v0.8.6 补 13 个派生归并词 → 33.6% → **42.5%**（双未分类 49.9% → 42.2%）
+   * - 反向：给每条都配 `60 1F-2F立面图.dwg`，二级命中不得低于 40%
    *   （合并池时代这一项是 1.8% —— 有人把 fileNames 塞回第一趟，这条立刻红）
+   *
+   * 门槛留 2~3 个点余量给词表漂移；**改词表后如果这组数掉了，先看基准台的分组表**。
    */
   it('回归线：二级命中 ≥ 0.33、双未分类 ≤ 0.52、统一配 立面图.dwg 后二级命中 ≥ 0.30', () => {
     const rows = load(REAL_PATH!)
@@ -374,8 +376,8 @@ describe.skipIf(REAL_PATH === null)('CAD 分类基准台 · 站方真值（label
     console.log(
       `\n[回归线] total=${total} 二级命中=${l2} (${pct(l2, total)}) 双未分类=${miss} (${pct(miss, total)}) 配立面图后=${worst} (${pct(worst, total)})`
     )
-    expect(l2 / total, '二级严格命中率跌破 0.33 —— 剥尾/兜底被改坏了？').toBeGreaterThanOrEqual(0.33)
-    expect(miss / total, '双未分类超过 0.52 —— 命中能力退化了？').toBeLessThanOrEqual(0.52)
-    expect(worst / total, '配 立面图.dwg 后塌缩 —— fileNames 又被塞回第一趟了？').toBeGreaterThanOrEqual(0.3)
+    expect(l2 / total, '二级严格命中率跌破 0.40 —— 剥尾/兜底/派生词被改坏了？').toBeGreaterThanOrEqual(0.4)
+    expect(miss / total, '双未分类超过 0.45 —— 命中能力退化了？').toBeLessThanOrEqual(0.45)
+    expect(worst / total, '配 立面图.dwg 后塌缩 —— fileNames 又被塞回第一趟了？').toBeGreaterThanOrEqual(0.4)
   })
 })

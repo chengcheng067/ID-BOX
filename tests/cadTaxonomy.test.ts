@@ -208,29 +208,61 @@ describe('CAD_LEVEL2_MAP（docs/34 §二：10 键 / 102 项 / 去重 97）', () 
       [
         '沙发', '柜子', '桌子', '窗帘', '地毯', '挂画', '摆件', '鱼缸', '人物', '动物', '壁炉',
         '背景墙', '文化墙', '屏风隔断', '晾衣架', '桁架', '大平层', '单身公寓', '商场', '企业展厅',
-        '栏杆', '办公景观', '集装箱', '城市规划'
+        '栏杆', '办公景观', '集装箱', '城市规划',
+        // v0.8.6 派生词带来的新重名：`健身器材` 也是 SU `电器/器材` 的二级
+        '健身器材'
       ].sort()
     )
-    expect(overlap3).toHaveLength(24)
+    expect(overlap3).toHaveLength(25)
   })
 })
 
-describe('CAD_LEVEL3_ALIAS（docs/34 §三：368 项 → 364 条）', () => {
-  it('长度 364，且 term 唯一（重复会让命中归因不可复现）', () => {
-    expect(CAD_LEVEL3_ALIAS).toHaveLength(364)
+/**
+ * 归并表分两类：
+ * - **站方节点**（364 条）：`source` 是 sgt 页面 URL，必须在 JSON 快照里找得到同三元组；
+ * - **派生归并词**（v0.8.6 起）：站方**没有**这个节点，是我们按真值补的别名，
+ *   `source` 以「派生自」开头并注明词的类型（简称/截断/同义/下义词/复合长形）。
+ *   ⚠️ 两类必须分开断言：派生词**不允许**出现在 JSON 里（出现了说明其实抄漏了站方节点，
+ *   那就该走"补抄录"流程进 `CAD_LEVEL2_MAP`，而不是当派生词塞进 alias）。
+ */
+const DERIVED_PREFIX = '派生自'
+const isDerived = (a: { source?: string }): boolean => (a.source ?? '').startsWith(DERIVED_PREFIX)
+const stationRows = CAD_LEVEL3_ALIAS.filter((a) => !isDerived(a))
+const derivedRows = CAD_LEVEL3_ALIAS.filter((a) => isDerived(a))
+
+describe('CAD_LEVEL3_ALIAS（docs/34 §三：368 项 → 364 站方 + 13 派生 = 377）', () => {
+  it('长度 378 = 364 站方 + 14 派生，且 term 唯一（重复会让命中归因不可复现）', () => {
+    expect(CAD_LEVEL3_ALIAS).toHaveLength(377)
+    expect(stationRows).toHaveLength(364)
+    expect(derivedRows).toHaveLength(13)
     const terms = CAD_LEVEL3_ALIAS.map((a) => a.term)
-    expect(new Set(terms).size).toBe(364)
+    expect(new Set(terms).size).toBe(377)
   })
 
-  it('★ 每一条都能在 JSON 里找到同 (一级, 二级, 名称) 的节点 —— 全覆盖，不是抽查', () => {
+  it('★ 站方 364 条每一条都能在 JSON 里找到同 (一级, 二级, 名称) 的节点 —— 全覆盖，不是抽查', () => {
     const triples = new Set(jsonLevel3.map((n) => `${n.level1}|${n.level2}|${n.name}`))
-    for (const a of CAD_LEVEL3_ALIAS) {
+    for (const a of stationRows) {
       expect(triples.has(`${a.level1}|${a.level2}|${a.term}`), `${a.term} → ${a.level1}/${a.level2}`).toBe(true)
     }
   })
 
+  it('★ 派生词一条都不在 JSON 里（在的话说明是抄漏，该走补抄录而不是当派生）', () => {
+    const triples = new Set(jsonLevel3.map((n) => `${n.level1}|${n.level2}|${n.name}`))
+    for (const a of derivedRows) {
+      expect(triples.has(`${a.level1}|${a.level2}|${a.term}`), `${a.term} 其实在站方树里，别当派生词`).toBe(false)
+    }
+  })
+
+  it('★ 派生词必须写明词类型（防止"碎片词"混进来）', () => {
+    const KINDS = ['简称', '截断', '同义', '下义词', '复合长形']
+    for (const a of derivedRows) {
+      expect(a.source, `${a.term} 的 source 必须注明词类型`).toMatch(/派生自「.+」，非站方节点 · (.+)/)
+      expect(KINDS.some((k) => a.source!.includes(k)), `${a.term} 的词类型不在白名单里：${a.source}`).toBe(true)
+    }
+  })
+
   it('★ JSON 里 364 个不同三级名一个都没漏（含 21 项「点不进去」的）', () => {
-    const ours = new Map(CAD_LEVEL3_ALIAS.map((a) => [a.term, a]))
+    const ours = new Map(stationRows.map((a) => [a.term, a]))
     const missing = [...new Set(jsonLevel3.map((n) => n.name))].filter((n) => !ours.has(n))
     expect(missing).toEqual([])
     // 21 项 reachable:false 的也必须进表（我们要的是文件名匹配，不是导航）
@@ -240,7 +272,7 @@ describe('CAD_LEVEL3_ALIAS（docs/34 §三：368 项 → 364 条）', () => {
   })
 
   it('★ 被丢掉的恰是 4 条同名另一支（3 个机电节点 + 展台），一条不多一条不少', () => {
-    const ours = new Map(CAD_LEVEL3_ALIAS.map((a) => [a.term, a]))
+    const ours = new Map(stationRows.map((a) => [a.term, a]))
     const dropped = jsonLevel3
       .filter((n) => {
         const kept = ours.get(n.name)
@@ -291,16 +323,20 @@ describe('CAD_LEVEL3_ALIAS（docs/34 §三：368 项 → 364 条）', () => {
     }
   })
 
-  it('每一条都带 source（站方节点 URL，可复核）', () => {
-    for (const a of CAD_LEVEL3_ALIAS) {
-      expect(a.source, `${a.term} 缺 source`).toMatch(/^https:\/\/sgt\.znzmo\.com\/sgt\//)
+  it('站方条目带节点 URL、派生条目写清派生依据（两者格式都要可复核）', () => {
+    for (const a of stationRows) {
+      expect(a.source, `${a.term} 缺站方 URL`).toMatch(/^https:\/\/sgt\.znzmo\.com\/sgt\//)
+    }
+    for (const a of derivedRows) {
+      expect(a.source, `${a.term} 缺派生说明`).toMatch(/^派生自「.+」，非站方节点/)
     }
   })
 
   it('抽查 5 条（固定 5 条 + 种子伪随机的另 5 条）：{term, level1, level2} 与 JSON 一致', () => {
     const picked = ['图例', '沙发', '火锅店', '商场', '暖通节点']
     for (const term of picked) {
-      const row = CAD_LEVEL3_ALIAS.find((a) => a.term === term)!
+      // 固定抽查必须是**站方节点**（派生词不在 JSON 里，见上面的专测）
+      const row = stationRows.find((a) => a.term === term)!
       const node = jsonLevel3.find(
         (n) => n.name === term && n.level1 === row.level1 && n.level2 === row.level2
       )
@@ -315,7 +351,7 @@ describe('CAD_LEVEL3_ALIAS（docs/34 §三：368 项 → 364 条）', () => {
     let seed = 20261029
     for (let k = 0; k < 5; k++) {
       seed = (seed * 1103515245 + 12345) % 2147483648
-      const row = CAD_LEVEL3_ALIAS[seed % CAD_LEVEL3_ALIAS.length]!
+      const row = stationRows[seed % stationRows.length]!
       const node = jsonLevel3.find(
         (n) => n.name === row.term && n.level1 === row.level1 && n.level2 === row.level2
       )

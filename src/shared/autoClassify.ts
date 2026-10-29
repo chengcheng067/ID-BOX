@@ -58,7 +58,7 @@
  *    并附加 `matchedLevel:'l3-alias'`。与二级词条同属"二级强度"：
  *    **最长优先；等长时二级原文优先**（候选数组把二级放前面，`pickBest` 只在严格更长时替换）。
  *    【v0.8.5】归并表**按频道分册**：默认扫 `LEVEL3_ALIAS`（SU，9 条），
- *    `level2Scope:'cad'` 时只扫 `CAD_LEVEL3_ALIAS`（CAD，364 条）。两者互不可见。
+ *    `level2Scope:'cad'` 时只扫 `CAD_LEVEL3_ALIAS`（CAD，377 条 = 364 站方 + 13 派生）。两者互不可见。
  * 10. **一级回退开关**（v1.0.12，`AutoClassifyOptions.level1Only`）：可选参数，
  *    为 `true` 时**跳过轮 1**（二级 + 三级归并），只做一级尾锚定。供 `importer` 在
  *    "二级命中的一级被 kind 闸门拒绝"时再问一次 —— **宁可不分二级，也要保住正确的一级**。
@@ -424,7 +424,7 @@ export interface AutoClassifyOptions {
    *
    * 【v0.8.5 / docs/34】`'cad'` = 同样的隔离，但换的是**整套 CAD 词表**：
    * - 二级扫 `CAD_LEVEL2_MAP`（10 键 / 102 项），命中 `matchedLevel:'cad-l2'`；
-   * - 三级归并扫 `CAD_LEVEL3_ALIAS`（364 条），命中 `matchedLevel:'cad-l3'`；
+   * - 三级归并扫 `CAD_LEVEL3_ALIAS`（377 条 = 364 站方 + 13 派生），命中 `matchedLevel:'cad-l3'`；
    * - **一级轮**改成扫 `CAD_LEVEL2_MAP` 的键（10 项），否则 `level1Only` 回退对
    *   CAD 永远为空（CAD 的一级不在 `LEVEL2_MAP` 里）；
    * - **两级都未命中 → 直接 `null`，不回落通用词表**（与 `'material'` 支刻意不同：
