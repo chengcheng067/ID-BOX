@@ -45,3 +45,6 @@ qa-settings-tmp/
 
 # qa-083 真机验收临时产物（截图/脚本/userdata，不入库）
 qa-083-tmp/
+
+# 0.9.0 筛选死角真机验证（临时，跑完删）
+qa-filter-tmp/
