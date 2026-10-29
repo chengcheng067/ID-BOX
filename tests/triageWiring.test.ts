@@ -232,7 +232,13 @@ describe('TriageOverlay · 源码守卫', () => {
 
   it('★取图走 quickLookImageUrl（不自己拼 vault://）', () => {
     expect(SRC).toContain("import { quickLookImageUrl } from '../logic/quickLook'")
-    expect(SRC).toContain('quickLookImageUrl(current)')
+    // 2026-10-30 探探式飞出改造：渲染对象从 `current` 换成 `view`
+    // （`swipeState?.asset ?? current` —— 飞出期间要显示**冻结的那张**，
+    //  否则确认写库后 `current` 已经变了，飞出去的会是空白/下一张）。
+    // 守卫的意图不变：**取图必须走 quickLookImageUrl**，所以锚点跟着换成 view。
+    expect(SRC).toMatch(/quickLookImageUrl\((view|current)\)/)
+    // 且不许在这里多开一条取图路径（只此一处调用）
+    expect(SRC.split('quickLookImageUrl(').length - 1).toBe(2) // import + 1 次调用
 
     // ⛔ 不许自己拼协议。判据要**先剥掉注释**再查 —— 文件头注释里解释了
     // 「三级回退 + `vault://` 编码全在那一处」，那是说明文字不是代码。
@@ -245,28 +251,39 @@ describe('TriageOverlay · 源码守卫', () => {
     expect(code).not.toContain('vaultUrl(')
   })
 
-  it('★归类失败不前进：moved > 0 才 setCursor(advanceAfterAssign)', () => {
+  it('★归类失败不前进：moved > 0 才播飞出（游标推进在 onAnimationEnd）', () => {
     // 找到 confirm 的实现体
     const at = SRC.indexOf('const confirm = useCallback(')
     expect(at).toBeGreaterThan(-1)
-    const body = SRC.slice(at, SRC.indexOf('}, [current, busy, level1, level2, decideReview, setNotice])'))
+    const body = SRC.slice(at, SRC.indexOf('},\n    [current, busy, level1, level2, decideReview, setNotice]\n  )'))
     // 锚点必须真的命中：`indexOf` 返回 -1 时 `slice` 会一路切到文件末尾，
     // 这条守卫就静默退化成"扫大半个文件"（真回归未必抓得住）。加一条显式断言兜住。
     expect(body.length).toBeLessThan(SRC.length)
-    // 成功分支：moved > 0 → 前进
+
+    // 成功分支：moved > 0 → 播**右飞**（`out-confirm`）。
+    // 2026-10-30 起推进不在这里直接 `setCursor`：动画还没播完就换人，
+    // 飞出去的会是下一张。推进统一在 `finishSwipe`（`onAnimationEnd`），
+    // 所以这里改守"成功分支必须触发 confirm 方向的飞出"。
     const okAt = body.indexOf('if (summary.moved > 0)')
     expect(okAt).toBeGreaterThan(-1)
-    expect(body.slice(okAt, okAt + 200)).toContain('advanceAfterAssign')
-    // 失败分支：failed > 0 → **只提示、不前进**
+    const okBlock = body.slice(okAt, okAt + 220)
+    expect(okBlock).toContain("'out-confirm'")
+    expect(okBlock).toContain('beginSwipe')
+
+    // 失败分支：failed > 0 → **只提示、不飞出、不前进**
     const failAt = body.indexOf('else if (summary.failed > 0)')
     expect(failAt).toBeGreaterThan(-1)
-    const failBlock = body.slice(failAt, failAt + 160)
+    const failBlock = body.slice(failAt, failAt + 200)
     expect(failBlock).toContain('setNotice')
     expect(failBlock).not.toContain('advanceAfterAssign')
-    // 兜底 catch 也不前进
+    expect(failBlock).not.toContain('beginSwipe')
+
+    // 兜底 catch 也不飞出、不前进
     const catchAt = body.indexOf('} catch (err)')
     expect(catchAt).toBeGreaterThan(-1)
-    expect(body.slice(catchAt, catchAt + 200)).not.toContain('advanceAfterAssign')
+    const catchBlock = body.slice(catchAt, catchAt + 260)
+    expect(catchBlock).not.toContain('advanceAfterAssign')
+    expect(catchBlock).not.toContain('beginSwipe')
   })
 
   it('★确认前校验一级分类（未选一级不静默失败）', () => {

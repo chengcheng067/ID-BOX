@@ -501,14 +501,12 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                       {/* 一级节点行：主按钮 + （未分类时的）整理入口。
                           ⚠️ 整理按钮**不能**塞进主按钮内部 —— `<button>` 里套 `<button>`
                           是非法 HTML（浏览器会把它提出去，点击区域错乱）。
-                          所以这一行是 `relative` 容器 + 主按钮 + 绝对定位的小按钮，
-                          主按钮右侧额外留出 `pr-9` 给整理按钮腾位。 */}
-                      <div className="group relative">
+                          所以这一行是 `flex` 行容器：主按钮 `flex-1 min-w-0` + 兄弟节点整理按钮。
+                          ⚠️ 不要退回 `absolute`：绝对定位不占位，数字永远被按钮压住（这就是
+                          「整理」胶囊盖掉计数左半边的原因）。flex 让数字真的让位。 */}
+                      <div className="group flex items-center gap-1">
                       <button
-                        className={`${itemCls(l1Active, 'accent', dropKey === l1Key)}${
-                          // 未分类行有整理按钮 → 数字前面多留一点，避免被按钮压住
-                          n.value === UNCLASSIFIED && n.count > 0 ? ' pr-9' : ''
-                        }`}
+                        className={`${itemCls(l1Active, 'accent', dropKey === l1Key)} min-w-0 flex-1`}
                         {...dropProps(l1Key, node, n.value)}
                         onClick={() => {
                           // 一级分类：退出文件视图 → 退出回收站 → 筛选到「大类 + 一级」，再点同一节点折叠
@@ -525,18 +523,31 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                       >
                         <span className="flex-1 truncate pl-4 text-left text-[13px]">
                           {n.value}
-                          {n.inferred && <span className="ml-1 text-[10px] text-muted">待核对</span>}
+                          {/* 「词表待补」= 该分类名来自**推断**的词表条目，不是等你处理的待办。
+                              旧文案的「核对」二字被误读成"我需要去确认一下"，但界面上没有确认入口
+                              （CONFIDENCE 是词表数据的可信度，不属于资产待办）。故改文案 + 虚线淡标，
+                              明确它是信息而不是任务。 */}
+                          {n.inferred && (
+                            <span
+                              className="ml-1 shrink-0 rounded-[3px] border border-dashed border-line px-1 text-[9px] leading-[14px] text-tertiary"
+                              title="该分类来自推断的词表条目，尚未与站方全表逐条核对（不影响你使用）"
+                            >
+                              词表待补
+                            </span>
+                          )}
                         </span>
-                        <span className={countCls}>{n.count}</span>
+                        <span className={`${countCls} shrink-0`}>{n.count}</span>
                       </button>
                       {/* 「整理」入口（P2）：只在**未分类且有资产**时出现（需求 1）。
                           常显而不是 hover 才现 —— 它是这一行的**主行动**，用户找不到入口
                           这功能就等于不存在；hover 才现只适合次要操作。
-                          走 `openTriage()` —— 待办集为空时它自己给 notice 且不开浮层。 */}
+                          走 `openTriage()` —— 待办集为空时它自己给 notice 且不开浮层。
+                          视觉：实心 accent 蓝 + 白字（沿用 .btn-solid 的 token，尺寸压到 h20）。
+                          它是 flex 兄弟节点 → 占位、把数字顶到左边，两者不可能重叠。 */}
                       {n.value === UNCLASSIFIED && n.count > 0 && (
                         <button
                           type="button"
-                          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-[6px] border border-line bg-card px-1.5 py-[2px] text-[10px] text-secondary transition hover:border-accent/50 hover:bg-accent-tint hover:text-accent-text"
+                          className="h-[20px] shrink-0 rounded-[5px] bg-accent px-1.5 text-[10px] font-medium leading-none text-white transition hover:brightness-110"
                           title="一键整理：一屏一张，选完分类自动跳到下一张"
                           onClick={(e) => {
                             // 不能冒泡到主按钮（那会顺手筛选到「未分类」并折叠树）

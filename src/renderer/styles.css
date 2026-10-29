@@ -746,3 +746,173 @@
     opacity: 0.3;
   }
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 整理浮层 · 探探式左右飞出（2026-10-30，**仅追加**，不改上方任何既有规则）
+ *
+ * 用户原话：
+ *   「关于"确认"或者"跳过"的操作，可以参考探探的动画效果，即"跳过"就向左滑，
+ *     卡片往左边飞出去；"确认"就向右滑，卡片往右边飞出去。」
+ *
+ * ## 结构
+ *   方向 → `--triage-dir`（`1` = 右飞 / `-1` = 左飞），由 JSX 内联样式写入
+ *   强度 → 三个 `triage-swipe-out-*` 类（与 `settings.motionQuality` 同名）
+ *   入场 → `triage-swipe-in`（方向复用同一个 `--triage-dir`，位移取反）
+ *
+ * ⚠️ **一份 keyframes 服务两个方向**（靠 `calc(var(--triage-dir) * 420px)`），
+ *    不是左右各写一套 —— 三档 × 两向 = 六份几乎相同的 `@keyframes`，改一处必漏一处。
+ *
+ * ⚠️ 时长必须与 `logic/triageSwipe.ts` 的 `TIER_TIMING` 一致（250 / 320 / 340，入场 200）。
+ *    那是唯一的时间来源，`tests/triageSwipe.test.ts` 会读本文件核对，单边改动会红。
+ *
+ * ⚠️ 不使用 `backdrop-filter`、不引入任何颜色 —— 只动 `transform` / `opacity`。
+ *    这是合成层动画，不触发布局与重绘（低端机也不掉帧）。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+.triage-swipe-out-smooth,
+.triage-swipe-out-balanced,
+.triage-swipe-out-ultra {
+  /* `both`：结束帧保持住，直到 JS 在 `onAnimationEnd` 里摘掉类 —— 
+     否则动画一结束卡片会"跳回"原位闪一下再消失。 */
+  animation-fill-mode: both;
+  animation-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+  will-change: transform, opacity;
+  /* 相对自身中心旋转（探探那种"整张歪着飞出去"的手感） */
+  transform-origin: 50% 50%;
+  /* 飞出期间不许交互：连点不该点到正在飞走的按钮 */
+  pointer-events: none;
+}
+.triage-swipe-out-smooth {
+  animation-name: triage-swipe-out-smooth;
+  animation-duration: 250ms;
+}
+.triage-swipe-out-balanced {
+  animation-name: triage-swipe-out-balanced;
+  animation-duration: 320ms;
+}
+.triage-swipe-out-ultra {
+  /* 3D 旋转要多给 20ms，否则收尾会显得"戛然而止"（与 `folder-tile-in-ultra` 同观感） */
+  animation-name: triage-swipe-out-ultra;
+  animation-duration: 340ms;
+}
+
+/* 入场：**方向与飞出相反**。`--triage-dir` 仍是飞出那个值，
+   所以位移取 `-24px` —— 右飞之后，新卡从左边略偏处滑进来。 */
+.triage-swipe-in {
+  animation: triage-swipe-in 200ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  will-change: transform, opacity;
+}
+.triage-swipe-right {
+  /* 方向变量兜底写在这里，JS 内联样式优先（内联没写上时也不会飞错方向） */
+  --triage-dir: 1;
+}
+.triage-swipe-left {
+  --triage-dir: -1;
+}
+
+/* ── 三档 keyframes ── */
+
+/* 流畅档：纯合成层位移 + 淡出。不带 rotate / perspective —— 
+   低端机只吃 translate/opacity，与 `folder-tile-slide-*` 同一条取舍。 */
+@keyframes triage-swipe-out-smooth {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(calc(var(--triage-dir, 1) * 360px), 0, 0);
+  }
+}
+
+/* 标准档：位移 + 6° 旋转 + 0.96 缩放 + 24px 下坠。
+   那个 `24px` 的 y 位移是刻意的：探探的手感来自"甩出去"的抛物线，
+   纯水平位移读起来像抽屉滑轨，不像一张卡被扔出去。
+   `rotate` 与位移同号 —— 右飞时顺时针歪（+6deg），左飞时逆时针（-6deg）。 */
+@keyframes triage-swipe-out-balanced {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) rotate(0deg) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(calc(var(--triage-dir, 1) * 420px), 24px, 0)
+      rotate(calc(var(--triage-dir, 1) * 6deg)) scale(0.96);
+  }
+}
+
+/* 极致档：在标准档上叠 `perspective` + `rotateY`（与 `folder-tile-in-ultra` 同款手法）。
+   `rotateY` 与位移**反号**：卡片是"转向背面"飞走的，同号会变成"绕着正面转"，
+   看起来像在自转而不是被推开。 */
+@keyframes triage-swipe-out-ultra {
+  from {
+    opacity: 1;
+    transform: perspective(900px) translate3d(0, 0, 0) rotateY(0deg) rotate(0deg) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: perspective(900px) translate3d(calc(var(--triage-dir, 1) * 420px), 24px, 0)
+      rotateY(calc(var(--triage-dir, 1) * -22deg)) rotate(calc(var(--triage-dir, 1) * 6deg))
+      scale(0.96);
+  }
+}
+
+/* 入场：从"与飞出相反的一侧、略偏 24px"滑回原点，同时 0.6 → 1 淡入。
+   `opacity: 0.6` 而不是 0：硬切到 0 会让下一张有一瞬间"整个不见了"，
+   0.6 是"还在但还没站稳"的读数（需求原文就是 0.6）。 */
+@keyframes triage-swipe-in {
+  from {
+    opacity: 0.6;
+    transform: translate3d(calc(var(--triage-dir, 1) * -24px), 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/* ── 无障碍兜底：完全不做位移，退化成 160ms 纯淡出 / 淡入 ──
+ * 这条不是"降级体验"：位移动画对前庭功能障碍用户是真实的不适源，
+ * 系统开了「减少动效」就**一律不许**位移，`ultra` 也不许给 3D。
+ * JS 侧 `swipeTimingOf(reduced)` 会直接换成 `triage-swipe-fade-*` 类，
+ * 这里再加一层 `!important` 兜住"类名没换成功"的情况（双保险）。 */
+.triage-swipe-fade-out {
+  animation: triage-swipe-fade-out 160ms linear both;
+  pointer-events: none;
+}
+.triage-swipe-fade-in {
+  animation: triage-swipe-fade-in 160ms linear both;
+}
+@keyframes triage-swipe-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes triage-swipe-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .triage-swipe-out-smooth,
+  .triage-swipe-out-balanced,
+  .triage-swipe-out-ultra {
+    animation-name: triage-swipe-fade-out !important;
+    animation-duration: 160ms !important;
+    animation-timing-function: linear !important;
+    transform: none !important;
+  }
+  .triage-swipe-in {
+    animation-name: triage-swipe-fade-in !important;
+    animation-duration: 160ms !important;
+    animation-timing-function: linear !important;
+    transform: none !important;
+  }
+}
