@@ -1296,7 +1296,7 @@ export interface FetchZhimoCoverResult {
 //
 // 与封面通道的分工：`zhimo:fetchCover` 要"下到图且 ≥200px"才算成功，
 // 图挂了会把**已经拿到**的站方分类一起丢掉。`zhimo:fetchMeta` 只发一次详情页 GET，
-// 解析 `classifyBaseName` / `style` / `version` / `title`，**零图片请求、零写盘**。
+// 解析 `classifyBaseName` / `style` / `version` / `title` / `breadcrumb`，**零图片请求、零写盘**。
 
 /** `zhimo:fetchMeta` 入参（**没有 `folder`**：本通道不写盘，不需要库内路径） */
 export interface FetchZhimoMetaPayload {
@@ -1309,7 +1309,8 @@ export interface FetchZhimoMetaPayload {
  *
  * 形状与 `FetchZhimoCoverResult` 同款（**扁平、不是联合**）：渲染层手写 `if (!r.ok)` 即可。
  *
- * - `ok === true`：四个字段恒在，**值为 `null` 是正常结果**（"站方没给"，不是错误）；
+ * - `ok === true`：五个字段恒在，**值为 `null` 是正常结果**（"站方没给"，不是错误）；
+ *   `breadcrumb` 例外 —— 站方这一页没有面包屑时**字段缺省**（`undefined`，不是空数组）。
  * - `ok === false` 且带 `reason`：详情页请求/解析失败（reason 沿用封面那套枚举，
  *   本通道**只会**出现 `no-id` / `not-found` / `timeout` / `network`）。
  */
@@ -1324,6 +1325,25 @@ export interface FetchZhimoMetaResult {
   version?: string | null
   /** 站方标题 */
   title?: string | null
+  /**
+   * 站方**完整分类路径**（详情页 `breadcrumb_data` 原文，按 `level` 升序）—— 分类三源交叉验证的 **S2 源**。
+   *
+   * 【docs/35 T-01】`classifyBaseName` 只有末级名字、还原不出路径；面包屑能同时给出一级与二级。
+   * 缺省（`undefined`）= 站方这一页没给面包屑（实测约 20%），**不是空数组**。
+   *
+   * ⚠️ 类型是**内联结构体**而不是 import `src/main/zhimoCover.ts` 的 `ZhimoBreadcrumbItem`：
+   * 渲染层不允许 import `src/main/**`（`tsconfig.web.json` 根本不 include 主进程）。
+   * 字段与主进程 `zhimoCover.ts` 的 `ZhimoBreadcrumbItem` 逐字一致 —— **改一处必须同步另一处**。
+   */
+  breadcrumb?: {
+    termId: number
+    /** 站方节点名（原话，未映射；如 `室内空间` / `办公空间`） */
+    name: string
+    /** 站方层级真值：`f{termId}` / `f{父}s{子}` / `f{祖}s{父}s{子}` */
+    href: string
+    /** 由 `href` 里 `s` 的个数推导（1 = 一级）；**不用数组下标** */
+    level: number
+  }[]
 }
 
 // ── HDR 预览（0.6.5，HDR 入库 + 降采样预览） ──────────────────────────────

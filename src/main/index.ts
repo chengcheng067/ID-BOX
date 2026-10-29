@@ -1328,13 +1328,15 @@ ipcMain.handle(
       return { ok: false, reason: res.reason }
     }
 
-    // 显式摊平四个字段（不透传内部对象，避免将来加字段时无意改 IPC 契约）
+    // 显式摊平五个字段（不透传内部对象，避免将来加字段时无意改 IPC 契约）
     return {
       ok: true,
       classifyBaseName: res.classifyBaseName,
       style: res.style,
       version: res.version,
-      title: res.title
+      title: res.title,
+      // 【docs/35 T-01】面包屑（S2 源）；没有就不带该字段（`undefined` ≠ 空数组）
+      ...(res.breadcrumb ? { breadcrumb: res.breadcrumb } : {})
     }
   }
 )

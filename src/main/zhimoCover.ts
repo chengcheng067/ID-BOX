@@ -1074,6 +1074,17 @@ export interface ZhimoMetaInfo {
   version: string | null
   /** 站方标题 */
   title: string | null
+  /**
+   * 站方**完整分类路径**（`breadcrumb_data` 逐条原文，按 `level` 升序）。
+   *
+   * 【docs/35 T-01】这是「分类三源交叉验证」里的 **S2 源**：`classifyBaseName` 只有末级
+   * 名字、给不出路径，而面包屑能还原 (一级, 二级)。**只解析、不落库** —— 判定归
+   * `shared/classifyCrossCheck.ts` 的 `decideClassify()`，本模块不掺任何分类逻辑。
+   *
+   * `undefined` = 站方这一页没给面包屑（实测约 20% 的详情页没有），**不是空数组**：
+   * "没有"与"空"是两件事（与 `ZhimoDetailInfo.breadcrumb` 同一口径）。
+   */
+  breadcrumb?: ZhimoBreadcrumbItem[]
 }
 
 /**
@@ -1103,7 +1114,10 @@ export function parseZhimoMeta(html: string): ZhimoMetaInfo | null {
     style: extras?.style ?? null,
     // `extras.version` 已经带 `res.version` 兜底；detail 再兜一次只为防 dpe 缺失
     version: extras?.version ?? detail?.version ?? null,
-    title: detail?.title ?? nonEmptyString(res?.title)
+    title: detail?.title ?? nonEmptyString(res?.title),
+    // 面包屑在 `parseZhimoDetail` 里已经解析好（同一个 `pageProps`，零额外成本）；
+    // 无有效条目时**不带该字段**（`undefined`，不写空数组）
+    ...(detail?.breadcrumb ? { breadcrumb: detail.breadcrumb } : {})
   }
 }
 
@@ -1114,6 +1128,8 @@ export interface ZhimoMetaSuccess {
   style: string | null
   version: string | null
   title: string | null
+  /** 站方完整分类路径（S2 源）；`undefined` = 这一页没给面包屑 */
+  breadcrumb?: ZhimoBreadcrumbItem[]
 }
 
 /** 元信息失败：只有 `ok` + `reason`（与封面失败同一套枚举口径） */
@@ -1197,13 +1213,15 @@ export async function fetchZhimoMeta(opts: ZhimoMetaFetchOptions): Promise<Zhimo
 
     if (!result.ok) return { ok: false, reason: result.reason }
 
-    // 明确摊平成四个字段：`ZhimoMetaInfo` 将来加字段也不会意外扩大 IPC 契约
+    // 明确摊平成五个字段：`ZhimoMetaInfo` 将来加字段也不会意外扩大 IPC 契约
     return {
       ok: true,
       classifyBaseName: result.value.classifyBaseName,
       style: result.value.style,
       version: result.value.version,
-      title: result.value.title
+      title: result.value.title,
+      // 【docs/35 T-01】面包屑（S2 源）。没有就不带该字段（`undefined` ≠ 空数组）
+      ...(result.value.breadcrumb ? { breadcrumb: result.value.breadcrumb } : {})
     }
   } catch {
     // 最后一道保险（运行时信号不可用 / 注入桩抛意外异常）：收敛成 reason，绝不抛错

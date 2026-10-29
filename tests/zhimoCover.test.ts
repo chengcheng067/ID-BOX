@@ -22,11 +22,15 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   ZHIMO_IMAGE_HOSTS,
   fetchZhimoCover,
+  fetchZhimoMeta,
   isZhimoImageUrl,
   parseZhimoDetail,
+  parseZhimoMeta,
   refreshZhimoCoverInto,
+  type ZhimoBreadcrumbItem,
   type ZhimoFetcher
 } from '../src/main/zhimoCover'
+import type { FetchZhimoMetaResult } from '../src/shared/types'
 
 // ── fixture 读取 ────────────────────────────────────────────────────────
 
@@ -339,6 +343,52 @@ describe('parseZhimoDetail：面包屑（层级由 href 推导，绝不看数组
   it('breadcrumb_data 缺失 → 字段不写（undefined）', () => {
     const info = parseZhimoDetail(pageHtml({ res: { listImageUrl: LIST_URL_1200 } }))
     expect(info?.breadcrumb).toBeUndefined()
+  })
+})
+
+// ── 详情页元信息也带面包屑（docs/35 T-01：S2 源要跨 IPC 到渲染层）──────────
+//
+// 为什么必须单测这一条：`parseZhimoMeta` 内部**早就调过** `parseZhimoDetail`（面包屑在它手里），
+// 但返回对象此前没带出来 —— 字段被"最后一米的摊平"丢掉，链路上游全是好的。
+// 这里断言的是「元信息通道」这个**新契约**，不是重复测 `parseZhimoDetail`。
+describe('parseZhimoMeta：把面包屑一并带出（S2 源，docs/35 T-01）', () => {
+  it('真实详情页 fixture → 3 条、level 1/2/2，末条 href = f765s1035', () => {
+    const meta = parseZhimoMeta(fixtureText('zhimo-detail-1186414883.html'))
+    expect(meta).not.toBeNull()
+    const crumb = meta?.breadcrumb ?? []
+    expect(crumb).toHaveLength(3)
+    expect(crumb.map((c) => c.level)).toEqual([1, 2, 2])
+    expect(crumb[0]).toMatchObject({ termId: 765, name: '软装陈设', href: 'f765', level: 1 })
+    expect(crumb[2]?.href).toBe('f765s1035')
+    expect(crumb[2]?.name).toBe('挂画')
+  })
+
+  it('页面没有面包屑 → 字段缺省（undefined，不是空数组）', () => {
+    const meta = parseZhimoMeta(pageHtml({ res: { listImageUrl: LIST_URL_1200 } }))
+    expect(meta).not.toBeNull()
+    expect(meta && 'breadcrumb' in meta).toBe(false)
+  })
+
+  it('fetchZhimoMeta 的成功结果也带面包屑（第一处摊平不能漏字段）', async () => {
+    const { fetcher } = makeFetcher((url) =>
+      url === detailUrl('1186414883')
+        ? { status: 200, body: fixtureText('zhimo-detail-1186414883.html') }
+        : { status: 200, body: JPEG_400() }
+    )
+    const out = await fetchZhimoMeta({ id: '1186414883', fetcher })
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(out.breadcrumb?.map((c) => c.name)).toEqual(['软装陈设', '墙饰墙绘', '挂画'])
+    expect(out.breadcrumb?.[2]?.href).toBe('f765s1035')
+  })
+
+  it('类型契约：渲染层内联结构体与主进程 ZhimoBreadcrumbItem **双向可赋值**（改一处必须同步另一处）', () => {
+    // `FetchZhimoMetaResult.breadcrumb` 是内联结构体（渲染层不许 import src/main/**），
+    // 所以两边的一致性只能靠编译器在这里守：任一方向不兼容 → typecheck 直接红。
+    const fromMain: ZhimoBreadcrumbItem = { termId: 1, name: '一级', href: 'f1', level: 1 }
+    const toIpc: NonNullable<FetchZhimoMetaResult['breadcrumb']>[number] = fromMain
+    const backToMain: ZhimoBreadcrumbItem = toIpc
+    expect(backToMain).toEqual(fromMain)
   })
 })
 
