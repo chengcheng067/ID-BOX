@@ -122,7 +122,7 @@ function CategoryCascade({
     ],
     [kind, l1Custom]
   )
-  const l2Options = level2OptionsFor(level1)
+  const l2Options = level2OptionsFor(level1, kind)
   const l2Items: CatOption[] = useMemo(
     () => [
       { value: UNCLASSIFIED, custom: false },

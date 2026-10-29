@@ -181,6 +181,78 @@ describe('logic/category · 级联选项', () => {
   })
 })
 
+/**
+ * CAD 图纸（`kind === 'cad'`）的手动改派级联。
+ *
+ * CAD 的一级/二级词表住 `CAD_LEVEL2_MAP`（**独立表，不进 `LEVEL2_MAP`**，理由见
+ * `shared/taxonomy.ts` 该表注释：97 个二级里 28 个与 SU 重名，并进扁平表会让
+ * `autoClassify` 的跨频道扫描污染模型分类）。所以 `level1OptionsFor` 必须从
+ * `CHANNEL_LEVEL1.cad` 取册，`level2OptionsFor` 必须靠 `kind` 参数显式换表
+ * ——否则一级在 `LEVEL2_MAP` 里查不到 → 返回 null → UI 把受控枚举错渲染成「可自由输入」。
+ */
+describe('logic/category · CAD 图纸的级联选项', () => {
+  it("level1OptionsFor('cad')：CHANNEL_LEVEL1.cad 10 项，不混入 SU 一级、不含「全部」", () => {
+    const l1 = level1OptionsFor('cad')
+    expect(l1).toHaveLength(10)
+    expect(l1).toContain('平立面系统图')
+    expect(l1).toContain('工装空间')
+    // 与 SU 19 项零交集：`家装` 是 SU 的键，CAD 写的是 `家装空间`
+    expect(l1).not.toContain('家装')
+    // 站方筛选栏首项「全部」= 导航控件，不进枚举（与 model/texture 同一条纪律）
+    expect(l1).not.toContain('全部')
+  })
+
+  it("level2OptionsFor(cad 一级, 'cad')：换到 CAD_LEVEL2_MAP，顺序照抄原序", () => {
+    // 3 项且顺序钉死（平立面系统图是最小一组，改序一眼能看出来）
+    expect(level2OptionsFor('平立面系统图', 'cad')).toEqual(['户型优化', '立面图/剖面图', '平面图'])
+    // 工装空间 12 项
+    const l2 = level2OptionsFor('工装空间', 'cad')
+    expect(l2).toHaveLength(12)
+    expect(l2).toContain('餐饮空间')
+  })
+
+  it("level2OptionsFor('餐饮空间', 'cad') → null：它是 CAD 的二级，不是一级", () => {
+    // 实测值就是 null，**不是** []。`餐饮空间` 只以「工装空间 下的二级」身份存在，
+    // 两张表都没有以它为键的项；`level2Of()` 也没有兜底逻辑
+    // （`LEVEL2_MAP[level1] ?? []`，纯查表），所以 `list.length === 0` → null。
+    // 语义正确：用户把 CAD 资产的一级选成「餐饮空间」这种非一级值时，二级应当自由输入。
+    expect(level2OptionsFor('餐饮空间', 'cad')).toBeNull()
+    // 反证：它确实是 `工装空间` 的二级，而不是一级
+    expect(level2OptionsFor('工装空间', 'cad')).toContain('餐饮空间')
+  })
+
+  it('回归：不传 kind 的老调用点行为逐字节不变', () => {
+    expect(level2OptionsFor('家具')).toContain('沙发')
+    // 显式传 model 与不传等价（都只查 LEVEL2_MAP）
+    expect(level2OptionsFor('家具', 'model')).toEqual(level2OptionsFor('家具'))
+    expect(level2OptionsFor('家具', 'model')).toContain('沙发')
+    // 材质预设仍无级联 → null（自由输入）
+    expect(level2OptionsFor('材质预设', 'material')).toBeNull()
+    // 未分类哨兵恒 [] —— kind 不影响这条短路
+    expect(level2OptionsFor(UNCLASSIFIED, 'cad')).toEqual([])
+  })
+
+  it('交叉污染守卫：CAD 表不外溢到 model，SU 表也不外溢到 cad', () => {
+    // `景观图库` 是 CAD 的**二级**（且在 CAD图库 / 园林景观 两个键下重名，属 5 组重名之一），
+    // 不是任何表的一级键 → 两张表都查不到。实测值 null（见上一条同型说明）。
+    expect(level2OptionsFor('景观图库', 'cad')).toBeNull()
+    expect(level2OptionsFor('景观图库', 'model')).toBeNull()
+
+    // 下面三条才是真正咬住「换表」这件事的断言：
+    // ① CAD 独有一级：cad 有枚举，model 查不到（SU 写 `景观`，不写 `园林景观`）
+    expect(level2OptionsFor('园林景观', 'cad')).toHaveLength(15)
+    expect(level2OptionsFor('园林景观', 'model')).toBeNull()
+    // ② SU 独有一级：model 有枚举，cad 查不到
+    expect(level2OptionsFor('景观', 'model')).toHaveLength(14)
+    expect(level2OptionsFor('景观', 'cad')).toBeNull()
+    // ③ 同名近义对：`家装`/`家装空间` 各自只在自己的表里
+    expect(level2OptionsFor('家装', 'model')).toHaveLength(17)
+    expect(level2OptionsFor('家装', 'cad')).toBeNull()
+    expect(level2OptionsFor('家装空间', 'cad')).toHaveLength(20)
+    expect(level2OptionsFor('家装空间', 'model')).toBeNull()
+  })
+})
+
 describe('logic/category · 风格选项与跨大类判定', () => {
   it('styleOptionsFor：按大类分册；kind=all 用并集；hdri 等无词表', () => {
     expect(styleOptionsFor('model')).toContain('简洁')

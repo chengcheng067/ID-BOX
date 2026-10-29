@@ -165,7 +165,7 @@ export function CategoryPicker() {
   if (!pickerIds || targets.length === 0 || !kind) return null
 
   const l1Options = level1OptionsFor(kind)
-  const l2Options = level2OptionsFor(level1) // null = 自由输入；[] = 锁定为未分类
+  const l2Options = level2OptionsFor(level1, kind) // null = 自由输入；[] = 锁定为未分类
   const multi = targets.length > 1
 
   // ── 自定义词表（2026-10）：与预设词条并列展示，`custom: true` 的行尾部画「自定义」角标 ──

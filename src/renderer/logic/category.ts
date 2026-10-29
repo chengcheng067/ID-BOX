@@ -9,6 +9,7 @@ import type { Asset, AssetKind, LayoutMove } from '../../shared/types'
 import {
   UNCLASSIFIED,
   CHANNEL_LEVEL1,
+  CAD_LEVEL2_MAP,
   MERGED_MATERIAL_LEVEL1,
   CONFIDENCE,
   level2Of,
@@ -145,10 +146,13 @@ export function duplicatedLevel2Names(assets: Asset[], kind: KindScope): Set<str
  * （两者落同一个「材质」目录，词表必须同源，否则"贴图能选、材质选不到"）。
  * 源数据仍是 `CHANNEL_LEVEL1`（`MERGED_MATERIAL_LEVEL1` 由 `TEXTURE_LEVEL1_LIST` ∪
  * `MATERIAL_LEVEL1_LIST` 派生，见 docs/14 §2.2），禁止从 `LEVEL2_MAP` 的 keys 推导。
+ * CAD 同样从 `CHANNEL_LEVEL1.cad` 取册（10 项），**不**从 `CAD_LEVEL2_MAP` 的 keys 推导
+ * ——后者是二级表，键的齐全与否受词条抄录进度影响，不能当一级词表用。
  * hdri/other 无词表 → [] → UI 自由输入。 */
 export function level1OptionsFor(kind: AssetKind): readonly string[] {
   if (kind === 'texture' || kind === 'material') return MERGED_MATERIAL_LEVEL1
   if (kind === 'model') return CHANNEL_LEVEL1.model
+  if (kind === 'cad') return CHANNEL_LEVEL1.cad
   return []
 }
 
@@ -157,10 +161,16 @@ export function level1OptionsFor(kind: AssetKind): readonly string[] {
  * - `[]` → 一级是「未分类」，二级强制未分类（禁用输入）；
  * - `null` → 无级联词表（如材质预设），UI 渲染为「可自由输入」（06 §3.3-②）；
  * - 其余 → 受控枚举（仍允许不在表内的值吗？——选择器只出枚举，自由值走自由输入路径）。
+ *
+ * `kind` 可选（老调用点不传 → 行为**逐字节不变**，仍只查 `LEVEL2_MAP`）。
+ * CAD 的二级住独立表 `CAD_LEVEL2_MAP`（不进 `LEVEL2_MAP`，理由见 taxonomy.ts 该表注释：
+ * 97 个二级里 28 个与 SU 重名，并进去会让 `autoClassify` 跨频道污染），
+ * 所以 CAD 必须**按 kind 显式换表**，否则一级（如「平立面系统图」）在 `LEVEL2_MAP` 里查不到
+ * → 返回 null → UI 把受控枚举错渲染成「可自由输入」。
  */
-export function level2OptionsFor(category1: string): readonly string[] | null {
+export function level2OptionsFor(category1: string, kind?: AssetKind): readonly string[] | null {
   if (!category1 || category1 === UNCLASSIFIED) return []
-  const list = level2Of(category1)
+  const list = kind === 'cad' ? (CAD_LEVEL2_MAP[category1] ?? []) : level2Of(category1)
   return list.length > 0 ? list : null
 }
 

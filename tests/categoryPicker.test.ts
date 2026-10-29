@@ -152,7 +152,10 @@ describe('二级联动：换 UI 承载，规则一行未改', () => {
   it('一级选项来源与二级级联来源仍是原来那两个纯函数', () => {
     const src = codeOf(read(PICKER))
     expect(src).toContain('const l1Options = level1OptionsFor(kind)')
-    expect(src).toContain('const l2Options = level2OptionsFor(level1)')
+    // 二级必须把 kind 一起传下去：CAD 的二级住独立表 `CAD_LEVEL2_MAP`，
+    // 不传 kind 会去查 `LEVEL2_MAP` → CAD 一级查不到 → null → 受控枚举被错渲染成自由输入。
+    // 断言钉住「参数传了」而不只是「函数被调用」，否则这条守卫等于白写。
+    expect(src).toContain('const l2Options = level2OptionsFor(level1, kind)')
   })
 
   it('改一级 → 二级重置为「未分类」（原 <select> onChange 的语义）', () => {
