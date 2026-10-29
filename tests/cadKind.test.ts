@@ -27,7 +27,7 @@ import {
   kindFromFolderName,
   primaryKind
 } from '../src/shared/classify'
-import { isLevel1AllowedForKind } from '../src/shared/taxonomy'
+import { CAD_LEVEL1_LIST, isLevel1AllowedForKind } from '../src/shared/taxonomy'
 import { classifyAssetName } from '../src/shared/classifyAsset'
 import type { AssetFile } from '../src/shared/types'
 
@@ -116,19 +116,63 @@ describe('cad 大类 · 筛选能力表', () => {
   })
 })
 
-describe('cad 大类 · 分类词表（本批不建词表，必须安全回落）', () => {
-  it('CHANNEL_LEVEL1 没有 cad 册 → isLevel1AllowedForKind 恒 false（不抛错）', () => {
+describe('cad 大类 · 分类词表（v0.8.5 词表已接：正面命中 + 跨频道仍是安全网）', () => {
+  /**
+   * ⚠️ 本组在 v0.8.5 **被修订过一次**（原文是「本批不建词表，必须安全回落」）。
+   * 词表接线（`CAD_LEVEL1_LIST` + `CAD_LEVEL2_MAP` + `CAD_LEVEL3_ALIAS` + `CHANNEL_LEVEL1.cad`）
+   * 之后，「恒 false / 恒双哨兵」的前提不再成立 —— 词表生效本身就是本批的目的。
+   * 修订**只拆正反面**，安全网一条都没放松：
+   * - 正面（新写）：命中知末真实二级 → 按词表落类；
+   * - 负面（保留原意、更硬）：CAD 资产的 category1 **永远只能是 CAD 册的 10 项之一**，
+   *   模型频道 / 贴图频道的一级一个都不许出现；表外词仍双哨兵。
+   * 词表逐项正确性由 `tests/cadTaxonomy.test.ts` 对着 `cad_tree.json` 快照守。
+   */
+  it('CAD 一级过闸；模型/贴图的一级仍被拒（闸门没被放松）', () => {
+    // cad 册现在有 10 项，但「家装」「石材」属于别的频道 → 仍必须 false
+    expect(isLevel1AllowedForKind('cad', '工装空间')).toBe(true)
+    expect(isLevel1AllowedForKind('cad', 'CAD图库')).toBe(true)
     expect(isLevel1AllowedForKind('cad', '家装')).toBe(false)
     expect(isLevel1AllowedForKind('cad', '石材')).toBe(false)
     expect(isLevel1AllowedForKind('cad', '')).toBe(false)
   })
 
-  it('classifyAssetName(kind=cad) 走双哨兵，不崩、不返回怪值', () => {
-    // 即便资产名命中了别的频道的一级（「家具沙发」→ 模型频道），CAD 也不该吞下它
-    for (const name of ['生态主题餐厅工装平面图', '家具沙发', '大理石瓷砖', '']) {
-      const out = classifyAssetName(name, ['平面图.dwg'], 'cad')
-      expect(out).toEqual({ category1: '未分类', category2: '未分类' })
-    }
+  it('正面：词表接上后，「…平面图」命中知末真实二级 平立面系统图/平面图', () => {
+    // docs/34 §二：`平立面系统图` 的二级就是 `户型优化 / 立面图/剖面图 / 平面图`。
+    // 文件名以「平面图」结尾 → 规则 1（CJK 尾锚定）+ 最长优先命中它。
+    expect(classifyAssetName('生态主题餐厅工装平面图', ['平面图.dwg'], 'cad')).toEqual({
+      category1: '平立面系统图',
+      category2: '平面图'
+    })
+  })
+
+  it('负面①：模型频道的词不被 CAD 吞 —— category1 永远落在 CAD 册内', () => {
+    // 说明：「家具沙发」在 SU 里是 `家具/沙发`；CAD 侧命中它**自己的**三级 `沙发`
+    // （站方真实节点 CAD图库 > 家具图库 > 沙发），所以不是"泄漏"，而是 CAD 该有的答案。
+    // 因此断言改守**更强的性质**：category1 ∈ CAD 册 10 项，且绝不是模型频道一级 `家具`。
+    const out = classifyAssetName('家具沙发', undefined, 'cad')
+    expect(CAD_LEVEL1_LIST).toContain(out.category1)
+    expect(out.category1).not.toBe('家具')
+    expect(out).toEqual({ category1: 'CAD图库', category2: '家具图库' })
+
+    // 干净的跨频道样本：`水槽` 是 SU 的 `厨卫五金/水槽`，CAD 表里没有 → 必须双哨兵
+    expect(classifyAssetName('水槽', undefined, 'cad')).toEqual({
+      category1: '未分类',
+      category2: '未分类'
+    })
+  })
+
+  it('负面②：贴图频道的词不被 CAD 吞（大理石瓷砖 → 双哨兵）', () => {
+    expect(classifyAssetName('大理石瓷砖', undefined, 'cad')).toEqual({
+      category1: '未分类',
+      category2: '未分类'
+    })
+  })
+
+  it('负面③：空名不崩、不返回怪值（双哨兵）', () => {
+    expect(classifyAssetName('', undefined, 'cad')).toEqual({
+      category1: '未分类',
+      category2: '未分类'
+    })
   })
 })
 

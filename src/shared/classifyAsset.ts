@@ -12,6 +12,9 @@
  * 0. 【v1.0.14】`kind==='material'` 时先跑**材质频道专属二级表**（`MATERIAL_LEVEL2_MAP`，
  *    20 键 / 106 项，docs/18）——命中即返回 `matchedLevel:'material-l2'`；
  *    未命中才继续下面的通用流程（`texture` 不走这一步，理由见 `MATERIAL_L2_SCOPE_KINDS`）；
+ *    【v0.8.5】`kind==='cad'` 时同理整轮换成 **CAD 词表**（`CAD_LEVEL2_MAP` + `CAD_LEVEL3_ALIAS`，
+ *    docs/34 §二/§三）——二级/三级/一级键三层都被作用域隔离，
+ *    `texture`/`model` 的匹配结果与改动前**逐字节一致**（见 `level2ScopeOf`）；
  * 1. `autoClassify()` 全量匹配（二级优先）；一级属于该 kind 的**容器**词表 → 采用；
  * 2. 否则**一级回退**：`autoClassify(name, undefined, { level1Only: true })` 再问一次
  *    "至少一级对不对"；一级过闸 → `{ 一级, 未分类 }`；
@@ -57,11 +60,23 @@ export interface ClassifyOutcome {
 const MATERIAL_L2_SCOPE_KINDS: ReadonlySet<string> = new Set(['material'])
 
 /**
+ * 某个 `kind` 的**二级词表作用域**（`undefined` = 走通用 `LEVEL2_MAP` 流程）。
+ *
+ * - `'material'` → `MATERIAL_LEVEL2_MAP`（材质频道专属表，v1.0.14）；
+ * - `'cad'` → `CAD_LEVEL2_MAP` + `CAD_LEVEL3_ALIAS`（CAD 频道整套词表，v0.8.5 / docs/34）。
+ *
+ * ⚠️ 这两个作用域的触发条件都**只按 kind**，不看内容：`kind` 就是频道身份。
+ * ⚠️ `texture` 刻意**不**走 material 表（理由见 `MATERIAL_L2_SCOPE_KINDS` 的反例注释）。
+ */
+const level2ScopeOf = (kind: string): 'material' | 'cad' | undefined =>
+  MATERIAL_L2_SCOPE_KINDS.has(kind) ? 'material' : kind === 'cad' ? 'cad' : undefined
+
+/**
  * 判定一个资产应落的「一级/二级」。
  *
  * @param assetName 资产名（导入时已清洗；重跑分类时直接用 `asset.name`）
  * @param fileNames 资产内文件名（仅参与二级匹配，见 `autoClassify` 规则 5）；可省略
- * @param kind 资产大类（`AssetKind`；决定闸门用哪套一级词表，以及是否走材质专属二级表）
+ * @param kind 资产大类（`AssetKind`；决定闸门用哪套一级词表，以及是否走频道专属二级表）
  * @returns `{ category1, category2 }`；判不出来时两个都是 `未分类`
  */
 export function classifyAssetName(
@@ -69,9 +84,8 @@ export function classifyAssetName(
   fileNames: string[] | undefined,
   kind: string
 ): ClassifyOutcome {
-  const opts = MATERIAL_L2_SCOPE_KINDS.has(kind)
-    ? ({ level2Scope: 'material' } as const)
-    : undefined
+  const level2Scope = level2ScopeOf(kind)
+  const opts = level2Scope === undefined ? undefined : ({ level2Scope } as const)
   const rawHit = autoClassify(
     assetName,
     fileNames === undefined ? undefined : [...fileNames],
@@ -81,7 +95,12 @@ export function classifyAssetName(
     return { category1: rawHit.category1, category2: rawHit.category2 }
   }
   // 一级回退：一级只看资产名（`autoClassify` 规则 5），故不传 fileNames。
-  const level1Hit = autoClassify(assetName, undefined, { level1Only: true })
+  // ⚠️ 作用域必须一起带下去：CAD 的一级不在 `LEVEL2_MAP` 里，不传 scope 时
+  // `level1Only` 对 CAD 恒返回 null，回退等于没有。
+  const level1Hit = autoClassify(assetName, undefined, {
+    level1Only: true,
+    ...(level2Scope === undefined ? {} : { level2Scope })
+  })
   if (level1Hit !== null && isLevel1AllowedForKind(kind, level1Hit.category1)) {
     return { category1: level1Hit.category1, category2: UNCLASSIFIED }
   }

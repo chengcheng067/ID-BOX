@@ -57,6 +57,8 @@
  *    命中后 `category2` 取归并表指定的二级、`matchedTerm` 取**实际命中的三级词**，
  *    并附加 `matchedLevel:'l3-alias'`。与二级词条同属"二级强度"：
  *    **最长优先；等长时二级原文优先**（候选数组把二级放前面，`pickBest` 只在严格更长时替换）。
+ *    【v0.8.5】归并表**按频道分册**：默认扫 `LEVEL3_ALIAS`（SU，9 条），
+ *    `level2Scope:'cad'` 时只扫 `CAD_LEVEL3_ALIAS`（CAD，364 条）。两者互不可见。
  * 10. **一级回退开关**（v1.0.12，`AutoClassifyOptions.level1Only`）：可选参数，
  *    为 `true` 时**跳过轮 1**（二级 + 三级归并），只做一级尾锚定。供 `importer` 在
  *    "二级命中的一级被 kind 闸门拒绝"时再问一次 —— **宁可不分二级，也要保住正确的一级**。
@@ -66,18 +68,29 @@
  * `docs/06-分类体系设计.md` + `src/shared/taxonomy.ts`（逐项照抄，禁止凭记忆敲）。
  */
 
-import { LEVEL2_MAP, LEVEL3_ALIAS, MATERIAL_LEVEL2_MAP, UNCLASSIFIED } from './taxonomy'
+import {
+  CAD_LEVEL2_CANONICAL_PARENT,
+  CAD_LEVEL2_MAP,
+  CAD_LEVEL3_ALIAS,
+  LEVEL2_MAP,
+  LEVEL3_ALIAS,
+  MATERIAL_LEVEL2_MAP,
+  UNCLASSIFIED
+} from './taxonomy'
 
 /**
- * 命中来源层级（v1.0.10 / v1.0.14）：
+ * 命中来源层级（v1.0.10 / v1.0.14 / v0.8.5）：
  * - `'l2'`：直接命中 `LEVEL2_MAP` 的二级词条（词表原文）；
  * - `'l3-alias'`：命中 `LEVEL3_ALIAS` 的三级归并表（落盘仍用归并表指定的二级）；
  * - `'material-l2'`：命中 `MATERIAL_LEVEL2_MAP`（**材质频道专属**二级表，v1.0.14）。
  *   只有显式传 `level2Scope:'material'` 时才会出现 —— 不传则该值永不存在。
+ * - `'cad-l2'` / `'cad-l3'`：命中 `CAD_LEVEL2_MAP` / `CAD_LEVEL3_ALIAS`
+ *   （**CAD 频道专属**二级表与三级归并表，v0.8.5）。同样只在
+ *   `level2Scope:'cad'` 时出现。
  *
  * ⚠️ 与 `matchedLevel` 无关的调用方（如 importer）无需感知本字段。
  */
-export type AutoClassifyLevel = 'l2' | 'l3-alias' | 'material-l2'
+export type AutoClassifyLevel = 'l2' | 'l3-alias' | 'material-l2' | 'cad-l2' | 'cad-l3'
 
 export interface AutoClassifyHit {
   category1: string
@@ -353,8 +366,16 @@ export interface AutoClassifyOptions {
    * 为什么必须显式开关而不是默认启用：材质二级与贴图/模型二级是**三套不同的切分维度**
    * （docs/18 §4：9 个同名一级的二级清单零一致），混用会系统性错分。
    * 不传 = 老行为，一个字节都不变。
+   *
+   * 【v0.8.5 / docs/34】`'cad'` = 同样的隔离，但换的是**整套 CAD 词表**：
+   * - 二级扫 `CAD_LEVEL2_MAP`（10 键 / 102 项），命中 `matchedLevel:'cad-l2'`；
+   * - 三级归并扫 `CAD_LEVEL3_ALIAS`（364 条），命中 `matchedLevel:'cad-l3'`；
+   * - **一级轮**改成扫 `CAD_LEVEL2_MAP` 的键（10 项），否则 `level1Only` 回退对
+   *   CAD 永远为空（CAD 的一级不在 `LEVEL2_MAP` 里）。
+   * 不做这三层隔离的后果是双向污染：SU 命 CAD（`餐厅` → `家装空间/餐厅`）、
+   * CAD 命 SU（`沙发` → `家具/沙发`）。
    */
-  level2Scope?: 'material'
+  level2Scope?: 'material' | 'cad'
 }
 
 /**
@@ -363,7 +384,8 @@ export interface AutoClassifyOptions {
  * @param assetName 资产名（导入时的最终层文件夹名 / 压缩包名 / 图片文件名去扩展名）
  * @param fileNames 资产内文件名列表（可选；英文贴图名常只出现在文件名里，如 `LOFT`）
  * @param opts 可选开关（v1.0.12：`level1Only` 只做一级匹配；v1.0.14：`level2Scope:'material'`
- *             先跑材质频道专属二级表）
+ *             先跑材质频道专属二级表；v0.8.5：`level2Scope:'cad'` 整轮换成 CAD 词表
+ *             ——二级 `CAD_LEVEL2_MAP` + 三级归并 `CAD_LEVEL3_ALIAS` + 一级键也换 CAD 的 10 项）
  * @returns 命中 → `{ category1, category2, matchedTerm, alternativeCategories1 }`；
  *          全不命中 → `null`（调用方落 `未分类/未分类`）
  */
@@ -410,6 +432,67 @@ export function autoClassify(
           matchedTerm: best.term,
           alternativeCategories1: [],
           matchedLevel: 'material-l2'
+        }
+      }
+    }
+
+    // 【v0.8.5 / docs/34】CAD 频道专属词表（二级 102 项 + 三级归并 364 条）。
+    //
+    // 为什么要整套隔离（而不是只加二级）：CAD 的**二级 97 个名里有 28 个与 SU 重名**
+    // （餐厅 / 卧室 / 客厅 / 办公空间 / 商业建筑 …）、**三级 364 条里有 24 条与 SU 重名**
+    // （沙发 / 桌子 / 窗帘 / 地毯 / 挂画 / 摆件 / 人物 / 动物 / 壁炉 / 背景墙 / 桁架 / 大平层 …）。
+    // 任何一层漏出作用域，都会让 SU 模型资产被分进 `CAD/…` 或反过来。
+    //
+    // 与 `material` 支的**唯一差异**：CAD 的三级归并也在这条支里跑（那里没有三级表）。
+    // 两个候选池合成一个数组再 `pickBest`，所以「等长时二级原文优先于三级归并」的既有
+    // 语义原样成立（`pickBest` 只在**严格更长**时替换，等长保留先出现者）。
+    if (opts?.level2Scope === 'cad') {
+      const cadHits: Array<{
+        term: string
+        level1s: string[]
+        kind: MatchKind
+        category2: string
+        matchedLevel: AutoClassifyLevel
+      }> = []
+      for (const [level1, list] of Object.entries(CAD_LEVEL2_MAP)) {
+        for (const term of list) {
+          const kind = matchTerm(term, asciiTokens, cjkHeads)
+          if (kind === null) continue
+          // 5 组重名二级挂在两个一级下 → 合并成一条候选（`level1s` 两个值），
+          // 由 `CAD_LEVEL2_CANONICAL_PARENT` 决定哪个是 category1、哪个进 alternative。
+          const existing = cadHits.find((h) => h.term === term && h.matchedLevel === 'cad-l2')
+          if (existing) {
+            existing.level1s.push(level1)
+          } else {
+            cadHits.push({ term, level1s: [level1], kind, category2: term, matchedLevel: 'cad-l2' })
+          }
+        }
+      }
+      for (const alias of CAD_LEVEL3_ALIAS) {
+        const kind = matchTerm(alias.term, asciiTokens, cjkHeads)
+        if (kind === null) continue
+        cadHits.push({
+          term: alias.term,
+          level1s: [alias.level1],
+          kind,
+          category2: alias.level2,
+          matchedLevel: 'cad-l3'
+        })
+      }
+      if (cadHits.length > 0) {
+        const best = pickBest(cadHits)
+        // ⚠️ 覆盖只对**二级命中**生效：三级归并表的 level1/level2 已是页面实际归属
+        // （重名三级在生成表时就去重定向了，见 `CAD_LEVEL3_ALIAS` 注释）。
+        const canonical =
+          best.matchedLevel === 'cad-l2' ? CAD_LEVEL2_CANONICAL_PARENT[best.term] : undefined
+        const category1 = canonical ?? best.level1s[0]!
+        const rest = best.level1s.filter((l1) => l1 !== category1)
+        return {
+          category1,
+          category2: best.category2,
+          matchedTerm: best.term,
+          alternativeCategories1: rest,
+          matchedLevel: best.matchedLevel
         }
       }
     }
@@ -477,8 +560,14 @@ export function autoClassify(
   // 文件名仍参与二级匹配（见上）。
   const assetTokens = tokenize(parts[0]!)
   const level1Hits: Array<{ term: string; index: number; kind: MatchKind }> = []
+  // 【v0.8.5 / docs/34】一级词表的**作用域**：CAD 频道扫 CAD 的 10 个键。
+  // 不隔离的话 `{ level1Only: true }` 对 CAD 恒为空（CAD 一级不在 `LEVEL2_MAP` 里），
+  // `classifyAssetName` 的「一级回退」就永远救不回一个 CAD 资产。
+  // 不传 scope 时仍扫 `LEVEL2_MAP` —— 既有行为一个字节不变。
+  const level1Keys =
+    opts?.level2Scope === 'cad' ? Object.keys(CAD_LEVEL2_MAP) : Object.keys(LEVEL2_MAP)
   let index = 0
-  for (const level1 of Object.keys(LEVEL2_MAP)) {
+  for (const level1 of level1Keys) {
     const kind = matchTerm(level1, assetTokens.asciiTokens, assetTokens.cjkHeads)
     if (kind !== null) {
       level1Hits.push({ term: level1, index, kind })
