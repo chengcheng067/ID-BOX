@@ -1159,6 +1159,9 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const runZhimoCategoryReclass = useVault((s) => s.runZhimoCategoryReclass)
   const cancelZhimoCategoryReclass = useVault((s) => s.cancelZhimoCategoryReclass)
   const refreshZhimoReclassBackupCount = useVault((s) => s.refreshZhimoReclassBackupCount)
+  // 汇总行里的「待确认 M 个」可点（docs/35 §4.3 的第三个入口）：conflict 只登记不搬目录，
+  // 用户看到数字必须能一步跳进队列裁定，否则只能自己去侧栏找。
+  const openReview = useVault((s) => s.openReview)
   /** 候选数（`allAssets` 复用上面 library drift 那一个选择器，不重复订阅） */
   const zhimoCandidateCount = useMemo(
     () => allAssets.filter(isZhimoReclassCandidate).length,
@@ -1300,9 +1303,22 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   /**
    * 「按站方分类重排」结束后的汇总块（运行中不显示）。
    *
-   * 六个桶全部列出，`approx` **单列并解释** —— 它是 `moved` 的子集，
-   * 代表"站方类目在本地没有一一对应，按已核准的相近类目归并"的条数，
-   * 是用户判断"有多少条是就近猜的"的唯一依据。
+   * T-14（docs/35）：通道已切到**三源交叉验证**，这里的分桶口径跟着改，两条硬约束：
+   *
+   * 1. `unverified` / `approx` 都是 `moved` 的**子集**，且**可以重叠**（一条既单源
+   *    又近似归并）—— 所以文案是并列列举，绝不能写成相加或"其中 A 个 + B 个"。
+   * 2. `ambiguous` **从界面拿掉**：新通道恒 0（`s2FromBreadcrumbGeneric` 遇候选不唯一
+   *    整条放弃，有末级名就落进 `unmapped`）。展示一个永远 0 的词只会让用户以为
+   *    "多候选"这条路还在跑。
+   *
+   * 「待确认」是真要用户动手的桶（conflict 只登记、不搬目录），所以 `> 0` 时做成
+   * 可点：一步进队列裁定，不用去侧栏找。
+   *
+   * 层级与关闭顺序：待确认队列是**全屏浮层**（`TriageOverlay` 自己占一层 Esc，
+   * 按 `zStack` 叠在本弹窗之上），所以不会被遮住；但按需求仍是「关设置 + 开浮层」——
+   * 裁完一批回来还停在设置页很突兀（与「重排完成 → 用户点关闭」同一个心智：看完就离开）。
+   * 顺序上**先 `openReview()` 成功再 `onClose()`**：队列已被用户裁完时它返回 false（只给
+   * 一条 notice），这时不该顺手把设置页也关掉 —— 点了、界面退了、什么都看不到是最差的手感。
    */
   const zhimoResultBlock =
     zhimoReclassResult && !zhimoReclass.running ? (
@@ -1320,11 +1336,46 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         </div>
         <div className="mt-1">
           移动{' '}
-          <span className="font-semibold text-primary">{zhimoReclassResult.moved}</span>{' '}
-          个（其中近似归并{' '}
-          <span className="font-semibold">{zhimoReclassResult.approx}</span> 个）；多候选{' '}
-          {zhimoReclassResult.ambiguous} · 未映射 {zhimoReclassResult.unmapped} · 站方未给{' '}
-          {zhimoReclassResult.noStation} · 失败{' '}
+          <span className="font-semibold text-primary">{zhimoReclassResult.moved}</span> 个
+          {/* 两个子集都为 0（默认情况）就连「其中」一起省掉：一个空的括号只是噪音 */}
+          {zhimoReclassResult.unverified > 0 || zhimoReclassResult.approx > 0 ? (
+            <>
+              （其中
+              {zhimoReclassResult.unverified > 0 ? (
+                <>
+                  单源 <span className="font-semibold">{zhimoReclassResult.unverified}</span> 个
+                </>
+              ) : null}
+              {/* 分隔符只在两段都在时出现：它们是并列的子集，不是两条互斥的桶 */}
+              {zhimoReclassResult.unverified > 0 && zhimoReclassResult.approx > 0 ? '、' : null}
+              {zhimoReclassResult.approx > 0 ? (
+                <>
+                  近似归并 <span className="font-semibold">{zhimoReclassResult.approx}</span> 个
+                </>
+              ) : null}
+              ）
+            </>
+          ) : null}
+          。
+        </div>
+        <div className="mt-1">
+          {zhimoReclassResult.conflicts > 0 ? (
+            // 有待确认才做成可点：0 条时给一个点了没反应的链接比不给更差
+            <button
+              className="cursor-pointer font-semibold text-accent-text underline underline-offset-2"
+              onClick={() => {
+                // 先开队列再关本弹窗：`openReview()` 返回 false（队列空）时不该顺手把
+                // 设置页关掉，否则用户点了一下、界面退了、什么也没看到。
+                if (openReview()) onClose()
+              }}
+              title="打开待确认队列，逐条裁定两源分类不一致的资产（不搬目录，等你决定）"
+            >
+              待确认 {zhimoReclassResult.conflicts} 个
+            </button>
+          ) : (
+            <>待确认 {zhimoReclassResult.conflicts} 个</>
+          )}{' '}
+          · 未映射 {zhimoReclassResult.unmapped} · 站方未给 {zhimoReclassResult.noStation} · 失败{' '}
           <span
             className={
               zhimoReclassResult.failed > 0 ? 'font-semibold text-danger' : 'font-semibold'
@@ -1335,7 +1386,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           。
         </div>
         <div className="mt-1 text-[10px] text-muted">
-          「近似归并」= 站方类目在本地没有一一对应，按已核准的「相近类目」归并（日志里标 approx）。
+          按「标题语义 × 知末分类」交叉验证后搬运：两源一致或仅知末有分类时才移动；两边不一致的进「待确认」由你裁定，不再自动搬。
+        </div>
+        <div className="mt-1 text-[10px] text-muted">
+          「单源」= 只有知末给了分类、本地语义判不出；「近似归并」= 站方类目在本地没有一一对应，按已核准的相近类目归并。
         </div>
       </div>
     ) : null

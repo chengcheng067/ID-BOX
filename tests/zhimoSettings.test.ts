@@ -143,8 +143,20 @@ describe('设置页接线：开关 / 手动入口 / 进度 / 取消 / 撤销', (
     expect(code).toContain('已抓到的结果会照常落库')
   })
 
-  it('结束后列出六个桶，approx 单列并注明「近似归并」', () => {
-    for (const bucket of ['moved', 'approx', 'ambiguous', 'unmapped', 'noStation', 'failed']) {
+  it('结束后列出新通道的桶，约归并未被丢掉并注明「近似归并」', () => {
+    // T-14（docs/35）：通道换成三源交叉验证后，界面口径是
+    // moved / unverified / approx / conflicts / unmapped / noStation / failed。
+    // `ambiguous` 被**刻意移除**（新通道恒 0，展示一个永远 0 的词只会误导），
+    // 它从界面消失这件事由 `tests/settingsReclassSummary.test.ts` 的反向断言守住。
+    for (const bucket of [
+      'moved',
+      'unverified',
+      'approx',
+      'conflicts',
+      'unmapped',
+      'noStation',
+      'failed'
+    ]) {
       expect(code).toContain(`zhimoReclassResult.${bucket}`)
     }
     expect(code).toContain('近似归并')
