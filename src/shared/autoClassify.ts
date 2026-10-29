@@ -347,6 +347,61 @@ function pickBest<T extends { term: string; kind: MatchKind }>(hits: T[]): T {
 }
 
 /**
+ * 【规则 C · 仅 CAD】**图种尾词**（有界白名单，**长词在前**）。
+ *
+ * 只在 `level2Scope:'cad'` 的第二趟匹配里用；模型/贴图/材质一个字节都不受影响。
+ * 依据：知末 CAD 标题实测 45.6% 以「施工图」结尾、63.2% 以「图」结尾，而图种词
+ * 横跨 10 个一级、零区分度 —— 它们不是信息，是把内容词挡在后面的"噪音尾巴"。
+ *
+ * ⚠️ 顺序是数据：`平面图` 必须排在 `图` 前面，否则「…平面图」会被先剥成「…平面」，
+ * 反而失去 `平面图` 这个真实二级（实测：p1「生态主题餐厅工装平面图」剥成「…工装平面」后落空）。
+ * ⚠️ `cad` 收进来是因为 token 已被小写化，真实标题尾巴普遍是「…施工图CAD图纸」，
+ * 剥掉「图纸」后还剩「…施工图cad」，不剥 `cad` 就卡住。
+ * ⚠️ 刻意**不收**：「图集」「图册」是同一层级的交付形态但会连带吃掉内容（如「平面图集」），
+ * 留给将来按真值再判；也不收「方案」（「平面布局方案」里的方案不是尾缀语义）。
+ */
+const CAD_TAIL_WORDS: readonly string[] = [
+  '施工图纸', 'cad图纸', '施工图', '方案图', '设计图', '大样图', '节点图', '三视图',
+  '立面图', '剖面图', '平面图', '图库', '详图', '图纸', 'cad', '图'
+]
+
+/** 剥尾词后残留的分隔符（token 已被切分器去掉大部分，这里兜住 `—` `_` 之类） */
+const CAD_TAIL_SEP_RE = /[\s_\-—|+、,，。.]+$/
+
+/**
+ * 【规则 C】**CAD 的「图种册」一级**（这两册是按"图纸类型"切的，不是按内容）。
+ *
+ * 用途只有一个：两趟匹配都命中时，若第一趟落在图种册、剥掉图种尾词后落在**别的册**，
+ * 取后者（内容轴压过图种轴）。见 `autoClassify` cad 支第 3 步的注释与实测样本。
+ *
+ * ⚠️ **不包含 `CAD图库`**：它虽然名字里带"图库"，但装的是**内容**（家具/软装/植物/人物/构件
+ * 图块），`沙发` / `图例` / `指北针` 都该落它 —— 把它算作图种册会把正确命中翻掉。
+ * ⚠️ 不包含 `其他图纸`：同上，它是内容兜底桶（三视图/吊顶图/水电图各有真实内容）。
+ */
+const CAD_DRAWING_TYPE_LEVEL1: ReadonlySet<string> = new Set(['平立面系统图', '节点详图'])
+
+/**
+ * 【规则 C】生成"剥掉 CAD 图种尾词"的候选词头（最多 3 层，**仅 CAD 作用域调用**）。
+ *
+ * @param cjkHeads 原始候选词头（分词 + 规则 B 剥离的结果）
+ * @returns 去重后的派生词头（只含**变短过**的，长度 ≥ 2；无派生时返回空数组）
+ */
+function cadStrippedHeads(cjkHeads: string[]): string[] {
+  const out = new Set<string>()
+  for (const head of cjkHeads) {
+    let cur = head
+    for (let depth = 0; depth < 3; depth++) {
+      const tail = CAD_TAIL_WORDS.find((w) => cur.length > w.length + 1 && cur.endsWith(w))
+      if (tail === undefined) break
+      cur = cur.slice(0, -tail.length).replace(CAD_TAIL_SEP_RE, '')
+      if (cur.length < 2) break
+      out.add(cur)
+    }
+  }
+  return [...out]
+}
+
+/**
  * 【v1.0.12】**可选**调用参数（加可选、不改既有签名与返回值结构）。
  *
  * `level1Only: true` → **只做一级匹配**：跳过第一轮的"二级词条 + 三级归并"，
@@ -450,39 +505,40 @@ export function autoClassify(
     // 两个候选池合成一个数组再 `pickBest`，所以「等长时二级原文优先于三级归并」的既有
     // 语义原样成立（`pickBest` 只在**严格更长**时替换，等长保留先出现者）。
     if (opts?.level2Scope === 'cad') {
-      const cadHits: Array<{
-        term: string
-        level1s: string[]
-        kind: MatchKind
-        category2: string
-        matchedLevel: AutoClassifyLevel
-      }> = []
-      for (const [level1, list] of Object.entries(CAD_LEVEL2_MAP)) {
-        for (const term of list) {
-          const kind = matchTerm(term, asciiTokens, cjkHeads)
-          if (kind === null) continue
-          // 5 组重名二级挂在两个一级下 → 合并成一条候选（`level1s` 两个值），
-          // 由 `CAD_LEVEL2_CANONICAL_PARENT` 决定哪个是 category1、哪个进 alternative。
-          const existing = cadHits.find((h) => h.term === term && h.matchedLevel === 'cad-l2')
-          if (existing) {
-            existing.level1s.push(level1)
-          } else {
-            cadHits.push({ term, level1s: [level1], kind, category2: term, matchedLevel: 'cad-l2' })
+      const runCad = (heads: string[]): AutoClassifyHit | null => {
+        const cadHits: Array<{
+          term: string
+          level1s: string[]
+          kind: MatchKind
+          category2: string
+          matchedLevel: AutoClassifyLevel
+        }> = []
+        for (const [level1, list] of Object.entries(CAD_LEVEL2_MAP)) {
+          for (const term of list) {
+            const kind = matchTerm(term, asciiTokens, heads)
+            if (kind === null) continue
+            // 5 组重名二级挂在两个一级下 → 合并成一条候选（`level1s` 两个值），
+            // 由 `CAD_LEVEL2_CANONICAL_PARENT` 决定哪个是 category1、哪个进 alternative。
+            const existing = cadHits.find((h) => h.term === term && h.matchedLevel === 'cad-l2')
+            if (existing) {
+              existing.level1s.push(level1)
+            } else {
+              cadHits.push({ term, level1s: [level1], kind, category2: term, matchedLevel: 'cad-l2' })
+            }
           }
         }
-      }
-      for (const alias of CAD_LEVEL3_ALIAS) {
-        const kind = matchTerm(alias.term, asciiTokens, cjkHeads)
-        if (kind === null) continue
-        cadHits.push({
-          term: alias.term,
-          level1s: [alias.level1],
-          kind,
-          category2: alias.level2,
-          matchedLevel: 'cad-l3'
-        })
-      }
-      if (cadHits.length > 0) {
+        for (const alias of CAD_LEVEL3_ALIAS) {
+          const kind = matchTerm(alias.term, asciiTokens, heads)
+          if (kind === null) continue
+          cadHits.push({
+            term: alias.term,
+            level1s: [alias.level1],
+            kind,
+            category2: alias.level2,
+            matchedLevel: 'cad-l3'
+          })
+        }
+        if (cadHits.length === 0) return null
         const best = pickBest(cadHits)
         // ⚠️ 覆盖只对**二级命中**生效：三级归并表的 level1/level2 已是页面实际归属
         // （重名三级在生成表时就去重定向了，见 `CAD_LEVEL3_ALIAS` 注释）。
@@ -498,22 +554,50 @@ export function autoClassify(
           matchedLevel: best.matchedLevel
         }
       }
-      // 【v0.8.5】**CAD 表未命中 → 一律 null，不回落通用词表**（主理人 2026-10-29 裁定）。
+
+      // 第 1 趟：原文（严格尾锚定），与改动前逐字节一致。
+      const first = runCad(cjkHeads)
+
+      // 第 2 趟【v0.8.5】**CAD 专属：剥图种尾词再匹配**（只在 cad 作用域内，最多 3 层）。
       //
-      // 此前照抄 `material` 支的"未命中继续走通用流程"，结果是 `autoClassify('LOFT',
-      // {level2Scope:'cad'})` 会返回模型频道的 `家装户型/LOFT` —— 端到端虽然有
-      // `isLevel1AllowedForKind` 闸门兜住（CAD 一级与 model/texture/material 一级零交集），
-      // 但那是"**能泄漏的通道 + 靠下游拦着**"：拿到 SU 二级必然被拒、等于白算一遍，
-      // 还让"cad 只认 cad 词表"这条不变量变成隐式依赖。
+      // 为什么只有 CAD 能这么干：知末 CAD 标题几乎全是「关键词 空格 关键词 施工图」的关键词串
+      // （实测 1091 条：45.6% 以「施工图」结尾、63.2% 以「图」结尾），而图种词
+      // （施工图/平面图/详图/图库…）在站方树里**横跨 10 个一级**、零区分度，纯粹是"挡住内容词"。
+      // 模型/贴图**不能**这么剥 —— 它们的尾锚定是防「藤编屏风」这类材料修饰语误伤的防线。
       //
-      // ⚠️ 与 `material` 支的差异是**刻意的**：那边未命中回落通用词表是设计（材质专表
-      // 只是"更具体的优先"，通用表仍是它的合法来源）；而 CAD 是一个**独立频道**，
-      // 没有任何 SU/贴图词条属于它。
-      // ⚠️ 一级档不受影响：`classifyAssetName` 的一级回退会另起一次
-      // `{ level1Only: true, level2Scope: 'cad' }`（一级轮按 CAD 的 10 个键扫），
-      // 所以 `'结构设计'` 仍能落 `{结构设计, 未分类}`，只是不经这次调用。
-      return null
+      // 剥的顺序：**长词优先**（否则 `平面图` 会先被 `图` 吃掉）；剥完仍要求长度 ≥ 2。
+      const stripped = cadStrippedHeads(cjkHeads)
+      const second = stripped.length > 0 ? runCad(stripped) : null
+
+      if (first === null) return second
+      if (second === null) return first
+
+      // 第 3 步【v0.8.5】**内容轴压过图种轴**：两趟都命中时，若第一趟落在「图种册」
+      // （平立面系统图 / 节点详图）、而剥掉图种尾词后落在**别的册**，取后者。
+      //
+      // 依据（实测 1091 条真值）：有 13 条标题第一趟因「平面图 / 立面图」这个尾巴判进图种册，
+      // 剥尾后能正确落到内容册 —— 例如
+      //   `办公室平面图` → 平立面系统图/平面图（错） → 剥 1 层 → 工装空间/办公空间（对）
+      //   `现代主卧室立面图` → 平立面系统图/立面图·剖面图（错） → 家装空间/卧室（对）
+      // 反向不成立：内容册的命中不会被图种册翻掉（图种词只在**尾位**才有话语权，剥掉即消失）。
+      // ⚠️ 只在 `second.category1` **离开**图种册时才让位，避免"剥完还是图种册"时白折腾。
+      if (
+        CAD_DRAWING_TYPE_LEVEL1.has(first.category1) &&
+        !CAD_DRAWING_TYPE_LEVEL1.has(second.category1)
+      ) {
+        return second
+      }
+      return first
     }
+
+    // 走到这里说明不是 cad 作用域（cad 支在上面**所有路径都 return 了**）：
+    // 未命中时**绝不回落通用词表** —— `autoClassify('LOFT', {level2Scope:'cad'})` 曾经
+    // 返回模型频道的 `家装户型/LOFT`，端到端虽有 `isLevel1AllowedForKind` 闸门兜住，
+    // 但那是"能泄漏的通道 + 靠下游拦着"，且白算一遍 SU 词表。与 `material` 支的差异
+    // 是**刻意的**：材质专表只是"更具体的优先"，通用表仍是它的合法来源；CAD 是独立频道，
+    // 没有任何 SU / 贴图词条属于它。
+    // ⚠️ 一级档不受影响：`classifyAssetName` 的一级回退会另起一次
+    // `{ level1Only: true, level2Scope: 'cad' }`，所以 `'结构设计'` 仍能落 `{结构设计, 未分类}`。
 
     const level2Hits: Array<{
       term: string

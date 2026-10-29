@@ -86,14 +86,40 @@ export function classifyAssetName(
 ): ClassifyOutcome {
   const level2Scope = level2ScopeOf(kind)
   const opts = level2Scope === undefined ? undefined : ({ level2Scope } as const)
-  const rawHit = autoClassify(
-    assetName,
-    fileNames === undefined ? undefined : [...fileNames],
-    opts
-  )
-  if (rawHit !== null && isLevel1AllowedForKind(kind, rawHit.category1)) {
-    return { category1: rawHit.category1, category2: rawHit.category2 }
+  const hasFiles = fileNames !== undefined && fileNames.length > 0
+
+  // ── 【v0.8.5】CAD 频道：**资产名优先、包内文件名只兜底**（两趟，不合并池） ──────
+  //
+  // 为什么 CAD 必须两趟：包内文件名表达的是**图种**（`1F平面图.dwg` / `立面图.dwg`），
+  // 资产名表达的是**空间/类型**（`火锅店` / `别墅`）。合并成一个池子后，图种词
+  // （`平面图` 等，本身是站方真实二级）会与内容词抢，而它往往是**更长**或**同长但二级优先**的一方。
+  // 实测（知末真标题 1091 条）：合并池里给每行配一个 `60 1F-2F立面图.dwg`，
+  // 二级命中从 30.8% 掉到 **1.8%**；改成"名字命中就不看文件名"后，伤害 0 条、还能救回 6~17 条。
+  //
+  // ⚠️ 顺序很重要：**名字先跑，落空才让文件名参与**；名字命中即采用，不再看文件名。
+  if (level2Scope === 'cad') {
+    const nameOnly = autoClassify(assetName, undefined, opts)
+    if (nameOnly !== null && isLevel1AllowedForKind(kind, nameOnly.category1)) {
+      return { category1: nameOnly.category1, category2: nameOnly.category2 }
+    }
+    if (hasFiles) {
+      const withFiles = autoClassify(assetName, [...fileNames!], opts)
+      if (withFiles !== null && isLevel1AllowedForKind(kind, withFiles.category1)) {
+        return { category1: withFiles.category1, category2: withFiles.category2 }
+      }
+    }
+    // 名字与文件名都没命中（或都被闸门拒）→ 一级回退（另一次调用，见下）
+  } else {
+    const rawHit = autoClassify(
+      assetName,
+      fileNames === undefined ? undefined : [...fileNames],
+      opts
+    )
+    if (rawHit !== null && isLevel1AllowedForKind(kind, rawHit.category1)) {
+      return { category1: rawHit.category1, category2: rawHit.category2 }
+    }
   }
+
   // 一级回退：一级只看资产名（`autoClassify` 规则 5），故不传 fileNames。
   // ⚠️ 作用域必须一起带下去：CAD 的一级不在 `LEVEL2_MAP` 里，不传 scope 时
   // `level1Only` 对 CAD 恒返回 null，回退等于没有。
