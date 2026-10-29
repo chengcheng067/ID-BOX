@@ -232,19 +232,22 @@ let settingsChangedSubscribed = false
 /**
  * 仅供单测：复位设置广播订阅守卫。
  *
- * ## 🚫 运行时**不允许**调用 —— 这是硬约束，不是建议
+ * ## 🚫 只给单测用 —— 运行时**不允许**调用（硬约束，不是建议）
  *
- * 复位会把标志打回 false 但**不会**退订已注册的 handler（`off` 没保存）。
- * 于是下一次 `init()` 会再挂一个 handler → 同一条广播被处理 N 次。
- * `set({settings})` 恰好幂等，所以用户看不出来；但订阅数会随每次误用线性泄漏，
- * 而且是**进程内不可回收**的（handler 挂在 ipcRenderer 上，没有引用就永远摘不掉）。
- * 单测之所以能用，是因为每条用例都在同一个模块实例里重新建一个干净的桩、且用例之间
- * 不共享真实 IPC（见 `tests/settingsBroadcast.test.ts` 的 `beforeEach`）。
+ * `src/renderer/` 下的生产代码**一律不许** import 本函数。目前全仓调用点只有
+ * `tests/settingsBroadcast.test.ts` 的 `beforeEach`（每条用例前复位，否则前一条留下的
+ * `true` 会让后一条的 `init()` 直接跳过订阅、测试假绿）。
  *
- * TODO（将来才需要动的场景）：若真的出现「主进程热重启 / 渲染进程不重载但 IPC 桥重建」
- * 这类需要运行时重建订阅的路径，**不能**直接调本函数 —— 必须改成
- * `ensureSettingsChangedSubscribed()` 保存返回的 `off`、由新的 reset 先 `off()` 再清标志，
- * 否则就是上面说的泄漏。
+ * 运行时不能用的原因：复位只把标志打回 false、**不会**退订已注册的 handler
+ * （订阅时返回的 `off` 没有保存）。于是下一次 `init()` 会再挂一个 handler →
+ * 同一条广播被处理 N 次。`set({settings})` 恰好幂等，所以用户看不出来；
+ * 但订阅数会随每次误用线性泄漏，而且是**进程内不可回收**的
+ * （handler 挂在 `ipcRenderer` 上，没有引用就永远摘不掉）。
+ *
+ * TODO（将来若主进程热重启 / 渲染进程不重载但 IPC 桥重建，需要运行时重建订阅时）：
+ * **`settingsChangedSubscribed` 必须跟着复位**，但**不能**靠直接调本函数 ——
+ * 必须让 `ensureSettingsChangedSubscribed()` 把 `onSettingsChanged` 返回的 `off` 存到
+ * 模块级变量，新的 reset 改成「先 `off()` 再清标志」。否则就是上面说的泄漏。
  */
 export function resetSettingsBroadcastForTests(): void {
   settingsChangedSubscribed = false
