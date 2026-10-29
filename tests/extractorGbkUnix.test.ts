@@ -94,7 +94,14 @@ describe('extractArchive — Unix 制作的 GBK zip（DEF-01 根因回归）', (
     'madeBy os=3：裸 7z 解成 PUA 乱码 → 嗅探命中 → -mcp=936 重解 → 文件名逐字正确',
     async () => {
       // `maxBytesForJsFallback: 1` 是**故意**的：把 adm-zip 兜底掐死，只留 `-mcp=936` 一条救法。
-      // 不这么设的话，`-mcp` 参数写错也会被 adm-zip 悄悄救回来（本用例就测不出参数对不对）。
+      // ⚠️ **别把这个 1 改成正常值**——改了这条用例就退化成"测不出东西"：
+      //   实测四组（同一用例，每次只动一处）：
+      //     · 只改 `-mcp=936`、不扩可疑类            → 红（嗅探不命中，重解压根不触发）
+      //     · 只扩可疑类 + 允许 adm-zip（小包）      → **绿**（`-mcp=GBK` 失败后 adm-zip 兜底救回来）
+      //     · 只扩可疑类 + 掐死 adm-zip（≈大包/rar） → 红（没有任何 JS 兜底，只剩 -mcp 一条路）
+      //     · 两处都改 + 掐死 adm-zip                → 绿
+      //   ⇒ 两处各管一段路：扩类是"总开关"，`-mcp=936` 负责"没有 JS 兜底"的那半边
+      //     （包 > 200MB 的 zip，以及 rar / 7z —— 那两类根本没有 adm-zip 分支）。
       const { names, result } = await extractZip(3, { maxBytesForJsFallback: 1 })
       // 逐字正确（不是"看起来像"）
       expect(names).toEqual(['餐厅平面设计方案.dwg', '微信扫码 看案例找灵感下素材必用知末.jpg', '知末网说明.txt'].sort())
