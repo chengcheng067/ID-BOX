@@ -31,11 +31,13 @@ import {
   snapshotFilters,
   sortAssets,
   type Filters,
-  type LibraryView
+  type LibraryView,
+  type SortKey
 } from './logic/filters'
 import { dedupeIds, pruneToVisible, selectRangeIds } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
 import { buildTriageQueue } from './logic/triageFlow'
+import { buildReviewQueue, type ReviewReason } from './logic/reviewFlow'
 import { planDuplicateCleanup, planThumbPresenceRepair } from './logic/recordHygiene'
 import { planCoverSelfHeal } from './logic/coverSelfHeal'
 import { assetFileAbs } from './logic/assetPath'
@@ -372,6 +374,76 @@ function restoreLibraryViewAfterImport(): void {
  */
 function withPickerClosed<P extends object>(patch: P): P & { categoryPickerIds: null } {
   return { ...patch, categoryPickerIds: null }
+}
+
+// ── P2 整理浮层的两种模式（docs/35 §4.2 · R-10）──────────────────────
+
+/**
+ * 整理浮层的模式。与 `logic/reviewFlow.ts` 的 `ReviewReason` 同名同义，但**不复用**那个
+ * 类型：`ReviewReason` 是"判据的返回值"（永不为 null），这里是"浮层状态"（可为 null）。
+ * 混用会让 `triageMode` 的 null 分支要靠 `| null` 硬套，读起来像笔误。
+ */
+export type TriageMode = ReviewReason
+
+/**
+ * 某个模式的待办集（**口径的唯一实现点**，`openTriage` 与两个 hook 都走它）。
+ *
+ * 三步，一步都不能少也不能换顺序：
+ * ① 滤软删（走 `isDeletedAsset`，与 `activeAssets` / `applyFilters` 同一判据来源）；
+ * ② 按当前排序排（`sortAssets` 走同一份 `filters.sort`，不自己另排）；
+ * ③ 按模式挑（`unclassified` 走 `buildTriageQueue`，`conflict` 走 `buildReviewQueue`）。
+ *
+ * ## 为什么必须合成一个函数（本卡最容易犯的错）
+ *
+ * `openTriage` 要知道"队列空不空"、`useTriageQueue` / `useReviewQueue` 要渲同一批 ——
+ * 三处各写一遍 `filter + sort + build`，就是三套真相。历史上"侧栏数字与浮层条数对不上"
+ * 的 bug 全部来自这种重复（`logic/triageFlow.ts` 文件头有记）。
+ *
+ * **不套 `filters`**（搜索词 / 大类 / 分类 / chip 都不参与）：两种队列都是全库口径，
+ * 理由见 `useTriageQueue` 的注释 —— 侧栏那两个数字本身也是全库口径。
+ *
+ * ## 为什么导出（它本是 store 内部实现细节）
+ *
+ * ① `openTriage` 与两个 hook 共用，已经是**公开行为的一部分**（"入口说有 3 条、
+ *    浮层就渲 3 条"就是它的契约），不属于私有实现；
+ * ② vitest 是 `environment: 'node'`，没有 jsdom / react-test-renderer，而 zustand v4
+ *    在 SSR 下用 `getServerSnapshot`（返回初始 state），`renderToStaticMarkup` 读不到
+ *    `setState` 之后的值 —— hook 本体在现有设施下**没法真跑**。把内核导出后，测试能
+ *    直接断言"含软删的混合数据在两个模式里都被滤掉"，而不是退化成扫源码字符串。
+ */
+export function triageQueueOf(
+  assets: readonly Asset[],
+  sort: SortKey,
+  mode: TriageMode
+): Asset[] {
+  const live = assets.filter((a) => !isDeletedAsset(a))
+  const ordered = sortAssets(live, sort)
+  return mode === 'unclassified'
+    ? buildTriageQueue(ordered)
+    : buildReviewQueue(ordered, 'conflict')
+}
+
+/**
+ * 进入某模式时队列为空给的那句话。**两种模式各不相同**（不能复用）：
+ *
+ * - `unclassified` 那句是 P2 的既有文案，用户已经熟悉，改一个字都算回归；
+ * - `conflict` 是新文案：如果复用未分类那句，用户在"待确认"入口看到「没有未分类的资产」
+ *   会以为点错了按钮 —— 而此时库里**可能确实还有几百张未分类**，是两句不同的事实。
+ */
+const TRIAGE_EMPTY_NOTICE: Record<TriageMode, string> = {
+  unclassified: '没有未分类的资产',
+  conflict: '目前没有待确认的素材'
+}
+
+/**
+ * 写 `triageMode` 的**唯一入口**（`triageActive` 是它的派生值）。
+ *
+ * 两个字段必须一起变：单独 `set({ triageActive: true })` 会让 `triageMode` 留在 null
+ * （浮层挂起来但不知道渲哪个队列），单独 `set({ triageMode: 'conflict' })` 会让
+ * `triageActive` 停在 false（模式变了但浮层不挂）。所以只留这一个写点。
+ */
+function withTriageMode(mode: TriageMode | null): { triageMode: TriageMode | null; triageActive: boolean } {
+  return { triageMode: mode, triageActive: mode !== null }
 }
 
 /** 本会话已尝试过生成缩略图且失败的资产 id（防止网格反复触发同一个失败的 ensureThumb） */
@@ -1219,12 +1291,35 @@ interface VaultState {
   closeQuickLook: () => void
   // ── P2 未分类整理流水线（键盘驱动的串行整理）──────────────────
   /**
+   * 整理浮层的**模式**（`null` = 未开启）。
+   *
+   * 为什么从"只存布尔"扩成"存模式"（docs/35 §4.2 · R-10）：待确认队列有两种原因 ——
+   * `unclassified`（双未分类，语义与 P2 完全一致）与 `conflict`（两源冲突，新）。
+   * 两者共用**同一个**浮层：`TriageOverlay` 的 509 行里真正与"未分类"耦合的只有 4 处
+   * （队列来源 / 标题文案 / 收尾文案 / 右栏内容），另起一个浮层会把另外 30+ 条纪律
+   * （Esc 栈顺序、`reconcileTriage` 接位、`busy` 防连按、`panelOpen` 让路、选中态跟随）
+   * 复制一遍，必然漂移。
+   *
+   * 所以浮层必须知道"打开的是哪个队列" —— 只存布尔的话 `conflict` 模式会去渲未分类那批。
+   * 两种原因共用同一套游标（`TriageCursor` 只吃 `Asset[]`，与原因无关），
+   * 差别只在**队列来源**一处（见 `triageQueueOf`）。
+   */
+  triageMode: TriageMode | null
+  /**
    * 整理模式是否开启；`true` 时 `App` 挂一个 `TriageOverlay`。
    *
-   * 存**布尔**而不是"当前资产 id"：待办集的游标（当前第几张 / 跳过集）是**会话内**
+   * ⚠️ **派生值，不是独立真相**。唯一写入口是模块内的 `withTriageMode()`：
+   * 它同时写 `triageMode` 与 `triageActive`（`triageActive === (triageMode !== null)`），
+   * 任何地方都不许单独 `set({ triageActive })` —— 两个字段各写一次迟早不一致。
+   *
+   * 保留这个字段而不是让调用方自己算，是因为它是**既有公共 API**（`App.tsx:730` 的挂载
+   * 判据、`triageWiring.test.ts` 的多处断言都直接读它）。改成派生 selector 要动十几处，
+   * 收益为零，风险是把"浮层到底该不该挂"这个判据散开。
+   *
+   * 存**布尔 + 模式**而不是"当前资产 id"：待办集的游标（当前第几张 / 跳过集）是**会话内**
    * 状态，关掉就该丢（需求：跳过"关闭浮层后不保留状态 —— 不做持久化"）。
    * 把它放进 store 只会让"哪些字段要跟着清理"变成一堆额外案件；浮层内部用
-   * `logic/triageFlow.ts` 的 `TriageCursor` 自己管，store 只回答"开没开"。
+   * `logic/triageFlow.ts` 的 `TriageCursor` 自己管，store 只回答"开没开、开的是哪个"。
    *
    * ## 悬空问题怎么解（**与 `quickLookAssetId` 的 5 个清理站点不同的做法**）
    *
@@ -1238,7 +1333,7 @@ interface VaultState {
    * 都自动被覆盖，不需要回来补第 6 个、第 7 个清理点。代价是浮层要做一次
    * `applyFilters`（已 memo、1 万条 2.6ms），而它一屏只渲一张、每次操作才重算一次。
    *
-   * 唯一仍要显式清理的是**切视图**（`setLibraryView` 里置 false）：那时待办集的
+   * 唯一仍要显式清理的是**切视图**（`setLibraryView` 里置 null）：那时待办集的
    * 语义整个换了（比如进回收站），继续整理没有意义。
    */
   triageActive: boolean
@@ -1248,9 +1343,20 @@ interface VaultState {
    * 待办集为空时**不打开**、只给一条 notice（需求：「进入时若待办集为空，不要开浮层」）。
    * 判据走 `logic/triageFlow.ts::buildTriageQueue`（与浮层内部同一份实现）。
    *
+   * @param mode `unclassified`（默认，等价于 P2 的既有行为）/ `conflict`（待确认队列）。
+   *   **`unclassified` 的每一步（队列、notice 文案、选中态）都与本卡之前逐字相同** ——
+   *   那是用户已经熟悉的路径，改一个字都算回归。
    * @returns 是否真的打开了（调用方一般不用，测试与排障用）
    */
-  openTriage: () => boolean
+  openTriage: (mode?: TriageMode) => boolean
+  /**
+   * 打开待确认队列（= `openTriage('conflict')`）。
+   *
+   * 单独一个方法而不是让调用方写 `openTriage('conflict')`：侧栏「待确认」节点 / 批次
+   * 汇总 notice / 卡片角「存疑」徽标三个入口都调它（docs/35 §4.3），
+   * 入口处不该知道"conflict 是 openTriage 的一个参数"这种实现细节。
+   */
+  openReview: () => boolean
   closeTriage: () => void
   openCategoryPicker: (ids: string[]) => void
   closeCategoryPicker: () => void
@@ -2434,6 +2540,7 @@ export const useVault = create<VaultState>((set, get) => ({
   folderViewAssetId: null,
   hdrPreviewAssetId: null,
   quickLookAssetId: null,
+  triageMode: null,
   triageActive: false,
   dupOnly: false,
   libraryView: 'assets',
@@ -2695,7 +2802,9 @@ export const useVault = create<VaultState>((set, get) => ({
         quickLookAssetId: null,
         // 整理模式同理，而且更严格：待办集就是"当前视图里双未分类的"，
         // 视图一换待办集整个换掉，留着会让用户对着另一批资产继续按确认。
-        triageActive: false,
+        // 走 `withTriageMode(null)` 而不是裸写 `triageActive: false`：两个字段必须一起清
+        // （否则会留下 `triageMode: 'conflict'` + `triageActive: false` 的脏组合）。
+        ...withTriageMode(null),
         dupOnly: view === 'trash' ? false : s.dupOnly
       })
     ),
@@ -3545,10 +3654,11 @@ export const useVault = create<VaultState>((set, get) => ({
   // ── P2 未分类整理流水线 ─────────────────────────────────────
 
   /**
-   * 打开整理模式。
+   * 打开整理浮层（两种模式共用，见 `TriageMode`）。
    *
-   * 待办集口径与 `useTriageQueue()` **完全一致**：全库（只滤软删）+ 当前排序 + 双未分类。
-   * 不套 `filters` 的理由见那个函数的注释（全库口径才能和侧栏数字对上）。
+   * 待办集口径与 `useTriageQueue()` / `useReviewQueue()` **完全一致**：全库（只滤软删）
+   * + 当前排序 + 该模式的判据 —— 三处共用 `triageQueueOf`，不会各写一遍。
+   * 不套 `filters` 的理由见 `useTriageQueue` 的注释（全库口径才能和侧栏数字对上）。
    *
    * 两个**不做**的动作，理由写在下面：
    * - **不改 `libraryView`**：用户可能正停在「最近删除」里点侧栏的整理按钮
@@ -3556,32 +3666,57 @@ export const useVault = create<VaultState>((set, get) => ({
    *   `quickLookAssetId` / `folderViewAssetId` / 清选中，用户还没开始就被清了状态。
    * - **不改筛选**：待办集不套 filters，所以改了也没意义；而且会打乱用户正在看的视图。
    *
+   * ## 空队列时**绝不退化成另一个模式**（本卡的核心约束）
+   *
+   * `openReview()` 在没有 conflict 但有一堆未分类时，必须"不开浮层 + 给待确认的 notice"，
+   * **不能**顺手把用户丢进未分类队列：用户点的是"处理存疑"，进去看到的却是一批从没分过
+   * 类的资产，会以为"存疑"这个词指的是没分类。同理 `openTriage()` 也不会在做完未分类后
+   * 把用户带进 conflict 队列。
+   *
+   * @param mode `unclassified`（默认，P2 既有行为，逐字不变）/ `conflict`（待确认队列）
    * @returns 是否真的打开了
    */
-  openTriage() {
+  openTriage(mode = 'unclassified') {
     const st = get()
-    // 已开着就别重开会话（会把跳过集清空、游标重置，用户会莫名其妙回到第一张）
-    if (st.triageActive) return true
-    const live = st.assets.filter((a) => !isDeletedAsset(a))
-    const queue = buildTriageQueue(sortAssets(live, st.filters.sort))
+    // 当前模式（未开启 → null）。`triageMode` 为 null 而 `triageActive` 为 true 是**不该
+    // 出现**的组合（唯一写入口 `withTriageMode` 不可能产生它），只有测试里手工 `setState`
+    // 才造得出来。这里按 `unclassified` 兜底 —— 那是 P2 的唯一模式，也就是"老状态"。
+    const current: TriageMode | null = st.triageActive ? (st.triageMode ?? 'unclassified') : null
+    // 已开着**同一个模式**就别重开会话：会把跳过集清空、游标重置，用户会莫名其妙
+    // 回到第一张。这是 P2 的既有行为，一个字节不改。
+    if (current === mode) return true
+    const queue = triageQueueOf(st.assets, st.filters.sort, mode)
     if (queue.length === 0) {
-      // 需求：「进入时若待办集为空，不要开浮层，直接给一条 notice」
-      set({ notice: '没有未分类的资产' })
+      // 需求：「进入时若待办集为空，不要开浮层，直接给一条 notice」。
+      // 已经开着另一个模式时**不动那个浮层**（用户正在里面干活，不能因为点了另一个
+      // 入口就被踢出来），只给一句"这边现在是空的"。
+      set({ notice: TRIAGE_EMPTY_NOTICE[mode] })
       return false
     }
     // 进入时把焦点落到待办集第一张：关闭后选中态要落回"最后整理的那张"（需求 7），
     // 而最后整理的那张是从这一张开始走的 —— 先把起点选上，即使中途一张都没归类就退出，
     // 选中态也是用户刚看到的那张（与 Quick Look 的"关浮层不清选中"同精神）。
-    set({ triageActive: true, selectedId: queue[0].id, selectedIds: [queue[0].id] })
+    //
+    // 从另一个模式切过来时走的也是这条路：`triageMode` 一换，两个 hook 的队列就换了，
+    // 浮层的 `reconcileTriage` 会把游标稳到新队列的第一张 —— 不需要先关再开
+    // （那会闪一次，还会多发一条收尾提示）。
+    set({
+      ...withTriageMode(mode),
+      selectedId: queue[0].id,
+      selectedIds: [queue[0].id]
+    })
     return true
   },
 
+  /** 打开待确认队列（docs/35 §4.3 三个入口共用）。空队列时**不**退化成未分类模式。 */
+  openReview: () => get().openTriage('conflict'),
+
   /**
-   * 关闭整理模式。**不动选中**（保留"最后整理的那张"，与 `closeQuickLook` 同口径）。
+   * 关闭整理浮层。**不动选中**（保留"最后整理的那张"，与 `closeQuickLook` 同口径）。
    *
    * 收尾提示由浮层自己发（它才知道本次会话结束后的真实剩余数），这里只撤标志。
    */
-  closeTriage: () => set({ triageActive: false }),
+  closeTriage: () => set(withTriageMode(null)),
 
   openCategoryPicker(ids) {
     if (ids.length === 0) return
@@ -5227,9 +5362,9 @@ export const useVault = create<VaultState>((set, get) => ({
 }))
 
 /**
- * 整理模式的待办集（派生数据，**不是 store 状态**）。
+ * 整理浮层的待办集（派生数据，**不是 store 状态**）。两个 hook 共用这一份。
  *
- * ## 口径：**全库**的双未分类资产（不是"当前筛选结果"）
+ * ## 口径：**全库**的该模式候选（不是"当前筛选结果"）
  *
  * 需求原文是「待办集 = **当前库中** `category1 === 未分类 && category2 === 未分类`
  * 且未软删的资产」。所以这里**不套 `filters`**（搜索词 / 大类 / 分类 / 各种 chip 都不参与）：
@@ -5246,16 +5381,32 @@ export const useVault = create<VaultState>((set, get) => ({
  * 待办集会随 `assets`（归类 / 删除 / rescan）与 `filters.sort` **任何一个**变化，
  * 把结果缓存进 store 就要在每一处写"更新它"，漏一处就是悬空。现算的代价是
  * `filter + sort`（1 万条约 3ms），而整理浮层一屏只渲一张、每次用户操作才重算一次。
+ *
+ * ## 为什么两个 hook 都走 `triageQueueOf`（而不是各自写一遍 filter + sort）
+ *
+ * `openTriage` 判"空不空"用的是同一个函数 —— 若 hook 里另写一遍，就有三套真相：
+ * 入口说"有 3 条可以处理"，浮层却渲出 2 条（差在某个边界条件上），用户会以为丢数据。
+ * 这个项目为"多处口径不同源"付过代价（见 `logic/triageFlow.ts` 文件头），别再来一次。
  */
-export function useTriageQueue(): Asset[] {
+function useTriageQueueOf(mode: TriageMode): Asset[] {
   const assets = useVault((s) => s.assets)
   const sort = useVault((s) => s.filters.sort)
-  return useMemo(() => {
-    // 软删过滤走 `isDeletedAsset`（与 `activeAssets` / `applyFilters` 同一个判据来源，
-    // 不在这里另写 `deletedAt` 判断）
-    const live = assets.filter((a) => !isDeletedAsset(a))
-    return buildTriageQueue(sortAssets(live, sort))
-  }, [assets, sort])
+  return useMemo(() => triageQueueOf(assets, sort, mode), [assets, sort, mode])
+}
+
+/** 整理模式的待办集：全库双未分类 + 当前排序 + 非软删。`TriageOverlay` 在 `unclassified` 模式下用它。 */
+export function useTriageQueue(): Asset[] {
+  return useTriageQueueOf('unclassified')
+}
+
+/**
+ * 待确认队列：全库 `conflict` 资产 + 当前排序 + 非软删。`TriageOverlay` 在 `conflict` 模式下用它。
+ *
+ * 与 `useTriageQueue()` **同源**（同一个 `triageQueueOf`）—— 这是侧栏「待确认」数字
+ * 与浮层条数能对上的唯一保证，也是本文件不留第二份软删过滤的原因。
+ */
+export function useReviewQueue(): Asset[] {
+  return useTriageQueueOf('conflict')
 }
 
 /** 过滤 + 排序（派生数据，纯函数内核在 logic/filters.ts，可单测） */
