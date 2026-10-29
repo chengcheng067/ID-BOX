@@ -87,3 +87,57 @@ describe('isScanMojibake', () => {
     expect(isScanMojibake(scan, { ratioThreshold: 0.5 })).toBe(false)
   })
 })
+
+/**
+ * 2026-10-29 真机补：**7-Zip 的 PUA 乱码**（DEF-01 兜底链从未触发的根因）
+ *
+ * 真包 `生态主题餐厅工装平面图ID_1152305168.zip`（中央目录 madeBy os=3 / 无 UTF-8 flag）
+ * 被裸 7z 解出来的名字长这样（实测码点）：
+ *   `餐厅平面设计方案.dwg` → U+EFB2 U+EFCD U+EFCC U+EFFC U+01BD U+EFC3 U+EFE6 U+EFC9 …
+ * 即 **私用区 U+E000–U+F8FF** 为主，零星夹着拉丁扩展/希腊/西里尔/希伯来/阿拉伯字符。
+ * 老可疑类一个都不覆盖 → ratio=0 → 整条兜底链不触发。
+ */
+describe('isMojibakeSuspect — PUA（7-Zip / Unix 制作的 GBK zip）', () => {
+  it('真包实测的 PUA 乱码名命中', () => {
+    expect(isMojibakeSuspect('\uEFB2\uEFCD\uEFCC\uEFFC\u01BD\uEFC3\uEFE6\uEFC9.dwg')).toBe(true)
+  })
+
+  it('半角片假名区（7-Zip 另一条兜底映射）2 连缀即命中', () => {
+    expect(isMojibakeSuspect('\uFF72\uFF8D\uFF8C\uFFBC.dwg')).toBe(true)
+  })
+
+  it('PUA 与拉丁扩展混排（真包以「知末」开头的那两个）命中', () => {
+    expect(isMojibakeSuspect('\u05AA\u0129\u0043\u0041\u0044\u037C\u05BD-\uEFBE\uEFAB\u0461.html')).toBe(true)
+    expect(isMojibakeSuspect('\u03A2\uEFD0\uEFC5\u0268\uEFC2\uEFEB \uEFBF.jpg')).toBe(true)
+  })
+
+  it('整包扫描：真包 4 个名字里 4 个可疑 → 判整包乱码', () => {
+    // 这 4 条是从真包解压结果里**逐码点抄下来的**（不是编的近似串）
+    const scan = scanNames([
+      '\uEFB2\uEFCD\uEFCC\uEFFC\u01BD\uEFC3\uEFE6\uEFC9\uEFF8\uEFBC\u01B7\uEFBD\uEFB0\uEFB8.dwg',
+      '\u05AA\u0129CAD\u037C\u05BD-\uEFBE\uEFAB\u0461\uEFD0\uEFD0\u04B5\u02A9\uEFB9\uEFA4\u037C\uEFA3\uEFAC\u05F7\uEFD7\uEFD9\uEFD7\uEFEE\uEFD0\uEFC2\u037C\u05BD.html',
+      '\u05AA\u0129\uEFCD\uEFF8\u02F5\uEFC3\uEFF7.txt',
+      '\u03A2\uEFD0\uEFC5\u0268\uEFC2\uEFEB \uEFBF\uEFB4\uEFB0\uEFB8\uEFC0\uEFFD\uEFD5\uEFD2\uEFC1\uEFE9\uEFB8\uEFD0\uEFCF\uEFC2\uEFCB\u0632\u0131\uEFD8\uEFD3\uEFC3\u05AA\u0129.jpg'
+    ])
+    expect(scan.suspicious).toBe(4)
+    expect(scan.ratio).toBe(1)
+    expect(isScanMojibake(scan)).toBe(true)
+  })
+})
+
+/** 反向守卫：把可疑类开太大会让**每个正常包都被重解两遍**，这三条必须仍是 false */
+describe('isMojibakeSuspect — 全角标点/全角字母不得误判', () => {
+  it('全角括号 + 全角冒号（中文名高频）为假', () => {
+    expect(isMojibakeSuspect('（修订版）平面图.dwg')).toBe(false)
+    expect(isMojibakeSuspect('【施工图】（修订版）：平面图.dwg')).toBe(false)
+  })
+
+  it('全角字母（Ｕ+FF21 在 FF01–FF5E 内）为假', () => {
+    expect(isMojibakeSuspect('Ａ号立面.png')).toBe(false)
+    expect(isMojibakeSuspect('ＡＢＣ立面图.dwg')).toBe(false)
+  })
+
+  it('单个重音外文名（R8 反例）仍为假', () => {
+    expect(isMojibakeSuspect('Café Munir.skp')).toBe(false)
+  })
+})

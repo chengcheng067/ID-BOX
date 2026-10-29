@@ -54,8 +54,18 @@ const LOCAL_SIG = 0x04034b50
 const CENTRAL_SIG = 0x02014b50
 const EOCD_SIG = 0x06054b50
 
-/** 手工拼装 ZIP：local header × N + central directory × N + EOCD */
-export function buildZip(entries: ZipEntrySpec[]): Buffer {
+/**
+ * 手工拼装 ZIP：local header × N + central directory × N + EOCD
+ *
+ * @param opts.madeByOs 「version made by」里的**宿主系统**字节（0=DOS/Win，3=Unix）。
+ *   这个字段是 DEF-01 的**根因指纹**：7-Zip 对「Unix 制作的 zip + 无 UTF-8 flag」
+ *   会**假定文件名是 UTF-8**（而不是按 ACP 936 解），于是 GBK 名字被解成一大串
+ *   PUA 垃圾（U+E000–U+F8FF）。实测真包 `生态主题餐厅工装平面图ID_1152305168.zip`
+ *   正是 `madeBy = 788`（os=3），而同期的 WinRAR 包是 `madeBy = 31`（os=0）→ 不乱码。
+ *   默认 0（既有用例行为一个字不变）。
+ */
+export function buildZip(entries: ZipEntrySpec[], opts?: { madeByOs?: number }): Buffer {
+  const madeBy = ((opts?.madeByOs ?? 0) << 8) | 20
   const locals: Buffer[] = []
   const centrals: Buffer[] = []
   let offset = 0
@@ -82,7 +92,7 @@ export function buildZip(entries: ZipEntrySpec[]): Buffer {
 
     const central = Buffer.alloc(46)
     central.writeUInt32LE(CENTRAL_SIG, 0)
-    central.writeUInt16LE(20, 4) // version made by
+    central.writeUInt16LE(madeBy, 4) // version made by（高字节 = 宿主系统）
     central.writeUInt16LE(20, 6) // version needed
     central.writeUInt16LE(flags, 8)
     central.writeUInt16LE(0, 10) // method

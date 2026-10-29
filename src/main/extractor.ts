@@ -40,7 +40,7 @@ export interface ExtractResult {
   /**
    * 实际采用的码页：
    * - `acp` = 7z 裸参数（**系统 ANSI 代码页**，中文系统上即 936/GBK；DEF-01 裁定的首选路径）
-   * - `gbk` / `utf8` = 显式指定（`-mcp=GBK` 重解或 adm-zip decoder）
+   * - `gbk` / `utf8` = 显式指定（`-mcp=936` 重解或 adm-zip decoder）
    */
   codepage: 'acp' | 'gbk' | 'utf8'
   /** 解压结果是否疑似乱码（UI 打「疑似乱码」标） */
@@ -146,14 +146,17 @@ async function runSevenZip(exe: string, args: string[], timeoutMs: number): Prom
 /**
  * 单次 7z 解压尝试，**永不抛出**（DEF-01 裁定第 3 条：任何失败都要能继续回退，不能向外抛）。
  *
- * @param mcp null = **裸参数**（首选，QA 实测 Windows 版 7z 默认按系统 ACP 解不带 UTF-8 flag
- *             的文件名，中文系统 936 零乱码）；`'GBK'` = 兜底重试（老版本 7z 可能认）。
+ * @param mcp null = **裸参数**（首选）；`'936'` = 兜底重解时显式指定中文码页。
+ *   ⚠️ `-mcp` 对 `x`（解压）命令**是有效**的，但**只认数字码页**：写 `-mcp=GBK`
+ *   会被 7-Zip 当成未知值，整体退化成 `Can't open as archive`（7-Zip 23.01 实测）。
+ *   中文系统用 `936`（= GBK/CP936）。老注释里「`-mcp` 对解压不受支持」是错的，
+ *   2026-10-29 真机复验已纠正。
  */
 async function sevenZipTry(
   exe: string,
   src: string,
   dest: string,
-  mcp: 'GBK' | null,
+  mcp: '936' | null,
   timeoutMs: number
 ): Promise<{ ok: boolean; err?: unknown }> {
   const cpArgs = mcp ? [`-mcp=${mcp}`] : []
@@ -181,7 +184,7 @@ async function retryWithCodepage(
   exe: string,
   src: string,
   dest: string,
-  mcp: 'GBK',
+  mcp: '936',
   timeoutMs: number
 ): Promise<{ ok: boolean; replaced: boolean }> {
   const workDir = path.join(dest, retryDirName())
@@ -265,12 +268,14 @@ function resultOf(engine: Engine, cp: 'acp' | 'gbk' | 'utf8', scan: NameScan): E
 /**
  * 解压压缩包到目标目录（P0-2 / C1 / C2；DEF-01 修复后的策略）
  *
- * ① 有 7z → **首选裸参数**（`-mcp` 对解压不受支持，QA 实测 7-Zip 23.01 报
- *    "Can't open as archive"；Windows 版 7z 默认按系统 ACP 解不带 UTF-8 flag 的文件名，
- *    中文系统 936 零乱码）。裸参数失败 → 兜底重试 `-mcp=GBK`（老版本可能认），
+ * ① 有 7z → **首选裸参数**（Windows 版 7z 对「DOS 制作的 zip + 无 UTF-8 flag」按系统
+ *    ACP 解 → 中文系统 936 零乱码）。裸参数失败 → 兜底重试 `-mcp=936`，
  *    **该次失败必须被兜住**，绝不向外抛。
- * ② 解压后 `scanNames` 嗅探乱码；命中且码页偏好为 gbk → 换 `-mcp=GBK` 重解到临时目录，
- *    **更干净才替换**；重解失败（真机 7z 不认）或仍乱码 → zip 可走 adm-zip + GBK decoder 兜底，
+ *    ⚠️ 裸参数**并非永远正确**：7-Zip 对「Unix 制作的 zip（madeBy os=3）+ 无 UTF-8 flag」
+ *    会假定文件名是 UTF-8，把 GBK 名字解成 PUA 垃圾（U+E000–U+F8FF）。实测真包
+ *    `生态主题餐厅工装平面图ID_1152305168.zip` 就是这种，只能靠 ② 嗅探后重解救回来。
+ * ② 解压后 `scanNames` 嗅探乱码；命中且码页偏好为 gbk → 换 `-mcp=936` 重解到临时目录，
+ *    **更干净才替换**；重解失败或仍乱码 → zip 可走 adm-zip + GBK decoder 兜底，
  *    否则保留结果并标「疑似乱码」。
  * ③ 无 7z 且是 ≤`maxBytesForJsFallback` 的 zip → adm-zip + 码页检测 + GBK decoder 兜底
  * ④ 其余情况抛带 `kind` 的 `ExtractionError`，文案可行动
@@ -296,19 +301,19 @@ export async function extractArchive(src: string, dest: string, opts: ExtractOpt
       if (kind === 'password' || kind === 'corrupt' || kind === 'timeout') {
         throw toExtractionError(attempt.err, '解压失败')
       }
-      // 其余失败（含 "Can't open as archive"）→ 兜底重试 -mcp=GBK，失败被兜住
-      attempt = await sevenZipTry(exe, src, dest, 'GBK', timeoutMs)
+      // 其余失败（含 "Can't open as archive"）→ 兜底重试 -mcp=936（只认数字码页），失败被兜住
+      attempt = await sevenZipTry(exe, src, dest, '936', timeoutMs)
       if (!attempt.ok) throw toExtractionError(attempt.err, '解压失败')
     }
     let scan = await scanDest(dest)
     // ── ② 乱码嗅探驱动重试（DEF-01）────────────────────────────
     // 仅"码页偏好为 gbk"时重试（偏好 utf8 时不再回退 GBK，直接标疑似乱码）
     if (isScanMojibake(scan) && first === 'gbk') {
-      const retry = await retryWithCodepage(exe, src, dest, 'GBK', timeoutMs)
+      const retry = await retryWithCodepage(exe, src, dest, '936', timeoutMs)
       if (retry.replaced) {
         return resultOf('7z', 'gbk', await scanDest(dest))
       }
-      // -mcp=GBK 重解失败（真机 7z 不认）或重解仍乱码 → zip 走 adm-zip + GBK decoder 兜底
+      // -mcp=936 重解失败或重解仍乱码 → zip 走 adm-zip + GBK decoder 兜底
       // （内容嗅探：.rar 后缀但内容是 zip 的包同样享受 JS 兜底）
       if (ext === '.zip' || (await detectZipContent(src))) {
         let archiveBytes = 0
