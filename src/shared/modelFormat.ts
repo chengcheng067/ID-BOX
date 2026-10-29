@@ -40,10 +40,17 @@ export function getModelFormat(files: ReadonlyArray<ModelFileLike> | undefined |
   return max
 }
 
-/** 格式 → 卡片徽标文案（用户原话：模型卡片上写 "3DS"） */
+/**
+ * 格式 → 卡片徽标文案。
+ *
+ * 2026-10-29 用户改口：原文案是旧的三字母缩写（大写的 3D + S），现在要**小写 `max`**
+ * （原话「3D Max 的字样换成 max」）。徽标文案同时被筛选摘要复用
+ * （`logic/filters.ts:686`），所以摘要也跟着显示 `max` —— 这是用户要的口径。
+ * ⚠️ `MODEL_FORMAT_OPTIONS` 里的 `'3DMAX'` 是筛选下拉的中文口径，**不跟着改**。
+ */
 export const MODEL_FORMAT_BADGE_LABEL: Record<ModelFormat, string> = {
   skp: 'SU',
-  max: '3DS'
+  max: 'max'
 }
 
 /** 筛选器「模型格式」维度的选项表（含「全部」档；中栏头浮层与测试共用） */

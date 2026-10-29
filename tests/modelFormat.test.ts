@@ -5,9 +5,12 @@
  * >    做一个偏向于 3DMAX 的颜色，并在我们的模型卡片上写上"3DS"
  * >  2. 在模型格式上提供一个选项，用于显示 3DMAX 还是 SU。」
  *
+ * ⚠️ 2026-10-29 用户改口（本文件的断言已按新口径）：卡片字样要我口述的
+ * 小写 `max`（旧的三字母缩写作废），颜色由红棕换成 3ds Max 官方青蓝。
+ *
  * 钉住四件事：
  * ① `shared/modelFormat.getModelFormat` 纯函数（格式识别，skp > max 优先级）；
- * ② 徽标文案（skp→SU / max→3DS）与 AssetGrid 源码守卫（组件在 node 渲染不了，
+ * ② 徽标文案（skp→SU / max→max）与 AssetGrid 源码守卫（组件在 node 渲染不了，
  *    本仓库惯例见 `tests/filterCaps.test.ts`）；
  * ③ 筛选维度：`Filters.modelFormat` 只对 kind=model 生效、切视图被 sanitize 清掉、
  *    智能集合快照/还原完整、入口可见性走能力表 `capsOfFilter(kind,'modelFormat')`；
@@ -102,9 +105,10 @@ describe('getModelFormat · 按文件扩展名识别模型格式', () => {
 // ── ② 徽标文案与 AssetGrid 源码守卫 ──────────────────────────────
 
 describe('格式徽标 · 文案表与源码守卫', () => {
-  it('文案表：skp→SU、max→3DS（用户原话「模型卡片上写上 3DS」）', () => {
+  it('文案表：skp→SU、max→max（2026-10-29 用户改口「3D Max 的字样换成 max」）', () => {
     expect(MODEL_FORMAT_BADGE_LABEL.skp).toBe('SU')
-    expect(MODEL_FORMAT_BADGE_LABEL.max).toBe('3DS')
+    expect(MODEL_FORMAT_BADGE_LABEL.max).toBe('max')
+    // 筛选下拉的中文口径不跟着改（仍是 3DMAX）
     expect(MODEL_FORMAT_NAME.max).toBe('3DMAX')
   })
 
@@ -113,7 +117,7 @@ describe('格式徽标 · 文案表与源码守卫', () => {
     expect(MODEL_FORMAT_OPTIONS.map((o) => o.value)).toEqual([null, 'skp', 'max'])
   })
 
-  it('AssetGrid 源码守卫：3DS 占位图标 + 双格式徽标 + .max 文件封面', () => {
+  it('AssetGrid 源码守卫：max 占位图标 + 双格式徽标 + .max 文件封面', () => {
     const grid = read('src/renderer/components/AssetGrid.tsx')
     // 占位图标（无封面兜底要能区分 3DMAX）
     expect(grid).toContain('function Icon3dsMax')
@@ -124,8 +128,47 @@ describe('格式徽标 · 文案表与源码守卫', () => {
     expect(grid).toContain('MODEL_FORMAT_BADGE_LABEL')
     // 文件视图 .max 强化封面（与 .skp 的大 SU 同族）
     expect(grid).toContain("row.ext.toLowerCase() === 'max'")
-    // 占位图标用 3ds Max 品牌红 #B3453B（色值写死在图标里，与 IconSketchUp 同做法）
-    expect(grid).toContain('#B3453B')
+    // 占位图标用 3ds Max 青蓝的深一档 #2A7A99（色值写死在图标里，与 IconSketchUp 同做法）
+    expect(grid).toContain('#2A7A99')
+  })
+
+  it('2026-10-29 改口守卫：源码里不再出现旧的三字母缩写，也不会残留红棕色值', () => {
+    const grid = read('src/renderer/components/AssetGrid.tsx')
+    // 五处（徽标文案 / 两个 SVG text / rect fill / drop-shadow）一处没改就会命中这里
+    expect(grid).not.toContain('3DS')
+    // 红棕 #B3453B 与其 rgba(179,69,59) 都必须清掉，否则界面一半红一半青蓝
+    expect(grid).not.toContain('#B3453B')
+    expect(grid).not.toContain('rgba(179,69,59')
+    // 新青蓝的阴影 rgba(42,122,153) 在
+    expect(grid).toContain('rgba(42,122,153')
+    const modelFormat = read('src/shared/modelFormat.ts')
+    expect(modelFormat).not.toContain('3DS')
+    const css = read('src/renderer/styles.css')
+    expect(css).not.toContain('3DS')
+    expect(css).not.toContain('#B3453B')
+    const tailwind = read('tailwind.config.js')
+    expect(tailwind).not.toContain('3DS')
+    expect(tailwind).not.toContain('#B3453B')
+  })
+
+  it('CAD 卡片守卫：FileCover 有 row.kind===\'cad\' 分支 + 双主题 token + tailwind 映射', () => {
+    const grid = read('src/renderer/components/AssetGrid.tsx')
+    // 分支判据（别用 getModelFormat —— 那只认 skp/max）
+    expect(grid).toContain("row.kind === 'cad'")
+    expect(grid).toContain("row.ext === 'dwg'")
+    expect(grid).toContain("row.ext === 'dxf'")
+    // 大字 CAD + token 类名（颜色不写死 hex）
+    expect(grid).toContain('bg-cad-tint text-cad')
+    expect(grid).not.toContain('#E51050')
+    const css = read('src/renderer/styles.css')
+    // 浅 / 深主题各一档
+    expect(css.match(/--brand-cad-bg:/g)?.length).toBe(2)
+    expect(css.match(/--brand-cad-text:/g)?.length).toBe(2)
+    const tailwind = read('tailwind.config.js')
+    expect(tailwind).toContain('--brand-cad-bg')
+    expect(tailwind).toContain('--brand-cad-text')
+    expect(tailwind).toContain("'cad-tint'")
+    expect(tailwind).toContain('cad: token')
   })
 
   it('styles.css / tailwind 配置守卫：brand token 双主题登记', () => {
@@ -138,6 +181,42 @@ describe('格式徽标 · 文案表与源码守卫', () => {
     const tailwind = read('tailwind.config.js')
     expect(tailwind).toContain("--brand-max-bg")
     expect(tailwind).toContain("--brand-su-bg")
+  })
+
+  /**
+   * 小写字形的字号补偿（2026-10-29 主理人复核后追加，同日定稿为 52）。
+   *
+   * `max` 全是小写、无上伸部，同字号下视觉高度只有 x-height；`SU` / `CAD` 全大写占
+   * cap height。实测（Chromium + 本机字体栈，weight 700，viewBox user unit）：
+   *   SU@38 → cap 30 ；CAD@38 → cap 30 ；max@38 → x-height 21（矮 30%，并排一眼看出）
+   *   max@52 → x-height 29（与 30 差 1 unit = 3%，静态卡片上看不出）
+   * 所以 max 必须用 52，**不能**跟着 SU/CAD 用 38。
+   *
+   * 52 的代价是宽度溢出（自然宽 109.37 > viewBox 100），用 textLength=96 +
+   * spacingAndGlyphs 整体等比压 12% 收回。主理人已明确否决「降字号换取留白」：
+   * 48 号只把留白从 2.0 提到 2.4，却要付 10% 的字高，是坏交易。
+   */
+  it('字号补偿守卫：max 用 52 + textLength 96，SU/CAD 仍用 38', () => {
+    const raw = read('src/renderer/components/AssetGrid.tsx')
+    // 断言前先剥掉注释：注释里会写「试过 textLength="82"，已否决」这类记录，
+    // 那是给人看的，不该让守卫自伤（本仓惯例：守卫看代码，不看注释）
+    const grid = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+      .replace(/\{\/\*[\s\S]*?\*\/\}/g, '')
+    // FileCover 的 .max 大字号：52 + textLength 压回 viewBox 内
+    expect(grid).toContain('fontSize="52"')
+    expect(grid).toContain('textLength="96"')
+    expect(grid).toContain('lengthAdjust="spacingAndGlyphs"')
+    // 两个属性必须同时出现且顺序正确（少了 textLength 就是两边裁字）
+    expect(grid.indexOf('fontSize="52"')).toBeLessThan(grid.indexOf('textLength="96"'))
+    // `spacingOnly` 不是合法 SVG 值（会被静默当成 spacing，字母重叠 -14.77）
+    expect(grid).not.toMatch(/lengthAdjust="spacingOnly"/)
+    // 大写字形保持 38（别把 SU/CAD 一起提到 52 —— 那会让它们顶出边界）
+    expect(grid.match(/fontSize="38"/g)?.length).toBeGreaterThanOrEqual(2)
+    // 占位图标里的小 max 同样按比例补：14 而非 SU 的 10.5
+    expect(grid).toContain('fontSize="14"')
+    expect(grid).toContain('fontSize="10.5"')
   })
 })
 
@@ -208,7 +287,8 @@ describe('模型格式筛选 · 匹配 / 归一化 / 快照 / 入口', () => {
     const dims = activeFilterDimensions(filters({ modelFormat: 'max' }))
     const hit = dims.find((d) => d.key === 'modelFormat')
     expect(hit?.label).toBe('模型格式')
-    expect(hit?.value).toBe('3DS')
+    // 摘要与卡片徽标**同源**（MODEL_FORMAT_BADGE_LABEL）→ 改口后摘要也显示 max
+    expect(hit?.value).toBe('max')
     expect(activeFilterDimensions(filters()).some((d) => d.key === 'modelFormat')).toBe(false)
   })
 

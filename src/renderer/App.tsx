@@ -853,10 +853,19 @@ export default function App() {
    *   （避免空浮层 / 避免筛不掉）。
    * ⚠️ 不要在组件里按大类名字硬编码判断（分组哨兵会被漏掉，将来加维度也必然漏改；
    * `tests/filterCaps.test.ts` 有源码守卫盯着）。
+   *
+   * 例外（2026-10-29 用户要求）：`体积` / `分辨率` / `格式` 三个入口在**「全部」视图下不再显示**。
+   * 为什么单独排除而不是改 `capsOfFilter`：能力表的 `'all' = 并集` 是全局语义
+   * （其它维度、`tests/filterCaps.test.ts`、`sanitizeFiltersForKind` 都依赖它）。
+   * 「全部」视图下这些筛选仍然**生效**（filters 状态照旧保留），只是不给入口 ——
+   * 用户进到具体大类里照样能看到并调整。
    */
-  const showResolutionEntry = capsOfFilter(filters.kind, 'resolution')
+  const hideInAllView = filters.kind === 'all'
+  /** 体积：本来无条件渲染，「全部」下也要收起来（与分辨率 / 格式同一口径） */
+  const showSizeEntry = !hideInAllView
+  const showResolutionEntry = capsOfFilter(filters.kind, 'resolution') && !hideInAllView
   /** 模型格式（全部 / SU / 3DMAX）：只有模型视图开放（能力表唯一判定，与分辨率同一机制） */
-  const showModelFormatEntry = capsOfFilter(filters.kind, 'modelFormat')
+  const showModelFormatEntry = capsOfFilter(filters.kind, 'modelFormat') && !hideInAllView
   const modelFormatFilterActive = filters.modelFormat !== null
   const showStyleEntry =
     capsOfFilter(filters.kind, 'style') && (styleCounts.length > 0 || filters.styles.length > 0)
@@ -879,7 +888,10 @@ export default function App() {
     if (!showResolutionEntry) setExtraPanel((p) => (p === 'resolution' ? null : p))
     // 模型格式浮层同理：切到材质 / HDR / 其他视图时收起（筛选值由 store 归一化清掉）
     if (!showModelFormatEntry) setExtraPanel((p) => (p === 'format' ? null : p))
-  }, [showResolutionEntry, showModelFormatEntry])
+    // 体积浮层走的是另一族 `quickPanel`：入口被「全部」视图收起时同样要收，
+    // 否则 chip 消失了浮层还浮在屏幕上（没有触发按钮，点不到关闭）。
+    if (!showSizeEntry) setQuickPanel((p) => (p === 'size' ? null : p))
+  }, [showResolutionEntry, showModelFormatEntry, showSizeEntry])
 
   // ── 排序胶囊（自绘浮层）────────────────────────────────────────────
   /** 胶囊上显示的当前排序名；`SORT_OPTIONS` 与 `SortKey` 同源，兜底防止脏值留下空白胶囊 */
@@ -1067,20 +1079,24 @@ export default function App() {
                     <div ref={quickRef} className="flex shrink-0 items-center gap-1">
                       {/* 回收站视图里这两个维度不生效（见 matchesFilters：trash 只吃搜索词）→
                           直接置灰禁用，避免"点了筛选回收站没变化"的困惑。筛选状态不清空，
-                          回到资产视图后原样继续生效。 */}
-                      <button
-                        className={`${sizeFilterActive ? 'chip-accent' : 'chip-ghost'} shrink-0 ${
-                          trashMode ? 'cursor-not-allowed opacity-40' : ''
-                        }`}
-                        disabled={trashMode}
-                        aria-pressed={sizeFilterActive}
-                        aria-haspopup="dialog"
-                        aria-expanded={quickPanel === 'size'}
-                        title={trashMode ? '回收站不支持体积筛选（返回资产视图后可用）' : '按体积筛选（> 10MB / > 50MB / > 200MB）'}
-                        onClick={toggleQuickPanel('size')}
-                      >
-                        体积
-                      </button>
+                          回到资产视图后原样继续生效。
+                          2026-10-29 用户要求：「全部」视图下不显示 `体积` / `分辨率` / `格式`
+                          三个入口（`hideInAllView`），筛选值仍保留、进具体大类可见。 */}
+                      {showSizeEntry && (
+                        <button
+                          className={`${sizeFilterActive ? 'chip-accent' : 'chip-ghost'} shrink-0 ${
+                            trashMode ? 'cursor-not-allowed opacity-40' : ''
+                          }`}
+                          disabled={trashMode}
+                          aria-pressed={sizeFilterActive}
+                          aria-haspopup="dialog"
+                          aria-expanded={quickPanel === 'size'}
+                          title={trashMode ? '回收站不支持体积筛选（返回资产视图后可用）' : '按体积筛选（> 10MB / > 50MB / > 200MB）'}
+                          onClick={toggleQuickPanel('size')}
+                        >
+                          体积
+                        </button>
+                      )}
                       <button
                         className={`${timeFilterActive ? 'chip-accent' : 'chip-ghost'} shrink-0 ${
                           trashMode ? 'cursor-not-allowed opacity-40' : ''

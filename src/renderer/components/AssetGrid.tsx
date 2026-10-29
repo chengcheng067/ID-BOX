@@ -274,14 +274,15 @@ function isSketchUpAsset(asset: Asset): boolean {
  * 3ds Max 风格应用图标占位（2026-10「3DMAX 支持」，与 IconSketchUp 同族）。
  *
  * 自绘 SVG 几何抽象——**不引用任何官方 logo 文件**（规避商标风险）：
- * 3ds Max 品牌红 #B3453B 圆角底（品牌辅色；主色 #2E2E2E 深灰在深色主题卡片上
- * 会糊进背景，故取红作底）+ 白色等距立方体（与 SU 图标同一几何，家族一致）+
- * 底部白色 "3DS" 字样（用户原话：模型卡片上写上 "3DS"）。
+ * 3ds Max 品牌青蓝 #37A5CC 的深一档 #2A7A99 作圆角底（官方图标逐像素采样；
+ * 直接用 #37A5CC 时上面白字对比只有 2.83:1，压到 #2A7A99 得 4.84:1 ≥ 4.5:1）
+ * + 白色等距立方体（与 SU 图标同一几何，家族一致）+
+ * 底部白色 "max" 字样（2026-10-29 用户改口：旧的三字母缩写作废，现要小写 max 并换青蓝）。
  */
 function Icon3dsMax(props: SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 48 48" width="48" height="48" fill="none" {...props}>
-      <rect x="0" y="0" width="48" height="48" rx="11" fill="#B3453B" />
+      <rect x="0" y="0" width="48" height="48" rx="11" fill="#2A7A99" />
       {/* 等距立方体三面（顶 / 右 / 左，明暗递减） */}
       <path d="M24 8.5 32.9 13.5 24 18.5 15.1 13.5Z" fill="#fff" fillOpacity="0.95" />
       <path d="M32.9 13.5 32.9 23.5 24 28.5 24 18.5Z" fill="#fff" fillOpacity="0.62" />
@@ -295,17 +296,22 @@ function Icon3dsMax(props: SVGProps<SVGSVGElement>) {
         strokeLinejoin="round"
       />
       <path d="M24 18.5 32.9 13.5M24 18.5 15.1 13.5M24 18.5 24 28.5" stroke="#fff" strokeOpacity="0.55" strokeWidth="0.9" />
+      {/* 字号 14 而非 SU 的 10.5（与上面 FileCover 同一个理由，按 44/38 的补偿比例外推）：
+          max 全小写只占 x-height —— 10.5 号下墨高仅 6，而 SU 的 cap 是 8，占位图标上能看出
+          "max 比 SU 小一圈"。实测（weight 800，viewBox 48）：max@12 墨高 7、max@13.5 起才到 8，
+          取 14（墨高 8、墨顶 y = 33.00，与 SU 的 33.00 完全齐平）。
+          宽度 30.0 / 48 格，左右各留 9.0，不裁切、不压立方体（立方体底边 y=28.5，间隙同为 4.5）。 */}
       <text
         x="24"
         y="41"
         textAnchor="middle"
-        fontSize="10.5"
+        fontSize="14"
         fontWeight="800"
         letterSpacing="0.4"
         fill="#fff"
         fontFamily="'Sarasa Gothic SC','Microsoft YaHei',sans-serif"
       >
-        3DS
+        max
       </text>
     </svg>
   )
@@ -376,14 +382,14 @@ function Cover({ asset, name }: { asset: Asset; name: string }) {
       </div>
     )
   }
-  // 第二级兜底（2026-10「3DMAX 支持」）：.max 模型无缩略图 → 3DS 品牌图标占位。
+  // 第二级兜底（2026-10「3DMAX 支持」）：.max 模型无缩略图 → 3ds Max 品牌图标占位。
   // .max 是 OLE 复合文档，没有可提取的内嵌预览图（本批明确不做），
   // 无封面时用这个占位区分「这是 3DMAX」，用户可随后手动贴封面。
   if (asset.kind === 'model' && !isSketchUpAsset(asset) && is3dsMaxAsset(asset)) {
     return (
       <div className="relative h-full w-full bg-canvas">
         <div className="flex h-full w-full items-center justify-center">
-          <div className="aspect-square h-[62%] drop-shadow-[0_2px_6px_rgba(179,69,59,.35)]">
+          <div className="aspect-square h-[62%] drop-shadow-[0_2px_6px_rgba(42,122,153,.35)]">
             <Icon3dsMax className="h-full w-full" />
           </div>
         </div>
@@ -695,12 +701,75 @@ function FileCover({ asset, row }: { asset: Asset; row: FileRow }) {
     )
   }
   // ── .max 专属封面（2026-10「3DMAX 支持」，与上面 .skp 同族）──────────────
-  // 口径：3ds Max 红棕 tint 底板 + 居中大号 "3DS"。只对「模型类 + 扩展名 max」生效；
-  // 色走 `--brand-max-bg / --brand-max-text` token（styles.css 注释里有色值与用途），
-  // 字号/字重/字距与 SU 完全一致（家族一致，只换色与字）。
+  // 口径：3ds Max 青蓝 tint 底板 + 居中大号 "max"。
+  // 2026-10-29 用户改口：字样由旧的三字母缩写改为小写 "max"，颜色由红棕改为 3ds Max 青蓝
+  // （官方图标采样 #37A5CC）。只对「模型类 + 扩展名 max」生效。
+  // 色走 `--brand-max-bg / --brand-max-text` token（styles.css 注释里有色值与用途）。
+  //
+  // ⚠️ 字号 52 是**小写字形的补偿**，不是随手拍的（2026-10-29 主理人拍板）：
+  // `m` / `a` / `x` 全无上伸部，同字号下只占 x-height（≈0.55 em），而 `SU` / `CAD`
+  // 是全大写占 cap height（≈0.79 em）。实测（Chromium，viewBox user unit，weight 700）：
+  //   SU@38   cap = 30      CAD@38 cap = 30      max@38 x-height = 21   ← 矮 30%
+  //   max@52  x-height = 29 ← 与 SU/CAD 的 30 齐平（差 1 unit = 3%）
+  // 所以 max 用 52、SU/CAD 仍用 38：**字号不同但视觉字高一致**，这才是「和 SU 一样大」。
+  //
+  // ⚠️ 「0.55 em」与「52 号」都是按**本机字体栈**（Sarasa Gothic SC / Microsoft YaHei）
+  // 实测的，不是通用常数。用户机器两款字体都没有时会回退到 `sans-serif`
+  // （Windows 上多为 Segoe UI / Arial，x-height 比值 0.50~0.52），此时 max 会比 SU
+  // 略矮一点点（估计 1~2 unit）—— **在可接受范围内，不要为此改回小字号**。
+  // 真要精确对齐得把字体文件打进安装包，体积代价不值得。
+  //
+  // ⚠️ textLength=96 是宽度溢出的必然代价（不是保守估计，是实测）：
+  // max@52 自然排布宽 109.37 > viewBox 的 100 → 左右各溢出约 4.7，父容器
+  // `overflow-hidden` 会直接把字裁掉。三条补救路都实测过：
+  //   a) 降到 48 以下 → x-height 掉到 27（矮 10%），只换来留白 2.4。花 10% 字高买
+  //      0.4 单位留白，是坏交易（主理人明确否决）；
+  //   b) `letterSpacing` 收到 -0.12em → 宽度勉强够，但 m/a/x 的字间净空变成 -2.5
+  //      （笔画互咬），比压字形更容易被看出来；
+  //   c) `textLength` + `spacingAndGlyphs` → 整体等比横向压 12%，字距**均匀**，
+  //      且 A/B 对比截图下肉眼不可辨（用户看到的是静态卡片，不是并排比对）。← 采用
+  // ⚠️ 不要写 `lengthAdjust="spacingOnly"` —— 那不是合法的 SVG 取值（SVG 2 只有
+  // `spacing` 和 `spacingAndGlyphs`），Chromium 会静默退回默认的 `spacing`：只压字距
+  // 不压字形，而三字母墨迹本身有 104 单位，塞进 96 必然重叠（实测净空 -14.77，糊成一团）。
+  // 同理 `textLength="82"` + `spacing` 更是算术上不可能（82 < 104）。
+  // 留白比 CAD（9.0）窄是数学必然 —— x-height 对齐 cap 需要放大 1.43 倍，
+  // 宽度必然逼近 100 上限；`SU` 留白 24.6 只是因为它是两个字母。
   if (row.kind === 'model' && row.ext.toLowerCase() === 'max') {
     return (
-      <div className="flex h-full w-full items-center justify-center bg-brand-max text-brand-max">
+      <div className="flex h-full w-full items-center justify-center bg-max-tint text-max">
+        <svg viewBox="0 0 100 100" className="h-full w-full" aria-hidden="true" focusable="false">
+          <text
+            x="50"
+            y="50"
+            textAnchor="middle"
+            dominantBaseline="central"
+            fontSize="52"
+            fontWeight="700"
+            textLength="96"
+            lengthAdjust="spacingAndGlyphs"
+            fill="currentColor"
+          >
+            max
+          </text>
+        </svg>
+      </div>
+    )
+  }
+  // ── .dwg / .dxf 专属封面（2026-10-29 用户反馈，与上面 .skp / .max 同族）─────
+  // 用户原话：「这个位置用 AutoCAD 的红色，在文件的框里面写 "CAD" 三个大字，
+  // 和 SU 和 max 的一样」。此前这两类图纸落到 FILE_ROW_ICON['cad'] 的灰色类型图标。
+  //
+  // 判定用 `row.kind === 'cad'`（不是 getModelFormat —— 那只认 skp/max）。`logic/fileView.ts`
+  // 已把 dwg/dxf 归到 'cad'，且 `row.ext` 是小写；再核一档扩展名，避免未来 'cad' 组扩进
+  // 其它格式（如 .rvt）时被这个封面抢走。
+  //
+  // 字号仍是 38（与 SU 同一枚 cap height = 30 user unit）——**不要**为了"看起来窄"降到
+  // 30~32：实测同字体栈下 32 号 cap 只剩 25，肉眼可见比 SU 矮一截。也不用
+  // `textLength="76"`：那会把 C/A/D 横向压扁（字形失真），且留白反而比 max 宽。
+  // 自然排布留白 9.0，与 max 的 10.4 同一档。
+  if (row.kind === 'cad' && (row.ext === 'dwg' || row.ext === 'dxf')) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-cad-tint text-cad">
         <svg viewBox="0 0 100 100" className="h-full w-full" aria-hidden="true" focusable="false">
           <text
             x="50"
@@ -712,7 +781,7 @@ function FileCover({ asset, row }: { asset: Asset; row: FileRow }) {
             letterSpacing="-0.02em"
             fill="currentColor"
           >
-            3DS
+            CAD
           </text>
         </svg>
       </div>
@@ -2404,9 +2473,10 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
             >
               {KIND_LABEL[a.kind]}
             </span>
-            {/* 模型格式徽标（2026-10「3DMAX 支持」，用户原话「模型卡片上写上 3DS」）：
+            {/* 模型格式徽标（2026-10「3DMAX 支持」，文案 `skp→SU` / `max→max`）：
                 kind=model 且能从文件列表判出格式时显示 —— SU 走 SketchUp 红系
-                （.badge-su），3DS 走 3ds Max 红棕系（.badge-max，用户拍板「偏 3DMAX 的颜色」）。
+                （.badge-su），max 走 3ds Max 青蓝系（.badge-max）。
+                2026-10-29 用户改口：字样由旧的三字母缩写改为「max」，色由红棕改青蓝。
                 判定走 shared/modelFormat 纯函数（skp > max），其余模型格式（fbx 等）不显示。 */}
             {a.kind === 'model' &&
               (() => {

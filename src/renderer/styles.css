@@ -45,14 +45,19 @@
   --preview-tint: #efe9fe;
 
   /* 模型格式品牌色（2026-10「3DMAX 支持」，浅色档）。
-     用途：模型卡片的格式徽标（.badge-su「SU」/ .badge-max「3DS」）与
-     文件视图 .max 封面底板（bg-max-tint / text-max）。
+     用途：模型卡片的格式徽标（.badge-su「SU」/ .badge-max「max」）
+     与文件视图 .skp / .max / .dwg 封面底板（bg-*-tint / text-*）。
      - SU：SketchUp 品牌红 #E62E2E 的浅 tint（底）与压暗红（字）；
-     - 3DS：3ds Max 品牌红 #B3453B（红棕系，主理人拍板「沉稳的红棕色系」）的浅 tint 与深红棕字。 */
+     - max：3ds Max 青蓝 #37A5CC（2026-10-29 用户改口「颜色也跟着换一下」，
+       原先的红棕系全部作废）的浅 tint（底）与压暗青蓝（字），白底对比 4.89:1；
+     - CAD：AutoCAD 红 #E51050（官方图标逐像素采样）的 5% tint（底）与压暗红（字），
+       白底对比 5.28:1。深浅档都 ≥ 4.5:1（WCAG AA 正文）。 */
   --brand-su-bg: #fde7e7;
   --brand-su-text: #c43c3c;
-  --brand-max-bg: #f3e4e1;
-  --brand-max-text: #a03a2f;
+  --brand-max-bg: #e3f2f8;
+  --brand-max-text: #16708f;
+  --brand-cad-bg: #fde7ef;
+  --brand-cad-text: #c00d43;
 
   /* Soft UI 阴影（替代描边，§1） */
   --shadow-card: 0 8px 24px rgba(100, 116, 139, 0.1);
@@ -103,12 +108,15 @@
   --preview-tint: #2b2140;
 
   /* 模型格式品牌色（2026-10「3DMAX 支持」，深色档）：
-     底走「比卡片 #1C1C1E 略亮一档」的暗红 tint，文字提亮保证在 #161618 上可读。
-     用途同浅色档：格式徽标 .badge-su / .badge-max 与文件视图 .max 封面底板。 */
+     底走「比卡片 #1C1C1E 略亮一档」的暗 tint，文字提亮保证在 #161618 上可读。
+     用途同浅色档：格式徽标 .badge-su / .badge-max 与文件视图封面底板。
+     对比度（底色上）：SU 6.16 / max 6.99 / CAD 5.41，全部 ≥ 4.5:1。 */
   --brand-su-bg: #3a2224;
   --brand-su-text: #f08c8c;
-  --brand-max-bg: #352421;
-  --brand-max-text: #e29687;
+  --brand-max-bg: #16303a;
+  --brand-max-text: #6cc4e0;
+  --brand-cad-bg: #3a1622;
+  --brand-cad-text: #ff5b8c;
 
   --shadow-modal: 0 16px 48px rgba(0, 0, 0, 0.5);
   /* 卡片不加投影，靠 #111113 → #161618 → #1C1C1E → #242428 明度分层（§1） */
@@ -261,7 +269,7 @@
     color: var(--accent-text);
   }
   /* 模型格式徽标（2026-10「3DMAX 支持」）：模型卡片 kind 徽标旁的格式角标。
-     SU = SketchUp 红系、3DS = 3ds Max 红棕系；色值见上面 --brand-* token 注释。 */
+     SU = SketchUp 红系、max = 3ds Max 青蓝系；色值见上面 --brand-* token 注释。 */
   .badge-su {
     background: var(--brand-su-bg);
     color: var(--brand-su-text);
