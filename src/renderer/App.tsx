@@ -79,6 +79,7 @@ import {
   activeImportedRange,
   activeSizeRange,
   describeNumericFilters,
+  hiddenActiveFilterLabels,
   resolutionChipTitle,
   resolutionOptionsFor,
   resolutionPanelTitle,
@@ -867,6 +868,14 @@ export default function App() {
   /** 模型格式（全部 / SU / 3DMAX）：只有模型视图开放（能力表唯一判定，与分辨率同一机制） */
   const showModelFormatEntry = capsOfFilter(filters.kind, 'modelFormat') && !hideInAllView
   const modelFormatFilterActive = filters.modelFormat !== null
+  /**
+   * 「全部」视图的隐形筛选兜底（2026-10-30 用户实测）：`体积` / `分辨率` / `格式` 三个 chip
+   * 在「全部」视图被 `hideInAllView` 隐藏入口，但筛选值仍然生效 —— 用户肉眼看不出
+   * （报的场景就是"格式=SU 仍在跑，界面无任何提示，全库 135 只剩 75"）。
+   * 维度名列表由 `logic/filters.ts` 的 `hiddenActiveFilterLabels` 给出（纯函数、可单测），
+   * 这里只负责渲染与一键清除。
+   */
+  const hiddenActiveLabels = hiddenActiveFilterLabels(filters)
   const showStyleEntry =
     capsOfFilter(filters.kind, 'style') && (styleCounts.length > 0 || filters.styles.length > 0)
   /** 风格是多选维度：只要有选中就算激活，chip 上带数量（与色标同规矩） */
@@ -1221,6 +1230,28 @@ export default function App() {
                         >
                           {numericSummary}
                         </span>
+                      )}
+                      {/* 「全部」视图的隐形筛选兜底（2026-10-30 用户实测报的死角）：
+                          这三个维度的 chip 在这里被 `hideInAllView` 隐藏，但筛选值仍生效，
+                          不给出口就等于"网格少了 60 个、界面毫无提示"。点一下即清除三个维度。
+                          只在「全部」视图渲染（其他视图 chip 自己可见，不需要这条）。 */}
+                      {!trashMode && hideInAllView && hiddenActiveLabels.length > 0 && (
+                        <button
+                          className="max-w-[132px] truncate text-[11px] text-tertiary transition hover:text-primary"
+                          title={`体积 / 分辨率 / 格式的筛选在「全部」视图不显示入口，但仍会过滤（当前生效：${hiddenActiveLabels.join(
+                            '、'
+                          )}）。点击清除。`}
+                          onClick={() =>
+                            setFilter({
+                              minBytes: null,
+                              maxBytes: null,
+                              minResolution: null,
+                              modelFormat: null
+                            })
+                          }
+                        >
+                          全部视图已隐去 {hiddenActiveLabels.length} 个筛选
+                        </button>
                       )}
 
                       {quickPanel && quickPos && (

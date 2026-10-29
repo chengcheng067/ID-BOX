@@ -167,9 +167,14 @@ describe('源码守卫：侧栏精简 / 中栏头新增快速筛选', () => {
     const src = read('../src/renderer/components/Sidebar.tsx')
     expect(src).not.toContain('SU 版本')
     expect(src).not.toContain('来源')
-    // 筛选能力本身保留（Filter 状态与「全部」重置里仍有这两个键）
-    expect(src).toContain('suVersion')
+    // 筛选能力本身保留：Sidebar 仍会清 `source`（点大类时），
+    // `suVersion` 随「全部 / 重复资产」的清空列表一起收敛到 `logic/filters.ts`
+    // 的 `allViewFilterPatch`（2026-10-30 修隐形筛选死角时统一搬的），
+    // 组件里再手写那份清单正是 bug 成因，所以这里不再要求它出现在 Sidebar。
     expect(src).toContain('source')
+    expect(read('../src/renderer/logic/filters.ts')).toMatch(
+      /export function allViewFilterPatch\(\)[\s\S]*?suVersion: null/
+    )
   })
 
   it('Sidebar 不再包含「快速筛选」整块', () => {

@@ -693,6 +693,81 @@ export function activeFilterDimensions(f: Filters): ActiveFilterDimension[] {
 }
 
 /**
+ * 「全部」视图的高亮判定：除 `kind`（视图本身）与 `query`（搜索框自显、看得见）外，
+ * 没有任何筛选维度生效。
+ *
+ * 为什么必须收敛成一个函数（而不是组件里手写 `&&` 链）：
+ * 2026-10-30 用户实测报「在模型里选了格式=SU，切到「全部」看不到 SU 模型」——
+ * 根因是「全部」按钮的清理列表与高亮判定各自手写了 13 个 `&&` / 字段，
+ * 0.9.0 加 `hideInAllView`（体积/分辨率/格式在全部视图不渲染入口）后两处**都漏了**
+ * `minResolution` 与 `modelFormat`：筛选隐形生效、左栏却显示成"无筛选"。
+ * 收敛到 `activeFilterDimensions`（那里已把每个维度都列全、且处理了
+ * "非法区间视为不启用"这类边界）→ 将来加维度只需改那一处。
+ *
+ * `query` 为什么不参与：它是搜索框里**自己看得见**的状态，不需要靠左栏高亮提示。
+ */
+export function isAllViewActive(f: Filters): boolean {
+  return activeFilterDimensions(f).every((d) => d.key === 'kind' || d.key === 'query')
+}
+
+/**
+ * 「全部」与「重复资产」两个入口共用的筛选重置 patch。
+ *
+ * 与 `clearFilterPatch` 的两点区别（**故意不合并**）：
+ * - **保留 `query`**：点「全部」就清空搜索框会让用户困惑（搜索框自己可见，不需要靠它复位）；
+ * - **`kind` 强制 `'all'`**：这两个入口都是"回到全库"。
+ *
+ * ⚠️ 逐项列全（不是 `{ ...DEFAULT_FILTERS }`）：将来给 `Filters` 加字段时，
+ * 这里会**立刻编译报错**，不会静默漏清一个维度。这正是本 bug 的成因。
+ */
+export function allViewFilterPatch(): Partial<Filters> {
+  return {
+    kind: 'all',
+    tag: null,
+    source: null,
+    suVersion: null,
+    category1: null,
+    category2: null,
+    styles: [],
+    favoriteOnly: false,
+    colorTags: [],
+    minBytes: null,
+    maxBytes: null,
+    importedAfter: null,
+    importedBefore: null,
+    minResolution: null,
+    modelFormat: null
+  }
+}
+
+/**
+ * 「全部」视图下**被隐藏但仍在生效**的筛选维度名（空数组 = 没有隐形筛选）。
+ *
+ * 供中栏头的兜底提示使用 —— 这三个维度在「全部」视图不渲染入口（`hideInAllView`），
+ * 不提示的话用户看不到、也取消不掉（2026-10-30 用户实测报的死角）。
+ *
+ * 文案与中栏头 chip 的文字保持一致（模型的 `modelFormat` 在 chip 上叫「格式」），
+ * 其余维度名复用 `DIMENSION_LABEL`，不另写一套。
+ */
+const HIDDEN_DIMENSION_LABEL: Partial<Record<ActiveFilterDimension['key'], string>> = {
+  modelFormat: '格式'
+}
+
+/** 在「全部」视图被隐藏入口的那三个维度（顺序 = 中栏头 chip 的排列顺序） */
+const HIDDEN_IN_ALL_VIEW_KEYS: ReadonlyArray<ActiveFilterDimension['key']> = [
+  'size',
+  'resolution',
+  'modelFormat'
+]
+
+export function hiddenActiveFilterLabels(f: Filters): string[] {
+  const active = new Set(activeFilterDimensions(f).map((d) => d.key))
+  return HIDDEN_IN_ALL_VIEW_KEYS.filter((key) => active.has(key)).map(
+    (key) => HIDDEN_DIMENSION_LABEL[key] ?? DIMENSION_LABEL[key]
+  )
+}
+
+/**
  * 侧栏大类点击的展开语义（用户反馈第 5 条 · 缺陷 2）：首次点击即展开，再点该大类 = 折叠。
  * 纯函数放这里（组件只做渲染、可单测）。要点是 `openKind` 只能有一个状态源：此前它从
  * `filters.category1` 反推，于是「显式折叠」与「筛选回退」互相打架——二级筛选在时点大类

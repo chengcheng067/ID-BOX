@@ -57,9 +57,14 @@ describe('Sidebar：不再承载风格筛选', () => {
     expect(library).toBeGreaterThan(saved)
   })
 
-  it('筛选状态仍保留：「全部」与「重复资产」重置里依旧写 styles: []（逻辑没被删掉）', () => {
+  it('筛选状态仍保留：「全部」与「重复资产」重置里依旧清 styles（逻辑没被删掉）', () => {
+    // 2026-10-30：清理列表从组件**收敛到** `logic/filters.ts` 的 `allViewFilterPatch`
+    // （两处手写清单各漏字段就是「格式=SU 看不到 SU 模型」那个 bug 的成因）。
+    // 守的原意不变：styles 维度仍被重置、两个入口都走它。
     const src = read(SIDEBAR)
-    expect(src.match(/styles: \[\]/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+    expect(src.match(/allViewFilterPatch\(\)/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+    const logic = read(FILTERS)
+    expect(logic).toMatch(/export function allViewFilterPatch\(\)[\s\S]*?styles: \[\]/)
   })
 })
 

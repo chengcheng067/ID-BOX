@@ -11,9 +11,7 @@ import {
 import { UNCLASSIFIED } from '../../shared/taxonomy'
 import { countLevel1, countLevel2, duplicatedLevel2Names } from '../logic/category'
 import { extraCopyCount, groupDuplicates } from '../logic/duplicates'
-import {
-  nextExpandKind
-} from '../logic/filters'
+import { allViewFilterPatch, isAllViewActive, nextExpandKind } from '../logic/filters'
 import { countDeletedAssets, isDeletedAsset } from '../logic/trashView'
 import { countPendingReview } from '../logic/reviewFlow'
 import { StarIcon } from './MarkControls'
@@ -228,8 +226,16 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const tagCounts = useMemo(() => {
     const m = new Map<string, number>()
     for (const a of activeAssets) for (const t of a.tags) m.set(t, (m.get(t) ?? 0) + 1)
-    return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
-  }, [activeAssets])
+    const sorted = [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
+    // 当前筛中的标签**必须**在列表里：否则它跌出 top12 后入口消失，筛选生效却取消不掉
+    //（与「全部」清理列表漏字段是同一类死角，2026-10-30 一并修）
+    const picked = filters.tag
+    if (picked && !sorted.some(([t]) => t === picked)) {
+      const hit = m.get(picked)
+      if (hit !== undefined) sorted.push([picked, hit])
+    }
+    return sorted
+  }, [activeAssets, filters.tag])
 
   /**
    * v0.4 重复资产：徽标数是「多余份数」（Σ 组内份数−1），不是组数——
@@ -397,43 +403,19 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
         <div>
         <button
           className={itemCls(
-            filters.kind === 'all' &&
-              !filters.category1 &&
-              !filters.tag &&
-              !filters.source &&
-              !filters.suVersion &&
-              !filters.favoriteOnly &&
-              // 风格入口已搬出左栏（现居中栏头 App.tsx）：左栏看不到已选风格，若这里仍判「全部」高亮，
-              // 会出现「左栏显示无筛选、网格却是筛过的」矛盾 → 一并纳入判定（只改高亮，不改筛选）。
-              filters.styles.length === 0 &&
-              filters.colorTags.length === 0 &&
-              filters.minBytes === null &&
-              filters.maxBytes === null &&
-              filters.importedAfter === null &&
-              filters.importedBefore === null &&
-              !dupOnly &&
-              libraryView === 'assets',
+            // 判定收敛在 `logic/filters.ts` 的 `isAllViewActive`：组件里**不要**再手写
+            // 「每个维度都没生效」的 `&&` 链 —— 0.9.0 的 bug 就是两处各写一遍、各漏 2 个字段
+            // （`minResolution` / `modelFormat`），结果筛选隐形生效、左栏却显示成"无筛选"。
+            isAllViewActive(filters) && !dupOnly && libraryView === 'assets',
             'neutral'
           )}
           onClick={() => {
-            // 「全部」= 退出文件视图 + 退出回收站 + 清空所有筛选维度（唯一能回到整库的入口）
+            // 「全部」= 退出文件视图 + 退出回收站 + 清空所有筛选维度（唯一能回到整库的入口）。
+            // 清理列表与高亮判定都收敛在 `logic/filters.ts` 的
+            // `allViewFilterPatch` / `isAllViewActive`，不要在组件里再手写。
             navTo(() => {
               setDupOnly(false)
-              setFilter({
-                kind: 'all',
-                tag: null,
-                source: null,
-                suVersion: null,
-                category1: null,
-                category2: null,
-                styles: [],
-                favoriteOnly: false,
-                colorTags: [],
-                minBytes: null,
-                maxBytes: null,
-                importedAfter: null,
-                importedBefore: null
-              })
+              setFilter(allViewFilterPatch())
             })
           }}
         >
@@ -650,19 +632,10 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
             disabled={dupExtra === 0}
             onClick={() => {
               // 退出文件视图 + 退出回收站 + 进入重复视图时清掉其它筛选维度：
-              // 入口语义是「看全库哪些资产重复了」
+              // 入口语义是「看全库哪些资产重复了」。清理列表与「全部」按钮**同源**
+              // （`allViewFilterPatch`），不要在这里另写一份 —— 0.9.0 这里漏了 6 个字段。
               navTo(() => {
-                setFilter({
-                  kind: 'all',
-                  tag: null,
-                  source: null,
-                  suVersion: null,
-                  category1: null,
-                  category2: null,
-                  styles: [],
-                  favoriteOnly: false,
-                  colorTags: []
-                })
+                setFilter(allViewFilterPatch())
                 setDupOnly(true)
                 setExpandKind(null)
                 setExpandL1(null)
