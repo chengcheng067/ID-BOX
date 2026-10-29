@@ -406,6 +406,8 @@ export function matchesResolution(a: Asset, bucket: ResolutionBucket | null): bo
  *
  * 调用点只有两处：`store.setFilter`（且仅在 `patch.kind` 存在时）与
  * `filtersFromSavedView`（存量视图可能存着非法组合）。
+ * 注意 `filtersFromSavedView` 之后还叠了一层 `normalizeFiltersForAllView`
+ * （「全部」视图独有的三个无入口维度），两者分工见该函数的注释。
  */
 export function sanitizeFiltersForKind(f: Filters): Filters {
   const next: Filters = { ...f }
@@ -422,6 +424,33 @@ export function sanitizeFiltersForKind(f: Filters): Filters {
   // 否则「切到材质视图后网格里模型少了」且用户找不到原因。
   if (!capsOfFilter(f.kind, 'modelFormat')) next.modelFormat = null
   return next
+}
+
+/**
+ * 「全部」视图专属的归一化：把在该视图**没有入口**的那三个维度清成 null。
+ *
+ * 与 `sanitizeFiltersForKind` 的区别（**不要合并成一个函数**）：
+ * - `sanitizeFiltersForKind` 判据是能力表（`capsOfFilter`），而能力表里 `'all' = 并集`
+ *   → 在「全部」视图它一个维度都不清。那是**故意**的：手头这个 filters 在
+ *   「模型 → 全部 → 模型」来回切时不能丢格式选择（切走时由模型视图自己保留语义）。
+ * - 本函数只服务**「这个状态要落成快照 / 要从快照恢复」**这类"持久化边界"：
+ *   快照一旦落盘，就必须是**自洽**的 —— 不能在「全部」里存一个只有模型视图才
+ *   看得见入口的筛选条件，否则恢复后用户既看不到、也取消不掉。
+ *
+ * 三个维度从哪来：`HIDDEN_IN_ALL_VIEW_KEYS`（本文件已有，
+ * 内容是 `['size','resolution','modelFormat']`），但它们映射到 `Filters` 的
+ * 具体字段是 `minBytes`/`maxBytes`、`minResolution`、`modelFormat`。
+ * ⚠️ 不要直接复用 `hiddenActiveFilterLabels` 的返回（那是给 UI 的文案数组）。
+ */
+export function normalizeFiltersForAllView(f: Filters): Filters {
+  if (f.kind !== 'all') return f
+  return {
+    ...f,
+    minBytes: null,
+    maxBytes: null,
+    minResolution: null,
+    modelFormat: null
+  }
 }
 
 /**
@@ -883,24 +912,27 @@ function colorTagList(v: unknown): ColorTag[] {
  * 这里不会静默把不可序列化的东西写进 settings.json。
  */
 export function snapshotFilters(f: Filters): Record<string, unknown> {
+  // 「全部」视图下这三个维度没有入口（App.tsx 的 hideInAllView）→ 快照里**不许**存它们的值，
+  // 否则套用时恢复出一个"看起来没筛、实际在筛"的状态（2026-10-30 用户实测的同类死角）。
+  const n = normalizeFiltersForAllView(f)
   return {
-    kind: f.kind,
-    tag: f.tag,
-    source: f.source,
-    suVersion: f.suVersion,
-    category1: f.category1,
-    category2: f.category2,
-    styles: [...f.styles],
-    favoriteOnly: f.favoriteOnly,
-    colorTags: [...f.colorTags],
-    minBytes: f.minBytes,
-    maxBytes: f.maxBytes,
-    importedAfter: f.importedAfter,
-    importedBefore: f.importedBefore,
-    minResolution: f.minResolution,
-    modelFormat: f.modelFormat,
-    query: f.query,
-    sort: f.sort
+    kind: n.kind,
+    tag: n.tag,
+    source: n.source,
+    suVersion: n.suVersion,
+    category1: n.category1,
+    category2: n.category2,
+    styles: [...n.styles],
+    favoriteOnly: n.favoriteOnly,
+    colorTags: [...n.colorTags],
+    minBytes: n.minBytes,
+    maxBytes: n.maxBytes,
+    importedAfter: n.importedAfter,
+    importedBefore: n.importedBefore,
+    minResolution: n.minResolution,
+    modelFormat: n.modelFormat,
+    query: n.query,
+    sort: n.sort
   }
 }
 
@@ -946,5 +978,9 @@ export function filtersFromSavedView(
   }
   // 存量视图可能存着「大类 + 该大类不支持的维度」这种非法组合
   // （例如 `kind: 'hdri' + minResolution: '2k'`：HDR 表里没有 2K 档）→ 套用即归一化
-  return sanitizeFiltersForKind(next)
+  // 两道归一化，顺序不能反：
+  // ① `sanitizeFiltersForKind`：清掉"该大类不支持该维度"（如 hdri + '2k' 档不存在）；
+  // ② `normalizeFiltersForAllView`：清掉"kind='all' 但维度没有入口"的存量脏档
+  //    （老版本存下的快照、手工改过的 settings.json 都可能有）。
+  return normalizeFiltersForAllView(sanitizeFiltersForKind(next))
 }

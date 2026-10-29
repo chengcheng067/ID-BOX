@@ -23,9 +23,12 @@ import type { Asset } from '../src/shared/types'
 import {
   DEFAULT_FILTERS,
   allViewFilterPatch,
+  filtersFromSavedView,
   hiddenActiveFilterLabels,
   isAllViewActive,
   matchesFilters,
+  normalizeFiltersForAllView,
+  snapshotFilters,
   type Filters
 } from '../src/renderer/logic/filters'
 
@@ -278,5 +281,139 @@ describe('端到端：模型里选格式=SU → 切到「全部」→ 整库可�
     const hit = all.filter((a) => matchesFilters(a, broken))
     expect(hit).toHaveLength(3) // SU 模型 + 贴图 + HDR（非模型资产不受格式约束）
     expect(hit).not.toContain(maxModel)
+  })
+})
+
+// ── ⑥ 智能集合（savedView）的同类死角（2026-10-30 第五条） ─────────────
+//
+// 用户在「全部」视图存过一个带 `modelFormat` 的快照（历史数据 / 手改 settings.json /
+// kind 曾被改过）→ 套用后是 `kind:'all' + modelFormat:'max'`：格式 chip 不渲染
+// （App.tsx 的 hideInAllView），但 max 过滤仍在生效 → 用户看到「全部」却只有 1 个模型。
+//
+// 修法是两处「持久化边界」各归一化一次：`snapshotFilters` 落盘前、`filtersFromSavedView`
+// 恢复后。`sanitizeFiltersForKind` 对此无能为力（能力表里 `'all' = 并集`，一个都不清）。
+
+describe('normalizeFiltersForAllView —— 「全部」视图的无入口维度归零', () => {
+  it('kind=all 时清掉 modelFormat / minResolution / 体积区间', () => {
+    const out = normalizeFiltersForAllView(
+      f({ kind: 'all', modelFormat: 'max', minResolution: '4k', minBytes: 10 * 1024 * 1024 })
+    )
+    expect(out.modelFormat).toBeNull()
+    expect(out.minResolution).toBeNull()
+    expect(out.minBytes).toBeNull()
+  })
+
+  it('kind=model + modelFormat=max → 原样保留（模型视图必须留着）', () => {
+    const out = normalizeFiltersForAllView(f({ kind: 'model', modelFormat: 'max' }))
+    expect(out.modelFormat).toBe('max')
+  })
+
+  it('kind=hdri + minResolution=8k → 原样保留（不是 all 就不归它管）', () => {
+    const out = normalizeFiltersForAllView(f({ kind: 'hdri', minResolution: '8k' }))
+    expect(out.minResolution).toBe('8k')
+  })
+
+  it('kind=all 返回新对象，且不改入参', () => {
+    const input = f({ kind: 'all', modelFormat: 'max', minResolution: '4k', minBytes: 4096 })
+    const out = normalizeFiltersForAllView(input)
+    expect(out).not.toBe(input)
+    // 入参一个字段都不许被改
+    expect(input.modelFormat).toBe('max')
+    expect(input.minResolution).toBe('4k')
+    expect(input.minBytes).toBe(4096)
+  })
+})
+
+describe('snapshotFilters —— 「全部」视图不把隐形维度写进快照', () => {
+  it('kind=all + modelFormat=max → 快照里 modelFormat 是 null', () => {
+    const snap = snapshotFilters(f({ kind: 'all', modelFormat: 'max' }))
+    expect(snap.modelFormat).toBeNull()
+  })
+
+  it('kind=all 时体积 / 分辨率也不落盘', () => {
+    const snap = snapshotFilters(
+      f({ kind: 'all', minBytes: 10 * 1024 * 1024, maxBytes: 20 * 1024 * 1024, minResolution: '4k' })
+    )
+    expect(snap.minBytes).toBeNull()
+    expect(snap.maxBytes).toBeNull()
+    expect(snap.minResolution).toBeNull()
+  })
+
+  it('kind=model + modelFormat=max → 快照里必须保住 max（否则「只看 max」的集合就废了）', () => {
+    const snap = snapshotFilters(f({ kind: 'model', modelFormat: 'max' }))
+    expect(snap.modelFormat).toBe('max')
+  })
+})
+
+describe('filtersFromSavedView —— 兜住存量脏档', () => {
+  const view = (filters: Record<string, unknown>): { filters: Record<string, unknown> } => ({
+    filters
+  })
+
+  it('老数据 { kind:all, modelFormat:max, minBytes:1024 } → 三项全 null', () => {
+    const out = filtersFromSavedView(view({ kind: 'all', modelFormat: 'max', minBytes: 1024 }))
+    expect(out.modelFormat).toBeNull()
+    expect(out.minBytes).toBeNull()
+    expect(out.minResolution).toBeNull()
+  })
+
+  it('正常快照 { kind:model, modelFormat:max } → 恢复后仍是 max', () => {
+    const out = filtersFromSavedView(view({ kind: 'model', modelFormat: 'max' }))
+    expect(out.modelFormat).toBe('max')
+  })
+
+  it('{ kind:hdri, minResolution:2k } → null（HDR 表里没有 2K 档，两道归一化叠加仍生效）', () => {
+    const out = filtersFromSavedView(view({ kind: 'hdri', minResolution: '2k' }))
+    expect(out.minResolution).toBeNull()
+  })
+})
+
+describe('端到端：套用脏档集合后「全部」= 真的全部', () => {
+  const suModel = asset({
+    kind: 'model',
+    name: 'SU 沙发',
+    size: 30 * 1024 * 1024,
+    files: [{ rel: 'b.skp', name: 'b.skp', ext: 'skp', size: 1, kind: 'model' }]
+  })
+  const maxModel = asset({
+    kind: 'model',
+    name: 'max 沙发',
+    size: 30 * 1024 * 1024,
+    files: [{ rel: 'b.max', name: 'b.max', ext: 'max', size: 1, kind: 'model' }]
+  })
+  const texture = asset({
+    kind: 'texture',
+    name: '木纹贴图',
+    size: 30 * 1024 * 1024,
+    files: [{ rel: 'b.png', name: 'b.png', ext: 'png', size: 1, kind: 'texture', w: 4096, h: 4096 }]
+  })
+  const hdri = asset({
+    kind: 'hdri',
+    name: '海边全景',
+    size: 30 * 1024 * 1024,
+    files: [{ rel: 'b.hdr', name: 'b.hdr', ext: 'hdr', size: 1, kind: 'hdri', w: 4096, h: 2048 }]
+  })
+  const all = [suModel, maxModel, texture, hdri]
+
+  it('脏档 { kind:all, modelFormat:max, minResolution:4k, minBytes:1024 } 恢复后四条全部命中', () => {
+    const restored = filtersFromSavedView({
+      filters: { kind: 'all', modelFormat: 'max', minResolution: '4k', minBytes: 1024 }
+    })
+    const hit = all.filter((a) => matchesFilters(a, restored))
+    expect(hit).toHaveLength(4)
+    // 逐条钉住，避免"数量对了但错在了别的维度"
+    expect(hit).toContain(suModel)
+    expect(hit).toContain(maxModel)
+    expect(hit).toContain(texture)
+    expect(hit).toContain(hdri)
+  })
+
+  it('存 → 恢复 往返：模型视图存的「只看 max」集合套用后仍是只看 max', () => {
+    const saved = snapshotFilters(f({ kind: 'model', modelFormat: 'max' }))
+    const restored = filtersFromSavedView({ filters: saved })
+    expect(restored.kind).toBe('model')
+    expect(restored.modelFormat).toBe('max')
+    const hit = all.filter((a) => matchesFilters(a, restored))
+    expect(hit).toEqual([maxModel])
   })
 })

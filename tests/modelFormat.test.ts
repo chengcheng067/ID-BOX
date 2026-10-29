@@ -267,20 +267,26 @@ describe('模型格式筛选 · 匹配 / 归一化 / 快照 / 入口', () => {
   })
 
   it('智能集合快照 / 还原：合法值往返、非法值丢弃', () => {
-    const snap = snapshotFilters(filters({ modelFormat: 'max' }))
+    // ⚠️ 必须带 kind:'model'：DEFAULT_FILTERS.kind 是 'all'，而「全部」视图没有格式入口
+    // （`App.tsx` 的 hideInAllView）→ 快照层会把 modelFormat 归一成 null（见
+    // `normalizeFiltersForAllView`）。模型的「只看 max」集合必须带 kind 才存得住。
+    const snap = snapshotFilters(filters({ kind: 'model', modelFormat: 'max' }))
     expect(snap.modelFormat).toBe('max')
-    expect(
-      filtersFromSavedView({ filters: snap }).modelFormat
-    ).toBe('max')
+    expect(filtersFromSavedView({ filters: snap }).modelFormat).toBe('max')
     // 非法值（脏数据 / 旧档）→ null
     expect(
-      filtersFromSavedView({ filters: { modelFormat: 'fbx' } }).modelFormat
+      filtersFromSavedView({ filters: { kind: 'model', modelFormat: 'fbx' } }).modelFormat
     ).toBeNull()
     expect(
-      filtersFromSavedView({ filters: { modelFormat: 42 } }).modelFormat
+      filtersFromSavedView({ filters: { kind: 'model', modelFormat: 42 } }).modelFormat
     ).toBeNull()
     // 缺键 → 默认 null
     expect(filtersFromSavedView({ filters: {} }).modelFormat).toBeNull()
+    // 「全部」视图的快照里不许出现 modelFormat（2026-10-30 第五条死角）
+    expect(snapshotFilters(filters({ kind: 'all', modelFormat: 'max' })).modelFormat).toBeNull()
+    expect(
+      filtersFromSavedView({ filters: { kind: 'all', modelFormat: 'max' } }).modelFormat
+    ).toBeNull()
   })
 
   it('空态维度摘要：模型格式生效时列出「模型格式」维度', () => {

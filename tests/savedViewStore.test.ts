@@ -169,11 +169,13 @@ describe('applySavedView', () => {
 
   it('套用视图会退出「重复资产」视图（视图模式不属于筛选快照）', () => {
     useVault.setState({ dupOnly: true })
+    // ⚠️ 必须带 kind: 'texture'：分辨率在「全部」视图没有入口（hideInAllView），
+    // `filtersFromSavedView` 末尾的 `normalizeFiltersForAllView` 会把裸 minResolution 清成 null。
     useVault.getState().applySavedView({
       id: 'c',
       name: 'C',
       createdAt: 0,
-      filters: { minResolution: '2k' }
+      filters: { kind: 'texture', minResolution: '2k' }
     })
     expect(useVault.getState().dupOnly).toBe(false)
     expect(useVault.getState().filters.minResolution).toBe('2k')
