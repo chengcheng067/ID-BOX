@@ -31,6 +31,7 @@ import {
   autoDismissDelayMs,
   importItemDetail,
   isTerminalStatus,
+  junkCleanupSummaryText,
   overwriteSummaryText,
   skippedSummaryText,
   statusClass
@@ -516,6 +517,23 @@ describe('importText：skipped 的配色 / 倒计时 / 终态（ImportStatus 加
     expect(skippedSummaryText(Number.NaN)).toBeNull()
   })
 
+  it('杂质删除汇总文案（0.9.0：说清"已删除 + 不进回收站"）', () => {
+    // 文案必须让用户知道**磁盘上少了东西**，且不可逆 —— 这是这条 toast 存在的唯一理由
+    expect(junkCleanupSummaryText(3)).toBe(
+      '已清理 3 个推广/说明文件（导入时自动删除，不进回收站）'
+    )
+    // 文案不能出现「回收站」以外的歧义说法
+    expect(junkCleanupSummaryText(3)).toContain('不进回收站')
+    // N≤0 一律不打扰：绝大多数包没有杂质
+    expect(junkCleanupSummaryText(0)).toBeNull()
+    expect(junkCleanupSummaryText(-1)).toBeNull()
+    expect(junkCleanupSummaryText(Number.NaN)).toBeNull()
+    // 小数向下取整，绝不印出「已清理 2.5 个」
+    expect(junkCleanupSummaryText(2.9)).toBe(
+      '已清理 2 个推广/说明文件（导入时自动删除，不进回收站）'
+    )
+  })
+
   it('覆盖汇总文案（与跳过对称；M 夹在 [0, N]）', () => {
     expect(overwriteSummaryText(2)).toBe('已覆盖 2 个重复素材（旧版在系统回收站）')
     expect(overwriteSummaryText(2, 1)).toBe('已覆盖 2 个重复素材，其中 1 个旧版未进回收站')
@@ -944,6 +962,54 @@ describe('store 接线（docs/27 T-06）', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('杂质删除汇总：累计 cleanedJunk.length，批次结束发一条「已清理 N 个」', () => {
+    importHandler!({
+      item: 'E:\\cad1.zip',
+      itemName: 'cad1.zip',
+      status: 'done',
+      asset: { name: '餐厅平面' } as never,
+      cleanedJunk: ['微信扫码 看案例找灵感下素材必用知末.jpg', '知末网说明.txt']
+    })
+    importHandler!({
+      item: 'E:\\cad2.zip',
+      itemName: 'cad2.zip',
+      status: 'done',
+      asset: { name: '卧室立面' } as never,
+      cleanedJunk: ['知末CAD图纸-精选行业施工图，追踪最新图纸.html']
+    })
+    // 干净包：字段缺席 → 不加也不抛（`?.length ?? 0` 的边界）
+    importHandler!({
+      item: 'E:\\clean.zip',
+      itemName: 'clean.zip',
+      status: 'done',
+      asset: { name: '木纹' } as never
+    })
+    // 空数组同样不加（主进程约定不写空数组，这里防一手老数据）
+    importHandler!({
+      item: 'E:\\empty.zip',
+      itemName: 'empty.zip',
+      status: 'done',
+      asset: { name: '石材' } as never,
+      cleanedJunk: []
+    })
+
+    batchDoneHandler!()
+    expect(useVault.getState().notice).toBe(
+      '已清理 3 个推广/说明文件（导入时自动删除，不进回收站）'
+    )
+  })
+
+  it('没有杂质时批次结束不给「已清理」toast（绝大多数包没有杂质，不打扰）', () => {
+    importHandler!({
+      item: 'E:\\clean.zip',
+      itemName: 'clean.zip',
+      status: 'done',
+      asset: { name: '木纹' } as never
+    })
+    batchDoneHandler!()
+    expect(useVault.getState().notice).toBeNull()
   })
 
   it('importPaths 把判重快照作为第二个参数传下去（D22），且快照排除软删', async () => {

@@ -105,6 +105,7 @@ import {
 } from './logic/thumbRescue'
 import {
   isTerminalStatus,
+  junkCleanupSummaryText,
   overwriteSummaryText,
   skippedSummaryText
 } from './logic/importText'
@@ -127,6 +128,18 @@ let skippedInBatchCount = 0
 let overwrittenInBatchCount = 0
 /** 其中走了退化路径的条数（`ImportEvent.conflict.degraded === true`：旧版没进回收站） */
 let overwrittenDegradedCount = 0
+
+/**
+ * 本批**物理删除**的杂质文件数（`ImportEvent.cleanedJunk.length` 之和）。
+ *
+ * 0.9.0 起导入会 `fs.rm` 掉包里的推广件 / 说明网页（见 `shared/junkCleanup.ts`）。
+ * 删除不可逆、不进回收站，所以批次结束必须给一条汇总回执 —— 否则用户发现包里
+ * 少了文件却不知道是谁删的。
+ *
+ * 消费型（`flushJunkSummary` 读后归零），与 `skippedInBatchCount` 同款：
+ * 逐条事件只累加，**绝不在这里发任何提示**。
+ */
+let cleanedJunkInBatchCount = 0
 
 /**
  * 本批**真正落库**的素材数（`status === 'done'` 的事件计数）。
@@ -422,6 +435,22 @@ function flushOverwriteSummary(): void {
   overwrittenInBatchCount = 0
   overwrittenDegradedCount = 0
   const text = overwriteSummaryText(total, degraded)
+  if (text) enqueueNotice(text)
+}
+
+/**
+ * 批次结束：汇总本轮**物理删除**的杂质文件数（0.9.0）。
+ *
+ * 位置在跳过 / 覆盖之后：那两条是"你的东西被怎么处理了"，这条是"我们主动删了什么"，
+ * 用户关心程度递减，放在最后一条不抢前两条的注意力。
+ *
+ * 只报条数不报文件名 —— 批量导入时文件名能刷满三屏，而用户真正需要知道的只有
+ * "删了几个 + 这事不可逆"。
+ */
+function flushJunkSummary(): void {
+  const n = cleanedJunkInBatchCount
+  cleanedJunkInBatchCount = 0
+  const text = junkCleanupSummaryText(n)
   if (text) enqueueNotice(text)
 }
 
@@ -2735,6 +2764,7 @@ export const useVault = create<VaultState>((set, get) => ({
       // 两条**互不吞并**（用 `enqueueNotice` 依次展示）：先跳过、后覆盖，顺序即发生顺序。
       flushSkippedSummary()
       flushOverwriteSummary()
+      flushJunkSummary()
       // 批次边界复位：监控目录导入不走 `importPaths`，只有这里能给下一批重新开门。
       // main 保证 `import:batchDone` 在整批 `import:event` 之后才发 → 复位不会吞掉本批的切换。
       libraryViewRestoredInBatch = false
@@ -2786,6 +2816,9 @@ export const useVault = create<VaultState>((set, get) => ({
       })
       // 跳过的重复素材：只累计，等批次结束汇总成一条 notice（§3.1）
       if (ev.status === 'skipped') skippedInBatchCount += 1
+      // 物理删除的杂质文件数：同样只累计（0.9.0）。`cleanedJunk` 字段**缺席 = 没删**，
+      // 不是空数组——所以这里用 `?.length ?? 0`，不要写成 `ev.cleanedJunk.length`。
+      if (ev.cleanedJunk) cleanedJunkInBatchCount += ev.cleanedJunk.length
       // 覆盖的重复素材：批次级汇总的累计。
       // 退化判定**只读结构化字段** `ImportEvent.conflict.degraded`（`: true` 仅当 overwrite 走了
       // 退化路径：旧目录不存在 / kind 变 / 库外 / 旧版没进回收站）。

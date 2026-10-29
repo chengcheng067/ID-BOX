@@ -104,6 +104,27 @@ export function overwriteSummaryText(total: number, degraded = 0): string | null
   return `已覆盖 ${n} 个重复素材（旧版在系统回收站）`
 }
 
+/**
+ * 杂质的批次汇总文案（与 `skippedSummaryText` 对称）。
+ *
+ * 为什么必须汇总、而且必须**说清"已删除"**：这条汇总的唯一价值是让用户知道
+ * **磁盘上少了东西**。此前这些推广件只是"不进索引"，文件还在；0.9.0 之后是 `fs.rm`，
+ * 不可逆、不进回收站。用户看到包里的扫码图 / 说明 html 消失了，必须有一个回执把它
+ * 解释成"我们干的"，否则会怀疑是不是导入把素材弄丢了。
+ *
+ * - `count ≤ 0` → `null`（不打扰；绝大多数包没有杂质）；
+ * - 只报条数不报文件名：批量导入时文件名列表能刷满三屏，而用户要的信息只有"删了几个"。
+ *
+ * 计数由调用方从 `ImportEvent.cleanedJunk` 的**长度**累加（只累加、批次结束发一条，
+ * 挂在逐条事件上就是"拖 50 个包弹 50 次"）。
+ */
+export function junkCleanupSummaryText(count: number): string | null {
+  if (!Number.isFinite(count) || count <= 0) return null
+  const n = Math.floor(count)
+  if (n <= 0) return null
+  return `已清理 ${n} 个推广/说明文件（导入时自动删除，不进回收站）`
+}
+
 /** `ImportItem` 里本文件用得到的字段（结构化类型，测试可直接传字面量） */
 export interface ImportItemTextInput {
   status: ImportQueueStatus

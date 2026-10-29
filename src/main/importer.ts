@@ -15,6 +15,7 @@ import {
   STAGING_DIR
 } from './fsutil'
 import { kindFolder, kindOfExt, isCoverAssetImage, pickCover, primaryKind } from '../shared/classify'
+import { shouldDeleteJunkFile } from '../shared/junkCleanup'
 import { isHdrExt, panoramaNoteFromName } from '../shared/hdrExts'
 import {
   composeRelFolder,
@@ -156,6 +157,39 @@ export async function fillImageSizes(folder: string, files: AssetFile[]): Promis
       /* 静默：读不到就是未知尺寸 */
     }
   }
+}
+
+/**
+ * 删除资产目录**根层**的高置信杂质文件，返回被删的文件名。
+ *
+ * 只扫根层不进子目录：站方的推广件全在包根（用户截图的扫码图 / 说明 txt / 推广 html
+ * 三件都是根层），而子目录里可能出现用户自己整理进素材包的说明文档，宁可不碰。
+ *
+ * 判定用 `shared/junkCleanup.ts#shouldDeleteJunkFile`（窄规则），**不是**
+ * `isJunkFileName` —— 后者会按「说明」「下载」泛词命中 `设计说明.dwg` 这类真图纸。
+ *
+ * 每个文件单独 try/catch：一个删不掉（被 DCC 占用 / 只读）不影响其它，也不影响导入。
+ * 目录读不到（不存在 / 权限）→ 返回 `[]`，绝不抛。
+ */
+async function deleteJunkFilesIn(dir: string): Promise<string[]> {
+  let entries: import('node:fs').Dirent[]
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const removed: string[] = []
+  for (const e of entries) {
+    if (!e.isFile()) continue
+    if (!shouldDeleteJunkFile(e.name)) continue
+    try {
+      await fs.rm(path.join(dir, e.name), { force: true })
+      removed.push(e.name)
+    } catch {
+      /* 单个删不掉：留个垃圾比让整次导入失败好 */
+    }
+  }
+  return removed
 }
 
 export function registerStaging(dir: string): void {
@@ -890,6 +924,15 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
 
     const { id, finalName, target, relFolder } = placement
 
+    // ── 杂质物理删除（2026-10-30 用户明确要求）─────────────────────────
+    // 落盘后把推广件从磁盘上删掉（此前只做到"不进 files 索引"，磁盘上仍留着）。
+    // 判定走 `shouldDeleteJunkFile`（窄规则），**不是** `isJunkFileName` ——
+    // 后者按「说明」「下载」泛词命中，拿去删会删真图纸（实测 `设计说明.dwg` 会中）。
+    // 必须放在 moveDir 之后：删除要在文件已经进库、路径确定之后做；放之前会删 staging
+    // 里的，而 moveDir 跨盘退化是复制+删源，两边都碰会出错。
+    // 失败静默：删不掉只是多留个垃圾，绝不能让整次导入失败。
+    const cleanedJunk = await deleteJunkFilesIn(target)
+
     // 0.6.0 分辨率筛选：文件已在最终位置 → 给图片补宽高（只读文件头，失败静默）。
     // 必须**在推送 skp 预览图之前**做：那张图是程序生成的封面，不是用户的贴图，
     // 让它参与「±2K 贴图」判定会把模型资产误算进高清档。
@@ -1071,7 +1114,8 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
       status: 'done',
       asset,
       ...(conflict ? { conflict } : {}),
-      ...(message ? { message } : {})
+      ...(message ? { message } : {}),
+      ...(cleanedJunk.length > 0 ? { cleanedJunk } : {})
     })
     return asset
   } finally {

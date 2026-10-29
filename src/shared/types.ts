@@ -467,6 +467,12 @@ export interface ImportEvent {
      */
     degraded?: boolean
   }
+  /**
+   * 本次导入**物理删除**的杂质文件名（2026-10-30 用户要求"进库后自动删掉"）。
+   * 只在真删掉时出现（空数组不写），供 UI 提示「已清理 N 个杂质文件」。
+   * 判定见 `shared/junkCleanup.ts`（**不是** `isJunkFileName`，两套规则）。
+   */
+  cleanedJunk?: string[]
 }
 
 // ── 2026-10 导入重复处置（docs/27） ──────────────────────────────────────
