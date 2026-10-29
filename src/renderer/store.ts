@@ -20,7 +20,7 @@ import type {
   ThumbStatus
 } from '../shared/types'
 import { baseNameOf, dedupeKeyOf, normalizeCategoryPair, zhimoIdFromSources, zhimoIdOf } from '../shared/naming'
-import { kindFolder } from '../shared/classify'
+import { kindFolder, kindsOfFilter, type KindFilter } from '../shared/classify'
 import { UNCLASSIFIED } from '../shared/taxonomy'
 import { classifyAssetName } from '../shared/classifyAsset'
 import {
@@ -503,10 +503,11 @@ export type TriageMode = ReviewReason
 /**
  * 某个模式的待办集（**口径的唯一实现点**，`openTriage` 与三个 hook 都走它）。
  *
- * 三步，一步都不能少也不能换顺序：
+ * 四步，一步都不能少也不能换顺序：
  * ① 滤软删（走 `isDeletedAsset`，与 `activeAssets` / `applyFilters` 同一判据来源）；
  * ② 按当前排序排（`sortAssets` 走同一份 `filters.sort`，不自己另排）；
- * ③ 按模式挑（`unclassified` 走 `buildTriageQueue`，`conflict` 走 `buildReviewQueue`）。
+ * ③ 按当前大类收窄（`kindsOfFilter(kind)`，`null` = 全部不收窄）—— **仅 `unclassified` 模式**；
+ * ④ 按模式挑（`unclassified` 走 `buildTriageQueue`，`conflict` 走 `buildReviewQueue`）。
  *
  * ## 为什么必须合成一个函数（本卡最容易犯的错）
  *
@@ -514,8 +515,22 @@ export type TriageMode = ReviewReason
  * 三处各写一遍 `filter + sort + build`，就是三套真相。历史上"侧栏数字与浮层条数对不上"
  * 的 bug 全部来自这种重复（`logic/triageFlow.ts` 文件头有记）。
  *
- * **不套 `filters`**（搜索词 / 大类 / 分类 / chip 都不参与）：两种队列都是全库口径，
- * 理由见 `useTriageQueue` 的注释 —— 侧栏那两个数字本身也是全库口径。
+ * ## 口径：**搜索词 / 分类 / 风格 / chip 仍然不参与，但大类（`kind`）必须参与**
+ *
+ * 不参与的仍然不参与：整理是"逐张过待办"，被搜索词收窄会让用户漏掉队列里的东西
+ * （"就剩这么点没分类"，整理完一退回来还有几百张）。
+ *
+ * **但大类必须收窄** —— 这是 2026-10-30 用户实测推翻的旧口径。入口是"某个大类下的
+ * 未分类节点"（`Sidebar` 里那一行的「整理」按钮），数字是按该大类算的；队列若取全库
+ * 就会串类：HDR 视图点整理 → 浮层里冒出材质 / 模型的资产（用户报的正是这个 bug）。
+ * 与侧栏数字的关系：`countLevel1` 在 `Sidebar` 里也是按 `openScope`（当前展开的大类）
+ * 算的 → 两边现在**同口径**，数字与浮层条数能对上。
+ *
+ * ⚠️ **`conflict`（待确认）模式不受 `kind` 约束**（`kind` 对它无效）：
+ * 侧栏「待确认 N」是 `countPendingReview(Sidebar 的 activeAssets).conflict`，
+ * `activeAssets` 只滤软删、**不套大类** → 那是**全库口径**（`Sidebar.tsx:256-267` 的注释
+ * 也写死了这一点）。若这里也收窄，就会把 bug 从"未分类"搬到"待确认"（数字全库、
+ * 浮层当前大类，再次对不上）。真要收窄待确认，得先改侧栏数字，那是另一处的口径，牵动面大。
  *
  * ## 为什么导出（它本是 store 内部实现细节）
  *
@@ -525,17 +540,27 @@ export type TriageMode = ReviewReason
  *    在 SSR 下用 `getServerSnapshot`（返回初始 state），`renderToStaticMarkup` 读不到
  *    `setState` 之后的值 —— hook 本体在现有设施下**没法真跑**。把内核导出后，测试能
  *    直接断言"含软删的混合数据在两个模式里都被滤掉"，而不是退化成扫源码字符串。
+ *
+ * ## 为什么收窄走 `kindsOfFilter` 而不是 `a.kind === kind`
+ *
+ * `kind` 可能是分组哨兵 `'materialGroup'`（= texture + material 两类）。手写相等比较会
+ * 静默漏掉其中一类；而且项目有源码守卫禁止按大类名硬编码判断（`tests/filterCaps.test.ts`）。
  */
 export function triageQueueOf(
   assets: readonly Asset[],
   sort: SortKey,
-  mode: TriageMode
+  mode: TriageMode,
+  kind: KindFilter
 ): Asset[] {
   const live = assets.filter((a) => !isDeletedAsset(a))
   const ordered = sortAssets(live, sort)
+  // ③ 先定当前大类的范围，再从这个范围里挑待办（顺序见上面的四步）。
+  //    `conflict` 不收窄：见上方注释「`conflict` 模式不受 `kind` 约束」。
+  const kinds = mode === 'unclassified' ? kindsOfFilter(kind) : null
+  const scoped = kinds ? ordered.filter((a) => kinds.has(a.kind)) : ordered
   return mode === 'unclassified'
-    ? buildTriageQueue(ordered)
-    : buildReviewQueue(ordered, 'conflict')
+    ? buildTriageQueue(scoped)
+    : buildReviewQueue(scoped, 'conflict')
 }
 
 /**
@@ -3856,15 +3881,18 @@ export const useVault = create<VaultState>((set, get) => ({
   /**
    * 打开整理浮层（两种模式共用，见 `TriageMode`）。
    *
-   * 待办集口径与 `useTriageQueue()` / `useReviewQueue()` **完全一致**：全库（只滤软删）
-   * + 当前排序 + 该模式的判据 —— 三处共用 `triageQueueOf`，不会各写一遍。
-   * 不套 `filters` 的理由见 `useTriageQueue` 的注释（全库口径才能和侧栏数字对上）。
+   * 待办集口径与 `useTriageQueue()` / `useReviewQueue()` **完全一致**：只滤软删
+   * + 当前排序 + （`unclassified` 模式）当前大类 + 该模式的判据 —— 三处共用
+   * `triageQueueOf`，不会各写一遍。
+   * **大类（`st.filters.kind`）也参与**（仅 `unclassified` 模式，见 `triageQueueOf` 的注释）：
+   * 入口是"某个大类下的未分类节点"，不收窄就会串类（HDR 视图点整理出材质资产）。
    *
    * 两个**不做**的动作，理由写在下面：
    * - **不改 `libraryView`**：用户可能正停在「最近删除」里点侧栏的整理按钮
-   *   （那个视图里侧栏分类树仍在）。待办集本身是全库的，与视图无关；切视图会顺手关掉
+   *   （那个视图里侧栏分类树仍在）。待办集口径与视图无关；切视图会顺手关掉
    *   `quickLookAssetId` / `folderViewAssetId` / 清选中，用户还没开始就被清了状态。
-   * - **不改筛选**：待办集不套 filters，所以改了也没意义；而且会打乱用户正在看的视图。
+   * - **不改筛选**：待办集只读 `filters.sort` / `filters.kind`，从不回写；改筛选会打乱
+   *   用户正在看的视图（而且用户点完整理退出后，视图应当还是他原来那个）。
    *
    * ## 空队列时**绝不退化成另一个模式**（本卡的核心约束）
    *
@@ -3885,7 +3913,7 @@ export const useVault = create<VaultState>((set, get) => ({
     // 已开着**同一个模式**就别重开会话：会把跳过集清空、游标重置，用户会莫名其妙
     // 回到第一张。这是 P2 的既有行为，一个字节不改。
     if (current === mode) return true
-    const queue = triageQueueOf(st.assets, st.filters.sort, mode)
+    const queue = triageQueueOf(st.assets, st.filters.sort, mode, st.filters.kind)
     if (queue.length === 0) {
       // 需求：「进入时若待办集为空，不要开浮层，直接给一条 notice」。
       // 已经开着另一个模式时**不动那个浮层**（用户正在里面干活，不能因为点了另一个
@@ -5572,17 +5600,23 @@ export const useVault = create<VaultState>((set, get) => ({
 /**
  * 整理浮层的待办集（派生数据，**不是 store 状态**）。两个 hook 共用这一份。
  *
- * ## 口径：**全库**的该模式候选（不是"当前筛选结果"）
+ * ## 口径：**当前大类内**的该模式候选（不是"当前筛选结果"）
  *
- * 需求原文是「待办集 = **当前库中** `category1 === 未分类 && category2 === 未分类`
- * 且未软删的资产」。所以这里**不套 `filters`**（搜索词 / 大类 / 分类 / 各种 chip 都不参与）：
- * - 用户点整理时可能正搜着 "wood" 或筛着某个大类，把待办集缩成那几条会让他误以为
- *   "就剩这么点没分类"，整理完一退回来发现还有几百张；
- * - 侧栏「未分类」那个数字本身也是全库口径（`Sidebar` 的 `activeAssets` 只滤软删、
- *   不套筛选）→ 数字与待办集数量必须对得上，否则点进去就看到两个不同的数。
+ * 「筛选」这个词在本项目里指多个维度，这里**只取两个**，其余一律不参与：
+ * - ✅ `filters.kind`（大类）—— **参与**（仅 `unclassified` 模式）。入口是侧栏某大类下的
+ *   「未分类」节点 + 它旁边的「整理」按钮，数字按该大类算；队列若取全库就会串类
+ *   （用户实测：HDR 视图点整理，浮层里全是材质资产）。侧栏数字（`countLevel1` 按
+ *   `openScope` 算）与浮层条数因此**同口径**，能对上。
+ * - ✅ `filters.sort`（排序）—— 参与（需求 2「复用既有排序结果，不要自己另排」）：
+ *   用户在中栏头选的是"按体积"，整理模式下"下一张"也按体积走。
+ * - ❌ 搜索词 / 分类（一级二级）/ 风格 / 各种 chip —— **不参与**：整理是"逐张过待办"，
+ *   被搜索词收窄会让用户漏掉队列里的东西（"就剩这么点没分类"，整理完一退回来还有几百张）。
  *
- * **但顺序跟随当前排序**（需求 2「复用既有排序结果，不要自己另排」）：用 `sortAssets`
- * 走同一份 `filters.sort`，用户在中栏头选的是"按体积"，整理模式下"下一张"也按体积走。
+ * ⚠️ `conflict`（待确认）**完全不受 `kind` 约束**：侧栏「待确认 N」走
+ * `countPendingReview(Sidebar 的 activeAssets)`，`activeAssets` 只滤软删、不套大类
+ * → 那是全库口径。这里若也收窄，数字（全库）与浮层（当前大类）会再次对不上，
+ * 等于把 bug 从"未分类"搬到"待确认"。真要收窄，必须连侧栏数字一起改（另一处口径）。
+ * 细节见 `triageQueueOf` 的同名注释。
  *
  * ## 为什么每帧现算而不是进 store
  *
@@ -5620,9 +5654,10 @@ const NO_TRIAGE_QUEUE: Asset[] = []
 export function activeTriageQueueOf(
   assets: readonly Asset[],
   sort: SortKey,
-  mode: TriageMode | null
+  mode: TriageMode | null,
+  kind: KindFilter
 ): Asset[] {
-  return mode === null ? NO_TRIAGE_QUEUE : triageQueueOf(assets, sort, mode)
+  return mode === null ? NO_TRIAGE_QUEUE : triageQueueOf(assets, sort, mode, kind)
 }
 
 /**
@@ -5633,11 +5668,18 @@ export function activeTriageQueueOf(
  * `reconcileTriage(cursor, queue)` 与若干 `useEffect` 依赖 `queue`，每次 render 换引用
  * 就是每次重跑 effect，轻则白烧 CPU，重则 `setCursor` → 重渲 → 新 `[]` → 再 `setCursor`
  * 的死循环。
+ *
+ * `kind` 也要订阅（不只是透传）：用户在整理途中切大类（`filters.kind` 变），队列必须
+ * 跟着换 —— 漏了这个依赖，`useMemo` 会拿旧 `kind` 的结果一直渲到下次 `assets` 变动。
  */
 function useTriageQueueOf(mode: TriageMode | null): Asset[] {
   const assets = useVault((s) => s.assets)
   const sort = useVault((s) => s.filters.sort)
-  return useMemo(() => activeTriageQueueOf(assets, sort, mode), [assets, sort, mode])
+  const kind = useVault((s) => s.filters.kind)
+  return useMemo(
+    () => activeTriageQueueOf(assets, sort, mode, kind),
+    [assets, sort, mode, kind]
+  )
 }
 
 /**
@@ -5660,7 +5702,7 @@ export function useActiveTriageQueue(): Asset[] {
   return useTriageQueueOf(mode)
 }
 
-/** 整理模式的待办集：全库双未分类 + 当前排序 + 非软删。`TriageOverlay` 在 `unclassified` 模式下用它。 */
+/** 整理模式的待办集：**当前大类内**双未分类 + 当前排序 + 非软删。`TriageOverlay` 在 `unclassified` 模式下用它。 */
 export function useTriageQueue(): Asset[] {
   return useTriageQueueOf('unclassified')
 }
@@ -5670,6 +5712,10 @@ export function useTriageQueue(): Asset[] {
  *
  * 与 `useTriageQueue()` **同源**（同一个 `triageQueueOf`）—— 这是侧栏「待确认」数字
  * 与浮层条数能对上的唯一保证，也是本文件不留第二份软删过滤的原因。
+ *
+ * ⚠️ **它不收窄大类**（虽然也走 `useTriageQueueOf` 传了 `filters.kind`）：`conflict` 模式
+ * 在 `triageQueueOf` 里会忽略 `kind`。原因见那里 —— 侧栏「待确认 N」是全库口径
+ * （`countPendingReview(Sidebar 的 activeAssets)`，只滤软删、不套大类）。
  *
  * ⚠️ `TriageOverlay` **不用**这个也不用 `useTriageQueue`，用 `useActiveTriageQueue()`
  * （原因见那个函数的注释）。这两个保留给需要"无视模式、固定拿某一批"的调用方（侧栏计数、

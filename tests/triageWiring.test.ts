@@ -3,7 +3,7 @@
  *
  * 三组：
  * ① **store 层**：`openTriage` / `closeTriage` / `useTriageQueue` 的口径
- *    （待办集全库口径 + 当前排序 + 双未分类 + 非软删；空集不开浮层）；
+ *    （待办集 = 当前大类内 + 当前排序 + 双未分类 + 非软删；空集不开浮层）；
  * ② **悬空不变量**：整理中那张被软删 / 硬删 / rescan → 不悬空（走 `reconcileTriage`）；
  * ③ **组件源码守卫**：`TriageOverlay` 里 Esc 走 `useEscLayer`（不得手写
  *    `addEventListener('keydown')` 捕获 Esc）、归类失败不前进、取图走 `quickLookImageUrl`。
@@ -130,17 +130,33 @@ describe('openTriage · 待办集口径', () => {
     expect(useVault.getState().notice).toBe('没有未分类的资产')
   })
 
-  it('★搜索词 / 大类筛选**不参与**（待办集是全库口径，与侧栏数字对得上）', () => {
+  it('★搜索词**不参与**（待办集不按搜索词收窄）', () => {
     const a = asset()
     const b = asset()
     useVault.setState({
       assets: [a, b],
-      // 故意把筛选设成一个都匹配不上的值
-      filters: { ...useVault.getState().filters, query: 'zzz-not-matching', kind: 'model' }
+      // 搜索词设成一个都匹配不上的值 —— 待办集不该被它缩空
+      filters: { ...useVault.getState().filters, query: 'zzz-not-matching' }
     })
     expect(useVault.getState().openTriage()).toBe(true)
-    // 浮层内部按全库算 → 两张都在（这由 useTriageQueue 的口径保证，下面单独测）
     expect(useVault.getState().triageActive).toBe(true)
+  })
+
+  /**
+   * 2026-10-30 用户实测推翻旧口径（原断言是「大类筛选**不参与**」）：
+   * 「HDR 的这个"未分类"，点了整理以后，弹出来的是材质的整理，不是 HDR 的整理」。
+   * 现在大类**必须**参与 —— 在哪一类里点整理，就只整理那一类。
+   * 详测见 `tests/triageQueueScope.test.ts`。
+   */
+  it('★大类**参与**：别的类别的未分类不会让当前大类开出浮层', () => {
+    // 夹具 kind 恒为 'texture'；把当前大类设成 'model' → 该类下没有未分类
+    useVault.setState({
+      assets: [asset()],
+      filters: { ...useVault.getState().filters, kind: 'model' }
+    })
+    expect(useVault.getState().openTriage()).toBe(false)
+    expect(useVault.getState().notice).toBe('没有未分类的资产')
+    expect(useVault.getState().triageActive).toBe(false)
   })
 
   it('★已经开着 → 不重开会话（返回 true，状态不变）', () => {

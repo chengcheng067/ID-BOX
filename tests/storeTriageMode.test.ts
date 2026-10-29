@@ -355,20 +355,20 @@ describe('⑤ 两个队列各管各的', () => {
     expect(useVault.getState().openTriage()).toBe(true)
     expect(useVault.getState().triageMode).toBe('unclassified')
     expect(
-      triageQueueOf(assets, useVault.getState().filters.sort, 'unclassified')
+      triageQueueOf(assets, useVault.getState().filters.sort, 'unclassified', 'all')
     ).toHaveLength(2)
 
     useVault.setState({ triageMode: null, triageActive: false })
     expect(useVault.getState().openReview()).toBe(true)
     expect(useVault.getState().triageMode).toBe('conflict')
-    expect(triageQueueOf(assets, useVault.getState().filters.sort, 'conflict')).toHaveLength(3)
+    expect(triageQueueOf(assets, useVault.getState().filters.sort, 'conflict', 'all')).toHaveLength(3)
   })
 
   it('★同一条资产不会同时出现在两个队列（互斥）', () => {
     const assets = [conflict('c1'), unclassified('u1'), asset('椅子', '餐椅')]
     const sort = useVault.getState().filters.sort
-    const a = triageQueueOf(assets, sort, 'unclassified').map((x) => x.id)
-    const b = triageQueueOf(assets, sort, 'conflict').map((x) => x.id)
+    const a = triageQueueOf(assets, sort, 'unclassified', 'all').map((x) => x.id)
+    const b = triageQueueOf(assets, sort, 'conflict', 'all').map((x) => x.id)
     expect(a).toEqual(['u1'])
     expect(b).toEqual(['c1'])
     expect(a.filter((id) => b.includes(id))).toEqual([])
@@ -398,8 +398,8 @@ describe('⑥ 两个队列同源（软删 / 排序 / 全库口径）', () => {
       unclassified('u-deleted', { deletedAt: 1_700_000_000_001 })
     ]
     const sort = 'recent'
-    expect(triageQueueOf(assets, sort, 'conflict').map((a) => a.id)).toEqual(['c1'])
-    expect(triageQueueOf(assets, sort, 'unclassified').map((a) => a.id)).toEqual(['u1'])
+    expect(triageQueueOf(assets, sort, 'conflict', 'all').map((a) => a.id)).toEqual(['c1'])
+    expect(triageQueueOf(assets, sort, 'unclassified', 'all').map((a) => a.id)).toEqual(['u1'])
   })
 
   it('★排序跟随传入的 sort（两种模式都不自己另排）', () => {
@@ -410,10 +410,10 @@ describe('⑥ 两个队列同源（软删 / 排序 / 全库口径）', () => {
       conflict('ccc', { size: 5, name: 'ccc' }),
       conflict('mmm', { size: 7, name: 'mmm' })
     ]
-    expect(triageQueueOf(assets, 'name', 'unclassified').map((a) => a.id)).toEqual(['aaa', 'zzz'])
-    expect(triageQueueOf(assets, 'name', 'conflict').map((a) => a.id)).toEqual(['ccc', 'mmm'])
-    expect(triageQueueOf(assets, 'size', 'unclassified').map((a) => a.id)).toEqual(['zzz', 'aaa'])
-    expect(triageQueueOf(assets, 'size', 'conflict').map((a) => a.id)).toEqual(['mmm', 'ccc'])
+    expect(triageQueueOf(assets, 'name', 'unclassified', 'all').map((a) => a.id)).toEqual(['aaa', 'zzz'])
+    expect(triageQueueOf(assets, 'name', 'conflict', 'all').map((a) => a.id)).toEqual(['ccc', 'mmm'])
+    expect(triageQueueOf(assets, 'size', 'unclassified', 'all').map((a) => a.id)).toEqual(['zzz', 'aaa'])
+    expect(triageQueueOf(assets, 'size', 'conflict', 'all').map((a) => a.id)).toEqual(['mmm', 'ccc'])
   })
 
   it('★源码守卫：两个 hook 只是 triageQueueOf 的一行封装（不许各写一遍过滤）', () => {
@@ -461,25 +461,25 @@ describe('⑦ activeTriageQueueOf · 浮层用一个 hook 按模式取队列', (
 
   it('★triageMode === null（浮层没开）→ 空队列', () => {
     // 浮层没开就不该有队列，也不该让 `startTriage` 拿到一批数据去初始化游标。
-    expect(activeTriageQueueOf(assets, 'recent', null)).toEqual([])
+    expect(activeTriageQueueOf(assets, 'recent', null, 'all')).toEqual([])
   })
 
   it('★null 时返回**同一个**空数组引用（每次新造 [] 会让 effect 每次重跑）', () => {
     // `TriageOverlay` 的 `reconcileTriage(cursor, queue)` 与若干 useEffect 依赖 queue；
     // 每次 render 换一个新 [] 就是每次重跑，轻则白烧 CPU，重则 setCursor → 重渲 → 死循环。
-    const a = activeTriageQueueOf(assets, 'recent', null)
-    const b = activeTriageQueueOf([], 'name', null)
+    const a = activeTriageQueueOf(assets, 'recent', null, 'all')
+    const b = activeTriageQueueOf([], 'name', null, 'all')
     expect(a).toBe(b)
   })
 
   it('★unclassified → 未分类那批（软删已滤）', () => {
-    expect(activeTriageQueueOf(assets, 'recent', 'unclassified').map((x) => x.id)).toEqual([
+    expect(activeTriageQueueOf(assets, 'recent', 'unclassified', 'all').map((x) => x.id)).toEqual([
       'u1'
     ])
   })
 
   it('★conflict → 待确认那批（软删已滤）', () => {
-    expect(activeTriageQueueOf(assets, 'recent', 'conflict').map((x) => x.id)).toEqual([
+    expect(activeTriageQueueOf(assets, 'recent', 'conflict', 'all').map((x) => x.id)).toEqual([
       'c1',
       'c2'
     ])
@@ -488,17 +488,17 @@ describe('⑦ activeTriageQueueOf · 浮层用一个 hook 按模式取队列', (
   it('★模式切换时返回对应队列（同一份数据，两种模式互不污染）', () => {
     // 这是 `TriageOverlay` 的实际用法：模式一变，同一个 hook 就该给出另一批。
     const modes = ['unclassified', 'conflict', 'unclassified'] as const
-    const seen = modes.map((m) => activeTriageQueueOf(assets, 'recent', m).map((x) => x.id))
+    const seen = modes.map((m) => activeTriageQueueOf(assets, 'recent', m, 'all').map((x) => x.id))
     expect(seen).toEqual([['u1'], ['c1', 'c2'], ['u1']])
   })
 
   it('与 triageQueueOf 逐字节同源（不是第二份实现）', () => {
     const sort = 'size'
-    expect(activeTriageQueueOf(assets, sort, 'conflict').map((x) => x.id)).toEqual(
-      triageQueueOf(assets, sort, 'conflict').map((x) => x.id)
+    expect(activeTriageQueueOf(assets, sort, 'conflict', 'all').map((x) => x.id)).toEqual(
+      triageQueueOf(assets, sort, 'conflict', 'all').map((x) => x.id)
     )
-    expect(activeTriageQueueOf(assets, sort, 'unclassified').map((x) => x.id)).toEqual(
-      triageQueueOf(assets, sort, 'unclassified').map((x) => x.id)
+    expect(activeTriageQueueOf(assets, sort, 'unclassified', 'all').map((x) => x.id)).toEqual(
+      triageQueueOf(assets, sort, 'unclassified', 'all').map((x) => x.id)
     )
   })
 })
