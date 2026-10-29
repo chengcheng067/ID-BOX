@@ -17,6 +17,15 @@
  * 为什么不直接读 `docs/probe/`：`.gitignore:16` 把 `docs/probe/` 整目录排除（探针原始样本
  * 按政策不入库），直接读会让**干净 clone / CI 上这个文件红一片**。
  * 快照是会漂的 —— 重跑探针后请一并刷新此夹具（内容变了就是新事实，得同步改断言）。
+ *
+ * 📌 **如果这些用例红了，先分清是哪一种**（写给半年后的你）：
+ * - 红的是「与 JSON 逐项相等 / 计数」类 → 要么生产表被手改了（**回去改代码**，
+ *   词表唯一来源是 `docs/34` + 快照），要么**有意更新了词表**——那就必须同时：
+ *   ① 重跑探针 → 刷新 `docs/probe/` 的 JSON；② 刷新本夹具
+ *   `tests/fixtures/cad-taxonomy/cad_tree.json`；③ 在 `docs/34` 里给这次抄录起一个新版本号。
+ *   **三件事缺一不可**，只改夹具不改 docs 等于给词表造了个没出处的副本。
+ * - 红的是「匹配行为 / 作用域隔离」类 → 那是匹配逻辑变了，**别动夹具**，
+ *   回去看 `autoClassify` 的 cad 支与 `classifyAssetName` 的闸门。
  */
 import { describe, expect, it } from 'vitest'
 import fs from 'node:fs'
@@ -450,6 +459,32 @@ describe('作用域隔离 · 反向不污染', () => {
     expect(autoClassify('火锅店')).toBeNull()
     // 而 SU 的既有命中不受影响
     expect(autoClassify('沙发')).toMatchObject({ category1: '家具', category2: '沙发' })
+  })
+
+  it('★CAD 表外的一律不外借：未命中直接 null，不回落通用词表（v0.8.5 裁定）', () => {
+    // 这三个词都能被**别的频道**的通用词表命中（LOFT → 家装户型/LOFT、实木门 → 硬装构件/门、
+    // 大理石瓷砖 → 瓷砖/大理石瓷砖），而 CAD 表里没有它们。cad 作用域下必须一个都不外借 ——
+    // 否则就是"能泄漏的通道 + 靠下游闸门拦着"，且白白算一遍 SU/贴图词表。
+    for (const name of ['LOFT', '实木门', '大理石瓷砖']) {
+      expect(autoClassify(name, undefined, { level2Scope: 'cad' }), name).toBeNull()
+      // 对照：不带 scope 时它们仍有别的频道的答案（证明是"作用域收口"，不是"词表坏了"）
+      expect(autoClassify(name), name).not.toBeNull()
+    }
+    // 端到端仍是双哨兵
+    for (const name of ['LOFT', '实木门', '大理石瓷砖']) {
+      expect(classifyAssetName(name, undefined, 'cad'), name).toEqual({
+        category1: '未分类',
+        category2: '未分类'
+      })
+    }
+    // ⚠️ 反例钉一下别误伤：`双人床` 看似"SU 的家具词"，但 `床` 是 CAD 自己的三级词条
+    // （CAD图库 > 家具图库 > 床），故 cad 作用域**必须**命中 —— 这不是外借。
+    expect(autoClassify('双人床', undefined, { level2Scope: 'cad' })).toMatchObject({
+      category1: 'CAD图库',
+      category2: '家具图库',
+      matchedTerm: '床',
+      matchedLevel: 'cad-l3'
+    })
   })
 
   it('model 侧：28 个重名二级一律走 SU 的答案，不进 CAD', () => {

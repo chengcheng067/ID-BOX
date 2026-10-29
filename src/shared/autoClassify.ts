@@ -371,7 +371,10 @@ export interface AutoClassifyOptions {
    * - 二级扫 `CAD_LEVEL2_MAP`（10 键 / 102 项），命中 `matchedLevel:'cad-l2'`；
    * - 三级归并扫 `CAD_LEVEL3_ALIAS`（364 条），命中 `matchedLevel:'cad-l3'`；
    * - **一级轮**改成扫 `CAD_LEVEL2_MAP` 的键（10 项），否则 `level1Only` 回退对
-   *   CAD 永远为空（CAD 的一级不在 `LEVEL2_MAP` 里）。
+   *   CAD 永远为空（CAD 的一级不在 `LEVEL2_MAP` 里）；
+   * - **两级都未命中 → 直接 `null`，不回落通用词表**（与 `'material'` 支刻意不同：
+   *   材质专表只是"更具体的优先"，通用表仍是它的合法来源；CAD 是独立频道，
+   *   没有任何 SU / 贴图词条属于它）。
    * 不做这三层隔离的后果是双向污染：SU 命 CAD（`餐厅` → `家装空间/餐厅`）、
    * CAD 命 SU（`沙发` → `家具/沙发`）。
    */
@@ -495,6 +498,21 @@ export function autoClassify(
           matchedLevel: best.matchedLevel
         }
       }
+      // 【v0.8.5】**CAD 表未命中 → 一律 null，不回落通用词表**（主理人 2026-10-29 裁定）。
+      //
+      // 此前照抄 `material` 支的"未命中继续走通用流程"，结果是 `autoClassify('LOFT',
+      // {level2Scope:'cad'})` 会返回模型频道的 `家装户型/LOFT` —— 端到端虽然有
+      // `isLevel1AllowedForKind` 闸门兜住（CAD 一级与 model/texture/material 一级零交集），
+      // 但那是"**能泄漏的通道 + 靠下游拦着**"：拿到 SU 二级必然被拒、等于白算一遍，
+      // 还让"cad 只认 cad 词表"这条不变量变成隐式依赖。
+      //
+      // ⚠️ 与 `material` 支的差异是**刻意的**：那边未命中回落通用词表是设计（材质专表
+      // 只是"更具体的优先"，通用表仍是它的合法来源）；而 CAD 是一个**独立频道**，
+      // 没有任何 SU/贴图词条属于它。
+      // ⚠️ 一级档不受影响：`classifyAssetName` 的一级回退会另起一次
+      // `{ level1Only: true, level2Scope: 'cad' }`（一级轮按 CAD 的 10 个键扫），
+      // 所以 `'结构设计'` 仍能落 `{结构设计, 未分类}`，只是不经这次调用。
+      return null
     }
 
     const level2Hits: Array<{
