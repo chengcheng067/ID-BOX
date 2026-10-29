@@ -251,6 +251,49 @@
     background-clip: content-box;
     border: 3px solid transparent;
   }
+
+  /* ── 键盘焦点环：全局统一成 accent 蓝 ─────────────────────────────────
+   *
+   * 为什么必须有这一段（2026-10-30 用户实测）：
+   * 全仓只有 1 处按钮自定义了 focus 样式，其余**全部没定义** → 退回 Chromium
+   * 的 `:focus-visible` 默认轮廓，而 Chromium 在 Windows 上取的是**系统强调色**。
+   * 用户的 Windows 强调色是橙/金色，于是「点任何按钮都冒出一个橙色框」。
+   * 那个橙色既不在设计 token 里、也违反 §1「全局禁用橙色高亮」。
+   *
+   * 三条纪律：
+   * ① 用 `:focus-visible` 而不是 `:focus` —— 鼠标点按钮**不该**出环，
+   *    只有键盘 Tab 过来才出。用户截图那次是鼠标点击，所以核心要治的是
+   *    「鼠标点也出环」，而这正是 Chromium 默认行为里 `:focus` 的部分。
+   * ② 颜色只用 `--accent`，不自造色值（规范 §1 禁自行取色）。
+   * ③ `outline` 而非 `box-shadow`：outline 不占布局、不影响相邻元素，
+   *    且能跟着圆角走（现代 Chromium 支持 `outline` 随 `border-radius`）。
+   *
+   * ⚠️ 放在 `@layer base` 是有意的：base 优先级最低，组件里若有更具体的
+   *    focus 样式（如 `.input` 的 `focus:ring-accent/15`）会正常覆盖它。
+   *    放在 `@layer components` 或更高层会把组件自定义顶掉。
+   */
+  :focus {
+    /* 先掐掉 Chromium 的默认轮廓（它才是橙色的来源） */
+    outline: none;
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    /* 正偏移让环落在元素外侧，不被自身 border 吃掉 */
+    outline-offset: 2px;
+  }
+  /* 输入框类自己有一套 `focus:border-accent/60 + focus:ring-2`（见 `.input`），
+   * 再叠一圈 outline 会有两条边、显得脏。让它们只走自已那套。 */
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: none;
+  }
+  /* 鼠标点击不该留下焦点环（`focus-visible` 已能区分，这里兜住某些
+   * 浏览器对 `button` 的判定差异：`button` 在部分场景仍会把鼠标焦点算作
+   * `:focus-visible`）。用 `:focus:not(:focus-visible)` 精确排除鼠标态。 */
+  button:focus:not(:focus-visible) {
+    outline: none;
+  }
 }
 
 @layer components {
