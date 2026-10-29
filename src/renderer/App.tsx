@@ -79,6 +79,7 @@ import {
   activeImportedRange,
   activeSizeRange,
   describeNumericFilters,
+  helpHintText,
   hiddenActiveFilterLabels,
   resolutionChipTitle,
   resolutionOptionsFor,
@@ -1645,7 +1646,7 @@ export default function App() {
                   （AssetGrid 文件卡顶部），在资产网格重复它没有意义。 */}
               {!folderAsset && showHelpHint && (
                 <div className="shrink-0 truncate px-5 pt-1 text-[11px] text-muted">
-                  双击卡片查看文件（HDR 直接进预览）· 拖拽卡片可拖到建模软件
+                  {helpHintText(filters.kind)}
                 </div>
               )}
               <AssetGrid view={view} />

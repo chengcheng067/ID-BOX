@@ -133,16 +133,6 @@ describe('logic/category · 三级树计数', () => {
     expect(countLevel1(list, 'model').at(-1)!.value).toBe(UNCLASSIFIED)
   })
 
-  it('inferred 标记：CONFIDENCE 为推断的一级组带「待核对」，事实组不带', () => {
-    const nodes = countLevel1(
-      [asset({ category1: '软装陈设', category2: '摆件' }), asset({ category1: '家具', category2: '沙发' })],
-      'model'
-    )
-    const byName = new Map(nodes.map((n) => [n.value, n]))
-    expect(byName.get('软装陈设')!.inferred).toBe(true)
-    expect(byName.get('家具')!.inferred).toBe(false)
-  })
-
   it('duplicatedLevel2Names：同大类内多个一级下重名的二级（06 §15-④）', () => {
     const list2 = [
       asset({ category1: '软装陈设', category2: '装饰画' }),

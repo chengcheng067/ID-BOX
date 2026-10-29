@@ -523,18 +523,13 @@ export function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
                       >
                         <span className="flex-1 truncate pl-4 text-left text-[13px]">
                           {n.value}
-                          {/* 「词表待补」= 该分类名来自**推断**的词表条目，不是等你处理的待办。
-                              旧文案的「核对」二字被误读成"我需要去确认一下"，但界面上没有确认入口
-                              （CONFIDENCE 是词表数据的可信度，不属于资产待办）。故改文案 + 虚线淡标，
-                              明确它是信息而不是任务。 */}
-                          {n.inferred && (
-                            <span
-                              className="ml-1 shrink-0 rounded-[3px] border border-dashed border-line px-1 text-[9px] leading-[14px] text-tertiary"
-                              title="该分类来自推断的词表条目，尚未与站方全表逐条核对（不影响你使用）"
-                            >
-                              词表待补
-                            </span>
-                          )}
+                          {/* 「词表待补」标签已删除（2026-10-30 用户拍板：不显示）。
+                              CONFIDENCE 是**词表条目的维护状态**（该词条是否与站方全表逐条核过），
+                              属于开发者内部指标：用户既无法操作、也没有任何路径能让它消失，
+                              显示出来只会变成一个"消不掉的假待办"。数据仍保留在
+                              shared/taxonomy.ts 的 CONFIDENCE 表里供维护使用，只是不再进 UI。
+                              ⛔ 不要加回来：真要呈现词表质量，得先有"用户能确认词表"的交互，
+                              否则又会变成上一个版本那样看不懂、关不掉的东西。 */}
                         </span>
                         <span className={`${countCls} shrink-0`}>{n.count}</span>
                       </button>

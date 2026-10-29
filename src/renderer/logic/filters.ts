@@ -358,6 +358,36 @@ export function resolutionChipTitle(kind: KindFilter): string {
     : '按贴图分辨率筛选（长边 ≥ 2048 / ≥ 4096；尺寸未知的资产不进这两档）'
 }
 
+/** 中栏顶部提示的「进入」半句：HDR 双击直接开预览，其余双击进软件内文件列表。 */
+const HELP_HINT_ENTER_HDRI = '双击卡片直接预览'
+const HELP_HINT_ENTER_FILES = '双击卡片查看文件'
+/** 「拖出去」半句对每个视图都成立，不参与分场合。 */
+const HELP_HINT_DRAG = '拖拽卡片可拖到建模软件'
+
+/**
+ * 中栏顶部的单行操作提示（**唯一文案来源**）。
+ *
+ * 为什么必须按视图分（2026-10-30 用户实测）：
+ * 原来是一句固定文案「双击卡片查看文件（HDR 直接进预览）· 拖拽卡片可拖到建模软件」，
+ * 不管当前是哪个大类都整句照写。而在模型 / CAD / 材质视图里根本没有 HDR 卡片，
+ * 「HDR 直接进预览」是纯噪声；反过来 HDR 视图里「双击查看文件」也是错的
+ * （HDR 双击不进文件列表，直接开预览）。
+ *
+ * ⚠️ **只有 `hdri` 一个分支**：分场合的唯一理由是「双击行为不同」——
+ * `AssetGrid.tsx` 的 `dblProps` 里 `a.kind === 'hdri'` 走 `openHdrPreview`，
+ * 其余一律 `openFolderView`。别的大类在双击这件事上完全同构，所以**不要**
+ * 顺着视图往后加分支（那只会制造维护成本，还会撞上「不许按大类名写判断」的守卫）。
+ *
+ * 与 `dblProps` 的对应关系由 `tests/helpHint.test.ts` 的源码守卫钉住：
+ * 改了任何一边，另一边没跟上就会红。
+ *
+ * 未知/非法输入按「非 HDR」兜底，不抛（视图状态来自持久化快照，理论上可能存在脏值）。
+ */
+export function helpHintText(kind: KindFilter): string {
+  const enter = kind === 'hdri' ? HELP_HINT_ENTER_HDRI : HELP_HINT_ENTER_FILES
+  return `${enter} · ${HELP_HINT_DRAG}`
+}
+
 /** 档位 → 阈值；`null`（不限）/ 非法值 → null（= 该维度不参与过滤） */
 export function resolutionMinEdge(bucket: ResolutionBucket | null | undefined): number | null {
   if (!bucket) return null

@@ -2,7 +2,8 @@ import fs from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 /**
- * 侧栏一级分类行：「未分类」的「整理」入口 + 「词表待补」标记。
+ * 侧栏一级分类行：「未分类」的「整理」入口。
+ * （「词表待补」标记已于 2026-10-30 用户拍板后整块删除，见 ③ 的回归守卫。）
  *
  * 背景（用户实测）：`未分类` 那一行的计数数字被「整理」小胶囊压掉左半边。
  * 根因不是宽度留得不够（`pr-9` = 36px），而是**「整理」是 `absolute` 定位** ——
@@ -75,19 +76,28 @@ describe('侧栏「整理」按钮 — 视觉规格', () => {
   })
 })
 
-// ── ③ 「待核对」→「词表待补」文案与语义澄清 ─────────────────────
-describe('推断分类标记 — 文案澄清', () => {
-  it('旧文案「待核对」已从侧栏消失（它被误读成用户待办）', () => {
-    expect(src).not.toContain('待核对')
+// ── ③ 「词表待补」标记已整块删除（2026-10-30 用户拍板：不显示）────────
+//  断言对象是**去掉注释后的源码**：Sidebar 里保留了一段解释性注释（说明为什么删、
+//  为什么不能加回来），那段注释本身会出现「词表待补」四个字——它不渲染，不算 UI。
+//  守卫要钉的是「界面上不再出现」，所以先把 JSX 注释与行注释剥掉再断言。
+describe('推断词表标记 — 已从侧栏彻底移除', () => {
+  const code = stripComments(src)
+
+  it('侧栏不再渲染「词表待补」', () => {
+    expect(code).not.toContain('词表待补')
   })
 
-  it('新文案「词表待补」存在', () => {
-    expect(src).toContain('词表待补')
+  it('旧文案「待核对」也不再出现（两代说法都已退场）', () => {
+    expect(code).not.toContain('待核对')
   })
 
-  it('新标记是虚线淡框（信息态而非任务态），并带解释性 title', () => {
-    expect(src).toContain('border-dashed border-line')
-    expect(src).toContain('尚未与站方全表逐条核对（不影响你使用）')
+  it('不再读 CategoryNodeCount.inferred（字段已从逻辑层删除）', () => {
+    expect(code).not.toContain('inferred')
+  })
+
+  it('虚线淡框标记的痕迹一并消失', () => {
+    expect(code).not.toContain('border-dashed border-line')
+    expect(code).not.toContain('尚未与站方全表逐条核对（不影响你使用）')
   })
 })
 
@@ -119,6 +129,11 @@ describe('一级行宽度预算 — 数字与按钮共存', () => {
 })
 
 // ── helper ────────────────────────────────────────────────────
+
+/** 剥掉 JSX 块注释与 // 行注释 —— 注释里的字面量不渲染，不应参与 UI 文案断言 */
+function stripComments(source: string): string {
+  return source.replace(/\{\/\*[\s\S]*?\*\/\}/g, '').replace(/^\s*\/\/.*$/gm, '')
+}
 
 /** 截取「整理」按钮那段 JSX，用于局部断言。
  *  用**唯一**的 title 文案定位（文件里「整理」/`openTriage` 在注释中出现多次，按它们切会截到主按钮）；

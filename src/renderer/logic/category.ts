@@ -11,7 +11,6 @@ import {
   CHANNEL_LEVEL1,
   CAD_LEVEL2_MAP,
   MERGED_MATERIAL_LEVEL1,
-  CONFIDENCE,
   level2Of,
   styleListOf,
   styleListAll
@@ -82,8 +81,6 @@ function kindSetOf(scope: KindScope): ReadonlySet<AssetKind> {
 export interface CategoryNodeCount {
   value: string
   count: number
-  /** 词表可信度为 inferred 的组 → 侧栏灰标「待核对」（06 §7.1 / §9.2-3） */
-  inferred: boolean
 }
 
 function sortNodes(nodes: CategoryNodeCount[]): CategoryNodeCount[] {
@@ -106,7 +103,7 @@ export function countLevel1(assets: Asset[], kind: KindScope): CategoryNodeCount
     const { category1 } = categoriesOf(a)
     m.set(category1, (m.get(category1) ?? 0) + 1)
   }
-  return sortNodes([...m.entries()].map(([value, count]) => ({ value, count, inferred: CONFIDENCE[value] === 'inferred' })))
+  return sortNodes([...m.entries()].map(([value, count]) => ({ value, count })))
 }
 
 /** 某（组）大类某一级下的二级分类计数（count 降序、未分类恒最后） */
@@ -119,7 +116,7 @@ export function countLevel2(assets: Asset[], kind: KindScope, category1: string)
     if (c1 !== category1) continue
     m.set(category2, (m.get(category2) ?? 0) + 1)
   }
-  return sortNodes([...m.entries()].map(([value, count]) => ({ value, count, inferred: false })))
+  return sortNodes([...m.entries()].map(([value, count]) => ({ value, count })))
 }
 
 /**
