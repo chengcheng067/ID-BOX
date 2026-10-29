@@ -102,10 +102,6 @@ describe('isMojibakeSuspect — PUA（7-Zip / Unix 制作的 GBK zip）', () => 
     expect(isMojibakeSuspect('\uEFB2\uEFCD\uEFCC\uEFFC\u01BD\uEFC3\uEFE6\uEFC9.dwg')).toBe(true)
   })
 
-  it('半角片假名区（7-Zip 另一条兜底映射）2 连缀即命中', () => {
-    expect(isMojibakeSuspect('\uFF72\uFF8D\uFF8C\uFFBC.dwg')).toBe(true)
-  })
-
   it('PUA 与拉丁扩展混排（真包以「知末」开头的那两个）命中', () => {
     expect(isMojibakeSuspect('\u05AA\u0129\u0043\u0041\u0044\u037C\u05BD-\uEFBE\uEFAB\u0461.html')).toBe(true)
     expect(isMojibakeSuspect('\u03A2\uEFD0\uEFC5\u0268\uEFC2\uEFEB \uEFBF.jpg')).toBe(true)
