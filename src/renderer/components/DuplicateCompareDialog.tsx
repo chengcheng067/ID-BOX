@@ -21,7 +21,7 @@ import { undoGraceSuffix } from '../logic/graceText'
 import { useVault } from '../store'
 import { DEFAULT_UNDO_GRACE_MS } from '../../shared/undoGrace'
 import { Modal } from './Modal'
-import { IconHdr, IconImage, IconMaterial, IconOther, IconTrash, IconBox } from '../icons'
+import { IconCad, IconHdr, IconImage, IconMaterial, IconOther, IconTrash, IconBox } from '../icons'
 import type { Asset, AssetKind } from '../../shared/types'
 
 const KIND_ICON: Record<AssetKind, typeof IconBox> = {
@@ -29,6 +29,7 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   texture: IconImage,
   hdri: IconHdr,
   material: IconMaterial,
+  cad: IconCad,
   other: IconOther
 }
 

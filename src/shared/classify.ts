@@ -9,13 +9,15 @@ import {
 export const EXT_KIND: Record<string, AssetKind> = {
   // ── 模型 ──
   skp: 'model', skb: 'model', '3ds': 'model', '3dm': 'model', max: 'model',
-  fbx: 'model', obj: 'model', dae: 'model', blend: 'model', dwg: 'model',
-  dxf: 'model', rvt: 'model', rfa: 'model', stl: 'model', ply: 'model',
+  fbx: 'model', obj: 'model', dae: 'model', blend: 'model',
+  rvt: 'model', rfa: 'model', stl: 'model', ply: 'model',
   glb: 'model', gltf: 'model', abc: 'model', usd: 'model', usda: 'model',
   usdc: 'model', mb: 'model', ma: 'model', c4d: 'model', zpr: 'model',
   sldprt: 'model', sldasm: 'model', ipt: 'model', iam: 'model', f3d: 'model',
   x_t: 'model', step: 'model', stp: 'model', igs: 'model', iges: 'model',
   scn: 'model', rho: 'model', lwo: 'model', lws: 'model', xsi: 'model',
+  // ── CAD 图纸（2026-10-29 从 model 拆出：独立目录 / 独立侧栏 / 正确图标） ──
+  dwg: 'cad', dxf: 'cad',
   // ── HDRI ──
   hdr: 'hdri', exr: 'hdri',
   // ── 贴图 ──
@@ -40,6 +42,7 @@ export const KIND_LABEL: Record<AssetKind, string> = {
   texture: '贴图',
   hdri: 'HDRI',
   material: '材质预设',
+  cad: 'CAD图纸',
   other: '其他'
 }
 
@@ -55,6 +58,8 @@ export const KIND_FOLDER: Record<AssetKind, string> = {
   texture: '材质',
   hdri: 'HDRI',
   material: '材质',
+  // CAD 独立大类目录（第 6 个顶层目录）：图纸与模型混放会让「模型」计数失真
+  cad: 'CAD',
   other: '其他'
 }
 
@@ -120,6 +125,7 @@ export function kindFilterLabel(f: KindFilter): string {
  * - `model`：封面是 720px 渲染图，按它筛"分辨率"没有意义 → 不给分辨率；风格主战场 → 给风格；
  * - `texture` / `material`：贴图长边就是真实规格 → 给分辨率；材质不挂风格（`DetailPanel` 已如此）→ 不给；
  * - `hdri`：全景宽度是硬规格 → 给分辨率；用户明确"不需要风格" → 不给；
+ * - `cad`：图纸不是位图 → 没有分辨率；站方无风格轴 → 不给风格；模型格式只认 skp/max → 不给；
  * - `other`：兜底不给任何入口。
  */
 export interface KindFilterCaps {
@@ -140,6 +146,9 @@ export const KIND_FILTER_CAPS: Record<AssetKind, KindFilterCaps> = {
   texture: { resolution: true, style: false, modelFormat: false },
   material: { resolution: true, style: false, modelFormat: false },
   hdri: { resolution: true, style: false, modelFormat: false },
+  // CAD：图纸不是位图 → 没有"分辨率"；站方无风格轴 → 没有风格；
+  // 模型格式筛选只认 skp/max（`getModelFormat`）→ CAD 不参与
+  cad: { resolution: false, style: false, modelFormat: false },
   other: { resolution: false, style: false, modelFormat: false }
 }
 
@@ -165,20 +174,30 @@ export function capsOfFilter(f: KindFilter, cap: keyof KindFilterCaps): boolean 
 /**
  * 侧栏/导航显示顺序（docs/14 §2.4 / §6.1）：`texture` 与 `material` 合并为一个
  * 「材质」节点（哨兵 `'materialGroup'`），展开后由两个 kind chip 单独筛选。
- * HDRI 仍在第 3 位、其他仍在末位。
+ *
+ * 2026-10-29 加入 `'cad'`（第 2 位，紧跟模型）后：模型 / CAD图纸 / 材质 / HDRI / 其他
+ * —— HDRI 从第 3 位挪到第 4 位、其他仍在末位。
  *
  * ⚠️ 这是**导航序的唯一来源**。旧的 5 元 `KIND_ORDER` 已随材质合并删除
  * （它会把两个材质类画成两行，且类型上无法表达分组）。
  */
 export const KIND_NAV_ORDER: ReadonlyArray<AssetKind | KindGroup> = [
   'model',
+  // CAD 紧跟在模型之后（2026-10-29）：都是"工程文件"，视觉上相邻；但独立成节点，
+  // 点它只筛图纸（不再混进模型计数）
+  'cad',
   MATERIAL_GROUP,
   'hdri',
   'other'
 ]
 
-/** 判定"资产主大类"时的优先级：一个包里同时有 skp 和贴图 → 算模型 */
-const KIND_PRIORITY: AssetKind[] = ['model', 'material', 'hdri', 'texture', 'other']
+/**
+ * 判定"资产主大类"时的优先级：一个包里同时有 skp 和贴图 → 算模型。
+ *
+ * `'cad'` 刻意排在 `'model'` **之后**：同时含 `.skp` 与 `.dwg` 的包应判 `'model'`
+ * （模型是主内容、图纸是附件）；只有图纸、没有模型时才落到 `'cad'`。
+ */
+const KIND_PRIORITY: AssetKind[] = ['model', 'cad', 'material', 'hdri', 'texture', 'other']
 
 // ── PBR 材质包识别（2026-10 用户装机反馈：Crystal/AmbientCG 样本 B） ──────────
 //
@@ -381,7 +400,20 @@ export function pickCover(files: AssetFile[], opts?: PickCoverOptions): CoverPic
   return { rel: largest.rel, source: 'largest' }
 }
 
-/** 主模型文件：.skp > .max > .fbx > .obj > .3ds > 首个模型文件 > files[0]（P0-14） */
+/**
+ * 主文件（P0-14）：`.skp > .max > .fbx > .obj > .3ds > 首个模型文件 > 首个 CAD 文件 > files[0]`
+ *
+ * ⚠️ **`cad` 必须显式收进来**（2026-10-29，CAD 拆出独立 kind 时补）：
+ * 这个函数的返回值不是"显示用"的，它驱动**拖出到 SketchUp/CAD 的文件**与
+ * **双击进文件视图后默认选中的文件**。CAD 从 `model` 迁到 `cad` 之后，
+ * 纯 CAD 资产里再也找不到 `kind === 'model'` 的文件，若不补这一支就会直接落到
+ * `files[0]` —— 而 `files[0]` 是**目录遍历顺序**，不是语义顺序：
+ * 包里只要有一张 `预览图.jpg`，拖出就会拖走那张 jpg 而不是 `.dwg`
+ * （样本包刚好只剩 dwg 一个文件，所以这个问题在样本上不会暴露，属于"运气"）。
+ *
+ * 顺序在 `model` **之后**：混合包（skp + dwg）里模型仍是主文件（与 `KIND_PRIORITY`
+ * 同口径 —— 模型是主内容，图纸是附件）。
+ */
 export function pickPrimaryFile(files: AssetFile[]): AssetFile | undefined {
   if (files.length === 0) return undefined
   for (const ext of PRIMARY_MODEL_EXTS) {
@@ -389,7 +421,9 @@ export function pickPrimaryFile(files: AssetFile[]): AssetFile | undefined {
     if (hit) return hit
   }
   const model = files.find((f) => f.kind === 'model')
-  return model ?? files[0]
+  if (model) return model
+  const cad = files.find((f) => f.kind === 'cad')
+  return cad ?? files[0]
 }
 
 /**

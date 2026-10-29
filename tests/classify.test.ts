@@ -43,12 +43,19 @@ describe('kindOfExt', () => {
     expect(kindOfExt('')).toBe('other')
   })
 
-  it('【裁定 06 §6】dwg/dxf 维持归 model，不改「其他」——防止未来被"顺手修正"', () => {
-    // 理由：「其他」是垃圾桶不是第四个大类；kind 的真实语义是"用什么软件打开、怎么取出去"，
-    // DWG 与模型资产同构（独占文件夹、有配套引用、要拖进 CAD/天正）。
-    // 扩建触发条件：库内 dwg/dxf 类资产 > 30 个，或用户主动提出一次。
-    expect(kindOfExt('dwg')).toBe('model')
-    expect(kindOfExt('dxf')).toBe('model')
+  it('【2026-10-29 改判】dwg/dxf 归 cad，不再归 model（独立大类，独立目录/侧栏/图标）', () => {
+    // 沿革：原断言是「【裁定 06 §6】dwg/dxf 维持归 model」，理由写的是
+    // 「kind 的真实语义是用什么软件打开、怎么取出去，DWG 与模型资产同构」。
+    // 该理由的后半段（独占文件夹 / 要拖进 CAD）**仍然成立**，所以才走 `importModelOne`
+    // 那条单文件通道；但前半段被"落盘目录 / 侧栏筛选 / 卡片图标"三处语义证伪了：
+    // 图纸落进 `模型/` 会让模型计数失真，卡片还会显示成立方体。
+    // 现在的口径：dwg/dxf → `'cad'`（落 `CAD/`），模型扩展名一个都不动。
+    expect(kindOfExt('dwg')).toBe('cad')
+    expect(kindOfExt('dxf')).toBe('cad')
+    // 防误伤：同一次改动不得顺手把模型扩展名也挪走
+    expect(kindOfExt('skp')).toBe('model')
+    expect(kindOfExt('max')).toBe('model')
+    expect(kindOfExt('rvt')).toBe('model')
   })
 })
 
@@ -127,6 +134,31 @@ describe('pickPrimaryFile', () => {
   it('空列表返回 undefined', () => {
     expect(pickPrimaryFile([])).toBeUndefined()
   })
+
+  // ── CAD 拆出独立 kind 之后（2026-10-29）────────────────────────────
+  // 这一组防的是"纯 CAD 资产落到 files[0]"这个真回归：
+  // files[0] 是目录遍历顺序，不是语义顺序 → 包里带一张预览图，拖出就会拖走 jpg。
+  it('纯 CAD 资产：dwg 是主文件，即使 jpg 排在它前面', () => {
+    // jpg 在数组第一位（模拟目录遍历先遇到预览图）
+    const files = [f('预览图.jpg', 'jpg'), f('平面图.dwg', 'dwg')]
+    expect(pickPrimaryFile(files)?.rel).toBe('平面图.dwg')
+  })
+
+  it('纯 CAD 资产：dxf 同样能被选为主文件', () => {
+    const files = [f('预览图.png', 'png'), f('图纸.dxf', 'dxf')]
+    expect(pickPrimaryFile(files)?.rel).toBe('图纸.dxf')
+  })
+
+  it('混合包（skp + dwg）：模型仍是主文件，图纸不抢（与 KIND_PRIORITY 同口径）', () => {
+    // 两种顺序都测：主文件判定不能依赖遍历顺序
+    expect(pickPrimaryFile([f('a.dwg', 'dwg'), f('b.skp', 'skp')])?.rel).toBe('b.skp')
+    expect(pickPrimaryFile([f('b.skp', 'skp'), f('a.dwg', 'dwg')])?.rel).toBe('b.skp')
+  })
+
+  it('README/说明文本仍不会抢走 CAD 图纸的主文件位', () => {
+    const files = [f('说明.txt', 'txt'), f('平面图.dwg', 'dwg')]
+    expect(pickPrimaryFile(files)?.rel).toBe('平面图.dwg')
+  })
 })
 
 describe('kindFolder / KIND_LABEL —— 显示名与目录名解耦（docs/14 §2.1）', () => {
@@ -178,8 +210,9 @@ describe('kindFolder / KIND_LABEL —— 显示名与目录名解耦（docs/14 �
     expect(kindFromFolderName('')).toBe('other')
   })
 
-  it('isKindFolderName：接受 4 个现行目录名 + 2 个历史别名', () => {
-    for (const v of ['模型', '材质', 'HDRI', '其他', '贴图', '材质预设']) {
+  it('isKindFolderName：接受 5 个现行目录名 + 2 个历史别名', () => {
+    // 2026-10-29：现行目录名从 4 个变 5 个（新增 `CAD`，CAD 图纸独立大类）
+    for (const v of ['模型', '材质', 'HDRI', 'CAD', '其他', '贴图', '材质预设']) {
       expect(isKindFolderName(v)).toBe(true)
     }
   })
@@ -203,10 +236,12 @@ describe('侧栏导航序 + 筛选分组哨兵（docs/14 §2.4）', () => {
     expect(KIND_NAV_ORDER).toContain(MATERIAL_GROUP)
     expect(KIND_NAV_ORDER).not.toContain('texture')
     expect(KIND_NAV_ORDER).not.toContain('material')
-    expect(KIND_NAV_ORDER).toHaveLength(4)
-    // HDRI 仍在第 3 位、其他仍在末位（§6.1 的视觉顺序）
-    expect(KIND_NAV_ORDER[2]).toBe('hdri')
-    expect(KIND_NAV_ORDER[3]).toBe('other')
+    expect(KIND_NAV_ORDER).toHaveLength(5)
+    // 加 cad 后全部索引后移一位：模型 / CAD图纸 / 材质 / HDRI / 其他
+    // （原先 [2]='hdri'、[3]='other'；现在 [3]='hdri'、[4]='other'）
+    expect(KIND_NAV_ORDER[1]).toBe('cad')
+    expect(KIND_NAV_ORDER[3]).toBe('hdri')
+    expect(KIND_NAV_ORDER[4]).toBe('other')
   })
 
   it('★分组值不能叫 material（会与 AssetKind.material 静默混淆）', () => {
@@ -226,8 +261,9 @@ describe('侧栏导航序 + 筛选分组哨兵（docs/14 §2.4）', () => {
     expect(kindsOfFilter('all')).toBeNull()
   })
 
-  it('kindsOfFilter：对 5 个 AssetKind 逐一与旧语义（单值等值判断）等价', () => {
-    const kinds: AssetKind[] = ['model', 'texture', 'hdri', 'material', 'other']
+  it('kindsOfFilter：对 6 个 AssetKind 逐一与旧语义（单值等值判断）等价', () => {
+    // 2026-10-29 加 `'cad'`：五元 → 六元（cad 是单 kind，不属于任何分组）
+    const kinds: AssetKind[] = ['model', 'texture', 'hdri', 'material', 'cad', 'other']
     for (const f of kinds) {
       const set = kindsOfFilter(f)
       expect(set).not.toBeNull()

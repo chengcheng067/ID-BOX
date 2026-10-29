@@ -27,7 +27,7 @@ import { PurgeConfirmDialog } from './PurgeConfirmDialog'
 import { CustomRenderDialog } from './CustomRenderDialog'
 import { ColorTagPicker, StarIcon, StarRating } from './MarkControls'
 import {
-  IconBox, IconExternal, IconFile, IconFolder, IconHdr, IconImage,
+  IconBox, IconCad, IconExternal, IconFile, IconFolder, IconHdr, IconImage,
   IconMaterial, IconOther, IconTrash, IconClose, IconEmptyPointer, IconRefresh
 } from '../icons'
 import type { Asset, AssetFile, AssetKind } from '../../shared/types'
@@ -38,6 +38,7 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   texture: IconImage,
   hdri: IconHdr,
   material: IconMaterial,
+  cad: IconCad,
   other: IconOther
 }
 

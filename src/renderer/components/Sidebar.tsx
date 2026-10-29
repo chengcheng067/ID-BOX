@@ -22,7 +22,7 @@ import {
   parseDragIds,
   planDropAssign
 } from '../logic/dragAssign'
-import { IconBox, IconDownload, IconFile, IconHdr, IconImage, IconMaterial, IconOther, IconSettings, IconTrash } from '../icons'
+import { IconBox, IconCad, IconDownload, IconFile, IconHdr, IconImage, IconMaterial, IconOther, IconSettings, IconTrash } from '../icons'
 import type { AssetKind } from '../../shared/types'
 import type { DragEvent } from 'react'
 
@@ -31,6 +31,7 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   texture: IconImage,
   hdri: IconHdr,
   material: IconMaterial,
+  cad: IconCad,
   other: IconOther
 }
 

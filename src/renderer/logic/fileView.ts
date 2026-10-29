@@ -13,8 +13,18 @@ import type { Asset, AssetFile } from '../../shared/types'
 import { formatBytes } from '../../shared/format'
 import { assetFileAbs } from './assetPath'
 
-/** 文件行分类：决定行首图标与排序分组 */
-export type FileRowKind = 'image' | 'model' | 'other'
+/**
+ * 文件行分类：决定行首图标与排序分组。
+ *
+ * 2026-10-29 增 `'cad'`：`.dwg` / `.dxf` 的 `AssetKind` 从 `'model'` 拆出独立大类后，
+ * 文件视图里也**独立成组**（不并进「模型」组，也不丢进「其他」组）——
+ *
+ * - 独立成组：进 CAD 资产的第一诉求是「把 .dwg 拖进 CAD 软件」，它必须排在最前；
+ *   若并进 `other`，图纸会和 `说明.txt` / `readme` 混在一起排到最后。
+ * - 不并进 `model`：一个包同时有 `.skp` 与 `.dwg` 时，模型仍是主文件（排第一），
+ *   图纸紧随其后；混成一组就分不出"哪个是模型、哪个是图纸"，图标也只有一个立方体。
+ */
+export type FileRowKind = 'image' | 'model' | 'cad' | 'other'
 
 /** 文件行模型（`Asset.files` 的展示投影） */
 export interface FileRow {
@@ -91,28 +101,42 @@ export const MODEL_EXTS: readonly string[] = [
   'abc'
 ]
 
+/**
+ * CAD 图纸扩展名（**小写**）。
+ *
+ * 与 `shared/classify.ts` 的 `EXT_KIND` 口径一致（`dwg` / `dxf` → `'cad'`）。
+ * 额外列出来的作用同 `MODEL_EXTS`：`Asset.files[].kind` 是**导入/重扫时**写进索引的，
+ * 升级前的旧记录里 dwg 仍写着 `kind: 'model'`，靠这张表才能在重扫前就分对组。
+ */
+export const CAD_EXTS: readonly string[] = ['dwg', 'dxf']
+
 /** 行分类的中文文案（tooltip） */
 export const FILE_ROW_KIND_LABEL: Record<FileRowKind, string> = {
   image: '图片',
   model: '模型文件',
+  cad: 'CAD图纸',
   other: '文件'
 }
 
 /**
- * 行分组顺序：**模型 → 图片 → 其他**（2026-10 用户反馈改口径）。
+ * 行分组顺序：**模型 → CAD图纸 → 图片 → 其他**（2026-10 用户反馈改口径 + 2026-10-29 加 CAD）。
  *
  * 用户原话：「模型的界面，就是点进来的这个文件夹，SKP 后缀的这一个文件应该排在第一位，
  * 而不是 JPG 这些材质排在第一位」。
  *
- * 理由（用户实际使用路径）：进文件夹的第一诉求是**把主模型拖进 SketchUp**，
- * 预览图 / 贴图是"看这个包值不值得用"的次要信息，`.json` / `.txt` / 说明文件是杂项。
+ * 理由（用户实际使用路径）：进文件夹的第一诉求是**把主文件拖进对应的软件**
+ * （模型 → SketchUp / 3ds Max；图纸 → CAD / 天正），预览图 / 贴图是"看这个包值不值得用"
+ * 的次要信息，`.json` / `.txt` / 说明文件是杂项。
  * 组内再按文件名**自然序**（`img2` 排在 `img10` 前面），比纯字节序符合文件管理器习惯。
+ *
+ * `cad` 排在 `model` **之后**：同时含 skp 与 dwg 的包里，模型是主内容；
+ * 纯 CAD 包里没有模型文件，图纸自然就是第一组。
  *
  * ⚠️ 只改这里的权重，**不要动 `fileRowKindOf` 的判定口径**（图标 / 其它模块依赖它）。
  * 另有第二条次级键：模型组内 `.skp` / `.max` 并列第一档（见 `buildFileRows` 的排序链，
  * 2026-10「3DMAX 支持」扩展口径）。
  */
-const KIND_ORDER: Record<FileRowKind, number> = { model: 0, image: 1, other: 2 }
+const KIND_ORDER: Record<FileRowKind, number> = { model: 0, cad: 1, image: 2, other: 3 }
 
 /** 自然序比较器（数字段按数值比较）；模块级复用以避免每行新建 collator */
 const NAME_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
@@ -121,6 +145,9 @@ const NAME_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity:
 export function fileRowKindOf(file: Pick<AssetFile, 'ext' | 'kind'>): FileRowKind {
   const ext = (file.ext ?? '').toLowerCase()
   if (IMAGE_EXTS.includes(ext)) return 'image'
+  // CAD 判定**先于**模型：升级前的旧索引里 dwg 的 kind 还写着 'model'
+  // （`EXT_KIND` 拆出 `'cad'` 之后要等重扫/重导才更新），靠扩展名先纠过来。
+  if (CAD_EXTS.includes(ext) || file.kind === 'cad') return 'cad'
   if (MODEL_EXTS.includes(ext) || file.kind === 'model') return 'model'
   return 'other'
 }
@@ -183,6 +210,9 @@ export function buildFileRows(asset: Pick<Asset, 'folder' | 'files'>): FileRow[]
      * ⚠️ 只对 `model` 组加这一档次级键，**image / other 组保持原有自然序**；
      * 其余模型扩展名（.fbx / .obj …）仍在这一档之后、图片之前（"模型文件排第一"）。
      * `ext` 在映射阶段已小写化，这里直接查表。
+     *
+     * 2026-10-29：`'cad'` 已是**独立组**（`KIND_ORDER` 里权重 1），本分支自然不覆盖它
+     * —— 图纸不参与"skp/max 并列第一"的排序，也不抢模型的位次。**不要**把 `'cad'` 加进来。
      */
     if (a.kind === 'model') {
       const byLead = Number(LEAD_MODEL_EXTS.has(b.ext)) - Number(LEAD_MODEL_EXTS.has(a.ext))

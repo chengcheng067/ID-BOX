@@ -174,16 +174,22 @@ export type AssetOpenMode = 'folder' | 'hdr' | 'reveal' | 'multi'
 /**
  * 第一项该做什么。
  *
- * - `model` / `texture` / `material` → 进入软件内文件夹视图；
+ * - `model` / `texture` / `material` / `cad` → 进入软件内文件夹视图；
  * - `hdri` → 直接进 HDR 预览（与双击一致：HDR 没有"文件夹里翻文件"的诉求）；
  * - `other` / 未知 → 只能落到系统资源管理器；
  * - 多选 → 没法定"进哪个文件夹"，退回"打开第一个所在文件夹"。
+ *
+ * ⚠️ `'cad'` 必须在这里（2026-10-29）：CAD 资产同样是**独占一个文件夹**的资产
+ * （`.dwg` + 配套预览图），"在文件夹中显示"只是兜底入口。漏掉它会让右键第一项
+ * 从「进入文件夹」退化成「打开文件位置」，与双击行为不一致。
  */
 export function assetOpenModeOf(targets: readonly Asset[]): AssetOpenMode {
   if (targets.length !== 1) return 'multi'
   const kind = targets[0]?.kind
   if (kind === 'hdri') return 'hdr'
-  if (kind === 'model' || kind === 'texture' || kind === 'material') return 'folder'
+  if (kind === 'model' || kind === 'texture' || kind === 'material' || kind === 'cad') {
+    return 'folder'
+  }
   return 'reveal'
 }
 

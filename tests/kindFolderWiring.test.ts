@@ -6,7 +6,7 @@
  * 「材质」会被判非法 → `assignCategory` 返回 null → **指派分类静默失效**（不报错、不移动）。
  *
  * 两条互补的守卫：
- * 1. **行为守卫**：对全部 5 个 `AssetKind`，`isKindFolderName(kindFolder(kind))` 必须为 true
+ * 1. **行为守卫**：对全部 6 个 `AssetKind`，`isKindFolderName(kindFolder(kind))` 必须为 true
  *    —— 渲染层实际传的就是 `kindFolder(asset.kind)`，这条直接证明安全门不会拦。
  * 2. **源码守卫**：`src/main/index.ts` 不得再出现 `Object.values(KIND_LABEL)`，
  *    且必须调用 `isKindFolderName`（防未来有人"顺手改回去"，编译期不会发现）。
@@ -22,10 +22,12 @@ import {
 } from '../src/shared/classify'
 import type { AssetKind } from '../src/shared/types'
 
-const ALL_KINDS: AssetKind[] = ['model', 'texture', 'hdri', 'material', 'other']
+// 2026-10-29 加 `'cad'`：五元 → 六元。**必须逐个列全**（不是在运行期从 KIND_FOLDER 取键）——
+// 这张表的用途正是"少一个大类就红"，自己派生出来就失去意义了。
+const ALL_KINDS: AssetKind[] = ['model', 'texture', 'hdri', 'material', 'cad', 'other']
 
 describe('assignCategory 安全门接线守卫', () => {
-  it('★渲染层传的值 = kindFolder(kind) → 必须被 isKindFolderName 接受（全部 5 个 kind）', () => {
+  it('★渲染层传的值 = kindFolder(kind) → 必须被 isKindFolderName 接受（全部 6 个 kind）', () => {
     for (const kind of ALL_KINDS) {
       const name = kindFolder(kind)
       expect(name.length).toBeGreaterThan(0)

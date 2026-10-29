@@ -46,7 +46,7 @@ import {
 import { categoriesOf } from '../logic/category'
 import { formatBytes } from '../../shared/format'
 import { KIND_LABEL } from '../../shared/classify'
-import { IconClose, IconHdr, IconImage, IconMaterial, IconOther, IconBox } from '../icons'
+import { IconCad, IconClose, IconHdr, IconImage, IconMaterial, IconOther, IconBox } from '../icons'
 import type { Asset, AssetKind } from '../../shared/types'
 
 /** kind 占位图标（与 AssetGrid / DetailPanel / Sidebar 同一张映射表） */
@@ -55,6 +55,7 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   texture: IconImage,
   hdri: IconHdr,
   material: IconMaterial,
+  cad: IconCad,
   other: IconOther
 }
 

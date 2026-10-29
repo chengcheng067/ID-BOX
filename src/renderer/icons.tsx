@@ -69,6 +69,23 @@ export const IconOther = (p: P) => (
   </Base>
 )
 
+/**
+ * 大类占位 · CAD 图纸（2026-10-29 新增大类 `'cad'`）。
+ *
+ * 语义是**平面图**：外框 = 图纸/房间边界，两条内墙把图分成几个开间。
+ * 不画「蓝底白线」的蓝图配色（图标一律单色继承 `currentColor`，规范 §图标规格 A），
+ * 也不复用 `IconImage`（那是位图语义，图纸不是位图）。
+ *
+ * 刻意只留两条内墙：卡片占位会放大到 ~35px，再细的线在 `strokeWidth=2.25` 下会糊成一块。
+ */
+export const IconCad = (p: P) => (
+  <Base {...p}>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <path d="M3 11h9V3" />
+    <path d="M21 14h-6v7" />
+  </Base>
+)
+
 export const IconFolder = (p: P) => (
   <Base {...p}>
     <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />

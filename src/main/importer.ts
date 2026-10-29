@@ -669,7 +669,13 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
     // 旧实现会掉进下面的 extractArchive 被判「不是压缩包」→ 用户拖进去像没反应。
     // 现在走 `importModelOne`：建资产文件夹 + **复制**（源工程文件原地不动）+ 补封面。
     // kind 判定用同一张 EXT_KIND（含 40+ 模型扩展名），别在这里列白名单。
-    if (kindOfExt(ext) === 'model') return importModelOne(src, st, deps, batch)
+    //
+    // ⚠️ 必须**同时**接受 `'cad'`（2026-10-29 CAD 大类拆出）：`.dwg` / `.dxf` 的单文件
+    // 与模型单文件同构（独占文件夹、要拖进 CAD 软件），但要落 `CAD/` 而不是 `模型/`。
+    // 漏掉这一项 → 单个 `.dwg` 会掉进下面的 `extractArchive` → 报「不是压缩包」。
+    // `importModelOne` 内部自己用 `kindOfExt(ext)` 算 kind，不写死 `'model'`。
+    const extKind = kindOfExt(ext)
+    if (extKind === 'model' || extKind === 'cad') return importModelOne(src, st, deps, batch)
   }
 
   // ── P0-3 磁盘空间预检：不足直接拒绝，**不建 staging、不产生半成品** ──

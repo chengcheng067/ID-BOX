@@ -51,6 +51,7 @@ import { MENU_TARGET_SELECTOR } from '../logic/contextMenu'
 import { PurgeConfirmDialog } from './PurgeConfirmDialog'
 import {
   IconBox,
+  IconCad,
   IconCheck,
   IconEmptyFilter,
   IconEmptyLibrary,
@@ -219,6 +220,7 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   texture: IconImage,
   hdri: IconHdr,
   material: IconMaterial,
+  cad: IconCad,
   other: IconOther
 }
 
@@ -625,10 +627,11 @@ function isTypingTarget(el: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable === true
 }
 
-/** 文件行图标：图片 / 模型 / 其它（图标口径见 `logic/fileView.ts` 的 IMAGE_EXTS / MODEL_EXTS） */
+/** 文件行图标：图片 / 模型 / CAD图纸 / 其它（图标口径见 `logic/fileView.ts` 的 IMAGE_EXTS / MODEL_EXTS / CAD_EXTS） */
 const FILE_ROW_ICON: Record<FileRow['kind'], typeof IconBox> = {
   image: IconImage,
   model: IconBox,
+  cad: IconCad,
   other: IconFile
 }
 

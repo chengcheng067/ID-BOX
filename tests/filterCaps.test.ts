@@ -113,9 +113,12 @@ describe('capsOfFilter · 每个大类视图支持哪些筛选维度', () => {
     expect(capsOfFilter('all', 'style')).toBe(true)
   })
 
-  it('能力表覆盖全部 5 个 AssetKind（加新大类时必须补一行，否则这里红）', () => {
+  it('能力表覆盖全部 6 个 AssetKind（加新大类时必须补一行，否则这里红）', () => {
+    // 2026-10-29 加 `'cad'`（CAD 图纸大类）：五元 → 六元。
+    // 这条是"计数守卫"不是"断言值随便改"：个数变了必须回到 KIND_FILTER_CAPS 补一行，
+    // 否则新大类在「全部」视图的能力并集里会被静默漏掉。
     expect(Object.keys(KIND_FILTER_CAPS).sort()).toEqual(
-      ['hdri', 'material', 'model', 'other', 'texture'].sort()
+      ['cad', 'hdri', 'material', 'model', 'other', 'texture'].sort()
     )
   })
 })

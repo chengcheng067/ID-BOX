@@ -3,8 +3,19 @@ import type { BallParamScales } from './ballParams'
 /** 7-Zip 官方下载页（未就绪时给用户的可行动入口） */
 export const SEVEN_ZIP_DOWNLOAD_URL = 'https://7-zip.org/'
 
-/** 资产大类：模型 / 贴图 / HDRI / 材质预设 / 其他 */
-export type AssetKind = 'model' | 'texture' | 'hdri' | 'material' | 'other'
+/**
+ * 资产大类：模型 / 贴图 / HDRI / 材质预设 / **CAD 图纸** / 其他
+ *
+ * `'cad'`（2026-10-29 拆出）：CAD（`.dwg` / `.dxf`）此前映射成 `'model'`，代价是
+ * 图纸落进 `模型/` 目录、卡片显示立方体图标并写「模型」、文件视图归到「模型」分组。
+ * 拆成独立大类的理由：**独立落盘目录**（`CAD/`）、**独立侧栏筛选节点**、
+ * **卡片标签与图标语义正确**；顺带让 `AssetGrid` 里那些
+ * `kind === 'model' && isSketchUpAsset(...)` 的手工守卫不再需要为图纸兜底。
+ *
+ * ⚠️ 优先级刻意**低于** `'model'`（见 `classify.ts` 的 `KIND_PRIORITY`）：一个包里
+ * 同时有 `.skp` 与 `.dwg` 时，模型是主内容、图纸是附件 → 仍判 `'model'`。
+ */
+export type AssetKind = 'model' | 'texture' | 'hdri' | 'material' | 'cad' | 'other'
 
 /**
  * 原压缩包处置三档（P0-5，替代旧布尔值 `trashArchiveAfterImport`）：

@@ -28,9 +28,14 @@ export type { IgnoredReason }
  * - 「材质」被 `texture` 与 `material` 共用 → 该函数返回 `null`，此处兜底 `texture`
  *   （docs/14 §2.1 裁定：该分支只在内容完全判不出大类时触发，真实材质资产由扩展名/
  *   PBR 材质包判定，几乎走不到这里；选 `texture` 使散装包行为与升级前一致）；
+ * - **`CAD` 目录名大小写不敏感**（2026-10-29 新增大类）：`kindFromFolderName` 走的是
+ *   `KIND_FOLDER` 精确匹配（`'CAD'` → `'cad'` 已自动生效），这里额外补一条是为了
+ *   用户手工建的小写 `cad/` 目录 —— 只针对这一个目录名，**不**把反查整体改成
+ *   大小写不敏感（那会顺带改变 `hdri`/`HDRI` 等既有目录名的语义）；
  * - 历史目录名 `贴图/`、`材质预设/` 仍能被反解（旧库未迁移时不炸）。
  */
 function fallbackKindOf(kindFolderName: string): AssetKind {
+  if (kindFolderName.toLowerCase() === 'cad') return 'cad'
   return kindFromFolderName(kindFolderName) ?? 'texture'
 }
 
