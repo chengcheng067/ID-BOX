@@ -229,6 +229,11 @@ export type ZhimoVerifyOutcome =
        * 否则"站方覆盖不全"与"我们的路径还原有缺口"就永远分不清。
        */
       unmapped?: true
+      /**
+       * true = 站方两个源都**完全没给**（无面包屑、无末级名）→ 计入 `noStation`。
+       * 与 `unmapped` 互斥：一个"什么都没说"、一个"说了但我们接不住"。
+       */
+      noStation?: true
     }
 
 /** `planZhimoReclass()` 的入参（拆成对象便于表驱动单测） */
@@ -445,6 +450,16 @@ export function planZhimoVerify(input: {
     }
   }
 
+  /**
+   * 「站方什么都没给」——`noStation` 桶的唯一来源（`ok:true` 但两个源都空）。
+   *
+   * ⚠️ 必须与 `unmapped` 分开：`decideClassify` 的 `none` 只看"两边都空"，它分不清
+   * "站方这一页什么都没有"（`noStation`，正常结果）和"站方给了名字但我们映射不出来"
+   * （`unmapped`，词表缺口）。合并会让"站方覆盖不全"和"我们的词表有 bug"永远分不清 ——
+   * 这正是 `ZhimoReclassSummary` 分桶的初衷。
+   */
+  const stationSaidNothing = s2 === null && baseName === null
+
   // ── medium-s1 / none：不搬、也不写库 ─────────────────────────────
   //
   // 理由（§5.3 末条）：这两种结论与 T0 写下的初值**完全同形**（T0 就是按 S1 写的），
@@ -454,7 +469,8 @@ export function planZhimoVerify(input: {
       kind: 'untouched',
       reason: 'same-as-initial',
       confidence: decision.confidence,
-      ...(stationNameOnly ? { unmapped: true as const } : {})
+      ...(stationNameOnly ? { unmapped: true as const } : {}),
+      ...(stationSaidNothing ? { noStation: true as const } : {})
     }
   }
 
@@ -672,13 +688,15 @@ const realSleep = (ms: number): Promise<void> =>
  * ③ `shouldStop()` 在**取任务前**与**发请求前**各查一次。
  *
  * 计数口径（互斥，加起来 = `scanned`）：
- * `hits.length + ambiguous + unmapped + noStation + failed === scanned`。
+ * `hits.length + conflicts + marked + unmapped + noStation + failed === scanned`。
  * 取消后 `stopped = true`，剩余条目既不计 scanned 也不计任何结果。
  *
- * **交叉验证通道**（`deps.decide` 注入 `planZhimoVerify`）额外占用两个不进 `hits` 的桶
- * —— `conflicts` / `unverified`，它们也计入上面那个等式（判定成功、只是不搬）。
- * `marked` 是"只写回不搬"的子集计数，**不进等式**（它的条目仍算 hits 里的一条？不：
- * 它连 hits 都不进，因为不搬；它的条数也进等式）。
+ * ⚠️ 2026-10-29 修订后，五个计数桶的归属（**别按旧注释理解**）：
+ * - `hits`：要搬的（`high` **和** `medium-s2` 都在这里，后者靠 `hit.review.confidence` 区分）；
+ * - `unverified`：**不是独立桶**，是 `hits` 里 `medium-s2` 那部分的计数（`≤ moved`）；
+ * - `conflicts` / `marked`：判定成功但不搬，进 `reviews` 单独写库；
+ * - `unmapped`：站方给了末级名但还原不出路径（`untouched` + `unmapped: true`）。
+ * - `untouched`（已定案 / `medium-s1` / `none`）什么都不计。
  */
 export async function runZhimoReclassQueue(
   items: readonly ZhimoReclassTarget[],
@@ -801,6 +819,9 @@ export async function runZhimoReclassQueue(
         } else if (outcome.kind === 'untouched' && outcome.unmapped) {
           // 站方给了末级名、面包屑还原不出路径 —— 这是真实的一类，必须计数
           result.unmapped += 1
+        } else if (outcome.kind === 'untouched' && outcome.noStation) {
+          // 站方两个源都没给（`ok:true` 但空）—— 正常结果，不是失败
+          result.noStation += 1
         }
         // 其余 `untouched`（已定案 / medium-s1 / none）→ 什么都不做：
         // 判定结果与库中现状等价，写回只会白写一次 bulkPut

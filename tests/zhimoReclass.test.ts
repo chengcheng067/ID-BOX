@@ -637,8 +637,8 @@ describe('runZhimoCategoryReclass — 候选 / 分组 / 落库', () => {
       ambiguous: 0,
       // 站方给了末级名但面包屑缺失 → 真实存在的一类，必须计数
       unmapped: 1,
-      // 站方完全没给（既无面包屑也无末级名）
-      noStation: 0,
+      // 站方两个源都空（`ok:true` 但无面包屑无末级名）→ 也是真实的一类，必须计数
+      noStation: 1,
       failed: 1,
       conflicts: 0,
       unverified: 1

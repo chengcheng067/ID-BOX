@@ -410,6 +410,60 @@ describe('④ medium-s2（站方单方结论）→ **搬目录** + unverified �
     // 与 T0 初值同形 → 不改库
     expect(assetById(a.id).classifyReview).toBeUndefined()
   })
+
+  it('medium-s2 **只解析到一级也搬** → 落到 (工装空间, 未分类)，不算 skip', async () => {
+    // 面包屑只有一级（站方这一页没细分）→ `s2FromBreadcrumb` 给 {level1:'工装空间', level2:'未分类'}
+    const a = fixture({
+      name: '一个语义判不出来的名字',
+      kind: 'cad',
+      zhimoId: '9004c',
+      classifyReview: { confidence: 'none' }
+    })
+    useVault.setState({ assets: [a] })
+    modvault.fetchZhimoMeta.mockResolvedValue(metaOf(null, [crumb('工装空间', 1, 'f100')]))
+
+    const summary = await runOnce()
+
+    // 「只到一级」是合法落点（一级的可靠性远高于二级，docs/35 §1.2）→ **必须搬**
+    expect(modvault.assignCategory).toHaveBeenCalledTimes(1)
+    const call = modvault.assignCategory.mock.calls[0]![0] as AssignCategoryPayload
+    expect(call.category1).toBe('工装空间')
+    expect(call.category2).toBe(UNCLASSIFIED)
+
+    expect(summary.moved).toBe(1)
+    expect(summary.unverified).toBe(1)
+    // 既不是 skip 也不是 unmapped / noStation
+    expect(summary.unmapped).toBe(0)
+    expect(summary.noStation).toBe(0)
+
+    const after = assetById(a.id)
+    expect(after.category1).toBe('工装空间')
+    expect(after.category2).toBe(UNCLASSIFIED)
+    expect(after.classifyReview?.confidence).toBe('medium-s2')
+    expect(typeof after.classifyReview?.decidedAt).toBe('number')
+  })
+
+  it('medium-s2 搬成功后**必须**写 decidedAt（否则每次启动都重抓重搬同一目录）', async () => {
+    const a = fixture({
+      name: '一个语义判不出来的名字',
+      kind: 'cad',
+      zhimoId: '9004d',
+      classifyReview: { confidence: 'none' }
+    })
+    useVault.setState({ assets: [a] })
+    modvault.fetchZhimoMeta.mockResolvedValue(metaOf(null, CRUMB_GARDEN))
+    await runOnce()
+
+    const first = assetById(a.id)
+    expect(typeof first.classifyReview?.decidedAt).toBe('number')
+    // 第二轮：已定案 → 不在候选里，零请求零搬（这正是 decidedAt 要写的原因）
+    modvault.fetchZhimoMeta.mockClear()
+    modvault.assignCategory.mockClear()
+    const second = await runOnce()
+    expect(modvault.fetchZhimoMeta).not.toHaveBeenCalled()
+    expect(modvault.assignCategory).not.toHaveBeenCalled()
+    expect(second.moved).toBe(0)
+  })
 })
 
 // ══════════════════════════════════════════════════════════════════
@@ -624,7 +678,7 @@ describe('⑧ hdri / other 没有站方源 → s2 恒 null、判 medium-s1 或 n
     })
   })
 
-  it('other 资产 + 站方连名字都没给 → none 且**不**计 unmapped（真·站方未给）', async () => {
+  it('other 资产 + 站方连名字都没给 → none 且计 noStation（真·站方未给），不计 unmapped', async () => {
     const out = planZhimoVerify({
       asset: {
         name: '某个 other 资产',
@@ -636,10 +690,12 @@ describe('⑧ hdri / other 没有站方源 → s2 恒 null、判 medium-s1 或 n
       meta: metaOf(null),
       now: 999
     })
+    // 两个桶互斥：`noStation` = "站方什么都没说"，`unmapped` = "说了但我们接不住"
     expect(out).toEqual({
       kind: 'untouched',
       reason: 'same-as-initial',
-      confidence: 'none'
+      confidence: 'none',
+      noStation: true
     })
   })
 })
