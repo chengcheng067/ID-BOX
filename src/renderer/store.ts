@@ -386,7 +386,7 @@ function withPickerClosed<P extends object>(patch: P): P & { categoryPickerIds: 
 export type TriageMode = ReviewReason
 
 /**
- * 某个模式的待办集（**口径的唯一实现点**，`openTriage` 与两个 hook 都走它）。
+ * 某个模式的待办集（**口径的唯一实现点**，`openTriage` 与三个 hook 都走它）。
  *
  * 三步，一步都不能少也不能换顺序：
  * ① 滤软删（走 `isDeletedAsset`，与 `activeAssets` / `applyFilters` 同一判据来源）；
@@ -404,7 +404,7 @@ export type TriageMode = ReviewReason
  *
  * ## 为什么导出（它本是 store 内部实现细节）
  *
- * ① `openTriage` 与两个 hook 共用，已经是**公开行为的一部分**（"入口说有 3 条、
+ * ① `openTriage` 与三个 hook 共用，已经是**公开行为的一部分**（"入口说有 3 条、
  *    浮层就渲 3 条"就是它的契约），不属于私有实现；
  * ② vitest 是 `environment: 'node'`，没有 jsdom / react-test-renderer，而 zustand v4
  *    在 SSR 下用 `getServerSnapshot`（返回初始 state），`renderToStaticMarkup` 读不到
@@ -5388,10 +5388,68 @@ export const useVault = create<VaultState>((set, get) => ({
  * 入口说"有 3 条可以处理"，浮层却渲出 2 条（差在某个边界条件上），用户会以为丢数据。
  * 这个项目为"多处口径不同源"付过代价（见 `logic/triageFlow.ts` 文件头），别再来一次。
  */
-function useTriageQueueOf(mode: TriageMode): Asset[] {
+
+/**
+ * 未开启时的空队列。**必须是模块级常量**：`useMemo` 每次返回字面量 `[]` 会造新引用，
+ * 而 `TriageOverlay` 的 `reconcileTriage(cursor, queue)` 与若干 `useEffect` 依赖 `queue`
+ * —— 每次 render 换引用就是每次 render 重跑 effect，轻则白烧 CPU，重则
+ * `setCursor` → 重渲 → 新 `[]` → 再 `setCursor` 的死循环。
+ */
+const NO_TRIAGE_QUEUE: Asset[] = []
+
+/**
+ * 「按模式选队列」的纯函数版（`useActiveTriageQueue` 的内核）。
+ *
+ * `mode === null`（浮层没开）→ **同一个**空数组引用（见 `NO_TRIAGE_QUEUE`）；
+ * 否则就是 `triageQueueOf` 的结果。抽出来只为一件事：让这条分支**能被真跑**。
+ *
+ * 为什么需要它单独存在：`useActiveTriageQueue` 是 hook，在 `environment: 'node'` 下
+ * 跑不了（zustand v4 的 `useStore` 把 `getServerSnapshot` 绑在**内部 api** 上，
+ * 从外部 `useVault.getServerState = ...` 改不动它，实测三个模式都拿到 `[]`）。
+ * 而"未开启时返回空"和"切模式返回对应队列"正是这两条新测试要钉的东西 ——
+ * 不能因为 hook 跑不了就不测。
+ */
+export function activeTriageQueueOf(
+  assets: readonly Asset[],
+  sort: SortKey,
+  mode: TriageMode | null
+): Asset[] {
+  return mode === null ? NO_TRIAGE_QUEUE : triageQueueOf(assets, sort, mode)
+}
+
+/**
+ * hook 侧的薄封装：读三个 state，交给纯函数 `activeTriageQueueOf`。
+ *
+ * `mode === null` 时 `activeTriageQueueOf` 返回**模块级常量** `NO_TRIAGE_QUEUE`
+ * （不是每次新造的 `[]`）—— 这一条对 `TriageOverlay` 不是洁癖：它的
+ * `reconcileTriage(cursor, queue)` 与若干 `useEffect` 依赖 `queue`，每次 render 换引用
+ * 就是每次重跑 effect，轻则白烧 CPU，重则 `setCursor` → 重渲 → 新 `[]` → 再 `setCursor`
+ * 的死循环。
+ */
+function useTriageQueueOf(mode: TriageMode | null): Asset[] {
   const assets = useVault((s) => s.assets)
   const sort = useVault((s) => s.filters.sort)
-  return useMemo(() => triageQueueOf(assets, sort, mode), [assets, sort, mode])
+  return useMemo(() => activeTriageQueueOf(assets, sort, mode), [assets, sort, mode])
+}
+
+/**
+ * **按当前 `triageMode` 自动选队列** —— `TriageOverlay` 用它，而不是自己二选一。
+ *
+ * ## 为什么需要它（hooks 不能条件调用的后果）
+ *
+ * `TriageOverlay` 要按模式渲不同的批次。写成
+ * `triageMode === 'conflict' ? useReviewQueue() : useTriageQueue()` 是**非法**的
+ * （hooks 数量必须稳定），而"两个都调用再二选一"更糟：`startTriage(queue)` 在首次挂载时
+ * 惰性初始化游标，若 queue 取自错的那个，用户一进 conflict 模式看到的是未分类那批。
+ *
+ * 所以把"选哪个"下沉到 store 层：调用方只调一个 hook，模式从 state 读。
+ *
+ * @returns `triageMode === null` → 空数组（浮层没开，不该有队列，也不该有游标）；
+ *   否则该模式的队列（口径仍然只有 `triageQueueOf` 一份）
+ */
+export function useActiveTriageQueue(): Asset[] {
+  const mode = useVault((s) => s.triageMode)
+  return useTriageQueueOf(mode)
 }
 
 /** 整理模式的待办集：全库双未分类 + 当前排序 + 非软删。`TriageOverlay` 在 `unclassified` 模式下用它。 */
@@ -5404,6 +5462,10 @@ export function useTriageQueue(): Asset[] {
  *
  * 与 `useTriageQueue()` **同源**（同一个 `triageQueueOf`）—— 这是侧栏「待确认」数字
  * 与浮层条数能对上的唯一保证，也是本文件不留第二份软删过滤的原因。
+ *
+ * ⚠️ `TriageOverlay` **不用**这个也不用 `useTriageQueue`，用 `useActiveTriageQueue()`
+ * （原因见那个函数的注释）。这两个保留给需要"无视模式、固定拿某一批"的调用方（侧栏计数、
+ * 批次汇总 notice）—— 它们不该跟着 `triageMode` 变。
  */
 export function useReviewQueue(): Asset[] {
   return useTriageQueueOf('conflict')

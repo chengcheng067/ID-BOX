@@ -66,7 +66,7 @@ const fakeTable = {
 }
 Object.defineProperty(db, 'assets', { value: fakeTable, configurable: true })
 
-const { triageQueueOf, useVault } = await import('../src/renderer/store')
+const { activeTriageQueueOf, triageQueueOf, useVault } = await import('../src/renderer/store')
 
 // ── 夹具 ───────────────────────────────────────────────────────────
 
@@ -432,6 +432,10 @@ describe('⑥ 两个队列同源（软删 / 排序 / 全库口径）', () => {
     expect(code).toMatch(
       /export function useReviewQueue\(\): Asset\[\] \{\s*return useTriageQueueOf\('conflict'\)\s*\}/
     )
+    // `useActiveTriageQueue` 也不许自己写过滤：它只把 state 里的 mode 交给 `useTriageQueueOf`
+    expect(code).toMatch(
+      /export function useActiveTriageQueue\(\): Asset\[\] \{\s*const mode = useVault\(\(s\) => s\.triageMode\)\s*return useTriageQueueOf\(mode\)\s*\}/
+    )
 
     // ② 软删过滤在**整个文件**里只出现在 triageQueueOf 内（其余是删除/回收站等
     //    不相关的调用点，所以这里数的是"队列口径"那一段）
@@ -442,5 +446,59 @@ describe('⑥ 两个队列同源（软删 / 排序 / 全库口径）', () => {
     expect(body).toContain('sortAssets')
     expect(body).toContain('buildTriageQueue')
     expect(body).toContain('buildReviewQueue')
+  })
+})
+
+// ── ⑦ useActiveTriageQueue 的内核：按模式自动选队列 ─────────────────
+
+describe('⑦ activeTriageQueueOf · 浮层用一个 hook 按模式取队列', () => {
+  const assets = [
+    unclassified('u1'),
+    conflict('c1'),
+    unclassified('u-deleted', { deletedAt: 1_700_000_000_000 }),
+    conflict('c2')
+  ]
+
+  it('★triageMode === null（浮层没开）→ 空队列', () => {
+    // 浮层没开就不该有队列，也不该让 `startTriage` 拿到一批数据去初始化游标。
+    expect(activeTriageQueueOf(assets, 'recent', null)).toEqual([])
+  })
+
+  it('★null 时返回**同一个**空数组引用（每次新造 [] 会让 effect 每次重跑）', () => {
+    // `TriageOverlay` 的 `reconcileTriage(cursor, queue)` 与若干 useEffect 依赖 queue；
+    // 每次 render 换一个新 [] 就是每次重跑，轻则白烧 CPU，重则 setCursor → 重渲 → 死循环。
+    const a = activeTriageQueueOf(assets, 'recent', null)
+    const b = activeTriageQueueOf([], 'name', null)
+    expect(a).toBe(b)
+  })
+
+  it('★unclassified → 未分类那批（软删已滤）', () => {
+    expect(activeTriageQueueOf(assets, 'recent', 'unclassified').map((x) => x.id)).toEqual([
+      'u1'
+    ])
+  })
+
+  it('★conflict → 待确认那批（软删已滤）', () => {
+    expect(activeTriageQueueOf(assets, 'recent', 'conflict').map((x) => x.id)).toEqual([
+      'c1',
+      'c2'
+    ])
+  })
+
+  it('★模式切换时返回对应队列（同一份数据，两种模式互不污染）', () => {
+    // 这是 `TriageOverlay` 的实际用法：模式一变，同一个 hook 就该给出另一批。
+    const modes = ['unclassified', 'conflict', 'unclassified'] as const
+    const seen = modes.map((m) => activeTriageQueueOf(assets, 'recent', m).map((x) => x.id))
+    expect(seen).toEqual([['u1'], ['c1', 'c2'], ['u1']])
+  })
+
+  it('与 triageQueueOf 逐字节同源（不是第二份实现）', () => {
+    const sort = 'size'
+    expect(activeTriageQueueOf(assets, sort, 'conflict').map((x) => x.id)).toEqual(
+      triageQueueOf(assets, sort, 'conflict').map((x) => x.id)
+    )
+    expect(activeTriageQueueOf(assets, sort, 'unclassified').map((x) => x.id)).toEqual(
+      triageQueueOf(assets, sort, 'unclassified').map((x) => x.id)
+    )
   })
 })
