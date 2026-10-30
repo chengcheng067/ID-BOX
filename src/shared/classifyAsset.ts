@@ -15,6 +15,8 @@
  *    【v0.8.5】`kind==='cad'` 时同理整轮换成 **CAD 词表**（`CAD_LEVEL2_MAP` + `CAD_LEVEL3_ALIAS`，
  *    docs/34 §二/§三）——二级/三级/一级键三层都被作用域隔离，
  *    `texture`/`model` 的匹配结果与改动前**逐字节一致**（见 `level2ScopeOf`）；
+ *    【HDR】`kind==='hdri'` 时**只换一级册**（`HDRI_LEVEL1_LIST` 5 项），二级/三级两轮整个跳过
+ *    ——站方 HDR 频道无二级级联，跑通用 40 项二级只会错分；
  * 1. `autoClassify()` 全量匹配（二级优先）；一级属于该 kind 的**容器**词表 → 采用；
  * 2. 否则**一级回退**：`autoClassify(name, undefined, { level1Only: true })` 再问一次
  *    "至少一级对不对"；一级过闸 → `{ 一级, 未分类 }`；
@@ -63,13 +65,22 @@ const MATERIAL_L2_SCOPE_KINDS: ReadonlySet<string> = new Set(['material'])
  * 某个 `kind` 的**二级词表作用域**（`undefined` = 走通用 `LEVEL2_MAP` 流程）。
  *
  * - `'material'` → `MATERIAL_LEVEL2_MAP`（材质频道专属表，v1.0.14）；
- * - `'cad'` → `CAD_LEVEL2_MAP` + `CAD_LEVEL3_ALIAS`（CAD 频道整套词表，v0.8.5 / docs/34）。
+ * - `'cad'` → `CAD_LEVEL2_MAP` + `CAD_LEVEL3_ALIAS`（CAD 频道整套词表，v0.8.5 / docs/34）；
+ * - `'hdri'` → **只换一级册**（`HDRI_LEVEL1_LIST` 5 项），二级/三级两轮整个跳过。
+ *   站方 HDR 频道只有一级细分、没有第三级，让通用 40 项二级词条跑一遍只会把
+ *   `木纹HDR` 这类名字错分进贴图频道（详见 `autoClassify` 的 `level2Scope` 注释）。
  *
- * ⚠️ 这两个作用域的触发条件都**只按 kind**，不看内容：`kind` 就是频道身份。
+ * ⚠️ 这三个作用域的触发条件都**只按 kind**，不看内容：`kind` 就是频道身份。
  * ⚠️ `texture` 刻意**不**走 material 表（理由见 `MATERIAL_L2_SCOPE_KINDS` 的反例注释）。
  */
-const level2ScopeOf = (kind: string): 'material' | 'cad' | undefined =>
-  MATERIAL_L2_SCOPE_KINDS.has(kind) ? 'material' : kind === 'cad' ? 'cad' : undefined
+const level2ScopeOf = (kind: string): 'material' | 'cad' | 'hdri' | undefined =>
+  MATERIAL_L2_SCOPE_KINDS.has(kind)
+    ? 'material'
+    : kind === 'cad'
+      ? 'cad'
+      : kind === 'hdri'
+        ? 'hdri'
+        : undefined
 
 /**
  * 判定一个资产应落的「一级/二级」。
@@ -121,8 +132,8 @@ export function classifyAssetName(
   }
 
   // 一级回退：一级只看资产名（`autoClassify` 规则 5），故不传 fileNames。
-  // ⚠️ 作用域必须一起带下去：CAD 的一级不在 `LEVEL2_MAP` 里，不传 scope 时
-  // `level1Only` 对 CAD 恒返回 null，回退等于没有。
+  // ⚠️ 作用域必须一起带下去：CAD / HDR 的一级不在 `LEVEL2_MAP` 里，不传 scope 时
+  // `level1Only` 对它们恒返回 null，回退等于没有。
   const level1Hit = autoClassify(assetName, undefined, {
     level1Only: true,
     ...(level2Scope === undefined ? {} : { level2Scope })

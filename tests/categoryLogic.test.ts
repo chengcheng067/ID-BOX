@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import type { Asset } from '../src/shared/types'
-import { UNCLASSIFIED } from '../src/shared/taxonomy'
+import { UNCLASSIFIED, HDRI_LEVEL1_LIST } from '../src/shared/taxonomy'
 import {
   categoriesOf,
   countLevel1,
@@ -146,7 +146,7 @@ describe('logic/category · 三级树计数', () => {
 })
 
 describe('logic/category · 级联选项', () => {
-  it('level1OptionsFor：model 用 SU 分册；texture/material 共用并集 33 项；其余大类无词表', () => {
+  it('level1OptionsFor：model 用 SU 分册；texture/material 共用并集 33 项；cad/hdri 各用本册；other 仍无词表', () => {
     expect(level1OptionsFor('model')).toContain('家装')
     expect(level1OptionsFor('model')).not.toContain('石材')
     expect(level1OptionsFor('texture')).toContain('石材')
@@ -159,7 +159,13 @@ describe('logic/category · 级联选项', () => {
     // 钉住"两 kind 同表"：贴图也能看到材质独有的 12 项，且顺序/内容完全一致
     expect(level1OptionsFor('texture')).toContain('布料')
     expect(level1OptionsFor('texture')).toEqual(level1OptionsFor('material'))
-    expect(level1OptionsFor('hdri')).toEqual([])
+    // HDR：本版新增 5 项一级册（站方 hdrtietu 频道页照抄）。
+    // ⚠️ 这条原本断言 `toEqual([])`（那时 hdri 无词表），现在**改口径**——
+    // 不是回归：`CHANNEL_LEVEL1.hdri` 已经是词表的合法来源，下拉必须能列出这 5 项，
+    // 否则用户手动改派 HDR 资产时一级只能自由输入（词表加了等于没用）。
+    expect(level1OptionsFor('hdri')).toHaveLength(5)
+    expect(level1OptionsFor('hdri')).toEqual(HDRI_LEVEL1_LIST)
+    expect(level1OptionsFor('hdri')).not.toContain('全部')
     expect(level1OptionsFor('other')).toEqual([])
   })
 

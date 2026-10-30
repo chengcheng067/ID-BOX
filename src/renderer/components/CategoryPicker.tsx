@@ -11,7 +11,8 @@ import { Modal } from './Modal'
 /**
  * 分类级联选择器（T07）：大类 → 一级 → 二级。
  *
- * - 一级选项：model/texture 有词表册（`level1OptionsFor`），其余大类只有自由输入；
+ * - 一级选项：model / texture·material / cad / hdri 都有词表册（`level1OptionsFor`），
+ *   只有 `other` 退回自由输入；
  * - 二级级联：`level2OptionsFor(一级)` —— 有枚举出下拉、空数组（一级=未分类）锁定为未分类、
  *   null（如材质预设）渲染为「可自由输入」（06 §3.3-②）；
  * - 批量目标跨大类时禁用确认（父目录永远由 asset.kind 算，03 §5.3）；

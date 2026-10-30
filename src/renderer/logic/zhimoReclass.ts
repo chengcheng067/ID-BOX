@@ -318,9 +318,19 @@ export function planZhimoReclass(input: ZhimoReclassPlanInput): ZhimoReclassDeci
 /**
  * 把 `FetchZhimoMetaResult.breadcrumb` 解析成 S2（`docs/35 §3`）。
  *
- * `hdri` / `other` **没有站方源**（§3.4）：`isLevel1AllowedForKind` 对这两册恒 false、
- * `CHANNEL_LEVEL1` 里也没有它们，所以这里**直接返回 null**，不做任何尝试 ——
+ * `hdri` / `other` **本通道不接**（§3.4）：这里**直接返回 null**，不做任何尝试 ——
  * 也不要"强转 kind 绕过类型"去凑一个 S2（那等于编造站方结论）。
+ *
+ * ⚠️ **2026-10 更正**：本函数原注释写的是「`isLevel1AllowedForKind` 对这两册恒 false、
+ * `CHANNEL_LEVEL1` 里也没有它们」。**前半句对 hdri 已不成立**（`hdri` 已有 5 项一级册，
+ * 闸门会正常放行「天空HDR」这类值），所以「恒 false」不再是拒绝的理由。
+ * 现在拒绝 `hdri` 的真实理由是**映射链没有 HDR 分支**：
+ * 站方 HDR 频道面包屑走 `mapZhimoCategory()` 只落到贴图频道的 `HDR贴图`（见
+ * `shared/zhimoTaxonomyMap.ts` 的 `category1: 'HDR贴图'` 那一条），而 `HDR贴图`
+ * **不属于** HDR 频道的一级册 → `adoptLookup` 的闸门会把它挡掉，走到这里等于白跑一趟。
+ * 要真正接通，得先给 `mapZhimoCategory` 加一张「站方 HDR 面包屑 → 天空HDR/城市HDR/…」的表
+ * （那件事**不在本批范围**，且需要站方真值抽样）。在它做出来之前，返回 null 是**正确**的
+ * ——比"能跑但必定被闸门拒"更省事，也不会给人"已经接通了"的错觉。
  */
 export function s2OfMeta(
   meta: FetchZhimoMetaResult,

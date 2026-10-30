@@ -62,6 +62,28 @@ export const CAD_LEVEL1_LIST: readonly string[] = [
 ]
 
 /**
+ * 【HDR 一级分类：5 项】**逐字照抄站方原文**（含「HDR」后缀，一个字符都不许改）。
+ *
+ * 【事实 · 站方 hdrtietu 频道页二级筛选栏 / docs/07 §3.17】
+ * 来源页：`https://tietu.znzmo.com/tietunewhome/hdrtietu.html`（知末 HDR贴图 频道页），
+ * 筛选栏实际条目与 URL 尾段：
+ * - 天空HDR（`tiank.html`）/ 城市HDR（`csjzhdr.html`）/ 小区HDR（`xiaoqHDR.html`）/
+ *   室内HDR（`shineihdr.html`）/ 户外HDR（`huwaihdr.html`）
+ *
+ * ⚠️ 该页的「全部」是导航控件、不是内容类目 → **不进枚举**（与 docs/05 §2、docs/07 §2、
+ * docs/34 §一 同一条纪律）。
+ * ⚠️ **不要为了目录好看去掉词条尾巴上的「HDR」**：词表纪律是照抄原文，本地目录名也必须
+ * 与站方筛选栏看得见的名字一致（否则用户按站方名字找本地分类会对不上）。
+ * ⚠️ 站方该频道**只有一级细分、没有第三级**（HDR 是扁平图库，不做二级级联），
+ * 故 `LEVEL2_MAP` **不为这 5 项建键** —— `level2Of('天空HDR') → []` →
+ * `level2OptionsFor` 返回 `null` → UI 走「该一级分类无级联词表，可自由输入」，
+ * 这是既有设计的正确行为，不是缺词。
+ */
+export const HDRI_LEVEL1_LIST: readonly string[] = [
+  '天空HDR', '城市HDR', '小区HDR', '室内HDR', '户外HDR'
+]
+
+/**
  * 【v1.0.8 / docs/14 §2.2】材质大类语境下的**一级词表并集（33 项）**。
  *
  * 「材质」目录下 `texture` 与 `material` 两类资产共用同一棵分类树，词表必须同源，
@@ -92,9 +114,18 @@ export const MERGED_MATERIAL_LEVEL1: readonly string[] = [
  * 【v1.0.8 / docs/14 §2.2】`material` 改为引用具名常量 `MATERIAL_LEVEL1_LIST`，值一字未改。
  * 注意：**UI 级联下拉不走本表**——`texture` 与 `material` 都改用并集 `MERGED_MATERIAL_LEVEL1`
  * （见 `renderer/logic/category.ts:level1OptionsFor`）；本表保留原册以便追溯来源。
+ *
+ * 【HDR 一级词表】`hdri` 引用具名常量 `HDRI_LEVEL1_LIST`（5 项，站方 hdrtietu 频道页照抄）。
+ * 加这一册之后 `isLevel1AllowedForKind('hdri', …)` 自动生效（它读的正是本表）——
+ * 加册前该函数对 hdri 恒返回 `false`（`CHANNEL_LEVEL1['hdri'] === undefined`），
+ * HDR 的自动分类结果会被闸门一律丢弃。
+ * ⚠️ **但只加册不够**：`autoClassify` 的一级匹配轮扫的是 `Object.keys(LEVEL2_MAP)`
+ * （40 个 SU/贴图键），HDR 的 5 项不在那个池子里 → 必须同时给 `autoClassify` 加
+ * `level2Scope:'hdri'` 分支（一级键换成 `HDRI_LEVEL1_LIST`），否则自动分类一个字节都不会变。
+ * 加册只让「手动改派的一级下拉」出现这 5 个选项。
  */
 export const CHANNEL_LEVEL1: Readonly<
-  Record<'model' | 'texture' | 'material' | 'cad', readonly string[]>
+  Record<'model' | 'texture' | 'material' | 'cad' | 'hdri', readonly string[]>
 > = {
   // SU 模型频道 19 项【事实 · docs/05 §2】
   model: LEVEL1_LIST,
@@ -106,7 +137,9 @@ export const CHANNEL_LEVEL1: Readonly<
   // 加这一册之后 `isLevel1AllowedForKind('cad', …)` 自动生效（它读的正是本表）——
   // 加册前该函数对 cad 恒返回 false（`CHANNEL_LEVEL1['cad'] === undefined`）。
   // ⚠️ CAD 的一级与 SU 19 项、贴图 21 项、材质 21 项**零交集**（有守卫），故四册键空间仍唯一。
-  cad: CAD_LEVEL1_LIST
+  cad: CAD_LEVEL1_LIST,
+  // 【HDR】站方 hdrtietu 频道页 5 项【事实 · 原序照抄】。与上四册零交集（有守卫）。
+  hdri: HDRI_LEVEL1_LIST
 }
 
 /**
@@ -1101,7 +1134,15 @@ export function isKnownCombo(level1: string, level2: string): boolean {
  * **模型频道**的一级不在 33 项并集里，依旧被挡（`屏风贴图` 仍落双未分类）。
  * `CHANNEL_LEVEL1` 三册原样保留（追溯抄录来源用），不再是本函数的判据。
  *
- * ⚠️ `hdri` / `other` 没有一级词表 → 一律 `false`（命中即丢弃），这是刻意的。
+ * ⚠️ `other` 没有一级词表 → 一律 `false`（命中即丢弃），这是刻意的。
+ *
+ * 【HDR 已加入册（本版）】`hdri` 现在**有**一级词表（`HDRI_LEVEL1_LIST`，5 项
+ * 站方 hdrtietu 频道页照抄），因此 `isLevel1AllowedForKind('hdri', '天空HDR')` 返回 **`true`**
+ * —— 属于 HDR 频道的一级会被正常放行，不再被一律拒绝。
+ * 但**别的频道的一级仍然被挡**（`isLevel1AllowedForKind('hdri', '室内')` 为 `false`：
+ * `室内` 不是 HDR 的一级，HDR 的是 `室内HDR`）。闸门的语义没变：只放行本容器的一级。
+ * 📌 历史注记：加册前这里写的是「`hdri` / `other` 都没有一级词表」——那句话现在只对
+ * `other` 成立。留着旧说法会让下一个人照它排查错方向（以为 HDR 恒被拒）。
  *
  * @param kind 资产大类（`AssetKind`）
  * @param level1 候选一级分类名

@@ -145,11 +145,13 @@ export function duplicatedLevel2Names(assets: Asset[], kind: KindScope): Set<str
  * `MATERIAL_LEVEL1_LIST` 派生，见 docs/14 §2.2），禁止从 `LEVEL2_MAP` 的 keys 推导。
  * CAD 同样从 `CHANNEL_LEVEL1.cad` 取册（10 项），**不**从 `CAD_LEVEL2_MAP` 的 keys 推导
  * ——后者是二级表，键的齐全与否受词条抄录进度影响，不能当一级词表用。
- * hdri/other 无词表 → [] → UI 自由输入。 */
+ * HDR 从 `CHANNEL_LEVEL1.hdri` 取册（5 项，站方 hdrtietu 频道页照抄）。
+ * `other` 无词表 → [] → UI 自由输入。 */
 export function level1OptionsFor(kind: AssetKind): readonly string[] {
   if (kind === 'texture' || kind === 'material') return MERGED_MATERIAL_LEVEL1
   if (kind === 'model') return CHANNEL_LEVEL1.model
   if (kind === 'cad') return CHANNEL_LEVEL1.cad
+  if (kind === 'hdri') return CHANNEL_LEVEL1.hdri
   return []
 }
 

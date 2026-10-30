@@ -1141,7 +1141,9 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
  *   网格和详情面板出现一张碎图；UI 走 `IconHdr` 类型占位。
  * - HDR：文件名里的**全景对齐参数**提取成一行写进 `note`（见 `panoramaNoteFromName`）
  * - 文件夹 = `<大类>/<一级>/<二级>/<资产名>`，与压缩包走同一 autoClassify 规则
- *   （`hdri` 没有一级词表 → 闸门必然拒绝 → 落 `未分类/未分类`，这是**预期**，不报错）
+ *   （`hdri` 有一级册 `HDRI_LEVEL1_LIST` 5 项，名字命中「天空/城市/小区/室内/户外」才落
+ *   `HDRI/<xx>HDR/未分类`；没命中仍落 `未分类/未分类` —— 绝大多数 HDR 文件名是
+ *   `古月视觉HDR-偏移U：0.23` 这种纯参数名，**落未分类是预期**，不报错）
  * - **源文件处置三档与压缩包完全一致**（复用同一个 `disposeArchive`）：
  *   `keep` 原地保留、`recycle` 进回收站、`delete` 删除。
  *   历史缺陷：本函数曾无条件 rename 源文件（见下方复制段的注释）。
@@ -1198,7 +1200,8 @@ async function importMediaOne(
 
   // 【v1.0.10】kind ↔ 一级容器闸门；【v1.0.12】拒绝后一级回退；
   // 【v1.0.13】与压包路径共用 `shared/classifyAsset.ts` 的唯一实现。
-  // `hdri` 在一级容器表里没有条目 → 必然回退到 `未分类/未分类`（预期行为）。
+  // `hdri` 现在有一级册（5 项）→ 名字命中「天空/城市/小区/室内/户外」才落 `HDRI/<xx>HDR`，
+  // 其余（绝大多数是 `古月视觉HDR-偏移U：…` 这类纯参数名）仍回退到 `未分类/未分类`（预期行为）。
   const { category1, category2 } = classifyAssetName(assetName, [itemName], kind)
 
   // ── DEF-14（0.7.8）：与压缩包路径同一条修法，必须在此处（**算目录之前**）净化 ──

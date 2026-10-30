@@ -72,6 +72,7 @@ import {
   CAD_LEVEL2_CANONICAL_PARENT,
   CAD_LEVEL2_MAP,
   CAD_LEVEL3_ALIAS,
+  HDRI_LEVEL1_LIST,
   LEVEL2_MAP,
   LEVEL3_ALIAS,
   MATERIAL_LEVEL2_MAP,
@@ -432,8 +433,18 @@ export interface AutoClassifyOptions {
    *   没有任何 SU / 贴图词条属于它）。
    * 不做这三层隔离的后果是双向污染：SU 命 CAD（`餐厅` → `家装空间/餐厅`）、
    * CAD 命 SU（`沙发` → `家具/沙发`）。
+   *
+   * 【HDR】**`'hdri'` = 只换一级键、不跑二级/三级**（`HDRI_LEVEL1_LIST` 5 项）。
+   * HDR 频道在站方**只有一级细分、没有第三级**（`LEVEL2_MAP` 里一个 HDR 词条都没有），
+   * 所以这里连"二级轮"都不进：
+   * - 让通用 40 项二级词条跑一遍只会**错分** —— 名字带「木纹」的 HDR 会被吸成
+   *   `木纹/<二级>`（贴图频道的答案），而 HDR 的正确落点是 `未分类/未分类`；
+   * - 两级都判不出 → 返回 `null`，**不回落通用词表**（与 `'cad'` 同一纪律：
+   *   HDR 是独立频道，SU / 贴图的任何一级都不可能是它的合法来源）。
+   * ⚠️ 只加 `CHANNEL_LEVEL1.hdri` **不够**：一级轮的键取自本开关（见 `level1Keys`），
+   * 不加这一支时 HDR 的 5 个一级根本不在扫描池里，`level1Only` 对 hdri 恒 `null`。
    */
-  level2Scope?: 'material' | 'cad'
+  level2Scope?: 'material' | 'cad' | 'hdri'
 }
 
 /**
@@ -443,7 +454,9 @@ export interface AutoClassifyOptions {
  * @param fileNames 资产内文件名列表（可选；英文贴图名常只出现在文件名里，如 `LOFT`）
  * @param opts 可选开关（v1.0.12：`level1Only` 只做一级匹配；v1.0.14：`level2Scope:'material'`
  *             先跑材质频道专属二级表；v0.8.5：`level2Scope:'cad'` 整轮换成 CAD 词表
- *             ——二级 `CAD_LEVEL2_MAP` + 三级归并 `CAD_LEVEL3_ALIAS` + 一级键也换 CAD 的 10 项）
+ *             ——二级 `CAD_LEVEL2_MAP` + 三级归并 `CAD_LEVEL3_ALIAS` + 一级键也换 CAD 的 10 项；
+ *             HDR：`level2Scope:'hdri'` **只换一级键**（`HDRI_LEVEL1_LIST` 5 项），
+ *             二级/三级两轮整个跳过 —— 站方 HDR 频道无二级级联，跑通用二级只会错分）
  * @returns 命中 → `{ category1, category2, matchedTerm, alternativeCategories1 }`；
  *          全不命中 → `null`（调用方落 `未分类/未分类`）
  */
@@ -459,12 +472,16 @@ export function autoClassify(
 
   // 【v1.0.12】`level1Only` 时整轮跳过（连分词都省掉）。
   const skipLevel2 = opts?.level1Only === true
+  // 【HDR】`level2Scope:'hdri'` 同样跳过**轮 1**（二级词条 + 三级归并）——但**不能**省掉分词：
+  // 一级轮要用 `cjkHeads`。因此这里单独一个开关，不改上面 `skipLevel2` 的"连分词都省"语义。
+  // 让通用 40 项二级词条对 HDR 跑一遍只会错分（`木纹HDR` → `木纹/<二级>`），见 `level2Scope` 注释。
+  const hdriScope = opts?.level2Scope === 'hdri'
   const { cjkHeads, asciiTokens } = skipLevel2
     ? { cjkHeads: [] as string[], asciiTokens: new Set<string>() }
     : tokenize(parts.join('\n'))
 
   // ── 第一轮：二级分类词表 + 三级归并表（命中即返回，二级压过一级） ──────
-  if (!skipLevel2) {
+  if (!skipLevel2 && !hdriScope) {
     // 【v1.0.14】材质频道专属二级表**优先**（docs/18 · 20 键 / 106 项）。
     //
     // 为什么优先于通用二级：材质与贴图/模型是**三套不同的切分维度**，同一资产名
@@ -666,8 +683,15 @@ export function autoClassify(
   // 不隔离的话 `{ level1Only: true }` 对 CAD 恒为空（CAD 一级不在 `LEVEL2_MAP` 里），
   // `classifyAssetName` 的「一级回退」就永远救不回一个 CAD 资产。
   // 不传 scope 时仍扫 `LEVEL2_MAP` —— 既有行为一个字节不变。
+  // 【HDR】同理换成本频道的一级册（`HDRI_LEVEL1_LIST` 5 项）：HDR 的 5 个一级
+  // （天空HDR/城市HDR/小区HDR/室内HDR/户外HDR）**不在 `LEVEL2_MAP` 里**，
+  // 只加 `CHANNEL_LEVEL1.hdri` 不会让它们进扫描池 —— 自动分类会一个都判不出。
   const level1Keys =
-    opts?.level2Scope === 'cad' ? Object.keys(CAD_LEVEL2_MAP) : Object.keys(LEVEL2_MAP)
+    opts?.level2Scope === 'cad'
+      ? Object.keys(CAD_LEVEL2_MAP)
+      : opts?.level2Scope === 'hdri'
+        ? HDRI_LEVEL1_LIST
+        : Object.keys(LEVEL2_MAP)
   let index = 0
   for (const level1 of level1Keys) {
     const kind = matchTerm(level1, assetTokens.asciiTokens, assetTokens.cjkHeads)
