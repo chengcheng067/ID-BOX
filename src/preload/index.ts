@@ -21,6 +21,8 @@ import type {
   ImportConflictContext,
   ImportConflictExpired,
   ImportEvent,
+  KindMigrateDetectResult,
+  KindMoveResult,
   LayoutApplyResult,
   LogExportResult,
   LogStats,
@@ -213,6 +215,28 @@ const api = {
   /** 遗留布局迁移（2/3 段 → 4 段双哨兵）；计划 >50 条建议改为手动触发（03 §4.4） */
   migrateLayout: (assets: Asset[]): Promise<LayoutApplyResult> =>
     ipcRenderer.invoke(IPC.migrateLayout, assets),
+
+  // ── 2026-10-30 存量大类迁移（升级前被判成 model 的 CAD 图纸 → CAD/）────
+  //
+  // ⚠️ 为什么仍然要传 `assets`：判据读 `asset.files`（历史 `files[].kind`）与
+  // `asset.relFolder`，这些只有索引里有（main 拿不到 Dexie）。但**路径不由渲染层说了算**：
+  // main 侧会逐条校验 `folder` 在库根内，然后自己用 `settings.libraryDir` 重算目标路径
+  // （渲染层传不了 plan、也传不了任何目标目录）。
+  /**
+   * 只读探测：有多少资产「当前 model、包内只有 CAD 图纸」待搬进 `CAD/`。
+   * **零写入**（不建目录、不写快照）。返回**精简**结构（`count` / `scanned` / `names`），
+   * 不含任何绝对路径 —— `count === 0` = 无需迁移（渲染层静默跳过）。
+   */
+  detectKindMigration: (assets: Asset[]): Promise<KindMigrateDetectResult> =>
+    ipcRenderer.invoke(IPC.detectKindMigration, assets),
+  /**
+   * 执行迁移。main 按传入的资产清单**自己重算 plan**（不接受 plan / 目标路径；
+   * 执行上下文与快照目录只存在于 main 进程内）。
+   * 返回每项的**最终落盘值**；`kind` / `folder` / `relFolder` / `name` / `dedupeKey`
+   * 与 `files[].kind` 的写库由渲染层 `store.migrateLegacyKind` 完成。
+   */
+  applyKindMigration: (assets: Asset[]): Promise<KindMoveResult[]> =>
+    ipcRenderer.invoke(IPC.applyKindMigration, assets),
 
   // ── 2026-10-19 材质大类合并（docs/14 §2.3） ────────────────────
   /**

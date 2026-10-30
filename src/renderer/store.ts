@@ -4,6 +4,7 @@ import { db, type IndexBackup } from './db'
 import type {
   Asset,
   AssetFile,
+  AssetKind,
   BallRenderShape,
   ClassifyReview,
   ColorTag,
@@ -20,7 +21,7 @@ import type {
   ThumbStatus
 } from '../shared/types'
 import { baseNameOf, dedupeKeyOf, normalizeCategoryPair, zhimoIdFromSources, zhimoIdOf } from '../shared/naming'
-import { kindFolder, kindsOfFilter, type KindFilter } from '../shared/classify'
+import { kindFolder, kindsOfFilter, isLegacyCadExt, type KindFilter } from '../shared/classify'
 import { UNCLASSIFIED } from '../shared/taxonomy'
 import { classifyAssetName } from '../shared/classifyAsset'
 import {
@@ -1425,6 +1426,19 @@ interface VaultState {
   mergeMaterial: (opts?: { force?: boolean }) => Promise<MergeMaterialSummary>
   /** 只读刷新待合并数量/来源（设置页打开时用；不搬任何文件） */
   detectMaterialMerge: () => Promise<void>
+  /**
+   * 存量大类迁移（2026-10-30 P0）：把**升级前**被判成 `model` 的 CAD 图纸搬进 `CAD/`。
+   *
+   * 背景：`cad` 是 0.9.0 新增大类，0.8.x 时代 `dwg → model`，所以那批图纸落盘在
+   * `模型/…` 且 `files[].kind === 'model'`。升级不回溯 → 首页把图纸显示在「模型」里。
+   * 「强制重扫」救不了（它按**磁盘目录名**算 `relFolder`，只会把 kind 改成 cad、目录还在模型下）。
+   *
+   * 顺序（不可调换）：detect（静默出口）→ apply（main 自己重算 plan）→ 单事务 put → 缩略图 →
+   * notice。**清理 `files[].kind` 与 `asset.kind` 是本 action 的责任**（main 只搬盘）。
+   *
+   * 幂等：迁移后 `kind` 变 `cad` → 下次 `detect` 返回空 → 直接返回、不弹任何提示。
+   */
+  migrateLegacyKind: () => Promise<{ moved: number; failed: number; scanned: number }>
   /** 双击卡片 → 进入该资产的文件视图；id 不存在时静默忽略（防越界 / 陈旧 id） */
   openFolderView: (id: string) => void
   /** 退出文件视图，恢复原网格 / 列表 */
@@ -2581,6 +2595,23 @@ async function bootstrapMigrations(): Promise<void> {
     /* 只读探测失败不阻塞启动（迁移失败下次启动重试） */
   }
   await maybeAutoMigrate()
+  // 存量大类迁移（2026-10-30 P0）：升级前被判成 model 的 CAD 图纸 → CAD/。
+  // **放在最后**（材质合并 → 布局迁移 → 大类迁移）：前两步会改 folder/relFolder，
+  // 大类迁移要读最终的 folder 去搬盘，顺序反了会对着已失效的路径搬。
+  // 幂等 + 静默：没有待迁移项时 detect 返回空 → 立即返回，零副作用、不弹提示。
+  //
+  // ⚠️ 已知边界（不是"无条件自愈"，别照这句排查）：本函数唯一调用点是 `init()` 里的
+  // `void bootstrapMigrations()`，而 `init` 有 `initInFlight` 重入闸门 —— 若本次 `init`
+  // 因另一次 init 在跑而提前 return，**这次自动迁移不会执行**。后果只是「这一次不迁，
+  // 下次启动再迁」，不是数据损坏也不是永久卡死。这种情况用户可用
+  // 设置 → 库 → 「重算资产大类」手动补跑（同一个 action）。
+  // 刻意**不**加 setTimeout 延迟重试：那条链路上的执行顺序（救援 → 存在性修复 →
+  // 补齐队列）有严格约束，为一个低频兜底去动时序，收益不抵风险。
+  try {
+    await useVault.getState().migrateLegacyKind()
+  } catch {
+    /* 迁移失败不阻塞启动（下次启动重试；单项失败已在 action 内隔离） */
+  }
 }
 
 /**
@@ -3725,6 +3756,103 @@ export const useVault = create<VaultState>((set, get) => ({
       materialMergeCount: info.needMerge ? info.count : 0,
       materialMergeSources: info.sources
     })
+  },
+
+  /**
+   * 存量大类迁移（2026-10-30 P0）：升级前被判成 `model` 的 CAD 图纸 → `CAD/`。
+   *
+   * 判据在 main（`kindMigrate.ts` 文件头），这里只做编排。四步顺序不可调换：
+   * ① `detect` —— 空计划**直接返回**（静默：启动时每次都会跑，不能吵）；
+   * ② `apply` —— main 自己重算 plan 再搬，渲染层只触发；
+   * ③ 写库 —— 单个事务 `bulkPut`，**主键不变**（禁止 delete+put，会丢 tags/note/styles）；
+   * ④ 缩略图 —— 目录变了 `coverAbs` 就变，salt 失效，有 cover 的走 `regenThumbSweep`。
+   *
+   * ## 为什么必须同时清 `files[].kind`（这是最容易漏的一步）
+   *
+   * `files[].kind` 是**历史快照**（0.8.x 时代写入 `'model'`），main 只搬目录、拿不到 DB。
+   * 不清它有两个真实后果：
+   * - 文件视图里 `.dwg` 卡片的图标按 `f.kind` 渲染 → 仍显示成模型图标；
+   * - 下次 `primaryKind(asset.files)` 再算一遍仍是 `'model'` → 迁移变成「目录对了、语义没对」，
+   *   任何以 `primaryKind` 为准的逻辑（拖出主文件判定 `pickPrimaryFile` 等）都还按模型走。
+   *
+   * ## 缩略图
+   *
+   * 与 `assignCategory`（同函数上方）**同一套口径**：有 `cover` 才重生（没有封面的
+   * 置 `thumbStatus:'none'` 交给既有 `ensureMissingThumbs` 补齐队列，不在迁移里空转）。
+   */
+  async migrateLegacyKind() {
+    const { assets } = get()
+    const empty = { moved: 0, failed: 0, scanned: 0 }
+    if (assets.length === 0) return empty
+
+    // ── ① 只读探测（静默出口）。返回**精简**结构：只含 count / scanned / names ──
+    // 不含路径（绝对路径没必要发到渲染进程），所以这里只能看 `count`
+    const probe = await window.modvault
+      .detectKindMigration(assets)
+      .catch(() => null)
+    if (!probe || probe.count === 0) return empty
+
+    // ── ② 执行（main 内部重算 plan，不接受本层给的路径）──────────────────
+    const results = await window.modvault.applyKindMigration(assets).catch(() => null)
+    if (!results) return { moved: 0, failed: probe.count, scanned: probe.scanned }
+
+    // ── ③ 写库：只处理成功项（`error` 有值 = 磁盘没动，索引也不能动）────────
+    const byId = new Map(assets.map((a) => [a.id, a]))
+    const updated: Asset[] = []
+    let renamed = 0
+    for (const r of results) {
+      if (r.error !== undefined) continue
+      const asset = byId.get(r.assetId)
+      if (!asset) continue
+      if (r.renamed) renamed += 1
+      updated.push({
+        ...asset,
+        kind: 'cad',
+        name: r.name,
+        folder: r.folder,
+        relFolder: r.relFolder,
+        // 资产级 kind 变了 → `dedupeKey` 的前缀（`<kind>:<归一化名>`）必须跟着变，
+        // 否则这条资产永远匹配不到同名的 cad 资产（重复检测失效）。
+        // 用基础名算 key（`-2` 是 main 的 uniqueName 追加的，不是用户命名的）——与
+        // `assignCategory` / `mergeMaterial` 同一个 v0.4 口径。
+        dedupeKey: dedupeKeyOf(baseNameOf(r.name), 'cad'),
+        // ⚠️ 见上方注释：`files[].kind` 必须一起改，否则文件视图图标 + 后续 primaryKind 都还是 model
+        // 判据与 main 的 `shouldMigrateKind` **同一个来源**（`isLegacyCadExt`），两边不可能漂移
+        files: asset.files.map((f) =>
+          f.kind === 'model' && isLegacyCadExt(f.ext) ? { ...f, kind: 'cad' as AssetKind } : f
+        ),
+        // 没有封面的资产：目录已变，残留的 `thumbPath` 是对着旧路径的孤儿 →
+        // 显式置 `none` 交给既有 `ensureMissingThumbs` 补齐队列（有封面的走下面第 ④ 步重生）
+        ...(asset.cover ? {} : { thumbStatus: 'none' as ThumbStatus }),
+        updatedAt: Date.now()
+      })
+    }
+
+    if (updated.length > 0) {
+      await db.assets.bulkPut(updated)
+      const updById = new Map(updated.map((a) => [a.id, a]))
+      set((s) => ({ assets: s.assets.map((a) => updById.get(a.id) ?? a) }))
+    }
+
+    // ── ④ 缩略图重生（先生成新、再通配删旧；无 cover 的在上一步已置 none 交给补齐队列）──
+    for (const a of updated) {
+      if (!a.cover) continue
+      void regenThumbSweep(a.id, assetFileAbs(a.folder, a.cover))
+        .then((thumb) => {
+          const current = get().assets.find((x) => x.id === a.id)
+          if (!current) return
+          commitAsset(set, { ...current, thumbPath: thumb.thumbPath, thumbStatus: thumb.thumbStatus })
+        })
+        .catch(() => undefined)
+    }
+
+    // ── ⑤ 汇总（有失败也要说清；改名要提一句，否则用户找不到那个资产了）────
+    const failed = results.length - updated.length
+    let notice = `已把 ${updated.length} 个图纸资产归到「CAD图纸」`
+    if (renamed > 0) notice += `（${renamed} 个因目标重名自动改名）`
+    if (failed > 0) notice += `，${failed} 个失败（目录不存在或路径非法）`
+    set({ notice })
+    return { moved: updated.length, failed, scanned: probe.scanned }
   },
 
   /**

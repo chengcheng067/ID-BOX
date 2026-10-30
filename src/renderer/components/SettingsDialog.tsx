@@ -1099,6 +1099,15 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
    * `disabled` 也不依赖这个标志）。
    */
   const [mergeProbed, setMergeProbed] = useState(false)
+  // 2026-10-30 存量大类迁移（升级前 `dwg → model` 的图纸 → CAD/）：
+  // 启动会自动跑一次，这里是"手动再核对一次"的入口（结果只在本弹窗会话内记住）
+  const migrateLegacyKind = useVault((s) => s.migrateLegacyKind)
+  const [kindMigrateBusy, setKindMigrateBusy] = useState(false)
+  const [kindMigrateResult, setKindMigrateResult] = useState<{
+    moved: number
+    failed: number
+    scanned: number
+  } | null>(null)
   // 2026-10 库安全：重扫前索引备份（可恢复）
   const rescanBackupCount = useVault((s) => s.rescanBackupCount)
   const restoreLastRescanBackup = useVault((s) => s.restoreLastRescanBackup)
@@ -2426,6 +2435,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         />
       </SettingsCard>
 
+      {/* 结构迁移：布局 / 材质合并 / 大类迁移 —— 三者都是"按当前规则把存量搬到正确位置"，
+          同一心智单元放一张卡（与「存量重排」把两条重排收在一张卡同理）。 */}
       <SettingsCard title="结构迁移">
         <SettingsRow
           title="迁移旧版目录结构"
@@ -2488,6 +2499,46 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                   : `立即合并${materialMergeCount > 0 ? `（${materialMergeCount} 个）` : ''}`}
               </button>
             )
+          }
+        />
+        {/* 存量大类迁移（2026-10-30 P0）：升级前 `dwg → model`，那批图纸落在「模型」下。
+            启动时会自动跑一次（静默、幂等），这个按钮是给用户"主动核对一次"的入口。
+            文案口径与上面两条一致：先说清「会真实移动目录」，再给数字。 */}
+        <SettingsRow
+          title="重算资产大类"
+          desc={
+            kindMigrateBusy
+              ? '正在重新判定…请勿关闭应用或手动改动库目录'
+              : kindMigrateResult
+                ? kindMigrateResult.moved > 0 || kindMigrateResult.failed > 0
+                  ? `上次重算：搬移 ${kindMigrateResult.moved} 个${kindMigrateResult.failed > 0 ? `，失败 ${kindMigrateResult.failed} 个` : ''}`
+                  : `上次重算：${kindMigrateResult.scanned} 个资产都已在正确大类下`
+                : '把升级前被当成模型的 CAD 图纸搬进「CAD图纸」'
+          }
+          actions={
+            <button
+              className="btn !py-1 text-xs"
+              disabled={kindMigrateBusy || allAssets.length === 0 || materialMergeBusy}
+              onClick={async () => {
+                setKindMigrateResult(null)
+                setKindMigrateBusy(true)
+                try {
+                  const r = await migrateLegacyKind()
+                  setKindMigrateResult(r)
+                } finally {
+                  setKindMigrateBusy(false)
+                  flash()
+                }
+              }}
+              title={
+                materialMergeBusy
+                  ? '材质大类合并进行中，暂不能重算大类'
+                  : '按当前规则重新判定每个资产的大类：包内只有 CAD 图纸的模型会被搬进「CAD图纸」；含 skp/max 的混合包一律不动'
+              }
+            >
+              <IconRefresh />
+              {kindMigrateBusy ? '重算中…' : '重算大类'}
+            </button>
           }
         />
       </SettingsCard>

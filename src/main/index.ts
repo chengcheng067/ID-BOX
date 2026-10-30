@@ -72,6 +72,7 @@ import {
   validateBallImageBase64
 } from './ballThumb'
 import { applyLayoutMigration, moveAssetCategory, planLayoutMigration } from './layout'
+import { applyKindMigration, detectKindMigration, planKindMigration } from './kindMigrate'
 import {
   detectMaterialMerge,
   manifestDirOf,
@@ -1791,6 +1792,80 @@ ipcMain.handle(IPC.assignCategory, async (_e, payload: AssignCategoryPayload) =>
 ipcMain.handle(IPC.migrateLayout, async (_e, assets: Asset[]) => {
   const plan = planLayoutMigration(assets ?? [], settings.libraryDir)
   return applyLayoutMigration(plan.moves)
+})
+
+// ── 2026-10-30 存量大类迁移（P0：升级前被判成 model 的 CAD 图纸 → CAD/）──────
+//
+// 根因与判据见 `main/kindMigrate.ts` 文件头。这里只做两件事：拿到**可信的**资产清单
+// （main 侧 rescan 出来的，或渲染层传但逐条校验过在库内）+ 注入 userData 快照目录。
+
+/**
+ * 迁移执行时的资产清单来源。
+ *
+ * 两条路都要过同一道校验：`folder` resolve 后必须在库根内、`id`/`name` 非空。
+ * ⚠️ 为什么**不能**只信渲染层：`planKindMigration` 只读 `folder` / `relFolder` /
+ * `kind` / `files`，其中 `folder` 会被 `fs.rename` 直接使用 —— 一条伪造
+ * `folder: 'C:\\Windows\\System32'` 的记录就等于任意目录移动。所以逐条 `isWithinRoot`。
+ */
+function trustedAssetsOf(raw: unknown): Asset[] {
+  if (!Array.isArray(raw)) return []
+  const lib = path.resolve(settings.libraryDir)
+  const out: Asset[] = []
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue
+    const a = r as Partial<Asset>
+    if (typeof a.id !== 'string' || !a.id) continue
+    if (typeof a.name !== 'string' || !a.name) continue
+    if (typeof a.folder !== 'string' || !a.folder) continue
+    if (!isWithinRoot(lib, path.resolve(a.folder), path.sep)) continue
+    if (typeof a.kind !== 'string') continue
+    out.push({
+      ...(a as Asset),
+      // `files` 只保留判据要用的两个字段形状（`ext` / `kind`）——多余字段不参与决策，
+      // 但保留原样更省事且不会误判；这里只保证它是数组。
+      files: Array.isArray(a.files) ? a.files : []
+    })
+  }
+  return out
+}
+
+/**
+ * 只读探测：待迁移的大类项。零写入（不写快照、不建目录）。
+ *
+ * 返回**精简结构** `KindMigrateDetectResult`（`count` / `scanned` / `names`），
+ * 不回 `items` —— 绝对路径没必要发到渲染进程（详见 `shared/types.ts` 该类型注释）。
+ */
+ipcMain.handle(IPC.detectKindMigration, async (_e, raw?: unknown) => {
+  return detectKindMigration(trustedAssetsOf(raw), settings.libraryDir)
+})
+
+/**
+ * 执行迁移。**渲染层只传资产清单触发**：main 自己按当前的 `settings.libraryDir`
+ * 重算 plan，**不接受 plan 或任何目标路径**。
+ *
+ * 执行上下文（库根 / 快照目录 / logger）在这里构造、只留在 main 进程内
+ * —— `KindMovePlan` 本身是纯数据，`onWarn` 这类函数永不过 IPC。
+ *
+ * 快照落在 `<userData>/kind-migrate-<ISO>.json`（写失败不阻断，只 `logWarn`；
+ * 只保留最近 5 份）。
+ */
+ipcMain.handle(IPC.applyKindMigration, async (_e, raw?: unknown) => {
+  const assets = trustedAssetsOf(raw)
+  const plan = planKindMigration(assets, settings.libraryDir)
+  if (plan.items.length === 0) return []
+  logInfo('kind-migrate:start', { count: plan.items.length, scanned: plan.scanned })
+  const results = await applyKindMigration(plan, {
+    libraryDir: settings.libraryDir,
+    snapshotDir: app.getPath('userData'),
+    onWarn: (m, ctx) => logWarn(m, ctx)
+  })
+  const failed = results.filter((r) => r.error !== undefined).length
+  logInfo('kind-migrate:done', {
+    moved: results.length - failed,
+    failed,
+    scanned: plan.scanned
+  })
+  return results
 })
 
 // ── 2026-10-19 材质大类合并（docs/14 §2.3，T-03） ──────────────────────

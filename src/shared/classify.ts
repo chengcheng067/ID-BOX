@@ -325,6 +325,25 @@ export function kindOfExt(ext: string): AssetKind {
 }
 
 /**
+ * 「CAD 图纸」扩展名 —— **历史语义对齐用的独立常量，刻意不与 `EXT_KIND` 耦合**。
+ *
+ * 用途只有一个：识别 **0.8.x 时代导入**的图纸资产（那时 `EXT_KIND` 把 `dwg` 映射成
+ * `model`，所以那批记录的 `files[].kind` 停在 `'model'`）。存量大类迁移
+ * （`main/kindMigrate.ts` + `store.migrateLegacyKind`）用它判断"这个包里有没有图纸"。
+ *
+ * ⛔ **不要**改成 `Object.entries(EXT_KIND).filter(([, k]) => k === 'cad')`：
+ * 那会让判据随**当前**词表漂移，而这份常量的职责恰恰是记住**过去**的语义。
+ * 将来 `EXT_KIND` 若再拆出别的 CAD 扩展名，正解是往这里手工加一项 + 补单测，
+ * 而不是让两份语义自动耦合（耦合后某天改 `EXT_KIND` 会静默改变迁移范围）。
+ */
+export const LEGACY_CAD_EXTS: ReadonlySet<string> = new Set(['dwg', 'dxf'])
+
+/** 是否「存量 CAD 扩展名」（小写比较；落库的 `ext` 已是小写，这里兜一层防手写数据） */
+export function isLegacyCadExt(ext: string | undefined): boolean {
+  return typeof ext === 'string' && LEGACY_CAD_EXTS.has(ext.toLowerCase())
+}
+
+/**
  * 从文件列表推断资产主大类。
  *
  * 优先级（2026-10 材质包裁定后）：model > **PBR 材质包（material）** >

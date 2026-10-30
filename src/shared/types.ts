@@ -847,6 +847,87 @@ export interface LayoutApplyResult {
   failed: Array<{ id: string; reason: string }>
 }
 
+// ── 存量「大类迁移」：升级前被判成 model 的 CAD 图纸搬进 CAD/（P0，0.9.0 补） ─────
+//
+// 背景：`cad` 是 0.9.0 新增大类，0.8.x 时代 `EXT_KIND` 把 `dwg → model`，所以那批图纸
+// 落盘在 `模型/…`、`files[].kind === 'model'`。升级不回溯 → 首页把图纸显示在「模型」里。
+// 实现与判据见 `main/kindMigrate.ts` 文件头。
+
+/**
+ * 一项待迁移的资产（**计划产物**，零 IO 可预演）。
+ *
+ * 字段与 `MergeMaterialMove` 同构的只有必要部分：这里不需要 `prevRelFolder` /
+ * `assetId: null` 那套"回滚凭据"（迁移方向单一且可逆——把目录搬回 `模型/` 即可）。
+ */
+export interface KindMoveItem {
+  assetId: string
+  name: string
+  /** 迁移前 relFolder（如 `模型/装修图/平面图/xxx`） */
+  fromRelFolder: string
+  /** 迁移后 relFolder（如 `CAD/装修图/平面图/xxx`，首段来自 `kindFolder('cad')`） */
+  toRelFolder: string
+  fromKind: AssetKind
+  toKind: AssetKind
+  /** 当前绝对路径（= `Asset.folder`） */
+  folder: string
+}
+
+/**
+ * 迁移计划（**纯数据，必须能过 structured clone**）。
+ *
+ * 这张形状是 `library:detectKindMigration` 的 IPC 返回值，所以它**只能含可序列化的值**。
+ *
+ * ⛔ **绝对不要往这里加函数**（`onWarn` 之类的回调）：Electron 的 `ipcMain.handle`
+ * 返回值走 structured clone，函数过不去 —— 轻则字段被静默丢弃（类型在骗人），
+ * 重则整个调用抛 `An object could not be cloned`。后者更糟：渲染层的
+ * `.catch(() => null)` 会把错误吞掉，功能表现为「永远已是最新」，**完全不生效**。
+ * 执行上下文（库根 / 快照目录 / 告警回调）因此拆到 `main/kindMigrate.ts` 的
+ * `KindMigrateContext`，只由 main 内部持有、永不过 IPC。
+ * `tests/kindMigrate.test.ts` 有一条「plan 可 JSON 往返」的回归守卫钉住这点。
+ */
+export interface KindMovePlan {
+  items: KindMoveItem[]
+  /** 本模块看过的资产数（= 入参长度），用于区分"没待迁移项"与"库里没数据" */
+  scanned: number
+}
+
+/**
+ * `library:detectKindMigration` 的**精简返回值**（渲染层只需要"有没有"）。
+ *
+ * 为什么不直接回 `KindMovePlan`：渲染层判断只需要 `count > 0`，
+ * 把 `items` 里的 `folder` / `toRelFolder` 绝对路径发到渲染进程是**无必要的信息暴露**
+ * （渲染层拿到也只会去 `items.length`）。`names` 只给资产名（不含路径），
+ * 用于排查时在日志/设置页显示"是哪几条"。
+ */
+export interface KindMigrateDetectResult {
+  /** 待迁移条数（0 = 无需迁移，渲染层静默跳过） */
+  count: number
+  /** 看过的资产总数 */
+  scanned: number
+  /** 待迁移的资产名（**不含路径**；仅用于排查展示，参与决策的只有 count） */
+  names: string[]
+}
+
+/**
+ * 单项迁移结果。`folder` / `name` / `relFolder` 是**最终落盘值**
+ * （目标重名被 `uniqueName` 追加 `-2` 后与计划值不同），渲染层写索引必须用它。
+ *
+ * 失败项：`moved === false` 且 `error` 有值，`folder` / `relFolder` 保持迁移前的值
+ * （渲染层据此跳过该条，磁盘与索引都不会被半改）。
+ */
+export interface KindMoveResult {
+  assetId: string
+  folder: string
+  name: string
+  relFolder: string
+  /** true = 实际执行了移动；false = 已是目标位置（self-target no-op）或失败 */
+  moved: boolean
+  /** true = 目标已有同名资产，按 `uniqueName` 追加了序号 */
+  renamed: boolean
+  /** 失败原因（有值即失败；渲染层不写这条的 DB） */
+  error?: string
+}
+
 // ── 0.6.0：批量重命名（docs/22 §3.4，命名模板 + 预览 + 失败回滚） ─────────────
 //
 // 语义（用户 2026-10 拍板，第一版）：**只改资产文件夹名，不改包里的文件名**。

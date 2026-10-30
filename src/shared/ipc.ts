@@ -81,6 +81,23 @@ export const IPC = {
   assignCategory: 'asset:assignCategory',
   /** 遗留布局迁移（2/3 段 → 4 段双哨兵），DB 驱动 */
   migrateLayout: 'library:migrateLayout',
+  // ── 2026-10-30 存量大类迁移（P0：升级前被判成 model 的 CAD 图纸搬进 CAD/）──
+  /**
+   * **只读**探测：库里有几个资产「当前是 model、包内只有 CAD 图纸」待搬进 `CAD/`。
+   *
+   * 判据（`main/kindMigrate.ts` 文件头）：`kind==='model' && hasCad && !hasModel`
+   * —— 含 `.skp`+`.dwg` 的混合包**不迁**（模型优先的既有裁定）。
+   * 幂等：迁移完成后 `kind` 变 `cad` → 本探测返回空。零写入（不建目录、不写快照）。
+   */
+  detectKindMigration: 'library:detectKindMigration',
+  /**
+   * 执行迁移。**渲染层只传空对象触发**，不接受任何路径 ——
+   * main 自己按 `settings.libraryDir` + 库内资产重算 plan 再执行
+   * （防渲染层被注入后传任意路径；与 `mergeMaterial` 的白名单校验同理但更严）。
+   *
+   * 返回 `KindMoveResult[]`（最终落盘值），DB 更新由渲染层做。
+   */
+  applyKindMigration: 'library:applyKindMigration',
   // ── 2026-10-19 材质大类合并（docs/14 §2.3，T-03） ─────────────────
   /** 只读探测：库里是否还有 `贴图/` / `材质预设/` 待合并（启动探测用，零写入） */
   detectMaterialMerge: 'library:detectMaterialMerge',
