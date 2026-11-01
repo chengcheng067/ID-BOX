@@ -123,6 +123,31 @@ check('main: 外链失败日志 app:open-external-failed', main, 'app:open-exter
 // ③ 写盘串行化：tmp 固定名仍是原语义（改名才是错），这里认"串行队列真的被 saveSettings 用上"
 check('main: 设置写盘串行队列 enqueueSettingsWrite', main, 'enqueueSettingsWrite')
 
+// ── 0.9.1 / 0.9.2 ──
+// 这批全是"字符串字面量型"标记（IPC 通道名、日志事件名、UI 文案、快照前缀），
+// 刻意避开函数名/类名 —— 那些会被压缩器 mangle，拿它们当标记必然假红/假绿。
+// ① 存量 CAD 迁移（0.9.1）：两个通道名 + 快照前缀，三者齐备才算真接上
+check('main: 存量大类迁移 ipc library:detectKindMigration', main, 'library:detectKindMigration')
+check('main: 存量大类迁移 ipc library:applyKindMigration', main, 'library:applyKindMigration')
+check('main: 大类迁移快照前缀 kind-migrate-', main, 'kind-migrate-')
+// ② HDR 一级词表（0.9.1）：词条是照抄站方的固定中文字面量
+check('renderer: HDR 一级词表 天空HDR', rendererAll, '天空HDR')
+// ③ 破坏性 IPC 守卫（0.9.2）：拒绝话术是用户可见文案，必然保留
+check('main: 破坏性 IPC 守卫日志 ipc:guard', main, 'ipc:guard')
+check('main: openPath 拒绝话术', main, '拒绝访问：该路径不在素材库或日志目录内')
+// ④ 分类移动事务（0.9.2）：两个补偿失败事件名
+check('renderer: 分类移动补偿失败 assign:rollback-move-failed', rendererAll, 'assign:rollback-move-failed')
+check('renderer: 分类移动回滚写库失败 assign:rollback-write-failed', rendererAll, 'assign:rollback-write-failed')
+// ⑤ 错误边界（0.9.2）：上报事件名 + 无边框窗口的逃生口语案
+check('renderer: 错误边界上报 react:error-boundary', rendererAll, 'react:error-boundary')
+check('renderer: 错误边界重试上限话术', rendererAll, '多次重试仍失败')
+// ⑥ 导入取消（0.9.2）：通道名 + 队列条文案 + 逐条取消文案
+check('main: 导入取消 ipc import:cancel', main, 'import:cancel')
+check('renderer: 导入队列「正在导入」条', rendererAll, '正在导入')
+check('renderer: 导入逐条取消文案', rendererAll, '已取消：这一项还没开始处理')
+// ⑦ 目录移动判据（0.9.2）：跨卷目标已存在时的显式拒绝话术
+check('main: 跨卷移动拒绝话术', main, '跨卷移动失败')
+
 const qr = find(/contact-qr.*\.png$/)
 console.log('contact-qr in bundle:', qr.join(',') || '(none)')
 if (qr.length) {
