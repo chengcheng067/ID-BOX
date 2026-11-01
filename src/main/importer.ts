@@ -115,6 +115,17 @@ export interface ImportDeps {
    * 与 `import:conflict:trash-failed`（旧版本没能进回收站）。
    */
   warn?: (event: string, context?: unknown) => void
+  /**
+   * 批次取消探针（2026-10 导入取消）：返回 true 表示「不要再开始新条目」。
+   *
+   * ⚠️ 语义铁律：**已在处理的那几条不受影响**。取消只在 worker 领取下一个条目之前
+   * 生效（见 `mapWithConcurrency`），中途绝不 abort —— 一次 `importOne` 内部是
+   * 「staging 解压 → mkdir 分类目录 → 逐个 copyFile」，拦腰打断会在库里留下
+   * 半成品目录（`mkdir` 占位目录 + 拷了一半的文件），比"用户多点一次导入"糟糕得多。
+   *
+   * 未注入 = 不取消（既有单测与老调用方全是这个行为，零影响）。
+   */
+  shouldStop?: () => boolean
   emit: (ev: ImportEvent) => void
 }
 
@@ -214,18 +225,37 @@ export function clearActiveStaging(): void {
  * **单个任务抛错不会中断整批**：worker 内 try/catch，捕获后交给 `onError`
  * （未传则静默），然后继续取下一个 item。这样「批量单包失败不阻断其余」
  * （PRD US-1 / G1）由工具函数兜底，而不只靠调用方自觉。
+ *
+ * ## `shouldStop`（2026-10 导入取消）
+ *
+ * 第 5 个参数是可选探针，返回 true 时 worker **直接退出**、不再领取新条目。
+ *
+ * **关键：检查点在 `cursor++` 之前。** 于是：
+ * - 还没领到条目的 worker → 一个都不碰（这些才是"被取消"的）；
+ * - 已经领到条目的 worker → 手上那条会被 `await fn(...)` 完整执行完（这正是
+ *   「不中途 abort 复制」的落点：没有 AbortSignal，也没有 race，`fn` 里跑一半的
+ *   copyFile 序列一定会走完）；
+ * - Promise **正常 resolve**，不 reject、不抛 `AbortError`：调用方拿到的仍然是一个
+ *   已结束的批次，只是条目少了几个（调用方按 `ImportEvent` 流判断真实结果）。
+ *
+ * 只有 4 个参数的调用方行为逐字节不变（向后兼容）。
  */
 export async function mapWithConcurrency<T>(
   items: T[],
   limit: number,
   fn: (item: T, index: number) => Promise<void>,
-  onError?: (err: unknown, item: T, index: number) => void
+  onError?: (err: unknown, item: T, index: number) => void,
+  shouldStop?: () => boolean
 ): Promise<void> {
   if (items.length === 0) return
   const n = Math.max(1, Math.min(Math.floor(limit) || 1, items.length))
   let cursor = 0
   const workers = Array.from({ length: n }, async () => {
     for (;;) {
+      // 取消检查必须在 `cursor++` **之前**：这一刻还没领活，所以"不开始"是安全的。
+      // 反过来写成"领完再检查要不要做"，就会白占一个条目（那条既没被处理、
+      // 也不会被 importPaths 报成 cancelled，用户会看到它凭空消失）。
+      if (shouldStop?.() === true) return
       const i = cursor++
       if (i >= items.length) return
       const item = items[i]
@@ -354,12 +384,28 @@ export async function importPaths(paths: string[], deps: ImportDeps): Promise<As
     settled: 0
   }
 
+  /**
+   * 「已经进入处理流程」的条目（2026-10 导入取消）。
+   *
+   * 只在 worker 真正开工时 add（`try` 里的第一句，早于 `importOne`）。
+   * 它和 `accepted` 的差集 = **一次都没碰过**的条目 —— 那才是既没落库、也没报错、
+   * 也没被跳过的那批，唯独它们该被报成 `cancelled`。
+   *
+   * ⚠️ 为什么不能"看到 shouldStop 就把剩下一律报 cancelled"：条目可能已经在
+   * worker 里跑过并走了 `skipped` / `error` 分支（那两条**自己发过事件**）。
+   * 用差集才不会把「跳过 / 失败」误报成「取消」——那会把用户的注意力引到
+   * 错误的地方（"为什么取消了 3 个？" 其实它们是重复包）。
+   */
+  const processed = new Set<string>()
+
   await mapWithConcurrency(
     accepted,
     deps.concurrency || DEFAULT_CONCURRENCY,
     async (p) => {
       // 双保险：mapWithConcurrency 已兜底，这里再包一层以保留原有错误语义
       try {
+        // 先登记再处理：这一句之后，无论成功 / 跳过 / 失败，本条都不再属于"被取消"
+        processed.add(p)
         const asset = await importOne(p, deps, batch)
         if (asset) assets.push(asset)
       } catch (err) {
@@ -369,8 +415,28 @@ export async function importPaths(paths: string[], deps: ImportDeps): Promise<As
         batch.settled += 1
       }
     },
-    (err, p) => emitFailure(deps, p, err)
+    (err, p) => emitFailure(deps, p, err),
+    // 取消探针：只决定"下一个条目要不要开始"，在途的那几条照常跑完
+    deps.shouldStop
   )
+
+  // ── 收尾：把"一次都没开始"的条目补上终态（2026-10 导入取消）──────────
+  // 顺序在 mapWithConcurrency 之后：此刻所有 worker 都已退出，`processed` 不会再变。
+  // 未处于取消状态的批次，差集恒为空，这个循环一次都不跑（零开销、零行为变化）。
+  const notStarted = accepted.filter((p) => !processed.has(p))
+  if (notStarted.length > 0) {
+    for (const p of notStarted) {
+      deps.emit({
+        item: p,
+        itemName: path.basename(p),
+        status: 'cancelled',
+        message: '已取消：这一项还没开始处理'
+      })
+    }
+    // 留一条汇总日志：只报条数不报路径（200 个包的路径能把日志刷爆，
+    // 而排查"取消有没有生效"只需要知道还剩几条没动手）。
+    deps.warn?.('import:cancel', { remaining: notStarted.length })
+  }
   return assets
 }
 

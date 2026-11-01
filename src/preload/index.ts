@@ -52,6 +52,10 @@ import type {
 /**
  * 渲染进程可用的全部 API（T05 照此签名写渲染层）。
  * 约定：新增通道必须同时改 `shared/ipc.ts` + `preload/index.ts` + `main/index.ts`，三处缺一不可。
+ *
+ * `window.modvault` 的接口声明**不需要另外维护**：文件末尾 `export type ModVaultApi =
+ * typeof api`，而 `renderer/env.d.ts` 就是 `interface Window { modvault: ModVaultApi }`。
+ * 在这里加的方法自动进类型，少写一处就少一处漂移。
  */
 const api = {
   // ── 导入 ────────────────────────────────────────────────────
@@ -371,6 +375,21 @@ const api = {
   /** 关闭窗口（send） */
   winClose: (): void => {
     ipcRenderer.send(IPC.winClose)
+  },
+  /**
+   * 取消**当前进行中的导入批次**（send；fire-and-forget）。
+   *
+   * 语义（务必别按直觉理解）：**只停止还没开始处理的条目**，正在复制的那几条会
+   * 正常做完并照常落库。绝不中途 abort 复制 —— 那会在库里留下「mkdir 占位目录 +
+   * 拷了一半的文件」的半成品，比"用户多点一次导入"糟糕得多。
+   *
+   * 取消后，被叫停的条目会以 `status='cancelled'` 的 `importEvent` 推回来
+   * （终态、中性色，与 `skipped` 同档：不是失败，素材没坏）。
+   *
+   * 返回 `void` 不是疏忽：`send` 没有回执。真实进度看 `onImportEvent`。
+   */
+  cancelImport: (): void => {
+    ipcRenderer.send(IPC.cancelImport)
   },
   /** 订阅最大化状态变化（□ / ❐ 图标切换）；返回退订函数 */
   onMaximizeChange: (cb: (maximized: boolean) => void): (() => void) => {

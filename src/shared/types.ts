@@ -194,8 +194,19 @@ export type CoverSource =
  * 加这个值**不会触发编译报错**，三处必须手工同步：
  * `components/ImportQueue.tsx`（STATUS_CLS / 图标 / 文案）、
  * `logic/importText.ts`（`autoDismissDelayMs`）、`store.ts`（`settled` 判定）。
+ *
+ * `'cancelled'`（2026-10 导入取消）：用户点了「取消」后，**还没开始处理**的条目落这个终态。
+ *
+ * 三条口径，改代码前先读完（改了会坏）：
+ * ① 它是**终态**，和 `done` / `error` 同级：可以倒计时消失、可以点 ✕ 手动关掉；
+ * ② 它**不是失败**：素材没有出问题、磁盘上也没有残留（连 staging 都没建过），
+ *    所以配色用中性灰（同 `skipped`），**绝不能用 `error` 的红**——红色会让用户
+ *    以为自己的包有问题，从而去重新下载素材；
+ * ③ 它**只表示"这一项我没动手"**。正在复制的那几条会正常做完并照常落 `done`
+ *    （见 `main/importer.ts#mapWithConcurrency`：取消只在领取新条目之前生效），
+ *    所以一个被取消的批次里"cancelled + done"同时出现是**正确现象**，不是竞态。
  */
-export type ImportStatus = 'extracting' | 'organizing' | 'done' | 'error' | 'skipped'
+export type ImportStatus = 'extracting' | 'organizing' | 'done' | 'error' | 'skipped' | 'cancelled'
 
 // ── 2026-10-19 用户自接模型 API 辅助分类（docs/15 §7） ────────────────────
 //

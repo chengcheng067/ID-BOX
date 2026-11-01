@@ -134,6 +134,21 @@ export const IPC = {
   winMaximizedEvent: 'win:maximizedChanged',
   /** 关闭窗口（send） */
   winClose: 'win:close',
+  // ── 2026-10 导入批次取消（用户拖错包时的「叫停」） ────────────────
+  /**
+   * 请求取消**当前进行中的导入批次**（send；fire-and-forget，不需要回执）。
+   *
+   * 为什么是 `send` 而不是 `invoke`：这个通道没有返回值可等。
+   * `invoke` 会向渲染层承诺一个 Promise 兑现，而主进程能做的最多就是"把取消
+   * 代次计数器 +1"——那是同步的一行代码，包成 Promise 只会在渲染层多一个
+   * 没人 await 的悬空 promise（还容易被误读成"取消已完成"，其实真正生效要等
+   * 在途的那几条复制跑完）。取消的真实结果由 `importEvent` 流里的 `cancelled`
+   * 条目和仍在推进的 `done` 条目自然表达，不需要额外回执。
+   *
+   * 语义见 `main/index.ts#importCancelGen`：**只停止还没开始的条目**，
+   * 正在复制的那几条会正常做完（中途 abort 会在库里留下半成品目录）。
+   */
+  cancelImport: 'import:cancel',
   /** package.json 版本号（设置·关于 tab 版本胶囊 / 侧栏小字） */
   getAppVersion: 'app:getVersion',
   // ── 2026-10 自动检查更新（GitHub Releases） ──────────────────────

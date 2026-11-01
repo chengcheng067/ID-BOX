@@ -2,11 +2,16 @@
  * 导入队列的**纯逻辑**：
  * ① 失败文案（P0-3 空间不足的「可用 X GB / 需要 Y GB」）；
  * ② 终态条目的**自动消失时机**（2026-10 用户反馈：条目完成后不消失，连导多个包堆一屏）；
- * ③ 条目明细文案 + 状态配色（docs/27 T-08：`skipped` 与「已覆盖 / 已保留为」两种重复处置结果）。
+ * ③ 条目明细文案 + 状态配色（docs/27 T-08：`skipped` 与「已覆盖 / 已保留为」两种重复处置结果；
+ *    2026-10 导入取消：`cancelled` 作为**中性终态**，与 `skipped` 同档）。
  *
  * ⚠️ `ImportStatus` 是字符串字面量联合，**加值时不会触发编译报错**（全仓没有
  * `Record<ImportStatus, _>` / 穷举 switch）。所以状态 → 配色 / 倒计时 / 文案这三处
  * 必须集中在本文件，由 `tests/importConflictUi.test.ts` 钉住，组件里不再各写一份。
+ * 加值时的自查清单（2026-10 加 `cancelled` 时逐条走过）：
+ * `main/index.ts#emitImportEvent`（watcher inflight 释放）、本文件三处、
+ * `components/ImportQueue.tsx` 的图标三元链、`store.ts`（靠 `isTerminalStatus` 判 `settled`，
+ * 只要本文件改对就自动跟上）。
  */
 import { humanGB } from '../../shared/space'
 import type { ImportEvent, ImportStatus } from '../../shared/types'
@@ -32,22 +37,29 @@ export const IMPORT_ERROR_DISMISS_MS = 12000
 /**
  * 该状态的条目应在「进入终态后」多久自动消失；`null` = **永不自动消失**。
  *
- * 只有 done / error / skipped 有倒计时：pending / extracting / organizing 是进行中，
- * 提前消失会让用户以为任务丢了（队列此刻正是唯一的进度反馈）。
+ * 只有 done / error / skipped / cancelled 有倒计时：pending / extracting / organizing
+ * 是进行中，提前消失会让用户以为任务丢了（队列此刻正是唯一的进度反馈）。
  *
  * `skipped`（docs/27）与 `done` 同为「本条目已经处理完毕、不需要用户再看」，
  * 停留 6 秒即可；**不给它 error 的 12 秒**——跳过不是失败，留太久反而像出了问题。
+ *
+ * `cancelled`（2026-10 导入取消）与 `skipped` 同档、同 6 秒：它同样是「这条我没动手」，
+ * 素材没坏、盘上没残留，用户不需要读任何东西就知道发生了什么。给 12 秒会把它
+ * 暗示成故障，给"永不消失"则会让一次误拖的 200 个包在屏幕下方堆成墙。
  */
 export function autoDismissDelayMs(status: ImportQueueStatus): number | null {
   if (status === 'done') return IMPORT_DONE_DISMISS_MS
   if (status === 'error') return IMPORT_ERROR_DISMISS_MS
   if (status === 'skipped') return IMPORT_DONE_DISMISS_MS
+  if (status === 'cancelled') return IMPORT_DONE_DISMISS_MS
   return null
 }
 
-/** 终态（不会再变、可以倒计时消失、可以手动 ✕）：done / error / skipped */
+/** 终态（不会再变、可以倒计时消失、可以手动 ✕）：done / error / skipped / cancelled */
 export function isTerminalStatus(status: ImportQueueStatus): boolean {
-  return status === 'done' || status === 'error' || status === 'skipped'
+  return (
+    status === 'done' || status === 'error' || status === 'skipped' || status === 'cancelled'
+  )
 }
 
 /**
@@ -55,6 +67,9 @@ export function isTerminalStatus(status: ImportQueueStatus): boolean {
  *
  * `skipped` 用**中性灰**（`text-muted`）：跳过是「这次不导入」，不是告警，
  * 写成 `text-danger` 会让用户以为素材坏了或导入失败了（docs/27 T-08 明确要求）。
+ *
+ * `cancelled`（2026-10 导入取消）**同样中性灰**：是用户自己按的取消，素材没出问题，
+ * 用红色等于替用户报告一个不存在的故障 —— 用户会以为包坏了、跑去重下。
  */
 export function statusClass(status: ImportQueueStatus): string {
   switch (status) {
@@ -63,6 +78,8 @@ export function statusClass(status: ImportQueueStatus): string {
     case 'error':
       return 'text-danger'
     case 'skipped':
+      return 'text-muted'
+    case 'cancelled':
       return 'text-muted'
     case 'extracting':
     case 'organizing':
@@ -141,10 +158,16 @@ export interface ImportItemTextInput {
  * 顺序即优先级：
  * - `error`：空间不足的可行动数字 > 主进程给的 message > 「导入失败」；
  * - `skipped`：主进程的 message（`已跳过重复素材（原文件保留在原位）`）> 兜底同义文案；
+ * - `cancelled`：主进程的 message（`已取消：这一项还没开始处理`）> 「已取消」；
  * - `done` + message：**message 优先**（见下）；
  * - `done` + 重复处置：`已覆盖到「旧名」` / `已保留为「新名」`（docs/27 §6.1 的文案）；
  * - `done` 普通：沿用「已归档到「大类」」，逐字符不变；
  * - 其余（pending / extracting / organizing）：message > 「处理中…」。
+ *
+ * ⚠️ `cancelled` 必须**排在 `done` 之前**拿 message、并且有自己的兜底句：
+ * 它跟 `done` 不同，`done` 无 message 时能靠 `asset` 拼「已归档到…」，而
+ * `cancelled` 的条目**根本没有 asset**（一次都没开始），落到 `done` 分支就会印出
+ * 「已归档」——那是在骗用户已导入，是最坏的一种错误。
  *
  * ⚠️ 为什么 `done` 要先看 `message`：main 侧 `doneMessage()`（importer.ts:423）只在
  * **覆盖档的两条退化路径**上给 message，且都是用户必须知道的事实：
@@ -161,6 +184,11 @@ export function importItemDetail(it: ImportItemTextInput): string {
   }
   if (it.status === 'skipped') {
     return it.message?.trim() || '已跳过重复素材（原文件保留在原位）'
+  }
+  if (it.status === 'cancelled') {
+    // message 优先（main 侧会带「已取消：这一项还没开始处理」）；
+    // 兜底只说「已取消」——不解释、不甩技术细节，用户按的按钮自己清楚。
+    return it.message?.trim() || '已取消'
   }
   if (it.status === 'done') {
     const override = it.message?.trim()

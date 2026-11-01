@@ -127,8 +127,11 @@ export function ImportQueue() {
                   <IconCheck />
                 ) : it.status === 'error' ? (
                   <IconAlert />
-                ) : it.status === 'skipped' ? (
-                  // 跳过：中性灰的 ✕（"这次没进来"），不是告警三角
+                ) : it.status === 'skipped' || it.status === 'cancelled' ? (
+                  // 跳过 / 已取消：中性灰的 ✕（"这次没进来"），不是告警三角。
+                  // `cancelled` 必须并进这一支：它是**终态**，落到下面的 default 分支
+                  // 会得到一个永远转圈的下载图标 —— 对一个已经停下的条目说"还在下"，
+                  // 比什么都不显示更糟。
                   <IconClose />
                 ) : (
                   <span className="inline-block animate-pulse">

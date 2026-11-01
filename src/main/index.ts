@@ -320,8 +320,17 @@ async function disposeArchiveWithStrategy(src: string, mode: Settings['archiveDi
 
 function emitImportEvent(ev: ImportEvent): void {
   win?.webContents.send(IPC.importEvent, ev)
-  // `skipped` 也算「该源文件已有结论」：watcher 不能把它的 inflight 占位一直挂着
-  if (ev.status === 'done' || ev.status === 'error' || ev.status === 'skipped') {
+  // `skipped` 也算「该源文件已有结论」：watcher 不能把它的 inflight 占位一直挂着。
+  // `cancelled` 同理（2026-10 导入取消）：这一批放弃了这个文件，但**本批次对它已有结论**。
+  // 不释放的话，`ArchiveWatcher.inflight` 会随着被取消的条目只增不减 —— 那是个
+  // 永远不会被清空的 Set（虽然 'add' 只对新增文件触发、不会立刻造成漏导，
+  // 但拖 200 个包点取消就会留下 200 个僵尸路径，下同名的重新下载会被误挡）。
+  if (
+    ev.status === 'done' ||
+    ev.status === 'error' ||
+    ev.status === 'skipped' ||
+    ev.status === 'cancelled'
+  ) {
     watcher.markDone(ev.item)
   }
 }
@@ -459,12 +468,39 @@ function clearPendingAsks(reason: string): void {
 }
 
 /**
+ * 导入取消的「代次」计数器。
+ *
+ * 每次用户请求取消 +1；批次在开始时快照自己的代次，`shouldStop` 判「代次变了没」。
+ * 这样：① 取消能命中所有**当时在跑**的批次（含 watcher 并发批次）；
+ *       ② 取消之后才开始的批次快照到新代次 → 天然不受影响，不需要任何"复位"。
+ *
+ * ## 为什么必须是计数器，不能是一个"批次开始时复位"的布尔开关
+ *
+ * 监控目录的自动导入走 `runImport([p], { index: [] })`（见 `restartWatcher`），
+ * **不经过 `batchChain`**，会和 UI 批次**并发**跑。若用布尔量并在批次开始时复位：
+ * 用户在 UI 上点了取消 → 布尔变 true，UI 批次停下；紧接着监控目录来了个新文件，
+ * 它一进 `runImport` 就把布尔复位成 false —— 于是**还在收尾的 UI 批次被"复活"**，
+ * 继续往下导，用户以为已经停住了。
+ *
+ * 代次计数器没有这个缺口：取消是"把水位抬高"，每个批次只认自己出生时的水位。
+ * 复位这件事根本不存在，也就不可能有人误复位别人。
+ *
+ * ⚠️ 也不要在任何地方**把计数器赋回 0**（那等于复位）：那会把当前及之前所有批次的
+ * 取消状态一次性抹掉，与上面那个 bug 是同一件事的另一种写法。
+ * `tests/importCancel.test.ts` ⑱ 用正则钉住了这一点。
+ */
+let importCancelGen = 0
+
+/**
  * 执行一个导入批次。
  *
  * `ctx` = 渲染层算好的判重快照（docs/27）：不传 → 完全不判重、不询问，
  * 行为与 0.6.9 逐字节等价（D21）。主进程**不自己扫盘**（D22）。
  */
 async function runImport(paths: string[], ctx?: ImportConflictContext): Promise<Asset[]> {
+  // 出生时快照取消代次：只有**本批次开始之后**发生的取消才会命中它。
+  // 必须在任何 await / 任何磁盘动作之前取，否则"取快照"和"用户点取消"会打架。
+  const myGen = importCancelGen
   // 一批一个询问门：聚合窗口、逐键复用、超时锁定都只在本批次内生效
   const gate = createConflictGate({ sendAsk: sendConflictAsk })
   try {
@@ -488,6 +524,9 @@ async function runImport(paths: string[], ctx?: ImportConflictContext): Promise<
       askConflict: (query) => gate.ask(query),
       trashFolder: (abs) => trashOne(abs, trashStrategy),
       warn: (event, context) => logWarn(event, context),
+      // 取消探针（代次比较）：返回 true = 不要再开始新条目。
+      // ⚠️ 只影响"还没领到手上的"条目；`importOne` 一旦开始就会跑完并正常落库。
+      shouldStop: () => importCancelGen !== myGen,
       emit: emitImportEvent
     })
     // ── AI 辅助分类触发点（docs/15 §7）────────────────────────────────
@@ -2016,6 +2055,26 @@ ipcMain.on(IPC.winMaximizeToggle, () => {
 
 ipcMain.on(IPC.winClose, () => {
   win?.close()
+})
+
+/**
+ * 取消当前进行中的导入批次（渲染层 `winClose` 那一组里的 fire-and-forget send）。
+ *
+ * 只做一件事：把代次计数器 +1。所有**当时在跑**的批次（UI 批次 + watcher 并发批次）
+ * 的 `shouldStop` 会立刻看到"我的代次过时了"，于是不再领取新条目。
+ *
+ * ⚠️ 这里**绝不能**去 abort 正在复制的那几条：
+ * 一次 `importOne` 内部是「staging 解压 → mkdir 分类目录 → 逐个 copyFile」，
+ * 中途打断会留下半成品目录（占位目录 + 拷了一半的文件），比让用户多点一次导入
+ * 糟糕得多。所以这个处理器是同步的、零 I/O 的，真正的停止点在下一次
+ * `mapWithConcurrency` 领活之前。
+ *
+ * 不做任何「有没有批次在跑」的判断：没有批次时 +1 也无害（下次批次出生即快照新代次，
+ * 天然不受影响）。这样省掉一个易漂移的布尔状态。
+ */
+ipcMain.on(IPC.cancelImport, () => {
+  importCancelGen += 1
+  logInfo('import:cancel', { gen: importCancelGen })
 })
 
 /** 设置·关于 tab 的版本胶囊 / tab 栏左下角小字（§3.6） */
