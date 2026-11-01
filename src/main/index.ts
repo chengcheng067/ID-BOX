@@ -56,6 +56,7 @@ import {
 } from './aiClassify'
 import { findSevenZip, thumbsDir } from './paths'
 import { guardDragIconPath } from './dragIconGuard'
+import { guardOpenPaths, guardTrashPaths } from './ipcGuard'
 import { fetchLatestRelease } from './updateCheck'
 import { freeBytesOf } from './disk'
 import { deleteThumb, deleteOneThumb, ensureThumb, ensurePreview, clearThumbs, listThumbFiles, pruneThumbs, thumbStats } from './thumb'
@@ -1070,13 +1071,64 @@ ipcMain.handle(IPC.pickWatchDir, async () => {
   return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
 })
 
-ipcMain.handle(IPC.openPath, async (_e, p: string) => {
-  const err = await shell.openPath(p)
+/**
+ * 打开 / 显示 / 删除三条**破坏性**通道的允许根（0.9.2 守卫）。
+ *
+ * ⚠️ 必须包含日志目录：`SettingsDialog` 的「打开日志文件夹」调 `openPath(logStat.dir)`，
+ * 该目录在 `<userData>/logs`、**在库根之外**。只放库根会把这个功能直接打断。
+ *
+ * `logDir()` 依赖 `app.getPath('userData')`，理论上在 ready 前会抛；IPC 处理器
+ * 只会在 ready 之后被调用，这里仍然兜一层，避免守卫本身成为新的崩溃点。
+ */
+function allowedOpenRoots(): string[] {
+  const roots: string[] = []
+  if (typeof settings?.libraryDir === 'string' && settings.libraryDir.length > 0) {
+    roots.push(settings.libraryDir)
+  }
+  try {
+    const dir = logDir()
+    if (typeof dir === 'string' && dir.length > 0) roots.push(dir)
+  } catch {
+    // userData 还没就绪 → 只放行库根，日志功能这次不可用但不崩
+  }
+  return roots
+}
+
+/** `openPath` 被守卫拒绝时返回的错误消息（契约：null=成功，字符串=错误） */
+const OPEN_PATH_DENIED = '拒绝访问：该路径不在素材库或日志目录内'
+
+/**
+ * 打开文件 / 文件夹（可执行外部关联程序）。
+ *
+ * **守卫（0.9.2）**：入参必须是「库根 ∪ 日志目录」内的绝对路径，否则不调
+ * `shell.openPath`（防渲染层被注入后借系统关联程序执行任意本机文件），
+ * 记一条 `ipc:guard` warn 并返回错误消息（渲染层据此提示用户）。
+ */
+ipcMain.handle(IPC.openPath, async (_e, p: unknown) => {
+  const guard = guardOpenPaths(p, allowedOpenRoots())
+  const target = guard.ok[0]
+  if (!target) {
+    logWarn('ipc:guard', { channel: 'openPath', rejected: guard.rejected })
+    return OPEN_PATH_DENIED
+  }
+  const err = await shell.openPath(target)
   return err || null
 })
 
-ipcMain.handle(IPC.reveal, (_e, p: string) => {
-  shell.showItemInFolder(p)
+/**
+ * 在资源管理器中显示某一项。
+ *
+ * **守卫（0.9.2）**：与 `openPath` 同一口径（同一套允许根）；被拒时**静默返回**，
+ * 保持 `void` 契约不变（渲染层不读返回值，也不需要弹窗）。
+ */
+ipcMain.handle(IPC.reveal, (_e, p: unknown) => {
+  const guard = guardOpenPaths(p, allowedOpenRoots())
+  const target = guard.ok[0]
+  if (!target) {
+    logWarn('ipc:guard', { channel: 'reveal', rejected: guard.rejected })
+    return
+  }
+  shell.showItemInFolder(target)
 })
 
 /**
@@ -1086,14 +1138,34 @@ ipcMain.handle(IPC.reveal, (_e, p: string) => {
  * `windows-trash.exe` 报 ENOENT → 静默失败 →「删除模型功能失效」。
  * 现走 `main/trash.ts` 策略（shell.trashItem 优先），**失败不再静默**：
  * 记日志 + 返回失败清单，渲染层据此保留索引并提示用户。
+ *
+ * **守卫（0.9.2）**：只接受库内、且不是结构节点（库根本身 / 大类目录 /
+ * `.trash` / `.staging`）的路径 —— 这一通道是唯一**不可逆**的入口。
+ * 被拒的路径**并入 `failed`**：`store.commitDelete` 按该数组决定"哪些资产
+ * 保留索引并提示失败"，契约（返回 `string[]`）保持不变。
  */
-ipcMain.handle(IPC.trashPaths, async (_e, paths: string[]) => {
-  const failed = await trashPaths(Array.isArray(paths) ? paths : [], trashStrategy)
-  if (failed.length > 0) {
-    console.error('[idbox] trashPaths 失败（文件可能被占用或不存在）：', failed)
-    logError('trash:failed', undefined, { failed, requested: paths.length })
+ipcMain.handle(IPC.trashPaths, async (_e, paths: unknown) => {
+  const requested = Array.isArray(paths) ? paths.length : 0
+  const guard = guardTrashPaths(paths, settings?.libraryDir ?? '')
+  if (guard.rejected.length > 0) {
+    logError('ipc:guard', undefined, {
+      channel: 'trashPaths',
+      libraryDir: settings?.libraryDir ?? '',
+      rejected: guard.rejected
+    })
   }
-  return failed
+  const failed = await trashPaths(guard.ok, trashStrategy)
+  // 被守卫拒绝的路径与"移动失败"同等对待：都不进回收站、都保留索引
+  const allFailed = [...failed, ...guard.rejected]
+  if (allFailed.length > 0) {
+    console.error('[idbox] trashPaths 失败（文件可能被占用、不存在或被守卫拒绝）：', allFailed)
+    logError('trash:failed', undefined, {
+      failed: allFailed,
+      requested,
+      rejected: guard.rejected.length
+    })
+  }
+  return allFailed
 })
 
 // ── C 线：库内「最近删除」（docs/20 §4） ─────────────────────────────
