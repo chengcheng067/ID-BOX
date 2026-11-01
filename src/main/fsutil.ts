@@ -66,16 +66,29 @@ export async function listTopLevel(dir: string): Promise<TopLevelEntry[]> {
  * 随后 `rm(src, { recursive: true })` 把源删掉 —— 本该报错的场景变成
  * 「两个目录被悄悄合并、其中一个消失了」。
  *
- * ## 两个调用点与目标唯一性
+ * ## 调用点与目标唯一性
  *
- * 仅有的两个调用点是 `src/main/importer.ts:947`（覆盖档 `replaceAssetFolder` 的回调）与
- * `src/main/importer.ts:975`（常规落盘），目标名都已由 `uniqueName` / 批内台账
- * （`batch.ledger.reserve`）保证唯一，所以跨卷复制时目标**理论上不存在**。
- * `errorOnExist: true` + `force: false` 是双保险：让「万一存在」变成**显式失败**
- * 而不是静默合并；且 `rm(src)` 排在 `cp` 之后，复制失败时源目录原样保留（绝不删源）。
+ * 调用点：`src/main/importer.ts:947`（覆盖档 `replaceAssetFolder` 的回调）、
+ * `src/main/importer.ts:975`（常规落盘）、`src/main/trash.ts`（软删 `moveToLibraryTrash`
+ * 与还原 `restoreFromLibraryTrash`）。导入侧目标名由 `uniqueName` / 批内台账
+ * （`batch.ledger.reserve`）保证唯一，跨卷复制时目标**理论上不存在**。
+ *
+ * ## 跨卷分支的三重保险（目标必须**不存在**）
+ *
+ * `fs.cp` 的默认语义是**合并**：`force: true`（默认）时目标里同名文件被覆盖、目录直接往里写
+ * —— 这正是静默丢数据的入口（回退验证：d93af1d 的无条件 catch 版本在本场景"成功"了）。
+ *
+ * 三道都要，覆盖面从大到小：
+ *
+ * 1. `pathExists(dest)` 显式探一次 —— 存在就抛，错误信息**中文 + 带路径**，可直接给用户看；
+ *    且行为不随 Node 版本漂移（`errorOnExist` 在旧版本 Node 上对**目录级**已存在不保证抛）；
+ * 2. `force: false` —— 不覆盖已有文件（兜第 1 道探完到 cp 之间被别处创建的窗口）；
+ * 3. `errorOnExist: true` —— 同一窗口内的文件级冲突（Node 22 实测目录级也）仍会抛。
+ *
+ * 且 `rm(src)` 排在 `cp` 之后：任何一道抛错都不会删源（复制失败时源目录原样保留）。
  *
  * @throws rename 的原始错误（非 EXDEV 时原样抛出，不再吞掉/退化成合并）
- * @throws 跨卷时 cp 的错误（此时源目录保持不变）
+ * @throws 跨卷时「目标已存在」或 cp 的错误（此时源目录保持不变）
  */
 export async function moveDir(src: string, dest: string): Promise<void> {
   try {
@@ -86,9 +99,14 @@ export async function moveDir(src: string, dest: string): Promise<void> {
     // fs.cp 默认 force:true 会把源**合并**进已有目标，再 rm(src) 就是静默丢数据。
     if ((err as NodeJS.ErrnoException)?.code !== 'EXDEV') throw err
   }
-  // 跨卷：目标必须**不存在**才允许复制（errorOnExist + force:false 双保险），
-  // 复制失败时源目录原样保留（rm 在下一行，只有 cp 成功才会执行到）。
+  // 跨卷：目标必须**不存在**才允许复制。
+  // ⚠️ `errorOnExist` 只挡文件级冲突；目标**目录**已存在时 fs.cp 会往里合并写入。
+  // 跨卷移动的语义是"搬过去"，目标必须不存在 —— 显式探一次，存在就直接抛。
+  if (await pathExists(dest)) {
+    throw new Error(`跨卷移动失败：目标已存在（${dest}）`)
+  }
   await fs.cp(src, dest, { recursive: true, force: false, errorOnExist: true })
+  // 只有 cp 成功才会执行到这一行：复制失败时源目录原样保留（绝不删源）。
   await fs.rm(src, { recursive: true, force: true })
 }
 

@@ -281,9 +281,19 @@ export async function mapWithConcurrency<T>(
  *
  * ## 为什么不复用 `shared/vault.ts:isWithinRoot`
  *
- * 那个函数是**大小写敏感**的，且被 `vault://` 路由当安全边界用；改它会改变既有行为。
- * 这里按导入链路的需求单独实现：统一 `\`、去尾部 `\`、`toLowerCase()`，
- * 并用 `root + sep` 前缀判定挡住 `…\Library2` 这类"同前缀不同目录"的陷阱。
+ * 那个函数只做**纯字符串包含判定**，假定调用方已经 `path.resolve` 过（它的各个调用点确实
+ * 都自己 resolve 了）；它不处理 `\` 与 `/` 混用、尾部多分隔符、大小写不一致 ——
+ * 而这正是本函数入参的常态（渲染层传来的**原始路径字符串**：拖入 / 粘贴 / 命令行）。
+ * 所以这里自己先归一化（`path.resolve` + 统一分隔符 + 去尾分隔符 + 小写）再判包含；
+ * 复用它就得在每个调用点补同一套归一化，反而更容易漏。
+ *
+ * 包含判定本身仍用 `root + sep` 前缀（不是裸 `startsWith(root)`），
+ * 否则 `…\Library2` 会被误判成 `…\Library` 之内。
+ *
+ * ⚠️ 口径更新（2026-11）：`isWithinRoot` 现已按 Windows 语义**大小写不敏感**（`sep === '\\'`
+ * 时小写后比较）。这里保留独立实现的理由**不再是大小写**，而是上面的**归一化**能力；
+ * 另外两者面向的入参不同：本函数声明为 `string`（`path.resolve(非字符串)` 会抛 TypeError），
+ * 面向 `unknown` 裸入参且**永不抛**的实现是 `ipcGuard.ts:isWithinRoot`。
  */
 export function isInsideLibraryDir(libraryDir: string, target: string): boolean {
   if (!libraryDir || !target) return false

@@ -8,7 +8,7 @@
  *    并发搬到同一 parent 会选出同一个名字，第二个 rename 撞已存在目标（Windows EPERM/EEXIST）；
  * 3. `shared/vault.isWithinRoot` 大小写敏感 → Windows 下合法路径被判越界，一串 fail-closed 故障。
  *
- * 全部在 `os.tmpdir()` 造目录（**绝不触碰真实库**），`afterEach` 清理；本文件最多建 7 个
+ * 全部在 `os.tmpdir()` 造目录（**绝不触碰真实库**），`afterEach` 清理；本文件最多建 9 个
  * 临时根目录（`materialMerge.test.ts` 曾因建 51 个目录把 5000ms 默认超时顶破）。
  *
  * `node:fs/promises` 被**模块级 mock**：只替换 `rename`（`EXDEV` 注入 + 调用顺序记录 + 闸门），
@@ -58,6 +58,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { moveDir } from '../src/main/fsutil'
 import { moveAssetCategory, moveQueueIdle } from '../src/main/layout'
+import { LIBRARY_TRASH_DIR, moveToLibraryTrash } from '../src/main/trash'
 import { isWithinRoot } from '../src/shared/vault'
 
 // ── 临时目录（本文件最多 7 个） ───────────────────────────────────────
@@ -193,6 +194,71 @@ describe('moveDir —— 只对跨卷退化（EXDEV）', () => {
     },
     20000
   )
+
+  it(
+    '⑭ 模拟 EXDEV + 目标**空目录**已存在 → 抛错（中文可读原因）、源保留、目标不被写入',
+    async () => {
+      const root = await tmpDir()
+      const src = await makeDirWithFile(path.join(root, 'src'), 'a.txt', 'A')
+      const dest = path.join(root, 'dest')
+      await fs.mkdir(dest) // 空目录：报错必须来自显式探活，而不是靠 cp 的英文 EEXIST
+
+      hook.renameCode = 'EXDEV'
+      await expect(moveDir(src, dest)).rejects.toThrow(/目标已存在/)
+
+      // 源目录保留
+      await expect(fs.readFile(path.join(src, 'a.txt'), 'utf-8')).resolves.toBe('A')
+      // 目标仍是空目录：没有被"合并写入"
+      await expect(fs.readdir(dest)).resolves.toEqual([])
+      // 反向验证结论（实测）：回退到 d93af1d 的无条件 catch 版本时本用例报
+      // 「promise resolved instead of rejecting」——即静默合并；
+      // 只回退到 `errorOnExist` 版本时抛的是 Node 的 `Target already exists: cp returned EEXIST`
+      // （英文、无路径、随 Node 版本漂移）。`pathExists` 前置探活给的是用户能看懂的中文原因。
+    },
+    20000
+  )
+})
+
+// ── A2. 软删路径复用 moveDir（2026-11 第二批） ───────────────────────
+
+describe('软删路径 —— 复用 moveDir，目标被占用时绝不合并', () => {
+  it(
+    '⑮ `.trash/<id>` 已被占用 → 走 `id-<时间戳>` 新名，两份资产各自完好（不熔成一份）',
+    async () => {
+      const root = await tmpDir()
+      const lib = path.join(root, 'Library')
+      const assetId = 'asset-1'
+      const asset = await makeDirWithFile(
+        path.join(lib, '模型', '未分类', '未分类', '沙发'),
+        'a.skp',
+        'NEW'
+      )
+      // 目标名已被上一次软删（或崩溃残留）占住，里面是**另一份**资产的内容
+      const taken = await makeDirWithFile(
+        path.join(lib, LIBRARY_TRASH_DIR, assetId),
+        'old.skp',
+        'OLD'
+      )
+
+      const res = await moveToLibraryTrash(lib, assetId, asset)
+
+      // 换了名字，没往已有目录里塞
+      expect(res.abs).not.toBe(taken)
+      expect(path.dirname(res.abs)).toBe(path.join(lib, LIBRARY_TRASH_DIR))
+      expect(path.basename(res.abs)).toMatch(/^asset-1-\d+$/)
+      expect(res.trashRel).toBe(`${LIBRARY_TRASH_DIR}/${path.basename(res.abs)}`)
+
+      // 旧条目原封不动（只有它自己那份文件）
+      await expect(fs.readdir(taken)).resolves.toEqual(['old.skp'])
+      await expect(fs.readFile(path.join(taken, 'old.skp'), 'utf-8')).resolves.toBe('OLD')
+      // 新条目只有搬进来的那份文件（没有和 old.skp 熔在一起）
+      await expect(fs.readdir(res.abs)).resolves.toEqual(['a.skp'])
+      await expect(fs.readFile(path.join(res.abs, 'a.skp'), 'utf-8')).resolves.toBe('NEW')
+      // 源目录已搬走
+      expect(await exists(asset)).toBe(false)
+    },
+    20000
+  )
 })
 
 // ── B. moveAssetCategory 串行化 ───────────────────────────────────────
@@ -306,14 +372,16 @@ describe('isWithinRoot —— Windows 大小写不敏感（POSIX 不受影响）
 
 // ── D. 接线 guard（读源码，防实现被回退） ────────────────────────────
 
-describe('接线 guard —— 三处硬化必须留在源码里', () => {
+describe('接线 guard —— 硬化必须留在源码里', () => {
   async function readSrc(rel: string): Promise<string> {
     return fs.readFile(new URL(rel, import.meta.url), 'utf-8')
   }
 
-  it('⑪ fsutil.moveDir：catch 条件化（只认 EXDEV）+ 跨卷复制要求目标不存在', async () => {
+  it('⑪ fsutil.moveDir：catch 条件化（只认 EXDEV）+ 跨卷前显式拒绝已存在目标', async () => {
     const src = await readSrc('../src/main/fsutil.ts')
     expect(src).toContain("!== 'EXDEV'")
+    expect(src).toContain('if (await pathExists(dest))')
+    expect(src).toContain('目标已存在')
     expect(src).toContain('errorOnExist: true')
     expect(src).toContain('force: false')
     // 不能再有无条件 catch（`catch {` 后直接 cp）
@@ -337,5 +405,15 @@ describe('接线 guard —— 三处硬化必须留在源码里', () => {
     expect(src).toContain("if (sep === '\\\\')")
     expect(src).toContain('root.toLowerCase()')
     expect(src).toContain('abs.toLowerCase()')
+  })
+
+  it('⑯ trash.ts：复用 `fsutil.moveDir`，内联的无条件 catch 副本已删除', async () => {
+    const src = await readSrc('../src/main/trash.ts')
+    expect(src).toContain("from './fsutil'")
+    expect(src).toContain('import { moveDir }')
+    expect(src).toContain('await moveDir(src, dest)')
+    // 不许再出现内联副本，也不许再直接 cp（那正是「无条件退化合并」的入口）
+    expect(src).not.toContain('moveDirFallback')
+    expect(src).not.toContain('fs.cp(')
   })
 })

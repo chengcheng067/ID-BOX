@@ -12,8 +12,12 @@
  * 修法：`drop` 里先按库根过滤。**判定必须大小写不敏感**（Windows 路径），
  * 且不能用裸 `startsWith(root)`（`…\Library2` 会被误判成 `…\Library` 之内）。
  *
- * ⚠️ 不要复用 `shared/vault.ts:isWithinRoot`：它是**大小写敏感**的，且被 `vault://`
- * 路由当作安全边界使用；改它会改变既有行为。这里按渲染层需求单独实现。
+ * ⚠️ 不要复用 `shared/vault.ts:isWithinRoot`：它只做**纯字符串包含判定**，假定调用方已经
+ * `path.resolve` 过，也不处理 `\` 与 `/` 混用、尾部多分隔符 —— 而这里的入参是渲染层拿到的
+ * 原始路径（`dataTransfer.files` 的 `path`），必须先归一化。两套口径混用会让「什么算在库内」
+ * 出现两个答案。
+ * （注：`isWithinRoot` 自 2026-11 起也按 Windows 语义大小写不敏感了，但差异仍在**归一化**能力上，
+ * 故仍不复用。）
  */
 
 /**

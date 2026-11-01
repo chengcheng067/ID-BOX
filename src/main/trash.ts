@@ -24,6 +24,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { isWithinRoot } from '../shared/vault'
 import { uniqueName } from '../shared/naming'
+import { moveDir } from './fsutil'
 
 /** 回收站策略的注入点（测试替换；主进程注入 shell.trashItem + trash 包） */
 export interface TrashStrategy {
@@ -201,15 +202,12 @@ async function removeMeta(root: string, trashName: string): Promise<void> {
   await fs.rm(metaPathOf(root, trashName), { force: true }).catch(() => {})
 }
 
-/** 跨盘退化复制 + 删除（与 `fsutil.moveDir` 同语义，此处内联避免 main 内循环依赖） */
-async function moveDirFallback(src: string, dest: string): Promise<void> {
-  try {
-    await fs.rename(src, dest)
-  } catch {
-    await fs.cp(src, dest, { recursive: true })
-    await fs.rm(src, { recursive: true, force: true })
-  }
-}
+// 说明（2026-11 自查）：本文件原先内联过一份「跨盘退化复制 + 删除」的私有副本，注释自称
+// 「与 `fsutil.moveDir` 同语义，内联是为了避免 main 内循环依赖」——**两个理由都不成立**：
+// `fsutil.ts` 根本不 import `trash.ts`（无环，`trash.ts → fsutil.ts` 是单向的），
+// 而那份实现是**无条件 catch**：`.trash/<name>` 已存在时会把资产**合并**进那个目录再删源，
+// 两份资产熔成一份、「最近删除」里只剩一条。现已改为直接复用 `fsutil.moveDir`
+// （只对 EXDEV 退化，其它原因原样抛出）。**不要再复制粘贴出第二份。**
 
 /**
  * 软删：把资产目录**移动**到 `<库根>/.trash/<trashName>/`。
@@ -219,7 +217,8 @@ async function moveDirFallback(src: string, dest: string): Promise<void> {
  * - 崩溃在 rename 后：meta 已就位，`deletedAt` 正确。
  * （反过来先 rename 再写 meta，崩溃会留下"无删除时间的孤儿目录"，只能按 mtime 猜。）
  *
- * 同盘即 `rename`（O(1)）；跨盘退化为 `cp + rm`（与导入移动同语义）。
+ * 移动统一走 `fsutil.moveDir`：同盘即 `rename`（O(1)），跨盘才退化 `cp + rm`，
+ * 且**只有 EXDEV 才退化**——目标已存在 / 文件被占用一律抛错，绝不合并两份资产。
  *
  * @throws 资产 id 非法 / 源目录不存在 / 移动失败（调用方按失败项上报）
  */
@@ -252,7 +251,7 @@ export async function moveToLibraryTrash(
 
   await writeMeta(root, trashName, meta)
   try {
-    await moveDirFallback(src, dest)
+    await moveDir(src, dest)
   } catch (err) {
     await removeMeta(root, trashName)
     throw err
@@ -310,7 +309,7 @@ export async function restoreFromLibraryTrash(
     renamed = true
   }
 
-  await moveDirFallback(src, finalFolder)
+  await moveDir(src, finalFolder)
   await removeMeta(root, trashName)
   return { folder: finalFolder, relFolder: finalRel, renamed }
 }
