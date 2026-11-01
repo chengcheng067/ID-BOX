@@ -1350,6 +1350,14 @@ interface VaultState {
   pruneSelection: (visibleIds: string[]) => void
   importPaths: (paths: string[]) => Promise<void>
   dismissImport: (item: string) => void
+  /**
+   * 请求取消当前导入批次（2026-10 导入取消）。
+   *
+   * 语义（与主进程一致，别在 UI 层改口径）：**只停还没开始的条目**，正在复制的那几个
+   * 会正常做完 —— 中途 abort 会在库里留半成品目录（`mkdir` 占位 + 拷了一半的文件）。
+   * 幂等：可以反复点，没有批次时调用也无害。
+   */
+  cancelImport: () => void
   // ── 删除安全四件套（P0-16）──────────────────────────────────
   /**
    * 请求删除：只登记待删清单并弹二次确认，**不碰磁盘**。
@@ -3155,6 +3163,34 @@ export const useVault = create<VaultState>((set, get) => ({
   },
 
   dismissImport: (item) => set((s) => ({ imports: s.imports.filter((i) => i.item !== item) })),
+
+  cancelImport: () => {
+    // fire-and-forget：没有回执，真实结果由 `importEvent` 流表达
+    try {
+      window.modvault.cancelImport()
+    } catch {
+      /* preload 缺失：静默（不能因为"停不下来"把设置页/队列炸掉） */
+    }
+    // 本地**只把 pending 标记成 cancelled**，让按钮立刻有反馈（主进程的逐条事件会紧跟着
+    // 覆盖成权威文案）。⚠️ 绝不能把 extracting / organizing 也标成 cancelled：
+    // ① 它们其实正在做，会被 `done` 事件改回来 → 卡片先"已取消"再"已完成"，观感是假的；
+    // ② 更糟的是 cancelled 是终态、会拿到 `settledAt` → 6 秒倒计时先把卡片删掉，
+    //    等 `done` 事件到达时 `onImportEvent` 发现条目不存在 → 追加到队尾，卡片
+    //    "消失又冒出来"。
+    set((s) => ({
+      imports: s.imports.map((i) =>
+        i.status === 'pending'
+          ? {
+              ...i,
+              status: 'cancelled' as const,
+              // 文案与主进程逐字一致，避免出现两套说法
+              message: '已取消：这一项还没开始处理',
+              settledAt: Date.now()
+            }
+          : i
+      )
+    }))
+  },
 
   // ── P0-16 删除安全 ───────────────────────────────────────────
 

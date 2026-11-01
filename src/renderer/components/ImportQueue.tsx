@@ -35,6 +35,13 @@ import { IconAlert, IconCheck, IconClose, IconDownload } from '../icons'
  * - `skipped` 走**中性灰** + ✕ 图标（跳过不是失败，不能学 error 用红色）；
  * - `done` 且带 `conflict` 时明细换成「已覆盖到「…」」/「已保留为「…」」。
  *   配色 / 倒计时 / 文案三处的唯一来源是 `logic/importText.ts`（本组件只管排布）。
+ *
+ * 2026-10 导入取消（数据层见 commit `0885189`）：
+ * - 内层容器的**最后一个** child 是取消条（`column-reverse` 下它才落在视觉顶部）。
+ *   位置写死在卡片栈之后，下面那段 JSX 有更详细的说明 —— 挪位置前先读。
+ * - 语义是「只停还没开始的条目」，正在复制的那几个会做完。所以点了之后本行不一定立刻消失：
+ *   只要还剩 `extracting` / `organizing`，`runningCount > 0`，条就留着。
+ * - 取消**不是**危险操作 → 中性色按钮，不用 danger 红；也不加二次确认、不弹 notice。
  */
 export function ImportQueue() {
   const imports = useVault((s) => s.imports)
@@ -42,8 +49,19 @@ export function ImportQueue() {
   const saveSettings = useVault((s) => s.saveSettings)
   const setNotice = useVault((s) => s.setNotice)
   const importPaths = useVault((s) => s.importPaths)
+  const cancelImport = useVault((s) => s.cancelImport)
   /** 鼠标是否停在队列区域内（悬停 = 暂停自动消失） */
   const [hovered, setHovered] = useState(false)
+
+  /**
+   * 取消条的可见性判据：还有**非终态**条目就显示。
+   *
+   * 用 `isTerminalStatus`（而不是只数 pending）是有意的：`extracting` / `organizing`
+   * 还算"在跑"，即使此刻已经没有 pending（取消后主进程仍在收尾），条也该留着 ——
+   * 否则用户刚点完取消，这行就凭空消失，看不出"它到底停没停"。
+   */
+  const runningCount = imports.filter((i) => !isTerminalStatus(i.status)).length
+  const hasRunning = runningCount > 0
 
   /**
    * 终态条目自动消失。
@@ -168,6 +186,29 @@ export function ImportQueue() {
             </div>
           )
         })}
+        {/*
+         * 「全部取消」条（2026-10 导入取消）—— 必须是内层 flex-col-reverse 容器的
+         * **最后一个** child：`column-reverse` 下 DOM[0] 贴底，放最前面会渲染到卡片栈
+         * **下方**（贴着 `bottom-14` 锚点），看起来像"最新一条"。放最后 = 视觉顶部。
+         *
+         * 不加二次确认：取消是无损操作（不回滚、不删文件，只停未开始的条目），
+         * 弹窗只会让用户多点一次。也不弹 notice：队列本身就是反馈，再叠一条 toast 是噪音。
+         * 按钮用中性色（`text-secondary`），**不用** danger 红 —— 与 `cancelled` / `skipped`
+         * 的中性口径一致：取消不是危险操作。
+         */}
+        {hasRunning && (
+          <div className="pointer-events-auto flex items-center justify-between gap-2 rounded-xl border border-line bg-card px-3 py-2 shadow-soft">
+            <span className="text-xs text-muted">正在导入 {runningCount} 项</span>
+            <button
+              type="button"
+              className="shrink-0 rounded-md px-2 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-primary"
+              title="只停止还没开始的条目；正在处理的会做完"
+              onClick={() => cancelImport()}
+            >
+              全部取消
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )
