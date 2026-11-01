@@ -2081,6 +2081,27 @@ function reportZhimoStyleNotInList(id: string, style: string, kind: string): voi
 }
 
 /**
+ * 记一条「分类搬盘事务失败」的 error 日志（`assignCategory` 专用）。
+ *
+ * 为什么必须落盘：这类失败发生在**磁盘已动而索引没动**的窗口里，用户看到的是
+ * 「文件丢失」，而控制台在打包后的渲染进程里根本看不到。只有落进主进程日志，
+ * 事后才能判断是配额 / 索引损坏（写库失败）还是目录被占用 / 路径非法（搬回失败）。
+ *
+ * 走 `reportLog`（fire-and-forget），老 preload / 测试桩没有该 API 时静默跳过；
+ * 日志本身**绝不**抛错（它出现在补偿路径里，再抛一次就把真正的失败盖掉了）。
+ */
+function reportAssignTxFailure(
+  message: 'assign:rollback-write-failed' | 'assign:rollback-move-failed',
+  context: { id: string; folder: string; movedFrom?: string; fromFolder?: string }
+): void {
+  try {
+    window.modvault?.reportLog?.({ level: 'error', message, context })
+  } catch {
+    /* 日志失败绝不反过来影响落库/回滚 */
+  }
+}
+
+/**
  * 把知末抓来的风格**补**进资产（TODO-3 / docs/25）：只补空、只认受控词表、只对 model。
  *
  * 落库点刻意放在 `commitCover` **之后**（同一个 `fetchOne` 的按资产锁内）：
@@ -3444,8 +3465,37 @@ export const useVault = create<VaultState>((set, get) => ({
 
   /**
    * 指派分类（03 §5.1，顺序严格）：normalize → 逐个调 IPC 移动目录 →
-   * RA3 缩略图重生（先生成新再删旧）→ **最后**才写 Dexie（id 不变，禁止 delete+put）。
+   * RA3 缩略图重生（先生成新再删旧）→ **逐条**写 Dexie（id 不变，禁止 delete+put）。
    * 同一大类才能批量（父目录由 asset.kind 算，调用方已把守，这里按资产各自算仍然安全）。
+   *
+   * ## 为什么必须「逐条落库」而不是整批一次 `bulkPut`（2026-11 崩溃半径收敛）
+   *
+   * 磁盘是**逐条**搬的（每条一次 `await` IPC），所以每搬完一条，磁盘上就已经少了一个
+   * 旧路径、多了一个新路径。若库只在循环结束后 `bulkPut` 一次，那么"搬完第 5 条、
+   * 第 6 条抛异常 / 进程被杀"就落成：**磁盘全搬了、IndexedDB 一条没写** → 这 5 条
+   * 记录全都指向已经消失的旧路径，重启后表现为「文件丢失」（用户最高频的操作，
+   * 却是本仓唯一没有快照可回滚的搬盘入口 —— `main/kindMigrate.ts`、`main/materialMerge.ts`
+   * 都有快照）。改成每条搬完立刻 `put`，最坏情况只坏**正在处理的那一条**。
+   *
+   * 内存态 `set()` 仍保持循环结束后**一次性**合并（`byId` Map）：逐条 set 会让 200 条
+   * 批量归类触发 200 次 re-render。库是事实（慢一点无所谓），state 只是视图。
+   *
+   * ## 写库失败必须补偿（盘已动、库没动 = 僵尸记录）
+   *
+   * `db.assets.put` 抛错时不能只记一个 `failed` 就算完 —— 磁盘已经搬走、库还是旧记录，
+   * 那条资产会变成"盘上在新目录、库里指向旧目录"的僵尸。于是**反向再搬一次**回原分类
+   * （目标路径刚刚空出，`uniqueName` 不会追加序号），让磁盘跟着记录回来：
+   *
+   * | 补偿结果 | 库 | 内存态 | 循环 |
+   * | --- | --- | --- | --- |
+   * | 反向搬回 + 回滚记录写库成功 | 回滚后的旧分类记录 | 保持旧值（不 push） | 继续 |
+   * | 反向搬回成功、回滚记录写库失败 | 旧记录（与盘一致） | 保持旧值（不 push） | **中断** |
+   * | 反向搬不回来（null/抛错） | 旧记录 | **跟着磁盘走**（push 新记录） | **中断** |
+   *
+   * 不变式：`updatedList`（= 内存态的唯一来源）里**绝不能**出现库与磁盘不一致的记录。
+   * 只有两个方向 —— 要么记录跟着磁盘走（commit），要么磁盘跟着记录回来（rollback）。
+   * 后两种结局中断整批：写不进去 / 搬不回来时继续搬后面的只会制造更多僵尸记录，
+   * 每条都已自洽，代价只是这一批少搬几条。
    */
   async assignCategory(ids, category1, category2) {
     const pair = normalizeCategoryPair(category1, category2)
@@ -3486,7 +3536,7 @@ export const useVault = create<VaultState>((set, get) => ({
         thumb = await regenThumbSweep(asset.id, assetFileAbs(res.folder, asset.cover))
       }
 
-      updatedList.push({
+      const updated: Asset = {
         ...asset,
         name: res.name,
         folder: res.folder,
@@ -3499,11 +3549,80 @@ export const useVault = create<VaultState>((set, get) => ({
         thumbPath: thumb.thumbPath,
         thumbStatus: thumb.thumbStatus,
         updatedAt: Date.now()
-      })
+      }
+
+      // ── 逐条落库：磁盘**已经**搬走了，索引必须立刻跟上（见函数头「崩溃半径」） ──
+      try {
+        await db.assets.put(updated)
+      } catch (writeErr) {
+        console.error('[assignCategory] 写库失败，尝试把磁盘搬回原分类', asset.id, writeErr)
+        // 补偿的方向是"磁盘跟着记录回来"：从**新位置** `res.folder` 搬回 `cur` 的原分类。
+        // `folder` 必须是新路径（盘现在在那里）；分类必须是**搬走之前**的那一对。
+        const back = await window.modvault
+          .assignCategory({
+            folder: res.folder,
+            kindFolderName: kindFolder(asset.kind),
+            category1: cur.category1,
+            category2: cur.category2
+          })
+          .catch(() => null)
+
+        if (back) {
+          const rolledBack: Asset = {
+            ...asset,
+            name: back.name,
+            folder: back.folder,
+            relFolder: back.relFolder,
+            // 用 main 的实回值（正常情况下就等于 `cur`；万一它做了级联降级，记录要跟盘走）
+            category1: back.category1,
+            category2: back.category2,
+            // 名字没变就**原样保留**旧 key（回滚是"恢复原状"，不该顺手重算用户数据）；
+            // 只有反向也撞名改了名，key 才必须跟着名字重算，否则重复检测会错
+            dedupeKey:
+              back.name === asset.name
+                ? asset.dedupeKey
+                : dedupeKeyOf(baseNameOf(back.name), asset.kind),
+            // 缩略图**沿用原值**：盘已回到原位置，旧 salt 重新有效，不必重生
+            thumbPath: asset.thumbPath,
+            thumbStatus: asset.thumbStatus ?? 'none',
+            updatedAt: Date.now()
+          }
+          try {
+            await db.assets.put(rolledBack)
+            // 盘与库都回到原状 → 这一条彻底无副作用，只记一次 failed，继续处理后面的
+            failed += 1
+            continue
+          } catch (rollbackWriteErr) {
+            console.error('[assignCategory] 回滚记录写库失败', asset.id, rollbackWriteErr)
+            reportAssignTxFailure('assign:rollback-write-failed', {
+              id: asset.id,
+              folder: back.folder,
+              movedFrom: res.folder
+            })
+            // 库保持旧记录（与已搬回原位的磁盘一致）→ 不 push，中断整批
+            failed += 1
+            break
+          }
+        }
+
+        // 反向搬不回来：磁盘停在新位置，而库改不动它 → 内存态**必须**如实反映磁盘，
+        // 否则 UI 显示旧路径、用户点开发现文件不在（比"多一条失败"糟糕得多）
+        console.error('[assignCategory] 补偿搬回失败，记录跟随磁盘', asset.id)
+        reportAssignTxFailure('assign:rollback-move-failed', {
+          id: asset.id,
+          folder: res.folder,
+          fromFolder: asset.folder
+        })
+        failed += 1
+        updatedList.push(updated)
+        break
+      }
+
+      updatedList.push(updated)
     }
 
     if (updatedList.length > 0) {
-      await db.assets.bulkPut(updatedList)
+      // 库已逐条写完，这里**只**合并内存态（一次性，避免 N 次 re-render）
       const byId = new Map(updatedList.map((a) => [a.id, a]))
       set((s) => ({ assets: s.assets.map((a) => byId.get(a.id) ?? a) }))
     }

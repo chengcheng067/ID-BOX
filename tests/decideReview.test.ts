@@ -173,12 +173,16 @@ describe('① 定案写入的形状', () => {
 
     await useVault.getState().decideReview(a.id, '建筑设计', '规划设计')
 
-    // assignCategory 用 bulkPut（搬成功那条），decideReview 用 put（只改一行）
-    expect(fakeTable.bulkPut).toHaveBeenCalledTimes(1)
-    expect(fakeTable.put).toHaveBeenCalledTimes(1)
-    const written = fakeTable.put.mock.calls[0][0] as unknown as Asset
-    expect(written.id).toBe(a.id)
-    expect('reason' in (written.classifyReview ?? {})).toBe(false)
+    // assignCategory **逐条** put（搬成功那条）→ decideReview 再 put 一次（只改一行）：
+    // 全程 2 次 `put`、0 次整批 `bulkPut`（2026-11 分类移动改为逐条落库，崩溃半径压到单条）
+    expect(fakeTable.bulkPut).not.toHaveBeenCalled()
+    expect(fakeTable.put).toHaveBeenCalledTimes(2)
+    // 其中只有一条带 `decidedAt`（= decideReview 写的那行），其余是搬运落库行
+    const rows = fakeTable.put.mock.calls.map((c) => c[0] as unknown as Asset)
+    const decided = rows.filter((r) => typeof r.classifyReview?.decidedAt === 'number')
+    expect(decided).toHaveLength(1)
+    expect(decided[0]!.id).toBe(a.id)
+    expect('reason' in (decided[0]!.classifyReview ?? {})).toBe(false)
   })
 })
 
@@ -279,8 +283,13 @@ describe('④ 搬的过程中资产没了', () => {
 
     const summary = await useVault.getState().decideReview(a.id, '建筑设计', '规划设计')
     expect(summary.moved).toBe(1)
-    // 找不到记录 → 早退，不 put（put 会把已消失的记录写回去）
-    expect(fakeTable.put).not.toHaveBeenCalled()
+    // assignCategory 自己的**逐条** put 只会写"搬过去"那一行（classifyReview 仍是 conflict、没有
+    // decidedAt）；decideReview 找不到记录 → 早退，**绝不**把已消失的行写回去（put 会复活它）
+    const rows = fakeTable.put.mock.calls.map((c) => c[0] as unknown as Asset)
+    expect(rows).toHaveLength(1)
+    expect(rows.every((r) => r.id === a.id)).toBe(true)
+    expect(rows.some((r) => typeof r.classifyReview?.decidedAt === 'number')).toBe(false)
+    expect(fakeTable.bulkPut).not.toHaveBeenCalled()
   })
 })
 

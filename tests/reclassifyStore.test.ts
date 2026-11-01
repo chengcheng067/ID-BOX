@@ -49,14 +49,21 @@ const fakeBackups = {
   })
 }
 
-/** 资产表（只关心 assignCategory 落库用到的 bulkPut） */
+/**
+ * 资产表。`assignCategory` 自 2026-11 起改为**逐条** `put`（崩溃半径压到单条），
+ * 所以这里同时收集 `put` 与 `bulkPut`：断言走 `putCalls`，`bulkPut` 只用来钉"它一次都不该出现"。
+ */
 const bulkPutCalls: Asset[][] = []
+const putCalls: Asset[] = []
 const fakeAssets = {
   bulkPut: vi.fn(async (list: Asset[]) => {
     bulkPutCalls.push(list)
     return list.length
   }),
-  put: vi.fn(async (a: Asset) => a.id),
+  put: vi.fn(async (a: Asset) => {
+    putCalls.push(a)
+    return a.id
+  }),
   toArray: vi.fn(async () => [])
 }
 Object.defineProperty(db, 'assets', { value: fakeAssets, configurable: true })
@@ -112,6 +119,7 @@ beforeEach(() => {
   order.length = 0
   backupStore.clear()
   bulkPutCalls.length = 0
+  putCalls.length = 0
   vi.clearAllMocks()
   modvault.ensureThumb.mockResolvedValue(null)
   modvault.deleteThumb.mockResolvedValue(0)
@@ -198,9 +206,9 @@ describe('reclassifyUnclassified — 分组与未命中', () => {
     expect(c1).toBe('家具')
     expect(c2).toBe('沙发')
     expect([...ids].sort()).toEqual([a.id, b.id, c.id].sort())
-    // 落库条数与三个 id 一致
-    const saved = bulkPutCalls.flat()
-    expect(saved.map((s) => s.id).sort()).toEqual([a.id, b.id, c.id].sort())
+    // 落库条数与三个 id 一致（逐条 put，不是整批 bulkPut）
+    expect(putCalls.map((s) => s.id).sort()).toEqual([a.id, b.id, c.id].sort())
+    expect(fakeAssets.bulkPut).not.toHaveBeenCalled()
   })
 
   it('判不出来的计入 missed，且不产生任何移动/备份', async () => {
