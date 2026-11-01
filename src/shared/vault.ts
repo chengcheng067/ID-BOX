@@ -20,12 +20,39 @@ export function routeVaultHost(host: string): VaultHost | null {
  * 目录穿越防护：abs 必须等于 root，或位于 root 之下。
  * 调用方负责先用 `path.resolve` 归一化，本函数只做**包含判定**（纯字符串，可单测）。
  *
+ * ## 大小写（2026-11 自查）：Windows 语义下不敏感
+ *
+ * Windows 文件系统大小写不敏感：`D:\ModVault\Library` 与 `d:\modvault\library` 是**同一个目录**。
+ * 而本函数的两个入参来自不同地方——`settings.libraryDir`（用户可在设置里手改、库目录也可能被
+ * 整体复制过）与 `asset.folder`（rescan 写的磁盘真名）——大小写一旦不一致，纯字符串比较会
+ * 把合法路径判成越界，表现为一串 **fail-closed 的功能故障**（安全，但用户完全看不懂）：
+ * - `main/trash.ts:234` 软删报「资产路径不在库内」→「最近删除」偶发失效；
+ * - `main/index.ts:1380` 换封面被拒；
+ * - `main/index.ts:1561` 拖不出文件。
+ *
+ * 所以：**只在 `sep === '\\'` 时**（= 调用方传的就是 Windows 的 `path.sep`）按小写比较；
+ * POSIX 保持原样（Linux 是大小写敏感的，不能连坐）。这个判断在所有调用点都成立——它们
+ * 传的就是 `path.sep`；也不需要 import `node:path`（本文件被渲染层共用，不能依赖 node 内置模块）。
+ *
+ * ⚠️ 签名固定三参，不许加第四参（7 个调用点 + 渲染层都按三参调用）。
+ *
  * @param root 已 resolve 的绝对路径根目录
  * @param abs  已 resolve 的绝对路径目标
  * @param sep  平台路径分隔符（`path.sep`）
  */
 export function isWithinRoot(root: string, abs: string, sep: string): boolean {
   if (!root || !abs) return false
+  // Windows 语义下路径大小写不敏感：`D:\ModVault\Library` 与 `d:\modvault\library` 是同一目录。
+  // 只在 sep 为反斜杠（= 调用方传的是 path.sep 且运行在 Windows）时启用，
+  // POSIX 保持原样 —— 这个判断在所有调用点都成立（它们传的就是 `path.sep`），
+  // 且不需要 import node:path（本文件被渲染层共用，不能依赖 node 内置模块）。
+  if (sep === '\\') {
+    const r = root.toLowerCase()
+    const a = abs.toLowerCase()
+    if (a === r) return true
+    const base = r.endsWith(sep) ? r : r + sep
+    return a.startsWith(base)
+  }
   if (abs === root) return true
   const base = root.endsWith(sep) ? root : root + sep
   return abs.startsWith(base)

@@ -134,8 +134,67 @@ export interface MoveCategoryResult {
   renamed: boolean
 }
 
+// ── 目录移动的串行队列（2026-11 自查） ──────────────────────────────────
+
+/**
+ * 目录移动的串行队列。
+ * 为什么需要：`uniqueName` 的判重基于 `readdir` 快照，并发搬到同一 parent 会选出同一个
+ * 名字 → 第二个 rename 撞已存在目标（Windows EPERM/EEXIST）→ 那次移动失败。
+ * 串行化让「读 siblings + 选名 + rename」成为一个不可分割的单元。
+ * 只串行**移动**，不动缩略图重生等调用方逻辑（那部分在渲染层）。
+ *
+ * 为什么现在的调用方"看起来"是逐条 await 却仍需串行：一次 `assignCategory` 内部逐条
+ * await，但**多个批次可以并发**——`assignCategory`、撤销归类、知末重排后的后置流水线
+ * 都会调到本函数，它们的批次之间没有共享锁。
+ *
+ * 写法照抄 `settings.ts:createSettingsWriteQueue`（本仓已跑一年的形状），两条都不能少：
+ *
+ * 1. `moveChain.then(fn, fn)`：**前一次失败时仍要执行这一次**。只写 `then(fn)` 的话，
+ *    一次 ENOENT/EPERM 会把队列永久卡死——之后所有归类移动都动不了，而且用户看不到
+ *    任何报错（链上挂着一个已 reject 的 Promise）。
+ * 2. `moveChain = next.then(() => undefined, () => undefined)`：链自己**不持有 rejection**。
+ *    若把 `next` 直接赋给链，无人 await 的那次失败就是一个 unhandledrejection。
+ *    失败只回传给该次的调用方（`moveAssetCategory` 的返回 Promise 依旧会 reject）。
+ *
+ * 为什么内联而不 import `settings.ts` 的 `createSettingsWriteQueue`：那个模块顶层
+ * `import { app } from 'electron'`，而本模块被 node 环境的单测直接 import
+ * （`tests/layout.test.ts`），不能拉起 electron。
+ */
+let moveChain: Promise<unknown> = Promise.resolve()
+
+/** 把一次目录移动排到链尾；返回的 Promise 兑现这一次任务自己的结果/错误 */
+function enqueueMove<T>(fn: () => Promise<T>): Promise<T> {
+  const next = moveChain.then(fn, fn)
+  moveChain = next.then(
+    () => undefined,
+    () => undefined
+  )
+  return next
+}
+
+/** 等待移动队列排空（测试 / 退出前诊断用；**永不 reject**） */
+export function moveQueueIdle(): Promise<void> {
+  return moveChain.then(
+    () => undefined,
+    () => undefined
+  )
+}
+
 /**
  * 指派分类时的目录移动（03 §5.1，`asset:assignCategory` 的落盘动作）。
+ *
+ * 对外签名与返回类型（`MoveCategoryResult`）不变；实际动作在 `moveAssetCategoryUnlocked`，
+ * 这里只是把整个「mkdir → readdir → uniqueName → rename」单元排进串行队列（见上方队列注释）。
+ */
+export async function moveAssetCategory(
+  folder: string,
+  parentDir: string
+): Promise<MoveCategoryResult> {
+  return enqueueMove(() => moveAssetCategoryUnlocked(folder, parentDir))
+}
+
+/**
+ * `moveAssetCategory` 的**实际动作**——只能在串行队列内部调用。
  *
  * **父目录永远由 `asset.kind` 算**（main 不信任渲染层传来的完整路径），
  * 保证不变量 `folder === libraryDir/kindFolder(kind)/category1/category2/name` 永远成立。
@@ -147,7 +206,7 @@ export interface MoveCategoryResult {
  * （`thumbFileSalt`，2026-10-22 起不再只是路径哈希），移动后 coverAbs 变 → salt 必变，必须
  * `ensureThumb(新 coverAbs)` + `matchThumbNames` 通配删旧，**先生成后删除**。
  */
-export async function moveAssetCategory(
+async function moveAssetCategoryUnlocked(
   folder: string,
   parentDir: string
 ): Promise<MoveCategoryResult> {

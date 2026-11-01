@@ -53,14 +53,43 @@ export async function listTopLevel(dir: string): Promise<TopLevelEntry[]> {
     .map((e) => ({ name: e.name, isDir: e.isDirectory() }))
 }
 
-/** 移动目录；跨盘时退化为复制+删除 */
+/**
+ * 移动目录；**只对跨卷（EXDEV）退化为复制+删除**。
+ *
+ * ## 为什么 catch 必须有条件（2026-11 自查，静默丢数据）
+ *
+ * `fs.rename` 失败的原因**不止**跨盘：
+ * - Windows 上「目标目录已存在且非空」→ `EPERM` / `EEXIST` / `ENOTEMPTY`；
+ * - 「文件正被 DCC / 3ds Max 占用」→ `EBUSY` / `EACCES`。
+ *
+ * 这些情况下若无条件走 `fs.cp`，而 `fs.cp` 默认 `force: true` 会**把源合并进已有目标目录**，
+ * 随后 `rm(src, { recursive: true })` 把源删掉 —— 本该报错的场景变成
+ * 「两个目录被悄悄合并、其中一个消失了」。
+ *
+ * ## 两个调用点与目标唯一性
+ *
+ * 仅有的两个调用点是 `src/main/importer.ts:947`（覆盖档 `replaceAssetFolder` 的回调）与
+ * `src/main/importer.ts:975`（常规落盘），目标名都已由 `uniqueName` / 批内台账
+ * （`batch.ledger.reserve`）保证唯一，所以跨卷复制时目标**理论上不存在**。
+ * `errorOnExist: true` + `force: false` 是双保险：让「万一存在」变成**显式失败**
+ * 而不是静默合并；且 `rm(src)` 排在 `cp` 之后，复制失败时源目录原样保留（绝不删源）。
+ *
+ * @throws rename 的原始错误（非 EXDEV 时原样抛出，不再吞掉/退化成合并）
+ * @throws 跨卷时 cp 的错误（此时源目录保持不变）
+ */
 export async function moveDir(src: string, dest: string): Promise<void> {
   try {
     await fs.rename(src, dest)
-  } catch {
-    await fs.cp(src, dest, { recursive: true })
-    await fs.rm(src, { recursive: true, force: true })
+    return
+  } catch (err) {
+    // 只对「跨卷」退化。其它原因（EEXIST/EPERM/EBUSY/EACCES…）必须原样抛出：
+    // fs.cp 默认 force:true 会把源**合并**进已有目标，再 rm(src) 就是静默丢数据。
+    if ((err as NodeJS.ErrnoException)?.code !== 'EXDEV') throw err
   }
+  // 跨卷：目标必须**不存在**才允许复制（errorOnExist + force:false 双保险），
+  // 复制失败时源目录原样保留（rm 在下一行，只有 cp 成功才会执行到）。
+  await fs.cp(src, dest, { recursive: true, force: false, errorOnExist: true })
+  await fs.rm(src, { recursive: true, force: true })
 }
 
 export async function pathExists(p: string): Promise<boolean> {
