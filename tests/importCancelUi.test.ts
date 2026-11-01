@@ -181,7 +181,15 @@ describe('ImportQueue.tsx 源码', () => {
   // ⑧ **位置断言**：取消条必须排在卡片 map 之后（column-reverse → DOM 末尾 = 视觉顶部）
   it('「全部取消」的源码位置在卡片渲染块之后', () => {
     const cardAnchor = queueSrc.indexOf('imports.slice(-6).reverse().map')
-    const cancelAnchor = queueSrc.indexOf('全部取消')
+    /**
+     * ⚠️ 锚点必须取**按钮自身的 onClick**，不能取可见文案「全部取消」。
+     *
+     * 原因：那段文案在 JSX 块注释里也出现（说明「这条必须是最后一个 child」的那段），
+     * 于是 `indexOf('全部取消')` 会**先命中注释**而不是按钮 —— 一旦有人把真按钮挪到
+     * 卡片 map 之前、只把注释留在后面，断言照样通过（假绿）。换成 onClick 唯一定位
+     * 才是真的在钉"按钮排在卡片之后"。
+     */
+    const cancelAnchor = queueSrc.indexOf('onClick={() => cancelImport()}')
 
     expect(cardAnchor).toBeGreaterThan(-1)
     expect(cancelAnchor).toBeGreaterThan(-1)
