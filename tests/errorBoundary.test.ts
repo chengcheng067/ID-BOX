@@ -276,8 +276,9 @@ describe('B3 兜底界面 · 不碰 store、不用 hook、可操作', () => {
     expect(BOUNDARY_CODE).not.toMatch(/\buse(State|Effect|Memo|Ref|Callback|Reducer|Context)\b/)
   })
 
-  it('★三个按钮文案齐全', () => {
+  it('★四个按钮文案齐全', () => {
     expect(BOUNDARY).toContain('重新加载界面')
+    expect(BOUNDARY).toContain('重新加载窗口')
     expect(BOUNDARY).toContain('复制诊断信息')
     expect(BOUNDARY).toContain('打开日志文件夹')
     expect(BOUNDARY).toContain('已复制')
@@ -287,6 +288,9 @@ describe('B3 兜底界面 · 不碰 store、不用 hook、可操作', () => {
     expect(BOUNDARY_CODE).toContain('MAX_RETRIES')
     expect(BOUNDARY_CODE).toContain('retries >= MAX_RETRIES')
     expect(BOUNDARY_CODE).toContain('多次重试仍失败')
+    // 文案不许带方位词：按钮行 flex-wrap，窄窗口下「重新加载窗口」可能换行到别处
+    expect(BOUNDARY).not.toContain('请点右侧')
+    expect(BOUNDARY).toContain('请点「重新加载窗口」')
   })
 
   it('★「打开日志文件夹」走 logStats().dir → openPath，且整体 try/catch', () => {
@@ -326,5 +330,47 @@ describe('B4 兜底界面的颜色 · 一律 var(--token, 兜底色)', () => {
     expect(BOUNDARY_CODE).toContain('maxWidth: 640')
     expect(BOUNDARY_CODE).toContain('borderRadius: 12')
     expect(BOUNDARY_CODE).toContain('padding: 28')
+  })
+})
+
+// ── B5. 无边框窗口的逃生口（`frame: false`，自绘标题栏随 App 一起被卸载） ────
+//
+// 这一组守的是**最严重的那类退化**：兜底界面出现后，窗口没有最小化/最大化/关闭按钮，
+// 用户唯一出路是任务管理器。所以「整页重载」和「关窗」这两条不依赖 React 树的出口
+// 必须存在、且不能被重试次数连坐禁用。
+
+describe('B5 Escape hatches · 重新加载窗口 / 关闭窗口', () => {
+  it('★「重新加载窗口」执行 location.reload()', () => {
+    expect(BOUNDARY_CODE).toContain('window.location.reload()')
+  })
+
+  it('★整页重载与关窗都在 try 里（兜底页绝不许自己抛错）', () => {
+    expect(BOUNDARY_CODE).toMatch(/handleReloadWindow[\s\S]*?try[\s\S]*?location\.reload\(\)/)
+    expect(BOUNDARY_CODE).toMatch(/handleCloseWindow[\s\S]*?try[\s\S]*?winClose/)
+  })
+
+  it('★关窗走 preload 的 winClose（可选链），不是 window.close()', () => {
+    expect(BOUNDARY_CODE).toContain('winClose?.()')
+    expect(BOUNDARY_CODE).toMatch(/winClose\?\..*\(/)
+    // 反向守卫：`window.close()` 会绕过主进程 `win:close` 的 closable 判断与退出逻辑
+    expect(BOUNDARY_CODE).not.toContain('window.close()')
+  })
+
+  it('★右上角 × 有 aria-label / title，且内容是 ×（U+00D7）', () => {
+    expect(BOUNDARY).toContain('aria-label="关闭 ID BOX"')
+    expect(BOUNDARY).toContain('title="关闭 ID BOX"')
+    expect(BOUNDARY).toContain('×')
+    // 绝对定位在卡片右上角（卡片必须 relative，否则 × 会跑到视口角上）
+    expect(BOUNDARY_CODE).toContain("position: 'absolute'")
+    expect(BOUNDARY_CODE).toContain("position: 'relative'")
+  })
+
+  it('★只有「重新加载界面」受 retries 约束：源码里 disabled= 只出现一次', () => {
+    // 静态能断言到这个程度就够了：一旦有人给别的按钮也加 disabled，
+    // 逃生口就会跟着重试次数一起失效（确定性错误时用户被关死）
+    expect(BOUNDARY_CODE.split('disabled=').length - 1).toBe(1)
+    expect(BOUNDARY_CODE).toContain('disabled={retryDisabled}')
+    // retryDisabled 的唯一来源就是 retries（不许出现第二个判据）
+    expect(BOUNDARY_CODE.split('const retryDisabled').length - 1).toBe(1)
   })
 })

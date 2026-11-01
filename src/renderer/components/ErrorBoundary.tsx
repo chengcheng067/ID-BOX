@@ -24,9 +24,13 @@ import { clip, describeError, formatErrorReport } from '../logic/errorReport'
  *    日志失败绝不能反过来影响兜底渲染。
  * 4. **兜底界面只读 state，不做任何磁盘/库操作** —— 这里唯一的承诺是
  *    「素材库和磁盘文件都没有被改动」，代码也必须兑现这句话。
+ * 5. **三条逃生口必须始终可用**（重新加载窗口 / 关窗 × / 打开日志文件夹）—— 本窗口是
+ *    `frame: false` 的无边框窗口，自绘标题栏（`WindowControls`）在 `Toolbar` → `App` 内部，
+ *    边界一接管就随之被卸载了。所以「不依赖 React 树能否重挂载」的出口不能跟着
+ *    重试次数一起禁用，否则确定性渲染错误时用户会被关在一个既打不开也关不掉的窗口里。
  */
 
-/** 重试按钮的最多次数（防无限重试死循环：2 次之后只能重新加载窗口） */
+/** 重试按钮（重新挂载 React 子树）的最多次数；超了只能走「重新加载窗口」那条逃生口 */
 const MAX_RETRIES = 2
 
 /** 日志消息常量（主进程日志里一条就是一条，便于 grep） */
@@ -95,7 +99,18 @@ interface ErrorBoundaryState {
 // ── 内联样式（全部走 CSS 变量 + 兜底色，理由见文件头「铁律 2」） ──────────────
 
 const styles: Record<
-  'scrim' | 'card' | 'title' | 'hint' | 'summary' | 'pre' | 'actions' | 'primary' | 'primaryOff' | 'secondary' | 'retryNote',
+  | 'scrim'
+  | 'card'
+  | 'close'
+  | 'title'
+  | 'hint'
+  | 'summary'
+  | 'pre'
+  | 'actions'
+  | 'primary'
+  | 'primaryOff'
+  | 'secondary'
+  | 'retryNote',
   CSSProperties
 > = {
   scrim: {
@@ -110,6 +125,8 @@ const styles: Record<
     background: 'var(--bg-canvas, #f8fafc)'
   },
   card: {
+    // `relative` 只为右上角那颗 × 定位用（绝对定位的包含块）
+    position: 'relative',
     width: '100%',
     maxWidth: 640,
     boxSizing: 'border-box',
@@ -119,6 +136,29 @@ const styles: Record<
     padding: 28,
     boxShadow: 'var(--shadow-modal, 0 16px 48px rgba(38, 48, 64, 0.18))',
     color: 'var(--text-primary, #1f2937)'
+  },
+  /**
+   * 卡片右上角的关闭钮（×）。
+   *
+   * **不做 hover 态**：兜底页的第一原则是"极简且一定能显示"，为一个悬停效果多挂两个
+   * React 事件处理器（还要内联改样式）不值当 —— 这里少一行 JS 就少一个出错点。
+   */
+  close: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    width: 28,
+    height: 28,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    border: 'none',
+    borderRadius: 6,
+    background: 'transparent',
+    color: 'var(--text-tertiary, #6b7280)',
+    fontSize: 16,
+    lineHeight: 1,
+    cursor: 'pointer'
   },
   title: {
     fontSize: 20,
@@ -329,6 +369,41 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     }
   }
 
+  /**
+   * 「重新加载窗口」：整页重载渲染进程（**逃生口 2**）。
+   *
+   * 为什么 `location.reload()` 不能替代「重新加载界面」，也不能被它替代：
+   *   - 重试（`handleRetry`）只是**重新挂载 React 子树**，主进程状态、渲染进程里
+   *     已经跑歪的模块级状态（词表缓存、Dexie 连接池、three.js 上下文）都还在，
+   *     "被污染的模块级状态导致的崩溃"重试一百次也修不好；
+   *   - 整页重载把这些全部重置，是比"重挂载"更彻底的一档。
+   * 数据安全：库的真相在磁盘 + Dexie，重载只是重新读一遍，不会丢东西。
+   */
+  private handleReloadWindow = (): void => {
+    try {
+      window.location.reload()
+    } catch {
+      /* 极端情况（location 被冻结）→ 静默：绝不能让兜底界面自己抛错 */
+    }
+  }
+
+  /**
+   * 「关闭 ID BOX」（卡片右上角 ×）：**逃生口 3**，走主进程既有的关窗流程。
+   *
+   * ⚠️ 不要改成 `window.close()`：`winClose` 是 `send` 到主进程的 `win:close`
+   * （`main/index.ts` 的 `ipcMain.on` 里有 `closable` 判断与 `window-all-closed` 退出逻辑），
+   * 而 `window.close()` 会绕过那一层 —— 关窗时该做的事（比如 `closable` 守卫）就全跳过了。
+   *
+   * 这条通道用的是可选链：preload 缺失时只是**关不掉**，绝不能反过来把兜底界面炸掉。
+   */
+  private handleCloseWindow = (): void => {
+    try {
+      window.modvault?.winClose?.()
+    } catch {
+      /* preload 缺失 / 窗口正在销毁 → 静默 */
+    }
+  }
+
   render(): ReactNode {
     const { error, retries, copied } = this.state
 
@@ -337,11 +412,27 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
       return <Fragment key={retries}>{this.props.children}</Fragment>
     }
 
+    /**
+     * 只有「重新加载界面」受重试次数约束（它依赖 React 树能重新挂载来"治好"），
+     * 其余三个按钮 + 右上角 × 是**逃生口**：整页重载 / 复制诊断 / 开日志目录 / 关窗，
+     * 都不依赖 React 树能否重挂载，所以**必须始终可用** —— 否则确定性渲染错误时
+     * 用户会被关在一个既打不开也关不掉的窗口里（本窗口 `frame: false`，
+     * 自绘标题栏随 App 一起被卸载了）。
+     */
     const retryDisabled = retries >= MAX_RETRIES
 
     return (
       <div style={styles.scrim}>
         <div style={styles.card} role="alert" aria-live="assertive">
+          <button
+            type="button"
+            onClick={this.handleCloseWindow}
+            style={styles.close}
+            aria-label="关闭 ID BOX"
+            title="关闭 ID BOX"
+          >
+            ×
+          </button>
           <div style={styles.title}>界面出错了</div>
           <div style={styles.hint}>你的素材库和磁盘文件都没有被改动，这里只是界面渲染失败。</div>
           <details>
@@ -356,6 +447,9 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
               style={retryDisabled ? styles.primaryOff : styles.primary}
             >
               重新加载界面
+            </button>
+            <button type="button" onClick={this.handleReloadWindow} style={styles.secondary}>
+              重新加载窗口
             </button>
             <button
               type="button"
@@ -373,7 +467,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
             </button>
           </div>
           {retryDisabled && (
-            <div style={styles.retryNote}>多次重试仍失败，请点右侧重新加载窗口</div>
+            // 不写方位词：按钮行是 `flex-wrap: wrap`，窄窗口下「重新加载窗口」可能换行到别处
+            <div style={styles.retryNote}>多次重试仍失败，请点「重新加载窗口」</div>
           )}
         </div>
       </div>
