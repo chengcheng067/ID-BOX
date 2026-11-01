@@ -176,7 +176,14 @@ beforeEach(() => {
   putFails = () => false
   vi.clearAllMocks()
   modvault.assignCategory.mockReset()
-  modvault.ensureThumb.mockResolvedValue('thumb-new.jpg')
+  // `regenThumbSweep`（非球图分支）对**一次重生**要发 2 次 `ensureThumb`：先探一次拿 `first`，
+  // 删掉旧 salt 之后再补一次拿 `finalName`。所以这里按**入参 coverAbs** 派生产物名 ——
+  // 这样断言能直接看出"落库的那张图是从哪个目录算出来的"，而不是靠调用序号猜。
+  modvault.ensureThumb.mockReset()
+  modvault.ensureThumb.mockImplementation(async (_id: string, coverAbs: string | null) => {
+    const abs = coverAbs ?? ''
+    return abs.includes(`\\${TARGET1}\\${TARGET2}\\`) ? 'thumb-new.jpg' : 'thumb-restored.jpg'
+  })
   modvault.deleteThumb.mockResolvedValue(0)
   modvault.deleteOneThumb.mockResolvedValue(true)
   useVault.setState({
@@ -272,8 +279,9 @@ describe('逐条落库：3 条成功 = 3 次 put，bulkPut 一次都没有', () 
 
 describe('put 抛错 · 反向搬回成功', () => {
   it('★该条彻底回滚：库与内存都是旧路径，moved=2 / failed=1，后续条目继续处理', async () => {
+    // b 带封面：回滚分支必须按**恢复后的路径**重生缩略图（见下面 ensureThumb 的两条断言）
     const a = fixture()
-    const b = fixture()
+    const b = fixture({ cover: '预览图.jpg', coverSource: 'named', thumbPath: 'old-b.jpg', thumbStatus: 'ready' })
     const c = fixture()
     const all = [a, b, c]
     seedDb(all)
@@ -299,15 +307,36 @@ describe('put 抛错 · 反向搬回成功', () => {
       category2: UNCLASSIFIED
     })
 
+    // ── 缩略图：`regenThumbSweep` 在 put 之前已经删掉了旧 salt，所以回滚必须重生 ──
+    // `regenThumbSweep` 一次重生 = 2 次 `ensureThumb`（先探一次、删旧后再补一次）：
+    //   调 0/1 = 搬到目标目录后重生（coverAbs 取 res.folder）
+    //   调 2/3 = **回滚后**重生（coverAbs 必须取恢复后的 back.folder）
+    const coverRel = '预览图.jpg'
+    const forwardAbs = `E:\\Lib\\模型\\${TARGET1}\\${TARGET2}\\${b.name}\\${coverRel}`
+    const restoredAbs = `${b.folder}\\${coverRel}`
+    expect(modvault.ensureThumb).toHaveBeenCalledTimes(4)
+    expect(modvault.ensureThumb.mock.calls[0]).toEqual([b.id, forwardAbs])
+    expect(modvault.ensureThumb.mock.calls[1]).toEqual([b.id, forwardAbs])
+    // ★ 关键：回滚那两次用的是**恢复后**的绝对路径（含 back.folder），既不是新路径也不是原值
+    expect(modvault.ensureThumb.mock.calls[2]).toEqual([b.id, restoredAbs])
+    expect(modvault.ensureThumb.mock.calls[3]).toEqual([b.id, restoredAbs])
+    expect(restoredAbs).not.toContain(`\\${TARGET1}\\`)
+    expect(restoredAbs).not.toBe(forwardAbs)
+
     // 库：b 仍是旧路径 / 旧分类（回滚记录把库拉回来了）
     const rowB = records.get(b.id)!
     expect(rowB.folder).toBe(b.folder)
     expect(rowB.relFolder).toBe(b.relFolder)
     expect(rowB.category1).toBe(UNCLASSIFIED)
     expect(rowB.category2).toBe(UNCLASSIFIED)
-    // 回滚是"恢复原状"：名字没变 → dedupeKey 与缩略图沿用原值
+    // 回滚是"恢复原状"：名字没变 → dedupeKey 沿用原值
     expect(rowB.dedupeKey).toBe(b.dedupeKey)
-    expect(rowB.thumbPath).toBeUndefined()
+    // ③ 缩略图来自**回滚后**那次重生的产物（产物名由 coverAbs 派生，见 beforeEach 的桩）：
+    //    既不是原值（旧 salt 已被删），也不是搬到目标目录后生成的那一张
+    expect(rowB.thumbPath).toBe('thumb-restored.jpg')
+    expect(rowB.thumbStatus).toBe('ready')
+    expect(rowB.thumbPath).not.toBe('old-b.jpg')
+    expect(rowB.thumbPath).not.toBe('thumb-new.jpg')
 
     // 内存：b 也是旧值（与库、与盘三方一致）
     expect(memFolder(b.id)).toBe(b.folder)
@@ -321,6 +350,28 @@ describe('put 抛错 · 反向搬回成功', () => {
 
     // 完全回滚 = 没有需要事后取证的残留状态 → 不落 error 日志
     expect(reportMessages()).toEqual([])
+  })
+
+  it('★没有封面 → 回滚不重生缩略图（第二次 ensureThumb 不调用），thumbStatus 退化为 none', async () => {
+    const a = fixture()
+    // 无 `cover` = 本来就没有缩略图可生成（搬家那条路径也不会调 regenThumbSweep）
+    const b = fixture({ thumbPath: undefined, thumbStatus: 'none' })
+    const c = fixture()
+    const all = [a, b, c]
+    seedDb(all)
+    useVault.setState({ assets: all, notice: null })
+    modvault.assignCategory.mockImplementation(async (p: AssignCategoryPayload) => movedTo(p))
+    putFails = (n) => n === 2
+
+    const summary = await useVault.getState().assignCategory([a.id, b.id, c.id], TARGET1, TARGET2)
+
+    expect(summary).toMatchObject({ moved: 2, failed: 1 })
+    // 没有封面 → 全程一次 ensureThumb 都不该发（既没搬后重生，也没回滚后重生）
+    expect(modvault.ensureThumb).not.toHaveBeenCalled()
+    const rowB = records.get(b.id)!
+    expect(rowB.folder).toBe(b.folder)
+    expect(rowB.thumbPath).toBeUndefined()
+    expect(rowB.thumbStatus).toBe('none')
   })
 })
 

@@ -3496,6 +3496,11 @@ export const useVault = create<VaultState>((set, get) => ({
    * 只有两个方向 —— 要么记录跟着磁盘走（commit），要么磁盘跟着记录回来（rollback）。
    * 后两种结局中断整批：写不进去 / 搬不回来时继续搬后面的只会制造更多僵尸记录，
    * 每条都已自洽，代价只是这一批少搬几条。
+   *
+   * ⚠️ 回滚记录里的**缩略图不是原值**：`regenThumbSweep` 在这一条的 put 之前已经跑过，
+   * 而它做的就是删旧 salt（见 `if (back)` 分支的注释）。所以回滚成功之后必须按恢复后的
+   * `back.folder` 重新派生一次缩略图，否则记录会带着一个已被删除的文件名 + `'ready'`，
+   * 用户看到的是一条永远裂图的资产（`repairThumbPresence` 只在下一次启动时跑）。
    */
   async assignCategory(ids, category1, category2) {
     const pair = normalizeCategoryPair(category1, category2)
@@ -3568,6 +3573,27 @@ export const useVault = create<VaultState>((set, get) => ({
           .catch(() => null)
 
         if (back) {
+          // ⚠️ 缩略图**必须重生**，不能沿用 `asset.thumbPath`：
+          // `regenThumbSweep` 在这一条的 `db.assets.put` **之前**就跑过了，而它做的正是
+          // **删旧缩略图** —— 非球图走 B 分支 `deleteThumb(id)`（通配删该资产全部历史 salt），
+          // 球图走 A 分支 `deleteOneThumb(id, prev)`（精确删 `asset.thumbPath` 那一张）。
+          // 所以执行到这里时，`asset.thumbPath` 指向的文件通常已经**不存在**了；沿用它 +
+          // `thumbStatus:'ready'` 就是「盘对了、索引说错了」：这一条在本会话里一直显示裂图，
+          // 而 `repairThumbPresence()` 只在下次启动的 bootstrap 里跑，用户不会想到要重启。
+          // → 按**恢复后的路径**重新派生一次（`back.folder` 是 main 的实回值，可能因重名
+          //   与 `asset.folder` 不同，所以 `coverAbs` 只能用 `back.folder` 算）。
+          let reThumb: { thumbPath?: string; thumbStatus: ThumbStatus } = { thumbStatus: 'none' }
+          if (asset.cover) {
+            try {
+              reThumb = await regenThumbSweep(asset.id, assetFileAbs(back.folder, asset.cover))
+            } catch (thumbErr) {
+              // 补偿路径里再抛一次错会把真正的失败原因盖掉（同 `reportAssignTxFailure` 的原则）
+              // → 退化成"没有缩略图"（下次 bootstrap 的 repairThumbPresence 会补回来）
+              console.error('[assignCategory] 回滚后重生缩略图失败', asset.id, thumbErr)
+              reThumb = { thumbStatus: 'none' }
+            }
+          }
+
           const rolledBack: Asset = {
             ...asset,
             name: back.name,
@@ -3582,9 +3608,9 @@ export const useVault = create<VaultState>((set, get) => ({
               back.name === asset.name
                 ? asset.dedupeKey
                 : dedupeKeyOf(baseNameOf(back.name), asset.kind),
-            // 缩略图**沿用原值**：盘已回到原位置，旧 salt 重新有效，不必重生
-            thumbPath: asset.thumbPath,
-            thumbStatus: asset.thumbStatus ?? 'none',
+            // 缩略图用上面按恢复后路径重生的结果（旧 salt 已被删，绝不能沿用旧值）
+            thumbPath: reThumb.thumbPath,
+            thumbStatus: reThumb.thumbStatus,
             updatedAt: Date.now()
           }
           try {
