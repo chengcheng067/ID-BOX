@@ -1,6 +1,7 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import './styles.css'
 import { installRendererLogHooks } from './logic/rendererLog'
 import { installEscProbe } from './logic/escLayer'
@@ -45,9 +46,18 @@ installEscProbe({
 // 失败完全静默、不阻塞首帧。
 startAutoCheck()
 
+// 顶层错误边界（2026-10 白屏兜底）。
+//
+// **必须挂在入口这一层**：App 内部任何位置在渲染期抛错，React 都会卸载**整棵**组件树 ——
+// 上面的 installRendererLogHooks 只能把原因落进主进程日志（取证），救不回界面；
+// 用户看到的是纯白屏、没有入口、也不知道数据有没有事。边界必须包住 App 本体
+// （放进 App 里面就跟着一起被卸载了），且放在 StrictMode **里面**：StrictMode 只是
+// 开发期的双调用检查，不产生 DOM，边界不需要观察它。
 createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </React.StrictMode>
 )
 
