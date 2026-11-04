@@ -28,7 +28,7 @@ require 'json'
 module IDBoxPanel
   # ── 契约常量（与 src/shared/pluginSnapshot.ts 逐字对齐，不得自造字段） ──────
   API_VERSION = '1'.freeze
-  PLUGIN_VERSION = '1.0.1'.freeze
+  PLUGIN_VERSION = '1.0.2'.freeze
   MANIFEST_FILE = 'manifest.json'.freeze
   INDEX_FILE = 'index.json'.freeze
   # 支持目录名 = 根 .rb 同名（去掉 .rb），docs/39 §4.2 硬要求
@@ -876,6 +876,8 @@ module IDBoxPanel
       @timer = nil
       @snapshot = nil
       @signature = nil
+      # build_dialog 失败的真实原因（上次 catch 把 NoMethodError 误报成"文件找不到"）
+      @build_error = nil
     end
 
     def show
@@ -888,8 +890,8 @@ module IDBoxPanel
       if @dialog.nil?
         unless build_dialog
           UI.messagebox(
-            "ID BOX 面板加载失败：找不到 panel.html。请重新安装插件（.rbz）。\n\n" \
-            "已尝试以下路径：\n#{Paths.tried_paths_text()}"
+            "ID BOX 面板打开失败。\n\n原因：#{@build_error.to_s.empty? ? '(未知)' : @build_error}\n\n" \
+            "已尝试的 panel.html 路径：\n#{Paths.tried_paths_text()}"
           )
           return false
         end
@@ -914,8 +916,12 @@ module IDBoxPanel
     end
 
     def build_dialog
+      @build_error = nil
       html = Paths.html_path
-      return false if html.empty? || !File.file?(html)
+      if html.empty? || !File.file?(html)
+        @build_error = "panel.html 不存在或不可读：#{html.empty? ? '(空路径)' : html}"
+        return false
+      end
       options = {
         :dialog_title => 'ID BOX',
         :preferences_key => 'idbox_panel_main_dialog',
@@ -929,7 +935,10 @@ module IDBoxPanel
       }
       @dialog = UI::HtmlDialog.new(options)
       @dialog.set_size(DIALOG_WIDTH, DIALOG_HEIGHT)
-      @dialog.set_min_size(DIALOG_MIN_WIDTH, DIALOG_MIN_HEIGHT)
+      # ⚠️ 不要调 set_min_size：**UI::HtmlDialog 没有这个方法**（官方 API 只有构造函数里的
+      # :min_width / :min_height）。1.0.1 在这里抛 NoMethodError，被下面的 rescue 吞掉后
+      # 被 show() 误报成「找不到 panel.html」——真机排查白跑了两轮。
+      # 最小尺寸已在上面 options 里给了，这里不需要再设。
       @dialog.center
       @dialog.set_file(html)
       @dialog.add_action_callback('ready') { |_context| on_ready }
@@ -938,7 +947,9 @@ module IDBoxPanel
       @dialog.set_on_closed { stop_polling }
       true
     rescue StandardError => error
-      puts("[ID BOX] build dialog failed: #{error.class}: #{error.message}")
+      # 失败必须留下**真实原因**：这句 rescue 曾经把 NoMethodError 伪装成"文件找不到"。
+      @build_error = "#{error.class}: #{error.message}"
+      puts("[ID BOX] build dialog failed: #{@build_error}")
       @dialog = nil
       false
     end
