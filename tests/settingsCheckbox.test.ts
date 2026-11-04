@@ -91,8 +91,11 @@ describe('自绘复选框必须复用既有视觉语言', () => {
     expect(code).not.toContain('accent-color')
   })
 
-  it('5 个调用点全部换成自绘 CheckRow（换一半 = 用户还会看到系统控件）', () => {
-    expect(code.match(/<CheckRow/g)?.length).toBe(5)
+  it('6 个调用点全部用自绘 CheckRow（换一半 = 用户还会看到系统控件）', () => {
+    // 原 5 个（别名建议 + forceAck + 三个 apply 勾选）+ 新增第 6 个 = 设置页的
+    // SketchUp 插件开关（`pluginIndexEnabled`）。新控件必须走同一个 CheckRow，
+    // 不许为了省事在设置页写原生 checkbox。
+    expect(code.match(/<CheckRow/g)?.length).toBe(6)
     expect(code).not.toMatch(/<label\b[\s\S]{0,120}type="checkbox"/)
   })
 
@@ -130,7 +133,7 @@ describe('可访问性：可聚焦、可键盘操作、语义是 checkbox', () =
   })
 })
 
-describe('5 个调用点的业务语义一字未改', () => {
+describe('原有 5 个调用点的业务语义一字未改', () => {
   const code = settingsCode()
 
   it('① 别名建议勾选列表：仍是 setPicked（勾选 → 显式按钮才写库）', () => {
@@ -163,5 +166,14 @@ describe('5 个调用点的业务语义一字未改', () => {
       expect(code).toMatch(new RegExp(`const \\[${state}, set[A-Za-z]+\\] = useState\\(false\\)`))
     }
     expect(code).toContain('勾选后才会修改（默认全部不勾）')
+  })
+
+  it('⑥ SketchUp 插件开关：走 saveSettings 唯一写入口，默认关（照 `settings.ts` 的 `.catch(false)`）', () => {
+    // 业务口径：开关关 = 主进程不落盘，插件读到「未开导出」（IDBOX-101）。
+    // 渲染层不许绕过 `saveSettings` 直接 setState，也不许默认打开。
+    expect(code).toMatch(/checked=\{settings\.pluginIndexEnabled === true\}/)
+    expect(code).toMatch(/onChange=\{\(next\) => \{\s*void saveSettings\(\{ pluginIndexEnabled: next \}\)/)
+    expect(code).toContain('为 SketchUp 插件导出索引快照')
+    expect(code).toContain('未开导出')
   })
 })

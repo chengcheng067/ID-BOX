@@ -558,7 +558,7 @@ describe('触发集（§6 A1 已拍板，deny by default）', () => {
     expect(isPluginTrigger(123)).toBe(false)
   })
 
-  it('store.ts 的上报调用点恰好六个，且缩略图涓流函数体内没有调用', () => {
+  it('store.ts 的上报调用点恰好七个（六个触发点 + 开关打开时复用 manualRefresh），且缩略图涓流函数体内没有调用', () => {
     const src = readFileSync(new URL('../src/renderer/store.ts', import.meta.url), 'utf-8')
     const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     const callSites = [...code.matchAll(/reportPluginSnapshot\('([A-Za-z]+)'\)/g)].map((m) => m[1]).sort()
@@ -566,10 +566,15 @@ describe('触发集（§6 A1 已拍板，deny by default）', () => {
       'assignCategory',
       'importBatchDone',
       'manualRefresh',
+      'manualRefresh',
       'rescan',
       'startup',
       'trashRestore'
     ])
+    // 七个调用点仍只用到六个触发名 —— 开关翻到「开」时靠 saveSettings 立刻落一次盘
+    // （复用 `manualRefresh`，不新增第七个触发名）。没有这一步，插件会一直显示
+    // 「未开导出」（IDBOX-101），用户必须再手动刷新才生效。
+    expect(code).toMatch(/if \(patch\.pluginIndexEnabled === true\) reportPluginSnapshot\('manualRefresh'\)/)
 
     // 涓流函数体里不许出现上报调用（它形成的持续小流会把 debounce 永久续期）
     const dripAt = code.indexOf('export async function ensureMissingThumbs(')

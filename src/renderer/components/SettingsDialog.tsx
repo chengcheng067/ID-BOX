@@ -2658,6 +2658,26 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </button>
           }
         />
+        {/* SketchUp 插件（docs/38 §8.1 / docs/39 §3）：开关必须能在这里打开——关着时
+            主进程不落盘，插件读到的是「未开导出」（IDBOX-101），而不是读到空文件。 */}
+        <SettingsRow
+          title="SketchUp 插件"
+          desc="为 SketchUp 插件持续导出索引快照（UTF-8 JSON，只读）。"
+          notice="关闭时插件会提示「未开导出」；打开后只在确有变化时落盘，最迟 5 秒写一次。落盘位置：用户目录下的 idbox/plugin/。"
+          actions={
+            <CheckRow
+              checked={settings.pluginIndexEnabled === true}
+              align="start"
+              title="为 SketchUp 插件导出索引快照"
+              onChange={(next) => {
+                void saveSettings({ pluginIndexEnabled: next })
+                flash()
+              }}
+            >
+              <span>开启插件索引导出</span>
+            </CheckRow>
+          }
+        />
       </SettingsCard>
 
       {/* 一键重扫 · 从知末获取封面（2026-10 用户拍板）：只补没有 cover 文件的资产，

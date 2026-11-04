@@ -5091,6 +5091,14 @@ export const useVault = create<VaultState>((set, get) => ({
   async saveSettings(patch) {
     const settings = await window.modvault.setSettings(patch)
     set({ settings })
+    /**
+     * 插件开关从「关」翻到「开」→ 立刻按 `manualRefresh` 落一次盘。
+     * 这是必要的，不是额外触发：**触发集仍是拍板的六项**（见 `PLUGIN_TRIGGER_SET`），
+     * 这里复用 `manualRefresh` 而不是新增第七个触发名。若不落这一次，开关刚打开时
+     * `manifest.json` 里根本没有内容（或仍是旧的 `pluginIndexEnabled:false`），
+     * 插件会一直显示「未开导出」（IDBOX-101），用户必须再点一次刷新或改一条素材才生效。
+     */
+    if (patch.pluginIndexEnabled === true) reportPluginSnapshot('manualRefresh')
     // 侧栏入口关闭 → 顺带重置对应筛选（否则"筛选生效但入口不存在"，用户无法解除）
     const reset = hiddenSidebarFilterReset(settings, get().filters, get().dupOnly)
     if (reset) {
