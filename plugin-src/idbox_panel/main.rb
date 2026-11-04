@@ -28,9 +28,11 @@ require 'json'
 module IDBoxPanel
   # ── 契约常量（与 src/shared/pluginSnapshot.ts 逐字对齐，不得自造字段） ──────
   API_VERSION = '1'.freeze
-  PLUGIN_VERSION = '1.0.0'.freeze
+  PLUGIN_VERSION = '1.0.1'.freeze
   MANIFEST_FILE = 'manifest.json'.freeze
   INDEX_FILE = 'index.json'.freeze
+  # 支持目录名 = 根 .rb 同名（去掉 .rb），docs/39 §4.2 硬要求
+  SUPPORT_DIR_NAME = 'idbox_panel'.freeze
 
   # 轮询（docs/39 §3.5：建议 3 s，只在面板打开时跑）
   POLL_SECONDS = 3
@@ -219,18 +221,68 @@ module IDBoxPanel
       File::ALT_SEPARATOR ? true : false
     end
 
-    # 支持目录 = 本文件所在目录（<Plugins>/idbox_panel）
-    def support_dir
+    # 支持目录 = 装好的 <Plugins>/idbox_panel。
+    #
+    # ⚠️ 真机踩过的坑（2026-11-05，SU 2024 + 本机 AppData）：SketchUp 把扩展里的
+    # `__FILE__` 给成**相对路径**（`idbox_panel/main.rb`），`File.expand_path` 于是按
+    # "当前工作目录"（SketchUp 安装目录）解析，算出 `...\SketchUp\idbox_panel` ——
+    # 目录不存在 → 面板报「找不到 panel.html」。所以**不能只信 `__FILE__`**。
+    #
+    # 按可信度依次尝试，第一个"目录存在且里面真有 panel.html"的胜出：
+    #   ① `__FILE__` 绝对路径（正常情况下就是它）
+    #   ② `Sketchup.find_support_file`（官方 API，按 Plugins 相对路径找，最稳）
+    #   ③ 从 `Sketchup.find_support_file('Plugins')` 拼
+    #   ④ AppData 兜底扫描（覆盖 2021–2026 各版本；真机实测真实路径是
+    #      `%APPDATA%\SketchUp\SketchUp 2024\SketchUp\Plugins`，比文档假设多一层 `SketchUp`）
+    def support_candidates
+      list = []
       begin
-        File.expand_path(File.dirname(__FILE__))
+        list << File.expand_path(File.dirname(__FILE__))
       rescue StandardError
-        ''
+        nil
       end
+      begin
+        found = Sketchup.find_support_file('panel.html', File.join('Plugins', SUPPORT_DIR_NAME))
+        list << File.dirname(found) if found && !found.to_s.empty?
+      rescue StandardError
+        nil
+      end
+      begin
+        plugins_root = Sketchup.find_support_file('Plugins')
+        list << File.join(plugins_root, SUPPORT_DIR_NAME) if plugins_root && !plugins_root.to_s.empty?
+      rescue StandardError
+        nil
+      end
+      begin
+        appdata = Support.text(ENV['APPDATA'])
+        unless appdata.strip.empty?
+          Dir.glob(File.join(appdata, 'SketchUp', 'SketchUp *', '**', 'Plugins', SUPPORT_DIR_NAME)).each do |dir|
+            list << dir
+          end
+        end
+      rescue StandardError
+        nil
+      end
+      list.compact.uniq
+    end
+
+    def support_dir
+      support_candidates.each do |dir|
+        return dir if File.directory?(dir) && File.file?(File.join(dir, 'panel.html'))
+      end
+      ''
     end
 
     def html_path
       dir = support_dir
       dir.empty? ? '' : File.join(dir, 'panel.html')
+    end
+
+    # 失败时把"试过哪些路径"一起给出来 —— 下一轮真机问题不用再猜（可诊断性优先）
+    def tried_paths_text
+      list = support_candidates
+      return '(无可尝试路径)' if list.empty?
+      list.map { |dir| "· #{dir}" }.join("\n")
     end
 
     # %APPDATA%\idbox\plugin —— D1 已拍板（docs/38 §8.1），不猜路径、不立第二个根
@@ -835,7 +887,10 @@ module IDBoxPanel
       end
       if @dialog.nil?
         unless build_dialog
-          UI.messagebox('ID BOX 面板加载失败：找不到 panel.html。请重新安装插件（.rbz）。')
+          UI.messagebox(
+            "ID BOX 面板加载失败：找不到 panel.html。请重新安装插件（.rbz）。\n\n" \
+            "已尝试以下路径：\n#{Paths.tried_paths_text()}"
+          )
           return false
         end
       end

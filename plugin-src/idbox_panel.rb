@@ -33,7 +33,7 @@ module IDBoxPanel
     # 支持目录名必须与根 .rb 同名（去掉 .rb），否则 SketchupExtension 找不到入口。
     ENTRY_POINT = 'idbox_panel/main'.freeze
     EXT_NAME = 'ID BOX Panel'.freeze
-    EXT_VERSION = '1.0.0'.freeze
+    EXT_VERSION = '1.0.1'.freeze
     EXT_CREATOR = 'ID BOX'.freeze
     EXT_COPYRIGHT = 'ID BOX'.freeze
     EXT_DESCRIPTION =
