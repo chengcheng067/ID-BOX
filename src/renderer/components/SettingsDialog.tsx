@@ -44,7 +44,7 @@ import { Modal } from './Modal'
 import { useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
 import { IconCheck, IconRefresh } from '../icons'
-import { UNCLASSIFIED } from '../../shared/taxonomy'
+import { isUnclassified } from '../logic/triageFlow'
 // 品牌资源（2026-10 用户要求「图标 logo 换一下」「关于页做上打赏和反馈」）：
 // 三张图都由 `scripts/build-app-icon.cjs` 从 `resources/brand/` 的原图生成，
 // 走 Vite 的 import（产物是哈希 URL），不放 public/ 也不内联 base64。
@@ -1132,17 +1132,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [pickNotIndexed, setPickNotIndexed] = useState(false)
   const [pickMismatch, setPickMismatch] = useState(false)
   // v1.0.13 重跑自动分类（词表/匹配规则升级后，旧资产不会自动变好）：
-  // 候选数直接由索引算（与 store 的筛选口径同一个哨兵），为 0 时按钮禁用。
-  const unclassifiedCount = useVault((s) => {
-    const assets = s.assets
-    let n = 0
-    for (const a of assets) {
-      const c1 = a.category1 ?? UNCLASSIFIED
-      const c2 = a.category2 ?? UNCLASSIFIED
-      if (c1 === UNCLASSIFIED && c2 === UNCLASSIFIED) n += 1
-    }
-    return n
-  })
+  // 候选数与「全库双未分类」共用 `isUnclassified` 唯一判据源，不再手写第四份；
+  // 为 0 时按钮禁用。这里刻意保持原行为：直接遍历 s.assets，不额外滤软删
+  //（store 的 reclassifyUnclassified 自带候选过滤，两处的软删口径差异见 docs/25）。
+  const unclassifiedCount = useVault((s) => s.assets.filter(isUnclassified).length)
   const reclassifyBusy = useVault((s) => s.reclassifyBusy)
   const reclassifyBackupCount = useVault((s) => s.reclassifyBackupCount)
   const reclassifyUnclassified = useVault((s) => s.reclassifyUnclassified)

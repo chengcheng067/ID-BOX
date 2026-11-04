@@ -238,4 +238,16 @@ describe('D · 源码守卫：文案 / 注释 / 初值语义', () => {
     expect(comment).toContain('一级未分类')
     expect(comment).toContain('双未分类总量')
   })
+
+  it('★SettingsDialog.tsx 候选数复用 isUnclassified，不再手写第四份双未分类判据', () => {
+    const settings = readFileSync(
+      fileURLToPath(new URL('../src/renderer/components/SettingsDialog.tsx', import.meta.url)),
+      'utf-8'
+    )
+    expect(settings).toContain("import { isUnclassified } from '../logic/triageFlow'")
+    expect(settings).toContain(
+      'const unclassifiedCount = useVault((s) => s.assets.filter(isUnclassified).length)'
+    )
+    expect(settings).not.toContain('c1 === UNCLASSIFIED && c2 === UNCLASSIFIED')
+  })
 })
