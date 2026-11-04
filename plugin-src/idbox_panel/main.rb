@@ -14,7 +14,10 @@
 # 4) 不解压、不读任何压缩包：V1.0 只取用**已入库**的单个文件。
 # 5) 不自删、不自升级。
 # 6) 纯读方：绝不 File.write / File.delete / File.rename 到 %APPDATA%\idbox\plugin\
-#    或 ID BOX 的任何数据目录。整个文件里不存在任何写文件调用。
+#    或 ID BOX 的任何数据目录。
+#    **唯一例外（用户 2026-11-05 批准）**：面板建窗失败时，向
+#    `%TEMP%\idbox_panel_diag.txt` 写一份诊断快照（环境 + 候选路径 + 真实异常），
+#    用于真机排障 —— 成功路径一个字都不写。见 `Diagnostics` 模块。
 # 7) 全部代码在本单一模块 IDBoxPanel 内；**禁止全局变量**（$x 一律不许出现）。
 # 8) 包内互相 require 用 Sketchup.require 'idbox_panel/xxx'（不带 .rb）。
 #
@@ -28,7 +31,7 @@ require 'json'
 module IDBoxPanel
   # ── 契约常量（与 src/shared/pluginSnapshot.ts 逐字对齐，不得自造字段） ──────
   API_VERSION = '1'.freeze
-  PLUGIN_VERSION = '1.0.2'.freeze
+  PLUGIN_VERSION = '1.0.3'.freeze
   MANIFEST_FILE = 'manifest.json'.freeze
   INDEX_FILE = 'index.json'.freeze
   # 支持目录名 = 根 .rb 同名（去掉 .rb），docs/39 §4.2 硬要求
@@ -339,6 +342,89 @@ module IDBoxPanel
       rescue StandardError
         false
       end
+    end
+  end
+
+  # ── 失败诊断（**唯一允许写盘的地方**，用户 2026-11-05 批准） ────────────────
+  #
+  # ⚠️ 只允许在面板建窗失败时调用，成功路径一个字都不写。
+  # 为什么需要它：真机排查两轮都卡在"报错文案与真实原因不符"上（1.0.1 的
+  # `set_min_size` NoMethodError 被折成"找不到 panel.html"）。有了这份文件，
+  # 任何失败都能直接看到环境与真实异常，不必再靠猜或让用户手敲控制台。
+  #
+  # 落点：%TEMP%\idbox_panel_diag.txt（不写 ID BOX 的任何目录）。
+  # 本方法自身也必须 rescue 全部异常 —— 诊断写不出来绝不能连带把面板搞崩。
+  module Diagnostics
+    module_function
+
+    def path
+      dir = Support.text(ENV['TEMP']).strip
+      dir = Support.text(ENV['TMP']).strip if dir.empty?
+      dir = '.' if dir.empty?
+      File.join(dir, 'idbox_panel_diag.txt')
+    end
+
+    def stamp
+      begin
+        Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+      rescue StandardError
+        '(unknown time)'
+      end
+    end
+
+    def write(reason, extra = nil)
+      lines = []
+      lines << 'ID BOX 面板诊断快照'
+      lines << "生成时间(UTC): #{stamp}"
+      lines << "插件版本: #{PLUGIN_VERSION}"
+      lines << "Ruby: #{RUBY_VERSION}"
+      lines << "SketchUp: #{Support.text(Sketchup.version)}"
+      lines << "失败原因: #{Support.text(reason)}"
+      lines << "extra: #{Support.text(extra)}" unless extra.nil?
+      lines << ''
+      lines << "__FILE__: #{Support.text(__FILE__)}"
+      lines << "ENV['APPDATA']: #{Support.text(ENV['APPDATA'])}"
+      lines << "ENV['TEMP']: #{Support.text(ENV['TEMP'])}"
+      lines << "Encoding.default_external: #{Encoding.default_external.to_s}"
+      lines << ''
+      lines << '候选支持目录（dir? / panel.html?）：'
+      Paths.support_candidates.each do |dir|
+        lines << format(
+          '  %s | dir=%s | panel.html=%s',
+          dir,
+          (File.directory?(dir) ? 'Y' : 'N'),
+          (File.file?(File.join(dir, 'panel.html')) ? 'Y' : 'N')
+        )
+      end
+      lines << "support_dir 命中: #{Paths.support_dir.inspect}"
+      lines << ''
+      lines << '插件数据文件：'
+      [Paths.manifest_path, Paths.index_path].each do |file|
+        next if file.to_s.empty?
+        exists = (File.file?(file) ? 'Y' : 'N')
+        size = (File.file?(file) ? (File.size(file).to_s + ' B') : '-')
+        lines << "  #{file} | exists=#{exists} | size=#{size}"
+      end
+      begin
+        File.open(path, 'w') do |f|
+          f.write(lines.join("\n"))
+          f.write("\n")
+        end
+        true
+      rescue StandardError
+        false
+      end
+    rescue StandardError
+      false
+    end
+
+    # 对话框相关的调用序列（知道自己调了哪些 HtmlDialog 方法，便于对照官方 API）
+    def describe_dialog(dialog)
+      return '(无 dialog 对象)' if dialog.nil?
+      calls = (dialog.respond_to?(:calls) ? dialog.calls : nil)
+      calls.nil? ? '(不可读)' : calls.inspect
+    rescue StandardError
+      '(读取失败)'
     end
   end
 
@@ -889,9 +975,12 @@ module IDBoxPanel
       end
       if @dialog.nil?
         unless build_dialog
+          # 只在失败时写诊断（成功路径零写盘）；写不出来也不能影响弹窗
+          diag_ok = Diagnostics.write(@build_error.to_s.empty? ? '(未知)' : @build_error)
+          diag_hint = diag_ok ? "\n\n诊断已写入：#{Diagnostics.path}" : ''
           UI.messagebox(
             "ID BOX 面板打开失败。\n\n原因：#{@build_error.to_s.empty? ? '(未知)' : @build_error}\n\n" \
-            "已尝试的 panel.html 路径：\n#{Paths.tried_paths_text()}"
+            "已尝试的 panel.html 路径：\n#{Paths.tried_paths_text()}#{diag_hint}"
           )
           return false
         end
@@ -949,6 +1038,14 @@ module IDBoxPanel
     rescue StandardError => error
       # 失败必须留下**真实原因**：这句 rescue 曾经把 NoMethodError 伪装成"文件找不到"。
       @build_error = "#{error.class}: #{error.message}"
+      # 把失败前已经调过的 HtmlDialog 方法也记下来（对照官方 API 一眼看出哪个方法不存在）
+      begin
+        if @dialog.respond_to?(:calls)
+          @build_error = @build_error + "\n已调用的 dialog 方法: " + Diagnostics.describe_dialog(@dialog)
+        end
+      rescue StandardError
+        nil
+      end
       puts("[ID BOX] build dialog failed: #{@build_error}")
       @dialog = nil
       false
