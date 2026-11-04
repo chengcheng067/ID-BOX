@@ -1,0 +1,13 @@
+const asar = require('@electron/asar')
+const path = require('path')
+const abs = path.resolve('release-v093/win-unpacked/resources/app.asar')
+const list = asar.listPackage(abs)
+const norm = (p) => p.split(path.sep).join('/').replace(/^\//, '')
+const files = list.map(norm).filter((f) => f.startsWith('out/') && /\.(cjs|js|css)$/.test(f))
+const read = (p) => asar.extractFile(abs, p.split('/').join(path.sep)).toString()
+const all = files.map(read).join(' ')
+const markers = ['待补', 'isUnclassified', 'displayName', 'HDRI_LEVEL1_LIST', '现代小区HDR']
+for (const m of markers) console.log(m, '->', all.includes(m) ? 'PRESENT' : 'MISSING')
+console.log('out/ js+css entries:', files.length)
+console.log('renderer assets entries:', files.filter((f) => f.startsWith('out/renderer/assets/')).length)
+console.log('total asar entries:', list.length)

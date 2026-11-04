@@ -8,7 +8,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-007AFF)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F)
-![Version](https://img.shields.io/badge/version-0.9.2-4B5563)
+![Version](https://img.shields.io/badge/version-0.9.3-4B5563)
 ![Tests](https://img.shields.io/badge/tests-4115%20passed-30A46C)
 ![Status](https://img.shields.io/badge/status-Preview-7A5AF8)
 
