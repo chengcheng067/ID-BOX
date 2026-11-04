@@ -81,6 +81,8 @@ import {
   rollbackMaterialMerge
 } from './materialMerge'
 import { isWithinRoot } from '../shared/vault'
+import { createPluginWriter, getPluginWriter, pluginRootDir } from './pluginExport'
+import { isPluginTrigger, type PluginSnapshotPayload } from '../shared/pluginSnapshot'
 import { probeSizes } from './probeSizes'
 import { isKindFolderName } from '../shared/classify'
 import { composeRelFolder, normalizeCategoryPair } from '../shared/naming'
@@ -887,6 +889,36 @@ function createWindow(): void {
  * 绝不碰 userData（两个进程共用同一份 IndexedDB 会导致 `init()` reject、界面永久卡在
  * 「正在加载…」）。
  */
+/**
+ * 初始化插件写盘排期器（docs/39 §2.2）。
+ *
+ * 两个关键决定，都不许后人改动：
+ * 1. **拿不到 APPDATA 就放弃**（返回 null）——绝不回落到猜测路径。插件是纯读方，它自己读
+ *    `ENV['APPDATA']`；两侧读同一来源才不会漂移。非 Windows 上这里直接返回，插件目录不存在
+ *    是预期行为，只记一条 warn。
+ * 2. **开关关也要建器**：`pluginIndexEnabled` 在同一会话里会被打开（设置页勾上 → `settings:set`），
+ *    上下文按次读取（见 `createPluginWriter`），所以勾上后下一次触发就生效、不需要重启。
+ *    若"关了就不建器"，用户必须重启才能用上 —— 那是不可接受的。
+ *
+ * 启动写一次（A1）由渲染层的 `init()` 上报 `startup` 触发：记录在 Dexie 里，主进程读不到，
+ * 所以主进程只负责"把排期器备好"，不自己造内容（§2.1 定案）。
+ */
+function initPluginWriter(): void {
+  const dir = pluginRootDir()
+  if (!dir) {
+    logWarn('plugin:writer:no-root', { reason: 'APPDATA 不可用（非 Windows 或未注入环境变量）' })
+    return
+  }
+  createPluginWriter(() => ({
+    dir,
+    appVersion: app.getVersion(),
+    libraryRoot: settings.libraryDir,
+    pluginIndexEnabled: settings.pluginIndexEnabled,
+    thumbsRoot: thumbsDir()
+  }))
+  logInfo('plugin:writer:ready', { dir, pluginIndexEnabled: settings.pluginIndexEnabled })
+}
+
 function bootstrap(): void {
   // 诊断日志**尽早**初始化（在 loadSettings 之前）：启动阶段的崩溃同样需要现场。
   // 此时还不知道 verboseLogging，先按默认 info 记，读到设置后再校正级别。
@@ -931,6 +963,13 @@ function bootstrap(): void {
     trashSweepTimer.unref?.()
     createWindow()
     restartWatcher()
+
+    // ── 插件写盘排期器（docs/39 §2.2 / §6 A1）──────────────────────────────
+    // 必须在 `createWindow()` 之后：渲染层的 `init()` 会在窗口加载后跑，它的启动上报
+    // 必须能看到已初始化的排期器（否则那一次上报被静默丢掉，插件只能等下一次触发）。
+    // 这段整体受单实例锁保护（`bootstrap()` 只在拿到锁的那个进程里跑）⇒ 全机只有一个写者，
+    // 所以不需要跨进程文件锁（§2.1 已把文件锁这条建议取消，修法是串行写队列）。
+    initPluginWriter()
 
     // 启动快照：崩溃报告里的第一段上下文（**不含 apiKey / 密钥**）
     logInfo('app:ready', {
@@ -1847,6 +1886,44 @@ ipcMain.handle(IPC.indexBackup, async (_e, json: string) => {
   } catch {
     return null
   }
+})
+
+/**
+ * 插件快照落盘（docs/39 §2.1 定案：渲染层生成内容 + 主进程执行落盘）。
+ *
+ * 与 `IPC.indexBackup` 同一分层理由：渲染层没有 Node 能力（`README.md:285`、preload 全文
+ * 无 `node:fs`），它只能把记录交过来，落盘动作必须由主进程执行。
+ *
+ * 三条纪律：
+ * 1. **deny by default**：`trigger` 必须落在 `PLUGIN_TRIGGER_SET` 内（缩略图涓流不在集里），
+ *    不在白名单直接拒，不写盘；渲染层传什么都不认。
+ * 2. **不阻断主流程**（§2.3）：这里不抛错给渲染层 —— 写盘失败只记 `manifest.lastError`，
+ *    IPC 返回 `false` 就够，渲染层不该因为一条快照没落盘给用户报错。
+ * 3. **排期器未初始化时静默跳过**：开关关 / APPDATA 拿不到 → 排期器不存在（见 `bootstrap()`），
+ *    返回 false，不回落到某个猜测路径（「插件不能猜路径」）。
+ *
+ * fire-and-forget 语义由排期器承担：`schedule()` 返回 true 表示本次立即落盘、false 表示
+ * 已排进 quiet 窗口；调用方不等待落盘完成。
+ */
+ipcMain.handle(IPC.pluginSnapshot, async (_e, payload: PluginSnapshotPayload) => {
+  if (!payload || !isPluginTrigger(payload.trigger)) {
+    logWarn('plugin:ipc:rejected-trigger', { trigger: payload?.trigger ?? null })
+    return false
+  }
+  const writer = getPluginWriter()
+  if (!writer) return false
+  if (!Array.isArray(payload.records)) {
+    // 取不到内容：保留上一份有效快照，绝不写空内容掩盖失败（§2.3）
+    return false
+  }
+  // 面板「手动刷新」绕过节流立刻落盘（§6 A1：启动写一次 + 手动刷新）。
+  // 用户点刷新意味着"我要现在就看"，把它排进 quiet 窗口等于把用户动作降级成一次普通变更；
+  // 这里等它落完再返回 boolean（渲染层是 fire-and-forget，不依赖返回值，等它只为让状态真实）。
+  if (payload.trigger === 'manualRefresh') {
+    const result = await writer.flushNow(payload.trigger, payload.records)
+    return result.ok
+  }
+  return writer.schedule(payload.trigger, payload.records)
 })
 
 // ── T06 新增：分类指派 / 遗留布局迁移 ─────────────────────────────

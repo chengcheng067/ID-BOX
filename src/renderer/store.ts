@@ -38,6 +38,9 @@ import {
 } from './logic/filters'
 import { dedupeIds, pruneToVisible, selectRangeIds } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
+// 插件快照（docs/39 §2.1）：渲染层只**生成内容**（它没有 Node 能力，写不了文件），
+// 落盘由主进程执行。字段表与判据都在 `shared/pluginSnapshot`，这里不复制第二份。
+import { buildPluginRecords, isPluginTrigger, type PluginTrigger } from '../shared/pluginSnapshot'
 import { buildTriageQueue } from './logic/triageFlow'
 import { buildReviewQueue, type ReviewReason } from './logic/reviewFlow'
 import { planDuplicateCleanup, planThumbPresenceRepair } from './logic/recordHygiene'
@@ -626,6 +629,35 @@ let initInFlight = false
 /** 仅供单测：复位重入闸门（运行时无调用点） */
 export function resetInitGuardForTests(): void {
   initInFlight = false
+}
+
+/**
+ * 插件快照上报（docs/39 §2.1 / §6 A1）。
+ *
+ * ## 为什么放在渲染层
+ * 元数据唯一权威在渲染层的 Dexie（`docs/16:108`），而渲染层没有任何 Node 能力 —— 它只能把
+ * 内容交出去，落盘由主进程执行（先例 `IPC.indexBackup`）。本函数**只生成内容 + 上报**，
+ * 不碰任何路径、不判断节流（节流在主进程）。
+ *
+ * ## 触发集（A1 已拍板，逐条照此）
+ * `startup` / `importBatchDone` / `rescan` / `assignCategory` / `trashRestore` / `manualRefresh`。
+ * ⚠️ **缩略图涓流不入触发集**：`ENSURE_THUMB_BATCH`（`:593`）的单轮补图会形成持续小流，
+ * 每一轮都上报会把 debounce 永久续期、最后靠 max-wait 硬上限强制落盘 —— 那不是拍板口径。
+ * 所以本函数的调用点**只允许出现在上面六个位置**，由 `tests/pluginExport.test.ts` 的源码守卫
+ * 钉住（注释会被删，守卫测试不会）。
+ *
+ * ## 失败纪律（§2.3）
+ * 全程 `.catch` 吞掉：写盘失败不阻断主流程，渲染层不能因为一条快照没落盘给用户报错。
+ * 开关关时主进程直接拒（返回 false），这里不重复判据，避免两处口径漂移。
+ */
+function reportPluginSnapshot(trigger: PluginTrigger): void {
+  const settings = useVault.getState().settings
+  if (!settings?.pluginIndexEnabled) return
+  if (!isPluginTrigger(trigger)) return
+  const records = buildPluginRecords(useVault.getState().assets)
+  void window.modvault
+    .reportPluginSnapshot({ trigger, records })
+    .catch(() => undefined)
 }
 
 /**
@@ -1582,6 +1614,14 @@ interface VaultState {
   rescan: (opts?: { force?: boolean }) => Promise<RescanOutcome>
   /** 强制重扫：语义 = `rescan({ force: true })`（共用同一条实现，不复制逻辑） */
   forceRescan: () => Promise<RescanOutcome>
+  /**
+   * 面板「手动刷新插件索引」（docs/39 §6 A1：启动写一次 + 手动刷新）。
+   *
+   * 语义 = 绕过节流、立刻把当前内存索引落盘一次。口径边界：这个手动刷新**只存在于 ID BOX
+   * 面板一侧** —— 插件（Ruby）是纯读方，无写权限也无 IPC，PRD §3.5 明确插件侧的刷新不能
+   * 触发主进程写盘。开关关时 `reportPluginSnapshot` 直接返回，不产生任何副作用。
+   */
+  refreshPluginIndex: () => void
   /**
    * 恢复最近一次「重扫前索引备份」（`db.backups` 里 `rescan-*` 最新一条）。
    * 只恢复**索引**（含 tags/note/styles）：磁盘文件需要用户自己放回原位置。
@@ -2783,6 +2823,9 @@ export const useVault = create<VaultState>((set, get) => ({
     ])
     set({ settings, assets, ready: true })
 
+    // 启动写一次（§2.3 / A1）：必须在 settings 到手之后 —— 开关状态决定是否落盘。
+    reportPluginSnapshot('startup')
+
     // ── 设置广播订阅（DEF-22-1）────────────────────────────────────────
     // **必须在上面那次 `set` 之后**：`getSettings()` 是 await 的，若先订阅，
     // 「init 还没跑完、用户从主进程改了设置 → 广播写入新值」随后会被这次
@@ -2853,6 +2896,8 @@ export const useVault = create<VaultState>((set, get) => ({
       // 批次边界复位：监控目录导入不走 `importPaths`，只有这里能给下一批重新开门。
       // main 保证 `import:batchDone` 在整批 `import:event` 之后才发 → 复位不会吞掉本批的切换。
       libraryViewRestoredInBatch = false
+      // 触发集之一（A1）：本批可能新增了记录，落盘交给主进程的 quiet 窗口。
+      reportPluginSnapshot('importBatchDone')
     })
 
     // docs/27 T-06：重复询问的订阅（**幂等**，模块级只注册一次；重复订阅会让一次询问被处理多次）
@@ -3404,7 +3449,13 @@ export const useVault = create<VaultState>((set, get) => ({
       delete next.trashRel
       updated.push(next)
     }
-    if (updated.length > 0) await db.assets.bulkPut(updated)
+    if (updated.length > 0) {
+      await db.assets.bulkPut(updated)
+      // ── 插件快照（docs/39 §2.3）：软删还原是合法触发点 ─────────────────
+      // 只在**真的写库成功**后上报；失败项不进快照（`buildPluginRecords` 会过滤软删记录，
+      // 此刻内存里已还原的那几条才是插件该看到的新状态）。
+      reportPluginSnapshot('trashRestore')
+    }
     const restoredIds = new Set(updated.map((u) => u.id))
     if (restoredIds.size > 0) {
       set((s) => {
@@ -3704,6 +3755,10 @@ export const useVault = create<VaultState>((set, get) => ({
     if (failed > 0) notice += `，${failed} 个失败（目录不存在或路径非法）`
     // changed=false 的幂等操作不提示（06 v1.0.3 §9.2 规则 6）；changed=true（非法字符/截断被改写）才提示
     if (pair.changed) notice += '。注意：输入的分类名已被规范化（非法字符清洗或超长截断）'
+    // ── 插件快照（docs/39 §2.3）：分类指派是合法触发点，但**只有真移动过**才上报 ──
+    // `moved === 0` 时磁盘与索引都没变化 → 没有可写的新内容；上报一次只会让插件看到
+    // 一份与上一轮字节完全相同的快照（无意义落盘）。`skipped`/`failed` 不触发。
+    if (summary.moved > 0) reportPluginSnapshot('assignCategory')
     set({ notice })
     return summary
   },
@@ -4637,6 +4692,10 @@ export const useVault = create<VaultState>((set, get) => ({
     } else {
       console.info('[recordHygiene] 跳过缩略图孤儿清理：读表失败或库为空（不冒删盘风险）')
     }
+    // ── 插件快照（docs/39 §2.3 触发点 A1）：重扫是合法触发点 ─────────────
+    // 必须在**下面那两次 `ensureMissingThumbs()` 之前**上报：缩略图涓流不在触发集内，
+    // 若把上报写在涓流之后，等于把"补图完成"当成写盘事件 —— 那是被明确排除的行为。
+    reportPluginSnapshot('rescan')
     // rescan 会把新/变更资产的 thumbStatus 重置为 none → 后台补齐（封顶 ENSURE_THUMB_BATCH）
     void ensureMissingThumbs()
     // 同上：材质球缓存也可能失效（贴图换了 → hash 变）→ 重新入队
@@ -4655,6 +4714,12 @@ export const useVault = create<VaultState>((set, get) => ({
   async forceRescan() {
     // 与 rescan 共用同一条实现（只有 opts 不同），避免两套行为漂移
     return get().rescan({ force: true })
+  },
+
+  refreshPluginIndex() {
+    // 手动刷新走的是同一个上报入口：节流在这里被绕过的语义由主进程侧的 flushNow 承担，
+    // 渲染层只负责「把当前内存索引交出去」，不参与时间语义（不在节流里抢跑）。
+    reportPluginSnapshot('manualRefresh')
   },
 
   async refreshRescanBackupCount() {

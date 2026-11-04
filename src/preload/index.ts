@@ -48,6 +48,7 @@ import type {
   TrashSweepResult,
   UpdateInfo
 } from '../shared/types'
+import type { PluginSnapshotPayload } from '../shared/pluginSnapshot'
 
 /**
  * 渲染进程可用的全部 API（T05 照此签名写渲染层）。
@@ -474,7 +475,20 @@ const api = {
   emptyTrash: (): Promise<TrashPurgeResult> => ipcRenderer.invoke(IPC.trashEmptyAll),
   /** 到期 / 超容量清理（设置页手动触发；启动与 6 小时定时由主进程自己跑） */
   sweepTrash: (opts?: { retentionDays?: number; maxBytes?: number }): Promise<TrashSweepResult> =>
-    ipcRenderer.invoke(IPC.trashSweep, opts)
+    ipcRenderer.invoke(IPC.trashSweep, opts),
+
+  // ── 插件导出（docs/39 §2.1，写盘侧）──────────────────────────────
+  /**
+   * 把一份快照记录交给主进程落盘（渲染层无 Node 能力，只能走这条白名单）。
+   *
+   * 与 `exportIndexBackup` 同形态：内容来自渲染层、落盘由主进程执行。这里**不**弹保存
+   * 对话框、不写任意路径 —— 目标只有 `%APPDATA%\idbox\plugin\` 下两个固定文件名。
+   *
+   * 返回 `false` = 被拒（开关关 / 触发点不在触发集内）。调用方一律 `.catch`：写盘失败
+   * 不阻断主流程（§2.3），渲染层不能因为一条快照没落盘而报错给用户。
+   */
+  reportPluginSnapshot: (payload: PluginSnapshotPayload): Promise<boolean> =>
+    ipcRenderer.invoke(IPC.pluginSnapshot, payload)
 }
 
 contextBridge.exposeInMainWorld('modvault', api)

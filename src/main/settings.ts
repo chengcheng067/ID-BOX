@@ -194,6 +194,15 @@ export const SettingsSchema = z.object({
    */
   sidebarLeftCollapsed: z.boolean().optional().catch(false),
   sidebarRightCollapsed: z.boolean().optional().catch(false),
+  /**
+   * 插件索引导出开关（docs/39 §2.2 新发现第 4 条：原 schema 没有任何插件键，默认关）。
+   *
+   * `.optional().catch(false)`：**单项降级** —— 脏值（`'yes'` / `1` / `null`）只让这一项回落
+   * 关闭，不拖垮整份 settings.json（否则 `libraryDir` 一起丢、库会"消失"；与 `gridDensity` /
+   * `trashRetention` / `undoGraceMs` 同一纪律）。方向与 `materialStage` 一致：只有严格 `true`
+   * 才开，缺键 / 脏值一律关。
+   */
+  pluginIndexEnabled: z.boolean().optional().catch(false),
   /** @deprecated 旧档迁移用 */
   trashArchiveAfterImport: z.boolean().optional()
 })
@@ -499,6 +508,10 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   // 左右侧边栏折叠（0.8.3）：只认严格 true（缺键 / 'yes' / 1 之类脏值一律展开）
   merged.sidebarLeftCollapsed = merged.sidebarLeftCollapsed === true
   merged.sidebarRightCollapsed = merged.sidebarRightCollapsed === true
+  // 插件索引导出（docs/39 §2.2）：只认严格 true（缺键 / 'yes' / 1 一律关）——与 materialStage
+  // 同方向。这个值会落进 `manifest.pluginIndexEnabled`，插件靠它区分「未开导出」(IDBOX-101)，
+  // 所以归一化必须收口成布尔、不能留 undefined。
+  merged.pluginIndexEnabled = merged.pluginIndexEnabled === true
   delete merged.trashArchiveAfterImport
   return merged
 }

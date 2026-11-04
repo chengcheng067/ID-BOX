@@ -256,5 +256,20 @@ export const IPC = {
    * 其它终止路径不需要发：用户自己答复时渲染层会主动清 `conflictAsk`；
    * 渲染进程崩溃时已经没有接收方。
    */
-  importConflictExpired: 'import:conflictExpired'
+  importConflictExpired: 'import:conflictExpired',
+  // ── 插件导出（docs/39 §2.1，写盘侧）──────────────────────────────
+  /**
+   * 渲染进程 → 主进程：交付一份插件快照记录（Payload = `PluginSnapshotPayload`）。
+   *
+   * 形状照既有先例 `indexBackup`（`shared/ipc.ts:78`、`main/index.ts:1832-1849`）：
+   * **渲染层生成内容、主进程执行落盘**——渲染层没有任何 Node 能力（`README.md:285`、preload
+   * 全文无 `node:fs`），它写不了 `%APPDATA%\idbox\plugin\`，只能把内容交出去。
+   *
+   * `trigger` 必须落在 `PLUGIN_TRIGGER_SET` 内（deny by default）；不在集里的一律拒，
+   * 缩略图涓流就是典型（§2.3 明确不入触发集）。主进程侧只做入队与节流，不重复判据。
+   *
+   * 返回 `true` = 本次触发**立即落盘**（或已排进 quiet 窗口）；`false` = 被拒（开关关 /
+   * 触发点不合法）。fire-and-forget 语义：本通道不抛错，渲染层 `.catch` 后继续。
+   */
+  pluginSnapshot: 'plugin:snapshot'
 } as const

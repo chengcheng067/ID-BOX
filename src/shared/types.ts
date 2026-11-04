@@ -778,6 +778,18 @@ export interface Settings {
    */
   sidebarLeftCollapsed: boolean
   sidebarRightCollapsed: boolean
+  /**
+   * 插件索引导出开关（docs/39 §2.2 新发现第 4 条：`SettingsSchema` 原本没有任何插件相关键）。
+   *
+   * `true` = 主进程把快照写进 `%APPDATA%\idbox\plugin\`（`manifest.json` + `index.json`）。
+   * 默认 **false**：写盘是新增副作用，不能"装上就自动生效"——插件读不到文件时靠这里给出的
+   * 状态走 IDBOX-101 的「请在 ID BOX 设置里开启插件索引导出」文案（PRD P0-2），所以这个值
+   * 必须落进 `manifest.pluginIndexEnabled`，而不只是控制本地行为。
+   *
+   * 归一化方向与 `materialStage` 一致：**只认严格 true**（缺键 / 脏值一律关），且单项降级
+   * （`.optional().catch(false)`）——一个脏值只让这一项回落，绝不拖垮整份 settings.json。
+   */
+  pluginIndexEnabled: boolean
   /** @deprecated 仅用于读取旧 settings.json，读到后映射为 archiveDisposal */
   trashArchiveAfterImport?: boolean
 }
@@ -835,7 +847,9 @@ export const DEFAULT_SETTINGS: Settings = {
   customTaxonomy: { level1: [], level2: {} },
   // 左右侧边栏默认展开（0.8.3 折叠功能；false = 展开态，升级无感）
   sidebarLeftCollapsed: false,
-  sidebarRightCollapsed: false
+  sidebarRightCollapsed: false,
+  // 插件索引导出默认关（docs/39 §2.2）：写盘是新增副作用，必须用户显式开启
+  pluginIndexEnabled: false
 }
 
 // ── T06 分类体系 IPC 载荷（shared 定义，main 与 preload 共用，避免 preload 反向 import main） ──
