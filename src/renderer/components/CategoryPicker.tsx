@@ -109,6 +109,8 @@ export function CategoryPicker() {
   const l2ButtonRef = useRef<HTMLButtonElement | null>(null)
 
   // 目标集合变化（打开/切换）时重置为当前值（批量取第一个目标的现状）
+  // 「未分类三口径」统一（docs/25）不涉此处：半归类资产带出已有的一级是对的，
+  // `targets[0].category1 || UNCLASSIFIED` 这个初值语义刻意保持不变（见 docs/25:2090-2091）。
   useEffect(() => {
     if (pickerIds && targets.length > 0) {
       setLevel1(targets[0].category1 || UNCLASSIFIED)

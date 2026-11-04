@@ -24,6 +24,30 @@ export function categoriesOf(a: Asset): { category1: string; category2: string }
   return { category1: a.category1 || UNCLASSIFIED, category2: a.category2 || UNCLASSIFIED }
 }
 
+/**
+ * 是否「待补分类」：一级**或**二级仍为未分类（半归类资产也算）。
+ *
+ * ## 这是中栏头「· 待补 N」的唯一判据源（docs/25「未分类三口径」② 号，已按语义统一）
+ *
+ * 与 `triageFlow.ts::isUnclassified`（`&&` 双未分类、全库、不套筛选）**刻意不同**：
+ * 产品意图是「当前这批里还有多少要补分类」，半归类资产（`'椅子' / '未分类'`）当然要算，
+ * 所以 `docs/25:2088-2089` 明确写了「不该改判据，只该改文案」。本函数就是那个不改的判据，
+ * 抽成纯函数只为可单测 + 让 `App.tsx` 不再内联写一套。
+ *
+ * **入参范围由调用方决定**：`App.tsx` 传 `useVisibleAssets()` 的结果（套当前筛选：
+ * 搜索词 / 大类 / 分类 / 体积 / 时间 / 分辨率 / 色标…），所以它量的集合与左栏分类树
+ * `countLevel1`（`activeAssets`，只滤软删）**本就没有可比性**，见 docs/25:2068-2072。
+ *
+ * 零 React / 零 DOM，可直接进 vitest。
+ *
+ * @param asset 单条资产；`null` / `undefined` 视为「不用补」（防御老数据 / 空槽）
+ */
+export function isCategoryIncomplete(asset: Asset | null | undefined): boolean {
+  if (!asset) return false
+  const c = categoriesOf(asset)
+  return c.category1 === UNCLASSIFIED || c.category2 === UNCLASSIFIED
+}
+
 /** relFolder 的段数（posix 分隔） */
 export function relSegmentCount(relFolder: string | undefined): number {
   return (relFolder ?? '').split('/').filter((s) => s.length > 0).length
@@ -94,7 +118,31 @@ function sortNodes(nodes: CategoryNodeCount[]): CategoryNodeCount[] {
   return un ? [...classified, un] : classified
 }
 
-/** 某（组）大类下的一级分类计数（count 降序、未分类恒最后） */
+/**
+ * 某（组）大类下的一级分类计数（count 降序、未分类恒最后）。
+ *
+ * ## 口径注释（docs/25「未分类三口径」① 号，已按语义统一后保留判据）
+ *
+ * - **「未分类」节点 = 一级未分类**：本函数按 `category1` **分组计数**（半归类资产
+ *   `'椅子' / '未分类'` 计入「椅子」节点，不进「未分类」节点）。它**不是**「双未分类总量」
+ *   （那是 `triageFlow.ts::isUnclassified` 的判据）；改成双未分类会破坏整棵分类树——
+ *   各一级节点之和不再等于总数，也没法解释「一个资产同时出现在两个一级节点下」。
+ * - 与 `isUnclassified` 的差异**只发生在「一级未分类、二级有值」这种非法数据上**：
+ *   本函数按 `category1` 把它计入「未分类」节点，而 `&&` 不算它。
+ *   `normalizeCategoryPair` 的级联降级（06 §9.2 规则 3：一级未指派 ⇒ 二级强制降为未分类）
+ *   已保证这种数据不产生，所以合法数据下两者集合一致。
+ * - **侧栏点击该节点用的筛选条件同为 `category1 = 未分类`，两者同源**（判据层面）：
+ *   `Sidebar.tsx` 的 `setFilter({ category1: 未分类, category2: null, ... })` 经
+ *   `matchesFilters` 落到同一条 `category1 !== f.category1 → return false`，
+ *   `category2: null` 不参与约束，所以不会有「数字按 `&&`、点进去按 `category1`」的
+ *   口径错配（docs/25:2086-2087 那条担心的「数字 100、点进去 180 条」）。
+ *   ⚠️ 范围上不严格相等：数字取 `activeAssets`（只滤软删、不套筛选），点进去的网格
+ *   取 `useVisibleAssets()`（套当前全部筛选，且 `setFilter` 是 patch merge 不清其它维度）；
+ *   带其它筛选时条数可能更少 —— 这是所有一级节点共有的既有产品行为，非本函数判据所致，
+ *   详见 docs/25 本条目的「本批落地记录」第 4 点。
+ * - 与中栏头「· 待补 N」（`isCategoryIncomplete`，`||` 且套当前筛选）**不同源**，
+ *   但已改名不再共用一个词，见本文件 `isCategoryIncomplete` 与 docs/25 三口径条目。
+ */
 export function countLevel1(assets: Asset[], kind: KindScope): CategoryNodeCount[] {
   const kinds = kindSetOf(kind)
   const m = new Map<string, number>()

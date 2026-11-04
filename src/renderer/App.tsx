@@ -71,7 +71,6 @@ import { resolveTheme } from '../shared/theme'
 import { displayName } from '../shared/naming'
 import { capsOfFilter, kindFilterLabel, kindsOfFilter } from '../shared/classify'
 import { MODEL_FORMAT_OPTIONS } from '../shared/modelFormat'
-import { UNCLASSIFIED } from '../shared/taxonomy'
 import {
   SIZE_PRESET_BYTES,
   SORT_OPTIONS,
@@ -95,7 +94,7 @@ import {
 import { summarizeAsset } from './logic/fileView'
 import { isAllSelected } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
-import { categoriesOf } from './logic/category'
+import { isCategoryIncomplete } from './logic/category'
 import { hasAssetDragPayload } from './logic/dragAssign'
 import { isInternalDragOut, resetInternalDragOut } from './logic/dragOut'
 import { pathsOutsideLibrary } from './logic/libraryPath'
@@ -816,10 +815,10 @@ export default function App() {
       ? '最近删除'
       : filters.category2 || filters.category1 || (filters.kind !== 'all' ? kindFilterLabel(filters.kind) : '全部')
   const trashMode = libraryView === 'trash'
-  const unclassified = assets.filter((a) => {
-    const c = categoriesOf(a)
-    return c.category1 === UNCLASSIFIED || c.category2 === UNCLASSIFIED
-  }).length
+  // 「待补」计数：当前这批可见资产里还有多少要补分类（判据源在 logic/category.ts，
+  // 套当前筛选；与侧栏分类树的「未分类」节点、整理流水线的双未分类都不是同一集合）。
+  // 刻意不叫「未分类」—— docs/25「未分类三口径」已按语义统一，见该文件与三口径条目。
+  const pendingCategory = assets.filter(isCategoryIncomplete).length
 
   // v0.4 数值筛选摘要（体积 / 导入时间）：无生效条件时返回 ''，不渲染、不占位。
   // 纯函数在 logic/filters.ts（可单测），组件只负责摆位置。
@@ -1059,7 +1058,7 @@ export default function App() {
                         → 不能共用 text-tertiary，走 .header-count */}
                     <span className="header-count shrink-0">
                       {assets.length} 项
-                      {!trashMode && unclassified > 0 ? ` · ${UNCLASSIFIED} ${unclassified}` : ''}
+                      {!trashMode && pendingCategory > 0 ? ` · 待补 ${pendingCategory}` : ''}
                       {` · ${formatBytes(totalSize)}`}
                     </span>
                     {/* 2026-10 多选入口补齐：计数旁的文字按钮（12px，复用既有字色 token）。
