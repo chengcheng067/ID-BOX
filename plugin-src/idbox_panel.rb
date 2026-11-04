@@ -7,7 +7,8 @@
 #
 # .rbz 包内结构（docs/39 §4.2，恰好两项）：
 #   idbox_panel.rb          ← 本文件
-#   idbox_panel/            ← 同名支持目录（main.rb / panel.html / README.md）
+#   idbox_panel/            ← 同名支持目录（main.rb / panel.html）
+# 源码目录根下的 README.md 是给人看的工程说明，**不进包**（打包侧白名单放行、不收）。
 #
 # 硬约束（docs/39 §4.1，违反即不合格，后人改代码时不得放开）：
 #   1) 零网络：包内不得出现 http / socket / Net::HTTP / open-uri；
