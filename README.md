@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-007AFF)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F)
 ![Version](https://img.shields.io/badge/version-0.9.2-4B5563)
-![Tests](https://img.shields.io/badge/tests-4100%20passed-30A46C)
+![Tests](https://img.shields.io/badge/tests-4115%20passed-30A46C)
 ![Status](https://img.shields.io/badge/status-Preview-7A5AF8)
 
 </div>
@@ -137,9 +137,13 @@ HDR 的一级词表照抄知末 HDR 频道，就 5 个：`天空HDR` / `城市HD
 自动分类靠 `level2Scope === 'hdri'` 跳过贴图通道的 round 1，不会把 HDR 塞进贴图的一级类目；
 闸门对 HDR 也不再无条件拒绝。
 
-命中率有限，这点要说清：词表认的是站方一级词的尾锚，而真实资产命名多是
-「N.古月视觉HDR-偏移U：0.23」这类 —— 既不带这 5 个尾锚词，也不带知末 ID，
-所以**未命中仍停「未分类」**。这不是 bug，是命名与词表对不上。
+**知末标准包能自动归类**：它下载下来是单个 `.hdr` 文件（没有压缩包），文件名带
+`ID_<数字>`，例如 `现代小区HDRID_1223468004.hdr` → 落 `小区HDR`。判定前会先剥掉
+ID 尾巴再匹配词表，**磁盘上的文件夹名仍是原名、一个字都不改**。
+
+只有自己收集、命名里不带场景词的素材会停「未分类」—— 例如
+「N.古月视觉HDR-偏移U：0.23」既不带这 5 个尾锚词，也不带知末 ID。这不是 bug，
+是命名里没有可判的信息。
 
 未命中之后，手动链路照旧可用：
 
@@ -208,7 +212,7 @@ HDR 的一级词表照抄知末 HDR 频道，就 5 个：`天空HDR` / `城市HD
 | 本地库 | Dexie（IndexedDB） |
 | 3D | three.js（材质球、HDR 环境光、PMREM） |
 | 构建 | electron-vite + electron-builder |
-| 测试 | Vitest（纯逻辑层 + 源码守卫，**4100 条通过**；默认跳过 6 条真机 / 真实样本用例，合计 4106 条） |
+| 测试 | Vitest（纯逻辑层 + 源码守卫，**4115 条通过**；默认跳过 6 条真机 / 真实样本用例，合计 4121 条） |
 
 设计原则：**本地优先**。素材、缩略图、索引全在本机，删除软件不删你的文件。
 
@@ -223,7 +227,7 @@ npm install
 
 npm run dev       # 开发（HMR）
 npm run build     # 编译到 out/
-npm run test      # 4100 条通过 + 6 条默认跳过（真机 7-Zip / 真实样本）
+npm run test      # 4115 条通过 + 6 条默认跳过（真机 7-Zip / 真实样本）
 npm run typecheck:node && npm run typecheck:web
 ```
 
@@ -524,7 +528,7 @@ resources/        打包资源（品牌素材、拖拽图标）
 - 仅支持 Windows（拖出、回收站、文件关联都用了平台能力）
 - 材质球 / HDR 预览需要可用的 WebGL；显卡过老时会降级成封面缩略图
 - HDR 首次打开要在主进程降采样（大文件几十秒），第二次走缓存
-- **HDR 自动分类命中率依赖命名**：词表只认站方一级词的尾锚，真实命名不带这些词时仍停「未分类」，需手动改派或自由输入
+- **HDR 自动分类依赖命名**：知末标准包（带 ID、名字里有场景词）会自动归类；自己收集的素材若命名里没有这 5 个一级词，仍停「未分类」，需手动改派或自由输入
 - 知末抓取依赖站方页面结构，站方改版可能失效（失败会明确报原因，不影响封面其它来源）
 - 素材包里夹带的 HTML / TXT 会被物理删除（**不进回收站**）——这是刻意选的边界：
   素材包里纯文本与网页没有资产意义。但历史库存量杂质不会追溯清理，只有重新导入才会删

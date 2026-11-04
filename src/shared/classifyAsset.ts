@@ -30,6 +30,7 @@
  */
 
 import { autoClassify } from './autoClassify'
+import { displayName } from './naming'
 import { isLevel1AllowedForKind, UNCLASSIFIED } from './taxonomy'
 
 /** 一次分类判定的结果（只含落盘需要的两个字段） */
@@ -99,6 +100,18 @@ export function classifyAssetName(
   const opts = level2Scope === undefined ? undefined : ({ level2Scope } as const)
   const hasFiles = fileNames !== undefined && fileNames.length > 0
 
+  // ── 【HDR】知末标准包的 `ID_<数字>` 尾巴会咬掉词表尾锚 ─────────────────────
+  // 知末 HDR 下载下来就是单个 `.hdr` 文件（无压缩包），真实样本
+  // `现代小区HDRID_1223468004` 分词后是 `现代小区hdrid` + `1223468004`；
+  // 而 `小区HDR` 要求 token **以** `小区hdr` 结尾 → 永远落空。`autoClassify` 的
+  // `stripCjkTrailingId()` 又因为「`id` 前一字符必须是 CJK」（防 grid/rapid/invalid
+  // 误伤）而不剥这个尾巴。
+  // 分类判据改用 `displayName()` 剥掉 ID 段即可命中；**只作用于 hdri**，且
+  // `displayName` 本就是「只改显示、磁盘名不动」的既有口径 ——
+  // 落盘目录名 / `Asset.name` / `dedupeKey` / 封面路径全部保持原值不变。
+  // 非 hdri 时 `matchName === assetName`，与改动前逐字节等价。
+  const matchName = level2Scope === 'hdri' ? displayName(assetName) : assetName
+
   // ── 【v0.8.5】CAD 频道：**资产名优先、包内文件名只兜底**（两趟，不合并池） ──────
   //
   // 为什么 CAD 必须两趟：包内文件名表达的是**图种**（`1F平面图.dwg` / `立面图.dwg`），
@@ -109,12 +122,12 @@ export function classifyAssetName(
   //
   // ⚠️ 顺序很重要：**名字先跑，落空才让文件名参与**；名字命中即采用，不再看文件名。
   if (level2Scope === 'cad') {
-    const nameOnly = autoClassify(assetName, undefined, opts)
+    const nameOnly = autoClassify(matchName, undefined, opts)
     if (nameOnly !== null && isLevel1AllowedForKind(kind, nameOnly.category1)) {
       return { category1: nameOnly.category1, category2: nameOnly.category2 }
     }
     if (hasFiles) {
-      const withFiles = autoClassify(assetName, [...fileNames!], opts)
+      const withFiles = autoClassify(matchName, [...fileNames!], opts)
       if (withFiles !== null && isLevel1AllowedForKind(kind, withFiles.category1)) {
         return { category1: withFiles.category1, category2: withFiles.category2 }
       }
@@ -122,7 +135,7 @@ export function classifyAssetName(
     // 名字与文件名都没命中（或都被闸门拒）→ 一级回退（另一次调用，见下）
   } else {
     const rawHit = autoClassify(
-      assetName,
+      matchName,
       fileNames === undefined ? undefined : [...fileNames],
       opts
     )
@@ -134,7 +147,7 @@ export function classifyAssetName(
   // 一级回退：一级只看资产名（`autoClassify` 规则 5），故不传 fileNames。
   // ⚠️ 作用域必须一起带下去：CAD / HDR 的一级不在 `LEVEL2_MAP` 里，不传 scope 时
   // `level1Only` 对它们恒返回 null，回退等于没有。
-  const level1Hit = autoClassify(assetName, undefined, {
+  const level1Hit = autoClassify(matchName, undefined, {
     level1Only: true,
     ...(level2Scope === undefined ? {} : { level2Scope })
   })
