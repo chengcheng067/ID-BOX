@@ -82,7 +82,12 @@ import {
 } from './materialMerge'
 import { isWithinRoot } from '../shared/vault'
 import { createPluginWriter, getPluginWriter, pluginRootDir } from './pluginExport'
-import { isPluginTrigger, type PluginSnapshotPayload } from '../shared/pluginSnapshot'
+import { buildRbz, defaultRbzFileName, resolvePluginSrcDir } from './pluginPackage'
+import {
+  isPluginTrigger,
+  type PluginRbzExportResult,
+  type PluginSnapshotPayload
+} from '../shared/pluginSnapshot'
 import { probeSizes } from './probeSizes'
 import { isKindFolderName } from '../shared/classify'
 import { composeRelFolder, normalizeCategoryPair } from '../shared/naming'
@@ -1924,6 +1929,60 @@ ipcMain.handle(IPC.pluginSnapshot, async (_e, payload: PluginSnapshotPayload) =>
     return result.ok
   }
   return writer.schedule(payload.trigger, payload.records)
+})
+
+/**
+ * 导出 SketchUp 插件包（`.rbz`）—— `docs/39` §4.3 形态①（用户 2026-11-04 拍板）。
+ *
+ * 三条纪律：
+ * 1. **只导出文件**：不联网、不下载、不执行任何代码、**不往 SU Plugins 目录复制**。
+ *    形态②（自动复制到 Plugins）V1.0 明确不采用——它可能不被扩展管理器登记、且要求 ID BOX
+ *    侧具备解压能力。这里不是它的入口，别"顺手"加上。
+ * 2. **前置校验写侧索引已就绪**：`pluginIndexEnabled` 关着就直接报错。否则用户拿到的是一个
+ *    "装完只能显示『未开导出』"的包，问题现场被推到 SketchUp 里，是排查成本最高的一种失败。
+ * 3. **失败一律收敛成文案**：`buildRbz` 不抛异常，这里也不抛；用户取消单独用 `canceled`
+ *    表达（"取消"和"失败"是两种界面语言，别混）。
+ *
+ * 成功时顺手 `shell.showItemInFolder`：用户下一步在资源管理器里（把文件拖进扩展管理器），
+ * 省掉"文件到底存哪了"这一轮问答。
+ */
+ipcMain.handle(IPC.pluginExportRbz, async (): Promise<PluginRbzExportResult> => {
+  if (settings.pluginIndexEnabled !== true) {
+    logWarn('plugin:rbz:rejected', { reason: 'pluginIndexEnabled=false' })
+    return { ok: false, error: '请先在设置里开启「SketchUp 插件」索引导出' }
+  }
+
+  const version = app.getVersion()
+  const srcDir = resolvePluginSrcDir({
+    isPackaged: app.isPackaged,
+    appPath: app.getAppPath(),
+    resourcesPath: process.resourcesPath
+  })
+
+  // 默认落点 = 下载目录（用户下一步就是把文件拖进 SU 扩展管理器，下载目录最好找）
+  const saveOptions = {
+    title: '导出 SketchUp 插件包（.rbz）',
+    defaultPath: path.join(app.getPath('downloads'), defaultRbzFileName(version)),
+    filters: [{ name: 'SketchUp 插件包', extensions: ['rbz'] }]
+  }
+  const picked = win
+    ? await dialog.showSaveDialog(win, saveOptions)
+    : await dialog.showSaveDialog(saveOptions)
+  if (picked.canceled || !picked.filePath) return { ok: false, canceled: true }
+  // 扩展名兜底：用户把后缀删了，SketchUp 就认不出这是扩展包（保存对话框不会强制后缀）
+  const outPath = picked.filePath.toLowerCase().endsWith('.rbz')
+    ? picked.filePath
+    : `${picked.filePath}.rbz`
+
+  const built = await buildRbz(srcDir, outPath)
+  if (!built.ok) {
+    logWarn('plugin:rbz:failed', { srcDir, outPath, error: built.error })
+    return { ok: false, error: built.error }
+  }
+
+  logInfo('plugin:rbz:ok', { outPath, bytes: built.bytes, entries: built.entries })
+  shell.showItemInFolder(outPath)
+  return { ok: true, path: outPath, bytes: built.bytes, entries: built.entries }
 })
 
 // ── T06 新增：分类指派 / 遗留布局迁移 ─────────────────────────────

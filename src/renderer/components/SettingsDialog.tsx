@@ -43,7 +43,7 @@ import {
 import { Modal } from './Modal'
 import { useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
-import { IconCheck, IconRefresh } from '../icons'
+import { IconCheck, IconDownload, IconRefresh } from '../icons'
 import { isUnclassified } from '../logic/triageFlow'
 // 品牌资源（2026-10 用户要求「图标 logo 换一下」「关于页做上打赏和反馈」）：
 // 三张图都由 `scripts/build-app-icon.cjs` 从 `resources/brand/` 的原图生成，
@@ -1218,6 +1218,17 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [aiOpen, setAiOpen] = useState(false)
   const [aiTesting, setAiTesting] = useState(false)
   const [aiTest, setAiTest] = useState<{ ok: boolean; message: string } | null>(null)
+  /**
+   * 「导出 SketchUp 插件包（.rbz）」的结果（docs/39 §4.3 形态①，用户 2026-11-04 拍板）。
+   *
+   * 三态分开存：`ok` / `error` / `null`（还没导出过）。**取消不入这三态**——用户主动放弃
+   * 保存不是失败，把取消显示成红字等于凭空报错（主进程用 `canceled` 单独表达）。
+   * 必须是 hook（写在 `if (!settings) return null` 之前），否则违反 hooks 规则。
+   */
+  const [rbzExport, setRbzExport] = useState<
+    { kind: 'ok'; path: string; bytes: number } | { kind: 'error'; message: string } | null
+  >(null)
+  const [rbzExporting, setRbzExporting] = useState(false)
 
   // 外部设置变化（另一个窗口/入口改了配置）→ 表单跟随（按字段比较，避免对象身份抖动）
   useEffect(() => {
@@ -1438,6 +1449,34 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       useVault.setState({ notice: `索引快照已导出：${p}` })
     } else {
       useVault.setState({ notice: '导出已取消或失败' })
+    }
+  }
+
+  /**
+   * 导出 SketchUp 插件包（`.rbz`）—— 用户 2026-11-04 拍板：**ID BOX 只导出文件**。
+   *
+   * 打包（`plugin-src` → 恰好两项的 ZIP）、原子写、`shell.showItemInFolder` 全在主进程；
+   * 渲染层只负责按钮忙碌态与结果文案。前置校验（`pluginIndexEnabled` 关着 → 报错）也在
+   * 主进程，这里不做二次判断（两处判断必然漂移）。
+   */
+  const exportRbz = async () => {
+    setRbzExporting(true)
+    setRbzExport(null)
+    try {
+      const r = await window.modvault.exportPluginRbz().catch(() => null)
+      if (!r) {
+        setRbzExport({ kind: 'error', message: '导出失败（主进程无响应）' })
+        return
+      }
+      // 用户取消：不提示、不置红（他不是做错事，只是改了主意）
+      if (r.canceled) return
+      if (r.ok && r.path) {
+        setRbzExport({ kind: 'ok', path: r.path, bytes: r.bytes ?? 0 })
+        return
+      }
+      setRbzExport({ kind: 'error', message: r.error || '导出失败' })
+    } finally {
+      setRbzExporting(false)
     }
   }
 
@@ -2678,6 +2717,41 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </CheckRow>
           }
         />
+        {/* 导出 .rbz（docs/39 §4.3 形态①）：这一行**必须是按钮，不能是 CheckRow**——
+            它不是开关，而且设置页的自绘复选框数量有守卫钉着（tests/settingsCheckbox.test.ts）。
+            文案必须写清"安装发生在 SketchUp 里"：ID BOX 不下载、不执行、不往 Plugins 目录
+            复制任何东西（形态② V1.0 不采用），用户唯一的下一步是扩展管理器。 */}
+        <SettingsRow
+          title="导出 SketchUp 插件包（.rbz）"
+          desc="在 SketchUp 里用「扩展 → 安装扩展」选中该文件；装完重启 SketchUp 生效"
+          actions={
+            <button
+              className="btn !py-1 text-xs"
+              disabled={rbzExporting}
+              onClick={() => void exportRbz()}
+              title="生成 .rbz 并打开所在文件夹；安装由 SketchUp 扩展管理器完成"
+            >
+              <IconDownload />
+              {rbzExporting ? '打包中…' : '导出 .rbz'}
+            </button>
+          }
+        />
+        {rbzExport && (
+          <div className="mt-2 rounded-lg border border-line bg-canvas px-3 py-2 text-[11px] leading-relaxed">
+            {rbzExport.kind === 'ok' ? (
+              <>
+                <span className="font-semibold text-primary">插件包已导出</span>
+                <span className="text-secondary">
+                  {' '}
+                  · {formatBytes(rbzExport.bytes)} · 已在文件夹中显示
+                </span>
+                <div className="mt-1 break-all text-muted">{rbzExport.path}</div>
+              </>
+            ) : (
+              <span className="text-danger">{rbzExport.message}</span>
+            )}
+          </div>
+        )}
       </SettingsCard>
 
       {/* 一键重扫 · 从知末获取封面（2026-10 用户拍板）：只补没有 cover 文件的资产，

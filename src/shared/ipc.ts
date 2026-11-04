@@ -271,5 +271,17 @@ export const IPC = {
    * 返回 `true` = 本次触发**立即落盘**（或已排进 quiet 窗口）；`false` = 被拒（开关关 /
    * 触发点不合法）。fire-and-forget 语义：本通道不抛错，渲染层 `.catch` 后继续。
    */
-  pluginSnapshot: 'plugin:snapshot'
+  pluginSnapshot: 'plugin:snapshot',
+  /**
+   * 渲染进程 → 主进程：**导出 SketchUp 插件包（`.rbz`）**。
+   *
+   * 用户 2026-11-04 拍板（`docs/39` §4.3 形态①）：ID BOX 侧动作只有「导出文件 + 引导用户去
+   * 扩展管理器安装」——**不联网、不下载、不执行代码、不复制到 Plugins 目录**。
+   * 形态②（自动复制进 Plugins）V1.0 不采用，这条通道不是它的入口。
+   *
+   * 无入参（源码目录由主进程解析：dev = `<仓库根>/plugin-src`，打包 = `resources/plugin-src`）。
+   * 返回 `PluginRbzExportResult`：成功带路径（主进程会顺手 `shell.showItemInFolder`），
+   * 取消带 `canceled:true`，失败带中文 `error`（含「先开启插件索引导出」这一类前置校验）。
+   */
+  pluginExportRbz: 'plugin:exportRbz'
 } as const

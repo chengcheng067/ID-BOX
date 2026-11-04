@@ -57,6 +57,12 @@
     "directories": {
       "output": "release"
     },
+    "extraResources": [
+      {
+        "from": "plugin-src",
+        "to": "plugin-src"
+      }
+    ],
     "win": {
       "target": [
         "nsis"

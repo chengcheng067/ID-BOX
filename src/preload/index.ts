@@ -48,7 +48,7 @@ import type {
   TrashSweepResult,
   UpdateInfo
 } from '../shared/types'
-import type { PluginSnapshotPayload } from '../shared/pluginSnapshot'
+import type { PluginRbzExportResult, PluginSnapshotPayload } from '../shared/pluginSnapshot'
 
 /**
  * 渲染进程可用的全部 API（T05 照此签名写渲染层）。
@@ -488,7 +488,18 @@ const api = {
    * 不阻断主流程（§2.3），渲染层不能因为一条快照没落盘而报错给用户。
    */
   reportPluginSnapshot: (payload: PluginSnapshotPayload): Promise<boolean> =>
-    ipcRenderer.invoke(IPC.pluginSnapshot, payload)
+    ipcRenderer.invoke(IPC.pluginSnapshot, payload),
+
+  /**
+   * 导出 SketchUp 插件包（`.rbz`）—— 用户 2026-11-04 拍板：**ID BOX 只导出文件**。
+   *
+   * 主进程负责：弹保存对话框（默认 `下载/idbox_panel-<版本>.rbz`）→ 打包 → 原子写 →
+   * `shell.showItemInFolder` 打开所在文件夹。渲染层只显示结果（路径 / 错误文案）。
+   *
+   * 前置校验在主进程：`pluginIndexEnabled` 关着时**直接返回错误**，不产出一个"装了也只会
+   * 显示『未开导出』"的包。用户取消 → `canceled:true`（界面不应说"失败"）。
+   */
+  exportPluginRbz: (): Promise<PluginRbzExportResult> => ipcRenderer.invoke(IPC.pluginExportRbz)
 }
 
 contextBridge.exposeInMainWorld('modvault', api)

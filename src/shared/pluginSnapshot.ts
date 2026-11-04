@@ -178,6 +178,30 @@ export interface PluginSnapshotPayload {
   records: PluginSnapshotRecord[]
 }
 
+/**
+ * 「导出 SketchUp 插件包（.rbz）」的返回（`docs/39` §4.3 形态①：ID BOX 只导出文件）。
+ *
+ * 归一成**一个扁平对象**而不是 union：IPC 的 `invoke` 结果要在渲染层直接显示，
+ * 用户取消（`canceled`）与失败（`error`）是两种不同的界面语言——取消不该说"失败"。
+ *
+ * - `ok:true` → `path` 必有（主进程已 `shell.showItemInFolder`），`bytes` / `entries` 供提示文案；
+ * - `ok:false` + `canceled:true` → 用户在保存对话框点了取消，**什么都不用提示**；
+ * - `ok:false` 且无 `canceled` → `error` 是给用户看的中文原因（开关没开 / 源码缺失 / 写盘失败）。
+ */
+export interface PluginRbzExportResult {
+  ok: boolean
+  /** 落盘的 `.rbz` 绝对路径（`ok:true` 时必有） */
+  path?: string
+  /** 面向用户的中文失败原因（`ok:false` 且非取消时必有） */
+  error?: string
+  /** 用户在保存对话框点了取消 */
+  canceled?: boolean
+  /** 包内字节数（`ok:true` 时） */
+  bytes?: number
+  /** ZIP 根的两个条目（`ok:true` 时，恒为 `['idbox_panel.rb','idbox_panel/']`） */
+  entries?: string[]
+}
+
 // ── 纯函数 ────────────────────────────────────────────────────────────────────
 
 /**
