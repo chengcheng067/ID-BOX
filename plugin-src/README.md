@@ -16,11 +16,13 @@
 plugin-src/
   idbox_panel.rb          ← 根注册文件（registrar）：只注册扩展 + 元数据，不含逻辑
   idbox_panel/            ← 与根 .rb 同名的支持目录（其余内容全在这里）
-    main.rb               ← 全部逻辑（单一模块 IDBoxPanel）
+    main.rb               ← 装配入口（加载链序 0–7 + guard 块，单一模块 IDBoxPanel）
     panel.html            ← 面板 UI（UI::HtmlDialog#set_file 加载；零外链、零网络）
+    lib/                  ← core / paths / loader / panel_callback / panel_dialog / toolbar（1.1.0 起实际产出，见 docs/42 §2）
+    assets/               ← toolbar.svg + toolbar.pdf（工具栏矢量图标成对，按平台二选一）
 ```
 
-`lib/` 与 `native/<platform>/<rubyVer>/` 按 `docs/39 §4.2` **只立约定、本轮不产出文件**
+`native/<platform>/<rubyVer>/` 按 `docs/39 §4.2` **只立约定、不产出文件**
 （V1.0 无原生件、无第三方 gem，只用 stdlib 的 `json` / `digest`）。
 
 ## 怎么安装
