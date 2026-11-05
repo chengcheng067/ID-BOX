@@ -63,7 +63,7 @@ module IDBoxPanel
   #    所以现在不写也不会报错；若提前写，离线冒烟会走桩的 miss 分支（打印 `[smoke] Sketchup.require miss:`
   #    并返回 false，不抛 LoadError —— SU 2026.2 起才抛），真机上同样只是打印提示。
   #    这里保持注释而非空 require，是为了让「T03 只需补一行、不改 guard 块」这条可核对。
-  # Sketchup.require 'idbox_panel/lib/toolbar'
+  Sketchup.require 'idbox_panel/lib/toolbar'
 
   # ── 序 7：只挂一次（guard 块位于 main.rb 末尾、module IDBoxPanel 内） ────────
   #
