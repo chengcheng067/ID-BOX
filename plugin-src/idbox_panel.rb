@@ -7,7 +7,7 @@
 #
 # .rbz 包内结构（docs/39 §4.2，恰好两项）：
 #   idbox_panel.rb          ← 本文件
-#   idbox_panel/            ← 同名支持目录（main.rb / panel.html）
+#   idbox_panel/            ← 同名支持目录（main.rb / panel.html / lib/*.rb / assets/）
 # 源码目录根下的 README.md 是给人看的工程说明，**不进包**（打包侧白名单放行、不收）。
 #
 # 硬约束（docs/39 §4.1，违反即不合格，后人改代码时不得放开）：
@@ -33,7 +33,10 @@ module IDBoxPanel
     # 支持目录名必须与根 .rb 同名（去掉 .rb），否则 SketchupExtension 找不到入口。
     ENTRY_POINT = 'idbox_panel/main'.freeze
     EXT_NAME = 'ID BOX Panel'.freeze
-    EXT_VERSION = '1.0.3'.freeze
+    # 1.0.3 → 1.1.0（docs/42 §11.1）：本批新增真工具栏 + 六块 UI + lib/ 实际拆分。
+    # 必须与 lib/core.rb 的 PLUGIN_VERSION 同步（两处版本号是不同编号体系：
+    # 插件版本 1.1.0，文档版本 docs/39 v1.6；线上发布仍是 0.9.2，本卡不 push）。
+    EXT_VERSION = '1.1.0'.freeze
     EXT_CREATOR = 'ID BOX'.freeze
     EXT_COPYRIGHT = 'ID BOX'.freeze
     EXT_DESCRIPTION =
