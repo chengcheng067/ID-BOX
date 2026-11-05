@@ -2,197 +2,541 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="X-UA-Compatible" content="IE=edge">
 <title>ID BOX</title>
 <!--
-  ID BOX · SketchUp 面板（本地文件，UI::HtmlDialog#set_file 加载）
+  ID BOX · SketchUp 面板（本地文件，由 UI::HtmlDialog 的 set_file 加载）
 
-  硬约束（docs/39 §4.1，改这个文件时不得放开）：
-    - 零网络：不允许任何 http(s) 请求、CDN、外链字体/图片、XHR/fetch/WebSocket。
-      所有样式与脚本都在这一个文件里内联。
-    - 零上报：不打点、不写 cookie、不用 localStorage 传数据。
-    - 搜索过滤纯前端：只在内存里过滤 Ruby 推下来的记录。
+  硬约束（改这个文件时不得放开，docs/39 §4.1）：
+    - 零网络：不发起任何网络请求，不用 CDN、远程资源、外部字体或图片。
+      所有样式与脚本都内联在这一个文件里；图片只允许 base64 内联或本地路径拼接。
+    - 零上报：不打点、不写本地存储、不写浏览器存储。
+    - 搜索与筛选纯前端：只在内存里过滤 Ruby 推下来的记录。
     - 只读：面板从不调用任何写文件的 Ruby 回调（Ruby 侧也没有这样的回调）。
 
-  与 Ruby 的契约（main.rb 注册的 add_action_callback）：
+  与 Ruby 的契约（add_action_callback，只增不删）：
     sketchup.ready()                → 面板就绪，请求数据
-    sketchup.refreshIndex()         → 强制重读索引文件
-    sketchup.insertRecord(id)       → 插入一条记录
+    sketchup.refreshIndex()         → 强制重读索引文件（新增调用点：提示条）
+    sketchup.insertRecord(id)       → 插入一条记录（新增调用点：卡片单击）
   Ruby 侧调用（execute_script）：
-    window.IDBOX.render(payload)    → 渲染整份数据
+    window.IDBOX.render(payload)    → 渲染整份数据（payload 只增字段：thumbsRoot）
     window.IDBOX.setStatus(obj)     → 底部状态行 { message, level }
+
+  必须保留的 11 个 DOM id：
+    banner clear count empty fresh list notes q refresh status ver
+
+  物理尺寸口径：960×680 / 最小 760×520（CSS 承担下限，见 body）。
 -->
 <style>
+  /* ══ 语义覆盖集 S（34 变量）· 浅色档 ══════════════════════════════════════
+     A 底色/描边 12 · B 文字四档 4 · C 强调/tint 6 · D 状态色 5
+     E 品牌格式徽标 6（取代退役的 --tag-*）· F 阴影 3
+     S5：--bg-active-nav 原生只在深色存在，浅色侧补别名（值 = --accent-tint）
+  ═════════════════════════════════════════════════════════════════════════ */
   :root {
-    --bg: #f6f7f9;
-    --panel: #ffffff;
-    --line: #e3e6ec;
-    --text: #1f2430;
-    --text-dim: #6b7280;
-    --text-faint: #98a1b0;
-    --accent: #2563eb;
-    --accent-soft: #eaf0ff;
-    --ok: #15803d;
-    --warn: #b45309;
-    --warn-soft: #fff8e6;
-    --err: #b91c1c;
-    --err-soft: #fdecec;
-    --tag-model: #2563eb;
-    --tag-texture: #7c3aed;
-    --tag-material: #0d9488;
-    --tag-hdri: #db2777;
-    --tag-cad: #b45309;
-    --tag-other: #6b7280;
+    /* A · 底色 / 描边（12） */
+    --bg-canvas: #f8fafc;
+    --bg-sidebar: #f1f5f9;
+    --bg-elevated: #e2e8f0;
+    --surface-card: #ffffff;
+    --bg-active-nav: #e1efff;            /* S5 别名（原生只在深色定义） */
+    --panel-bg: #ffffff;
+    --border: #e2e8f0;
+    --border-panel: #e8edf2;
+    --border-soft: #eef1f4;
+    --pill-bg: #f1f5f9;
+    --toast-bg: #f8fafc;
+    --bg-floatbar: #ffffff;
+
+    /* B · 文字四档（4） */
+    --text-primary: #1f2937;
+    --text-secondary: #4b5563;
+    --text-tertiary: #6b7280;
+    --text-muted: #9ca3af;
+
+    /* C · 强调 / tint / 分段控件（6） */
+    --accent: #007aff;
+    --accent-text: #007aff;
+    --accent-tint: #e1efff;
+    --tint-neutral: #eef1f4;
+    --tint-neutral-text: #4b5563;
+    --seg-active: #ffffff;
+
+    /* D · 状态色（5） */
+    --danger: #e5484d;
+    --danger-tint: #fef1f0;
+    --success: #30a46c;
+    --preview: #7a5af8;
+    --preview-tint: #efe9fe;
+
+    /* E · 品牌格式徽标（6，取代 --tag-*） */
+    --brand-su-bg: #fde7e7;
+    --brand-su-text: #c43c3c;
+    --brand-max-bg: #e3f2f8;
+    --brand-max-text: #16708f;
+    --brand-cad-bg: #fde7ef;
+    --brand-cad-text: #c00d43;
+
+    /* F · 阴影（3） */
+    --shadow-card: 0 8px 24px rgba(100,116,139,.10);
+    --shadow-card-hover: 0 12px 28px rgba(100,116,139,.16);
+    --shadow-card-active: 0 8px 24px rgba(0,122,255,.15);
+
+    /* 字号八级（portable-spec §2.2） */
+    --fs-page-title: 17px;
+    --fs-modal-title: 16px;
+    --fs-section: 14px;
+    --fs-card-title: 13px;
+    --fs-card-name: 12px;
+    --fs-body: 12px;
+    --fs-caption: 11px;
+    --fs-micro: 10px;
+
+    /* 圆角 / 间距（浅色档，portable-spec §3.2） */
+    --radius-card: 16px;
+    --radius-nav: 9px;
+    --radius-chip: 6px;
+    --radius-badge: 4px;
+    --radius-search: 10px;
+    --radius-cta: 10px;
+    --radius-logo: 6px;
+    --radius-seg: 6px;
+    --radius-seg-group: 10px;
+    --radius-pill: 999px;
+    --radius-pill-header: 9px;
+    --radius-toast: 8px;
+    --radius-toast-undo: 8px;
+    --radius-toast-undo-inner: 6px;
+    --radius-cover: 12px;
+    --gap-card: 14px;
+
+    /* 系统字体栈（不引字体文件） */
+    --font-ui: -apple-system,"PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
   }
+
+  /* ══ 深色档：S 集 34 变量必须成对且逐变量 ≠ 浅色值（S3）═══════════════════ */
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #1b1e24;
-      --panel: #23272f;
-      --line: #343a45;
-      --text: #e8eaf0;
-      --text-dim: #a3abba;
-      --text-faint: #7d8697;
-      --accent: #6d9bff;
-      --accent-soft: #23304f;
-      --ok: #4ade80;
-      --warn: #fbbf24;
-      --warn-soft: #3a2f16;
-      --err: #f87171;
-      --err-soft: #3d1f1f;
+      /* A（12） */
+      --bg-canvas: #111113;
+      --bg-sidebar: #161618;
+      --bg-elevated: #242428;
+      --surface-card: #1c1c1e;
+      --bg-active-nav: #1e2a38;
+      --panel-bg: #161618;
+      --border: #2a2a2d;
+      --border-panel: #2a2a2d;
+      --border-soft: #2a2a2d;
+      --pill-bg: #1c1c1e;
+      --toast-bg: #161618;
+      --bg-floatbar: #242428;
+
+      /* B（4） */
+      --text-primary: #f2f2f4;
+      --text-secondary: #98989e;
+      --text-tertiary: #98989e;
+      --text-muted: #636368;
+
+      /* C（6） */
+      --accent: #0a84ff;
+      --accent-text: #6db2ff;
+      --accent-tint: #1e2a38;
+      --tint-neutral: #242428;
+      --tint-neutral-text: #98989e;
+      --seg-active: #2c2c2e;
+
+      /* D（5） */
+      --danger: #ff6961;
+      --danger-tint: #2a1517;
+      --success: #7a9268;
+      --preview: #b18cff;
+      --preview-tint: #2b2140;
+
+      /* E（6） */
+      --brand-su-bg: #3a2224;
+      --brand-su-text: #f08c8c;
+      --brand-max-bg: #16303a;
+      --brand-max-text: #6cc4e0;
+      --brand-cad-bg: #3a1622;
+      --brand-cad-text: #ff5b8c;
+
+      /* F（3）· 深色必须 none */
+      --shadow-card: none;
+      --shadow-card-hover: none;
+      --shadow-card-active: none;
+
+      /* 圆角 / 间距（深色档整体比浅色小一档；logo / seg / gap-card 两主题同值） */
+      --radius-card: 10px;
+      --radius-nav: 7px;
+      --radius-chip: 5px;
+      --radius-search: 8px;
+      --radius-cta: 8px;
+      --radius-seg-group: 8px;
+      --radius-pill-header: 7px;
+      --radius-toast-undo-inner: 5px;
+      --radius-cover: 8px;
     }
   }
+
   * { box-sizing: border-box; }
   html, body {
     margin: 0; padding: 0; height: 100%;
-    background: var(--bg); color: var(--text);
-    font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
-    font-size: 13px; line-height: 1.45;
+    min-width: 760px; min-height: 520px;      /* 物理下限（CSS 承担） */
+    background: var(--bg-canvas); color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--fs-body); line-height: 1.45;
     -webkit-font-smoothing: antialiased;
   }
   body { overflow: hidden; }
   .app { display: flex; flex-direction: column; height: 100%; }
 
-  /* ── 头部 ─────────────────────────────────────────────────────────── */
-  .hd { padding: 10px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
-  .hd-row { display: flex; align-items: center; justify-content: space-between; }
-  .title { font-size: 13px; font-weight: 700; letter-spacing: .12em; }
-  .title .ver { font-weight: 400; letter-spacing: 0; color: var(--text-faint); font-size: 11px; margin-left: 4px; }
-  .hd-right { display: flex; align-items: center; gap: 8px; }
-  .count { color: var(--text-dim); font-size: 12px; font-variant-numeric: tabular-nums; }
-  .btn-ghost {
-    border: 1px solid var(--line); background: transparent; color: var(--text-dim);
-    font-size: 12px; padding: 3px 9px; border-radius: 5px; cursor: pointer;
+  /* ── 图标精灵表（24×24 网格、图形占 20×20、stroke-width 2.25 → 16px 视觉 1.5）── */
+  .sprite { display: none; }
+  .icon { width: 16px; height: 16px; flex: 0 0 auto; display: block; }
+  .icon-nav { width: 15px; height: 15px; }
+  .icon-10 { width: 10px; height: 10px; }
+  .icon-40 { width: 40px; height: 40px; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ══ ① 顶栏 56px ═════════════════════════════════════════════════════════ */
+  .topbar {
+    flex: 0 0 auto; height: 56px; display: flex; align-items: center; gap: 10px;
+    padding: 0 14px; background: var(--bg-canvas); border-bottom: 1px solid var(--border-panel);
+  }
+  .logo {
+    width: 22px; height: 22px; flex: 0 0 auto; border-radius: var(--radius-logo);
+    background: var(--accent); display: flex; align-items: center; justify-content: center;
+    color: var(--accent-tint); font-size: var(--fs-micro); font-weight: 600; letter-spacing: .06em;
+  }
+  .brand { font-size: 15px; font-weight: 600; letter-spacing: .04em; color: var(--text-primary); flex: 0 0 auto; }
+  .search-wrap { position: relative; display: flex; align-items: center; flex: 1 1 auto; min-width: 180px; }
+  .search-wrap .icon { position: absolute; left: 9px; color: var(--text-tertiary); }
+  .search {
+    width: 100%; height: 32px; padding: 0 26px 0 30px;
+    border: 1px solid var(--border); border-radius: var(--radius-search);
+    background: var(--pill-bg); color: var(--text-primary);
+    font-size: var(--fs-body); font-family: inherit; outline: none;
+  }
+  .search:focus { border-color: var(--accent); background: var(--bg-elevated); }
+  .clear {
+    position: absolute; right: 8px; border: none; background: transparent;
+    color: var(--text-tertiary); cursor: pointer; padding: 2px; display: flex; align-items: center;
     font-family: inherit;
   }
-  .btn-ghost:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-  .fresh { margin-top: 4px; font-size: 11px; color: var(--text-faint); }
-  .fresh.stale { color: var(--warn); }
+  .clear:hover { color: var(--text-primary); }
 
-  /* ── 提示区 ───────────────────────────────────────────────────────── */
+  .seg { display: flex; align-items: center; gap: 2px; padding: 2px; background: var(--pill-bg); border-radius: var(--radius-seg-group); }
+  .seg-btn {
+    display: flex; align-items: center; justify-content: center; width: 28px; height: 24px;
+    border: none; border-radius: var(--radius-seg); background: transparent;
+    color: var(--text-tertiary); cursor: pointer; font-family: inherit; padding: 0;
+  }
+  .seg-btn:hover { color: var(--text-primary); }
+  .seg-btn.is-active { background: var(--seg-active); color: var(--accent-text); }
+  .density { font-size: var(--fs-caption); color: var(--text-muted); letter-spacing: .06em; white-space: nowrap; }
+
+  .status-area { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+  .fresh { font-size: var(--fs-caption); color: var(--text-muted); max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fresh.stale { color: var(--text-secondary); }
+  .ver { font-size: var(--fs-caption); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+  /* ══ 提示条（P1-2）：≤ 单行可点击 ═════════════════════════════════════════ */
   .banner {
-    margin: 8px 12px 0; padding: 8px 10px; border-radius: 6px;
-    font-size: 12px; white-space: pre-wrap; word-break: break-word;
-    border: 1px solid transparent;
+    flex: 0 0 auto; display: none; align-items: center; gap: 6px;
+    padding: 7px 14px; font-size: var(--fs-caption); cursor: pointer;
+    border-bottom: 1px solid var(--border-panel); background: var(--danger-tint); color: var(--danger);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .banner.error { background: var(--err-soft); color: var(--err); border-color: var(--err); }
-  .banner.warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
-  .banner .banner-code { font-weight: 700; margin-right: 4px; }
-  .notes { padding: 0 12px; }
-  .note { font-size: 11px; color: var(--text-faint); padding: 4px 0 0; white-space: pre-wrap; }
+  .banner .banner-code { font-weight: 600; flex: 0 0 auto; }
+  .banner.warn { background: var(--pill-bg); color: var(--text-secondary); }
+  .banner.error { background: var(--danger-tint); color: var(--danger); }
 
-  /* ── 搜索 ─────────────────────────────────────────────────────────── */
-  .search-wrap { position: relative; padding: 10px 12px 8px; }
-  .search {
-    width: 100%; padding: 7px 26px 7px 10px; border-radius: 6px;
-    border: 1px solid var(--line); background: var(--panel); color: var(--text);
-    font-size: 13px; font-family: inherit; outline: none;
-  }
-  .search:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
-  .btn-clear {
-    position: absolute; right: 18px; top: 50%; transform: translateY(-40%);
-    border: none; background: transparent; color: var(--text-faint);
-    font-size: 16px; line-height: 1; cursor: pointer; padding: 2px 4px;
-  }
-  .btn-clear:hover { color: var(--text); }
+  #notes { flex: 0 0 auto; padding: 0 14px; }
+  .note { font-size: var(--fs-micro); color: var(--text-muted); padding: 4px 0 0; white-space: pre-wrap; }
 
-  /* ── 列表 ─────────────────────────────────────────────────────────── */
-  .list { flex: 1 1 auto; overflow-y: auto; padding: 0 12px 6px; }
-  .row {
-    display: flex; align-items: center; gap: 8px;
-    padding: 7px 9px; margin-bottom: 4px; border-radius: 6px;
-    background: var(--panel); border: 1px solid var(--line);
-    cursor: pointer;
-  }
-  .row:hover { border-color: var(--accent); background: var(--accent-soft); }
-  .row.row-disabled { cursor: default; opacity: .62; }
-  .row.row-disabled:hover { border-color: var(--line); background: var(--panel); }
-  .row-main { flex: 1 1 auto; min-width: 0; }
-  .row-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .row-name .name {
-    font-size: 13px; font-weight: 500;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .tag {
-    flex: 0 0 auto; font-size: 10px; line-height: 1.6; padding: 0 5px;
-    border-radius: 3px; color: #fff; letter-spacing: .02em;
-  }
-  .tag-model { background: var(--tag-model); }
-  .tag-texture { background: var(--tag-texture); }
-  .tag-material { background: var(--tag-material); }
-  .tag-hdri { background: var(--tag-hdri); }
-  .tag-cad { background: var(--tag-cad); }
-  .tag-other { background: var(--tag-other); }
-  .row-path {
-    font-size: 11px; color: var(--text-faint); margin-top: 2px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .btn-insert {
-    flex: 0 0 auto; border: 1px solid var(--accent); background: transparent;
-    color: var(--accent); font-size: 12px; padding: 3px 10px; border-radius: 5px;
-    cursor: pointer; font-family: inherit;
-  }
-  .btn-insert:hover:not(:disabled) { background: var(--accent); color: #fff; }
-  .btn-insert:disabled { cursor: not-allowed; border-color: var(--line); color: var(--text-faint); }
+  /* ══ 主体两列 ═════════════════════════════════════════════════════════════ */
+  .shell { flex: 1 1 auto; display: flex; min-height: 0; }
 
-  .empty { padding: 24px 16px; text-align: center; color: var(--text-faint); font-size: 12px; white-space: pre-wrap; }
-
-  /* ── 状态行 ───────────────────────────────────────────────────────── */
-  .status {
-    flex: 0 0 auto; min-height: 26px; padding: 5px 12px;
-    border-top: 1px solid var(--line); background: var(--panel);
-    font-size: 11px; color: var(--text-dim); white-space: pre-wrap;
-    max-height: 74px; overflow-y: auto;
+  /* ── ② 左栏 216px ── */
+  .side { flex: 0 0 216px; width: 216px; display: flex; flex-direction: column; background: var(--bg-sidebar); border-right: 1px solid var(--border); }
+  .side-scroll { flex: 1 1 auto; overflow-y: auto; padding: 0 8px 8px; }
+  .group-head { font-size: var(--fs-caption); font-weight: 500; letter-spacing: .08em; color: var(--text-muted); padding: 10px 4px 4px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 8px;
+    border-radius: var(--radius-nav); cursor: pointer; color: var(--text-secondary);
+    font-size: var(--fs-card-title);
   }
-  .status.ok { color: var(--ok); }
-  .status.warn { color: var(--warn); }
-  .status.error { color: var(--err); }
+  .nav-item .icon { color: var(--text-tertiary); }
+  .nav-item .nav-count { margin-left: auto; font-size: var(--fs-caption); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .nav-item:hover { background: var(--bg-elevated); }
+  .nav-item.is-active { background: var(--bg-active-nav); color: var(--accent-text); }
+  .nav-item.is-active .icon { color: var(--accent-text); }
+  .nav-tree { margin-top: 6px; }
+  .tree-item {
+    display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px;
+    border-radius: var(--radius-nav); cursor: pointer; color: var(--text-secondary); font-size: var(--fs-body);
+  }
+  .tree-item .icon { color: var(--text-tertiary); }
+  .tree-item .nav-count { margin-left: auto; font-size: var(--fs-caption); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .tree-item:hover { background: var(--bg-elevated); }
+  .tree-item.is-active { background: var(--bg-active-nav); color: var(--accent-text); }
+  .side-foot { flex: 0 0 auto; border-top: 1px solid var(--border); padding: 10px 12px; }
+  .cta {
+    display: flex; align-items: center; gap: 6px; width: 100%; height: 32px; padding: 0 10px;
+    border: none; border-radius: var(--radius-cta); background: var(--accent-tint);
+    color: var(--accent-text); font-size: var(--fs-card-name); font-weight: 600; font-family: inherit;
+  }
+  .side-meta { margin-top: 8px; font-size: var(--fs-micro); color: var(--text-muted); }
+  .side-meta .lib-path { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .side-settings { margin-top: 6px; display: flex; align-items: center; gap: 6px; font-size: var(--fs-caption); color: var(--text-tertiary); }
+
+  /* ── ③ 筛选 chips ── */
+  .main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+  .chips { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 10px 14px 0; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 4px; height: 28px; padding: 0 10px;
+    border: 1px solid var(--border); border-radius: var(--radius-chip);
+    background: var(--bg-canvas); color: var(--text-secondary);
+    font-size: var(--fs-body); font-family: inherit; cursor: pointer;
+  }
+  .chip-ghost { background: transparent; color: var(--text-tertiary); }
+  .chip:hover { border-color: var(--accent); }
+  .chip.is-active, .chip-accent { background: var(--accent-tint); color: var(--accent-text); border-color: transparent; }
+  .chip .caret { font-size: var(--fs-micro); color: inherit; }
+  .header-count { margin-left: auto; font-size: var(--fs-body); color: var(--text-tertiary); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  /* ── ④ 卡片网格 ── */
+  .grid {
+    flex: 1 1 auto; overflow-y: auto; padding: 10px 14px 12px;
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gap-card);
+    align-content: start;
+  }
+  .card {
+    position: relative; display: flex; flex-direction: column;
+    background: var(--surface-card); border: 1px solid transparent;
+    border-radius: var(--radius-card); box-shadow: var(--shadow-card);
+    cursor: pointer; transition: transform 150ms ease-out, box-shadow 150ms ease-out, background-color 150ms ease-out;
+  }
+  .card:not(.is-selected):hover { transform: translateY(-2px); box-shadow: var(--shadow-card-hover); }
+  .card.is-selected { outline: 2px solid var(--accent); box-shadow: var(--shadow-card-active); }
+  .card.is-disabled { cursor: default; opacity: .62; }
+  .card-cover-frame { position: relative; aspect-ratio: 4 / 3; border-radius: var(--radius-cover); background: var(--bg-canvas); overflow: hidden; }
+  .card-cover { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .card-cover.is-hidden { display: none; }
+  .card-ph { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--text-tertiary); }
+  .card-ph.is-on { display: flex; }
+  .badge {
+    position: absolute; left: 6px; top: 6px; padding: 1px 6px;
+    border-radius: var(--radius-badge); background: var(--tint-neutral); color: var(--tint-neutral-text);
+    font-size: var(--fs-micro); font-weight: 500;
+  }
+  .card.is-selected .badge { background: var(--accent-tint); color: var(--accent-text); }
+  .check-badge {
+    position: absolute; right: 6px; top: 6px; width: 22px; height: 22px; display: none;
+    align-items: center; justify-content: center; border-radius: var(--radius-pill);
+    background: var(--accent); border: 2px solid #fff; color: #fff;   /* S4 豁免：白描边 */
+  }
+  .card.is-selected .check-badge { display: flex; }
+  .card-body { padding: 8px 10px 10px; min-width: 0; }
+  .card-name { font-size: var(--fs-card-name); font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-meta { margin-top: 3px; font-size: var(--fs-caption); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  @media (prefers-color-scheme: dark) {
+    .card { border-color: var(--border); box-shadow: none; }
+    .card:not(.is-selected):hover { background-color: var(--bg-elevated); box-shadow: none; transform: translateY(-2px); }
+    .card.is-selected { box-shadow: none; }
+  }
+
+  /* ── ⑤ 空态两态（图形与 DOM 各自不同） ── */
+  /* 默认可见；隐藏只靠 .hidden（JS 置 className = 'empty' / 'empty hidden'，与原实现一致） */
+  .empty { flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 26px 20px; color: var(--text-tertiary); }
+  .empty .empty-text { font-size: var(--fs-body); text-align: center; white-space: pre-wrap; }
+  .empty .empty-lead { font-size: var(--fs-section); font-weight: 600; color: var(--text-secondary); }
+
+  /* ── ⑥ 底部状态栏 44px（文档流真实行，非浮层） ── */
+  .statusbar {
+    flex: 0 0 44px; height: 44px; display: flex; align-items: center; gap: 10px;
+    padding: 0 16px; background: var(--toast-bg); border-top: 1px solid var(--border-panel);
+  }
+  .status-mark {
+    flex: 0 0 16px; width: 16px; height: 16px; border-radius: var(--radius-pill);
+    background: var(--success); color: #fff;   /* S4 豁免：白描边 */
+    display: flex; align-items: center; justify-content: center;
+  }
+  .status { flex: 1 1 auto; min-width: 0; font-size: var(--fs-card-name); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .status.ok { color: var(--success); }
+  .status.error { color: var(--danger); }
+  .status.warn, .status.info { color: var(--text-secondary); }
+  .undo-pill {
+    flex: 0 0 auto; display: flex; align-items: center; height: 28px; padding: 0 10px;
+    border-radius: var(--radius-toast-undo); background: var(--accent-tint);
+  }
+  .undo-inner {
+    display: flex; align-items: center; height: 20px; padding: 0 8px;
+    border-radius: var(--radius-toast-undo-inner); background: var(--accent); color: #fff;  /* S4 豁免：白描边 */
+    font-size: var(--fs-caption); font-weight: 600;
+  }
+
   .hidden { display: none !important; }
+  .view-list { grid-template-columns: minmax(0, 1fr); }
+  .view-list .card { flex-direction: row; align-items: center; }
+  .view-list .card-cover-frame { width: 92px; flex: 0 0 92px; }
+  .view-list .card-body { padding: 8px 12px; }
 </style>
 </head>
 <body>
-<div class="app">
-  <div class="hd">
-    <div class="hd-row">
-      <div class="title">ID BOX<span id="ver" class="ver"></span></div>
-      <div class="hd-right">
-        <span id="count" class="count">—</span>
-        <button id="refresh" class="btn-ghost" type="button" title="重新读取索引文件（只读，不会改动 ID BOX 数据）">刷新</button>
-      </div>
-    </div>
-    <div id="fresh" class="fresh">正在读取索引…</div>
-  </div>
 
-  <div id="banner" class="banner hidden"></div>
+<!-- 内联 SVG 精灵表（24×24 / fill none / currentColor / stroke-width 2.25 / round cap|join） -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
+  </symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+    <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+  </symbol>
+  <symbol id="i-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>
+  </symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+    <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+  </symbol>
+  <symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3 8l9 5 9-5"/><path d="M12 13v8"/>
+  </symbol>
+  <symbol id="i-material" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 000 18"/>
+    <circle cx="9" cy="10" r="1" fill="currentColor"/><circle cx="15" cy="10" r="1" fill="currentColor"/>
+    <circle cx="12" cy="15" r="1" fill="currentColor"/>
+  </symbol>
+  <symbol id="i-hdr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+  </symbol>
+  <symbol id="i-cad" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 11h9V3"/><path d="M21 14h-6v7"/>
+  </symbol>
+  <symbol id="i-other" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/>
+  </symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
+  </symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l-.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+  </symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 6L9 17l-5-5"/>
+  </symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>
+  </symbol>
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 6L6 18M6 6l12 12"/>
+  </symbol>
+  <symbol id="i-empty-library" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 12v7a2 2 0 002 2h14a2 2 0 002-2v-7"/>
+    <path d="M3 12h4M17 12h4"/>
+    <path d="M12 11V2"/>
+    <path d="M8.5 5.5L12 2l3.5 3.5"/>
+  </symbol>
+  <symbol id="i-empty-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 4H3l7 8.5V19l4 2v-8.5L21 4z"/>
+  </symbol>
+  <!-- 补支：CTA 加号（portable-spec §5.2 补充支，path 逐字取 icons.tsx IconPlus） -->
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 5v14M5 12h14"/>
+  </symbol>
+</svg>
+
+<!-- 图标模板：JS 用 cloneNode 复制（不用 createElementNS，避免在文件里出现命名空间 URL） -->
+<svg id="icon-tpl" class="hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+  <use href="#i-check"></use>
+</svg>
+
+<div class="app">
+
+  <!-- ① 顶栏 56px -->
+  <header class="topbar">
+    <div class="logo" aria-hidden="true">ID</div>
+    <div class="brand">ID BOX<span id="ver" class="ver"></span></div>
+    <div class="search-wrap">
+      <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+      <input id="q" class="search" type="text" placeholder="搜索名称 / 分类…" autocomplete="off" spellcheck="false">
+      <button id="clear" class="clear hidden" type="button" title="清空搜索">
+        <svg class="icon icon-10" aria-hidden="true"><use href="#i-close"></use></svg>
+      </button>
+    </div>
+    <div class="seg" role="group" aria-label="视图">
+      <button class="seg-btn is-active" type="button" data-view="grid" title="网格视图">
+        <svg class="icon" aria-hidden="true"><use href="#i-grid"></use></svg>
+      </button>
+      <button class="seg-btn" type="button" data-view="list" title="列表视图（单列）">
+        <svg class="icon" aria-hidden="true"><use href="#i-list"></use></svg>
+      </button>
+    </div>
+    <span class="density" title="静态密度字样，本批不接行为">大 中 小</span>
+    <div class="status-area">
+      <div id="fresh" class="fresh">正在读取索引…</div>
+      <button id="refresh" class="chip chip-ghost" type="button" title="重新读取索引文件（只读，不会改动 ID BOX 数据）">
+        <svg class="icon icon-10" aria-hidden="true"><use href="#i-refresh"></use></svg>刷新
+      </button>
+    </div>
+  </header>
+
+  <!-- 提示条（P1-2）：≤ 单行可点击，点击 → refreshIndex()；与 #empty 是两个独立 DOM 节点 -->
+  <div id="banner" class="banner hidden" title="点击重新读取索引文件"></div>
   <div id="notes" class="notes"></div>
 
-  <div class="search-wrap">
-    <input id="q" class="search" type="text" placeholder="搜索名称 / 分类…" autocomplete="off" spellcheck="false">
-    <button id="clear" class="btn-clear hidden" type="button" title="清空搜索">×</button>
+  <div class="shell">
+
+    <!-- ② 左栏 216px -->
+    <aside class="side">
+      <div class="side-scroll">
+        <div class="group-head">素材大类</div>
+        <nav id="side-nav"></nav>
+        <div class="group-head">一级分类</div>
+        <nav id="side-tree" class="nav-tree"></nav>
+      </div>
+      <div class="side-foot">
+        <div class="cta" title="面板只读：导入请在 ID BOX 主程序内完成">
+          <svg class="icon icon-10" aria-hidden="true"><use href="#i-plus" id="cta-plus"></use></svg>+ 在 ID BOX 里导入
+        </div>
+        <div class="side-meta">
+          <span class="lib-path" id="lib-path">—</span>
+          <span class="side-settings">
+            <svg class="icon icon-10" aria-hidden="true"><use href="#i-settings"></use></span>
+            <span id="side-version"></span>
+          </span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <!-- ③ 筛选 chips（#count 是 11 个必保留 id 之一，静态节点，由 renderChips 挂到行右侧） -->
+      <div id="chips" class="chips">
+        <span id="count" class="header-count">—</span>
+      </div>
+
+      <!-- ④ 卡片网格（按 state.data.records 全量渲染，非虚拟滚动） -->
+      <div id="list" class="grid"></div>
+
+      <!-- ⑤ 空态两态 -->
+      <div id="empty" class="empty hidden"></div>
+    </main>
   </div>
 
-  <div id="list" class="list"></div>
-  <div id="empty" class="empty hidden"></div>
-  <div id="status" class="status"></div>
+  <!-- ⑥ 底部状态栏 44px（文档流真实行） -->
+  <div class="statusbar">
+    <span class="status-mark" aria-hidden="true">
+      <svg class="icon icon-10"><use href="#i-check"></use></svg>
+    </span>
+    <span id="status" class="status"></span>
+    <span class="undo-pill" title="面板不实现撤销计时；撤销在 SketchUp 里用 Ctrl+Z">
+      <span class="undo-inner">撤销 Ctrl+Z</span>
+    </span>
+  </div>
 </div>
 
 <script>
@@ -204,8 +548,27 @@
     query: '',
     kindLabels: {},
     insertableKinds: ['model'],
-    unsupportedHint: ''
+    unsupportedHint: '',
+    selectedId: '',        /* 单值，不是数组（§5.2 裁定 2） */
+    activeKind: '',        /* '' = 全部；展示分组见 KIND_GROUPS */
+    activeCategory1: '',
+    sortKey: 'default',
+    thumbsRoot: '',        /* 来自 payload（T04 才落字段），本卡默认空 ⇒ 首屏全 SVG 占位 */
+    viewMode: 'grid'
   };
+
+  /* 左栏 5 个展示分组 → KINDS 6 值（「材质 = texture + material」，§10.2 风险 8 建议口径） */
+  var KIND_GROUPS = [
+    { key: '', label: '全部', icon: 'i-grid', kinds: ['model', 'texture', 'material', 'hdri', 'cad', 'other'] },
+    { key: 'model', label: '模型', icon: 'i-box', kinds: ['model'] },
+    { key: 'material', label: '材质', icon: 'i-material', kinds: ['texture', 'material'] },
+    { key: 'hdri', label: 'HDR', icon: 'i-hdr', kinds: ['hdri'] },
+    { key: 'cad', label: 'CAD', icon: 'i-cad', kinds: ['cad'] },
+    { key: 'other', label: '其他', icon: 'i-other', kinds: ['other'] }
+  ];
+
+  var SORT_KEYS = ['default', 'name', 'category1', 'fileCount'];
+  var SORT_LABELS = { default: '默认排序', name: '按名称', category1: '按分类', fileCount: '按文件数' };
 
   function $(id) { return document.getElementById(id); }
 
@@ -224,7 +587,26 @@
     return !!(window.sketchup && typeof window.sketchup[name] === 'function');
   }
 
-  /* ── 状态行 ──────────────────────────────────────────────────────── */
+  /* 精灵表渲染：复制 #icon-tpl 模板 + 改 use 的 href。
+     不用 createElementNS —— 避免在文件里出现命名空间 URL（A3「0 http(s)://」）。 */
+  function iconEl(name, sizeClass) {
+    var svg = $('icon-tpl').cloneNode(true);
+    svg.setAttribute('class', 'icon ' + (sizeClass || ''));
+    svg.setAttribute('aria-hidden', 'true');
+    var use = svg.querySelector('use');
+    use.setAttribute('href', '#' + name);
+    return svg;
+  }
+
+  function iconForKind(kind) {
+    if (kind === 'model') { return 'i-box'; }
+    if (kind === 'texture' || kind === 'material') { return 'i-material'; }
+    if (kind === 'hdri') { return 'i-hdr'; }
+    if (kind === 'cad') { return 'i-cad'; }
+    return 'i-other';
+  }
+
+  /* ── 状态行（⑥，#status 是 44px 行里的文字节点） ─────────────────────── */
   function setStatus(payload) {
     var node = $('status');
     if (!node) { return; }
@@ -234,7 +616,7 @@
     node.textContent = message;
   }
 
-  /* ── 顶部提示条 ──────────────────────────────────────────────────── */
+  /* ── 提示条（③ 索引未开 / IDBOX-101）───────────────────────────────── */
   function renderBanner(data) {
     var banner = $('banner');
     banner.className = 'banner hidden';
@@ -242,6 +624,7 @@
 
     if (!data.ok) {
       banner.className = 'banner error';
+      banner.appendChild(iconEl('i-alert', 'icon-10'));
       var codeText = textOf(data.codeText);
       if (codeText) {
         banner.appendChild(make('span', 'banner-code', codeText));
@@ -261,7 +644,7 @@
     }
   }
 
-  /* ── 灰字备注（不占错误码的提示，例如非 ASCII 用户目录） ─────────── */
+  /* ── 灰字备注 ──────────────────────────────────────────────────────── */
   function renderNotes(data) {
     var box = $('notes');
     box.textContent = '';
@@ -271,7 +654,7 @@
     }
   }
 
-  /* ── 新鲜度 ──────────────────────────────────────────────────────── */
+  /* ── 新鲜度 ────────────────────────────────────────────────────────── */
   function freshnessParts(data) {
     var iso = textOf(data && data.generatedAt);
     var parsed = iso ? Date.parse(iso) : NaN;
@@ -305,9 +688,10 @@
     var parts = freshnessParts(data);
     node.className = parts.stale ? 'fresh stale' : 'fresh';
     node.textContent = parts.text;
+    node.title = parts.text;   /* 顶栏单行省略，完整内容走 title */
   }
 
-  /* ── 行 ──────────────────────────────────────────────────────────── */
+  /* ── 分类路径 / 禁用原因 ───────────────────────────────────────────── */
   function categoryPath(record) {
     var first = textOf(record.category1);
     var second = textOf(record.category2);
@@ -321,8 +705,6 @@
     return parts.join(' / ') || '（未分类）';
   }
 
-  /* 禁用原因：材质/贴图/HDRI 走「待真机验证」文案（D2 未结）；
-     CAD / 其他 与材质无关，另给一句更准确的话，避免误导。 */
   function unsupportedHintFor(kind) {
     if (kind === 'cad' || kind === 'other') {
       return 'V1.0 只支持插入模型（kind = model）；CAD / 其他类型暂不支持';
@@ -340,42 +722,89 @@
     return '';
   }
 
-  function rowFor(record) {
-    var reason = blockReason(record);
-    var row = make('div', reason ? 'row row-disabled' : 'row');
-    var kind = textOf(record.kind) || 'other';
-
-    var main = make('div', 'row-main');
-    var nameLine = make('div', 'row-name');
-    nameLine.appendChild(make('span', 'name', textOf(record.name) || '（未命名）'));
-    nameLine.appendChild(make('span', 'tag tag-' + kind, state.kindLabels[kind] || kind));
-    main.appendChild(nameLine);
-
-    var pathLine = make('div', 'row-path', categoryPath(record));
-    pathLine.title = textOf(record.relFolder);
-    main.appendChild(pathLine);
-    row.appendChild(main);
-
-    var button = make('button', 'btn-insert', '插入');
-    button.type = 'button';
-    if (reason) {
-      button.disabled = true;
-      button.title = reason;
-      row.title = reason;
-    } else {
-      button.title = '插入到当前模型（一次操作，可 Ctrl+Z 撤销）';
-      row.title = textOf(record.mainFile);
-      button.addEventListener('click', function (event) {
-        event.stopPropagation();
-        insertRecord(record.id);
-      });
-      row.addEventListener('click', function () { insertRecord(record.id); });
-    }
-    row.appendChild(button);
-    return row;
+  /* ── ④ 卡片：双轨封面（真实 file:/// 图片 ↔ 内联 SVG 占位）─────────── */
+  function encodeSegment(segment) {
+    return encodeURIComponent(segment);
   }
 
+  function thumbSrc(record) {
+    if (!state.thumbsRoot) { return ''; }
+    var rel = textOf(record.thumbRel);
+    if (!rel) { return ''; }
+    var root = textOf(state.thumbsRoot).replace(/\\/g, '/').replace(/\/+$/, '');
+    rel = rel.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!root || !rel) { return ''; }
+
+    /* file:/// 不是网络协议；逐段编码以处理中文 / 空格 / # ；盘符段（C:）保留冒号 */
+    var out = 'file:///';
+    var segments = root.split('/');
+    for (var i = 0; i < segments.length; i += 1) {
+      if (i > 0) { out += '/'; }
+      out += /^[A-Za-z]:$/.test(segments[i]) ? segments[i] : encodeSegment(segments[i]);
+    }
+    var relSegments = rel.split('/');
+    for (var j = 0; j < relSegments.length; j += 1) {
+      out += '/' + encodeSegment(relSegments[j]);
+    }
+    return out;
+  }
+
+  function cardFor(record) {
+    var reason = blockReason(record);
+    var kind = textOf(record.kind) || 'other';
+    var card = make('div', 'card' + (reason ? ' card-disabled' : '') + (state.selectedId === textOf(record.id) ? ' is-selected' : ''));
+    card.setAttribute('data-id', textOf(record.id));
+    card.title = reason || textOf(record.mainFile) || '单击插入到当前模型（可 Ctrl+Z 撤销）';
+
+    var frame = make('div', 'card-cover-frame');
+    var placeholder = make('div', 'card-ph');
+    placeholder.appendChild(iconEl(iconForKind(kind), 'icon-40'));
+
+    var src = thumbSrc(record);
+    if (src) {
+      var img = make('img', 'card-cover');
+      img.src = src;
+      img.alt = '';
+      img.addEventListener('error', function () {
+        /* 加载失败 → 隐藏破图、显示同卡内预置的 SVG 占位层 */
+        img.className = 'card-cover is-hidden';
+        placeholder.className = 'card-ph is-on';
+      });
+      frame.appendChild(img);
+    } else {
+      placeholder.className = 'card-ph is-on';
+    }
+
+    frame.appendChild(placeholder);
+    frame.appendChild(make('span', 'badge', state.kindLabels[kind] || kind));
+    card.appendChild(frame);
+
+    var body = make('div', 'card-body');
+    body.appendChild(make('div', 'card-name', textOf(record.name) || '（未命名）'));
+    var meta = categoryPath(record);
+    var files = Number(record.fileCount);
+    if (isFinite(files) && files > 0) { meta += ' · ' + files + ' 个文件'; }
+    body.appendChild(make('div', 'card-meta', meta));
+    card.appendChild(body);
+
+    var check = make('span', 'check-badge');
+    check.appendChild(iconEl('i-check', 'icon-10'));
+    card.appendChild(check);
+    return card;
+  }
+
+  function groupOf(record) {
+    var kind = textOf(record.kind);
+    for (var i = 0; i < KIND_GROUPS.length; i += 1) {
+      if (KIND_GROUPS[i].kinds.indexOf(kind) >= 0) { return KIND_GROUPS[i].key; }
+    }
+    return 'other';
+  }
+
+  /* 纯前端内存过滤：搜索 + 左栏分组 + 一级分类（不请求任何数据） */
   function matches(record) {
+    if (state.activeKind && groupOf(record) !== state.activeKind) { return false; }
+    if (state.activeCategory1 && textOf(record.category1) !== state.activeCategory1) { return false; }
     var query = state.query.trim().toLowerCase();
     if (!query) { return true; }
     var fields = [textOf(record.name), textOf(record.category1), textOf(record.category2)];
@@ -385,38 +814,77 @@
     return false;
   }
 
-  function renderList() {
-    var list = $('list');
+  function visibleRecords() {
+    var data = state.data;
+    if (!data || !data.ok) { return []; }
+    var records = data.records || [];
+    var shown = [];
+    for (var i = 0; i < records.length; i += 1) {
+      if (matches(records[i])) { shown.push(records[i]); }
+    }
+    if (state.sortKey === 'name') {
+      shown.sort(function (a, b) { return textOf(a.name).localeCompare(textOf(b.name)); });
+    } else if (state.sortKey === 'category1') {
+      shown.sort(function (a, b) { return textOf(a.category1).localeCompare(textOf(b.category1)); });
+    } else if (state.sortKey === 'fileCount') {
+      shown.sort(function (a, b) { return Number(b.fileCount) - Number(a.fileCount); });
+    }
+    return shown;
+  }
+
+  /* ── ⑤ 空态两态：图形与 DOM 各自不同，互不覆盖 ─────────────────────── */
+  function renderEmpty(shown) {
     var empty = $('empty');
-    list.textContent = '';
+    empty.textContent = '';
     var data = state.data;
 
     if (!data) {
+      /* ④ 加载中：首帧到首份 payload 之间不误报「库为空 / 筛选 0」 */
       empty.className = 'empty';
-      empty.textContent = '正在读取索引…';
+      empty.appendChild(make('div', 'empty-lead', '正在读取索引…'));
       return;
     }
     if (!data.ok) {
       empty.className = 'empty';
-      empty.textContent = '索引不可用，处理办法见上方提示。';
+      empty.appendChild(iconEl('i-empty-library', 'icon-40'));
+      empty.appendChild(make('div', 'empty-text', '索引不可用，处理办法见上方提示条。'));
       return;
     }
+
     var records = data.records || [];
-    var shown = 0;
-    for (var i = 0; i < records.length; i += 1) {
-      if (!matches(records[i])) { continue; }
-      list.appendChild(rowFor(records[i]));
-      shown += 1;
+    if (records.length === 0) {
+      /* ① 库为空 */
+      empty.className = 'empty';
+      empty.appendChild(iconEl('i-empty-library', 'icon-40'));
+      empty.appendChild(make('div', 'empty-lead', '库为空'));
+      empty.appendChild(make('div', 'empty-text', '请在 ID BOX 里导入素材并开启插件索引，\n然后回到这里点「刷新」。'));
+      return;
     }
     if (shown === 0) {
+      /* ② 筛选 0：搜索框与已输入词保留，不被全局空态盖掉 */
       empty.className = 'empty';
-      empty.textContent = records.length === 0
-        ? '索引里没有记录。\n请在 ID BOX 里刷新索引后回到这里点「刷新」。'
-        : '没有匹配「' + state.query.trim() + '」的记录。';
-    } else {
-      empty.className = 'empty hidden';
-      empty.textContent = '';
+      empty.appendChild(iconEl('i-empty-filter', 'icon-40'));
+      empty.appendChild(make('div', 'empty-text', '没有匹配「' + state.query.trim() + '」的记录。'));
+      return;
     }
+    empty.className = 'empty hidden';
+  }
+
+  function renderList() {
+    var list = $('list');
+    list.textContent = '';
+    list.className = 'grid' + (state.viewMode === 'list' ? ' view-list' : '');
+
+    var data = state.data;
+    if (!data) { renderEmpty(0); return; }
+
+    var shown = 0;
+    var visible = visibleRecords();
+    for (var i = 0; i < visible.length; i += 1) {
+      list.appendChild(cardFor(visible[i]));
+      shown += 1;
+    }
+    renderEmpty(shown);
   }
 
   function renderCount() {
@@ -424,14 +892,122 @@
     if (!node) { return; }
     var data = state.data;
     if (!data || !data.ok) { node.textContent = '—'; return; }
-    var shown = 0;
+    var records = data.records || [];
+    var shown = visibleRecords().length;
+    node.textContent = (shown === records.length)
+      ? ('共 ' + records.length + ' 项')
+      : ('共 ' + shown + ' / ' + records.length + ' 项');
+  }
+
+  /* ── ② 左栏 + ③ chips ─────────────────────────────────────────────── */
+  function groupCounts() {
+    var data = state.data;
+    var counts = {};
+    if (!data || !data.ok) { return counts; }
     var records = data.records || [];
     for (var i = 0; i < records.length; i += 1) {
-      if (matches(records[i])) { shown += 1; }
+      var key = groupOf(records[i]);
+      counts[key] = (counts[key] || 0) + 1;
     }
-    node.textContent = (shown === records.length)
-      ? (records.length + ' 条')
-      : (shown + ' / ' + records.length + ' 条');
+    return counts;
+  }
+
+  function topCategories() {
+    var data = state.data;
+    if (!data || !data.ok) { return []; }
+    var records = data.records || [];
+    var counts = {};
+    for (var i = 0; i < records.length; i += 1) {
+      var first = textOf(records[i].category1);
+      if (!first) { continue; }
+      counts[first] = (counts[first] || 0) + 1;
+    }
+    var list = [];
+    for (var name in counts) {
+      if (Object.prototype.hasOwnProperty.call(counts, name)) { list.push({ name: name, count: counts[name] }); }
+    }
+    list.sort(function (a, b) { return b.count - a.count; });
+    return list.slice(0, 8);
+  }
+
+  function renderSide() {
+    var nav = $('side-nav');
+    var tree = $('side-tree');
+    nav.textContent = '';
+    tree.textContent = '';
+
+    var counts = groupCounts();
+    var data = state.data;
+    var total = (data && data.ok) ? ((data.records || []).length) : 0;
+
+    for (var i = 0; i < KIND_GROUPS.length; i += 1) {
+      var group = KIND_GROUPS[i];
+      var item = make('div', 'nav-item' + (state.activeKind === group.key ? ' is-active' : ''));
+      item.setAttribute('data-kind', group.key);
+      item.appendChild(iconEl(group.icon, 'icon-nav'));
+      item.appendChild(make('span', null, group.label));
+      item.appendChild(make('span', 'nav-count', counts[group.key] || 0));
+      nav.appendChild(item);
+    }
+
+    var categories = topCategories();
+    for (var j = 0; j < categories.length; j += 1) {
+      var row = make('div', 'tree-item' + (state.activeCategory1 === categories[j].name ? ' is-active' : ''));
+      row.setAttribute('data-category', categories[j].name);
+      row.appendChild(iconEl('i-folder', 'icon-nav'));
+      row.appendChild(make('span', null, categories[j].name));
+      row.appendChild(make('span', 'nav-count', categories[j].count));
+      tree.appendChild(row);
+    }
+
+    var libPath = $('lib-path');
+    libPath.textContent = (data && textOf(data.libraryRoot)) || '（库路径未知）';
+    libPath.title = libPath.textContent;
+    var version = $('side-version');
+    version.textContent = (data && data.pluginVersion ? 'v' + data.pluginVersion : '—') + ' · 本地库';
+  }
+
+  function renderChips() {
+    var chips = $('chips');
+    /* #count 是必保留 id 的静态节点：先取出，清空后重新挂回行右侧 */
+    var countNode = $('count');
+    chips.textContent = '';
+
+    var all = make('button', 'chip' + (state.activeKind === '' && state.activeCategory1 === '' ? ' chip-accent' : ' chip-ghost'), '全部');
+    all.type = 'button';
+    all.setAttribute('data-chip', 'reset');
+    chips.appendChild(all);
+
+    var typeChip = make('button', 'chip chip-ghost' + (state.activeKind ? ' is-active' : ''));
+    typeChip.type = 'button';
+    typeChip.setAttribute('data-chip', 'type');
+    typeChip.appendChild(document.createTextNode(state.activeKind ? groupLabel(state.activeKind) : '类型'));
+    typeChip.appendChild(make('span', 'caret', '▾'));
+    chips.appendChild(typeChip);
+
+    var catChip = make('button', 'chip chip-ghost' + (state.activeCategory1 ? ' is-active' : ''));
+    catChip.type = 'button';
+    catChip.setAttribute('data-chip', 'category');
+    catChip.appendChild(document.createTextNode(state.activeCategory1 || '分类'));
+    catChip.appendChild(make('span', 'caret', '▾'));
+    chips.appendChild(catChip);
+
+    var sortChip = make('button', 'chip chip-ghost' + (state.sortKey !== 'default' ? ' is-active' : ''));
+    sortChip.type = 'button';
+    sortChip.setAttribute('data-chip', 'sort');
+    sortChip.appendChild(document.createTextNode(SORT_LABELS[state.sortKey] || '排序'));
+    sortChip.appendChild(make('span', 'caret', '▾'));
+    chips.appendChild(sortChip);
+
+    /* 「共 N 项」用 #count（§4.1 必保留 id），挂在 chips 行右侧 */
+    if (countNode) { chips.appendChild(countNode); }
+  }
+
+  function groupLabel(key) {
+    for (var i = 0; i < KIND_GROUPS.length; i += 1) {
+      if (KIND_GROUPS[i].key === key) { return KIND_GROUPS[i].label; }
+    }
+    return key;
   }
 
   /* ── 动作 ────────────────────────────────────────────────────────── */
@@ -455,9 +1031,19 @@
 
   function applyQuery(value) {
     state.query = textOf(value);
-    $('clear').className = state.query ? 'btn-clear' : 'btn-clear hidden';
+    $('clear').className = state.query ? 'clear' : 'clear hidden';
     renderList();
     renderCount();
+  }
+
+  /* ⑤ 选中：与插入是同一次 click（单值 state.selectedId） */
+  function selectCard(id) {
+    state.selectedId = textOf(id);
+    var list = $('list');
+    var cards = list.querySelectorAll('.card');
+    for (var i = 0; i < cards.length; i += 1) {
+      cards[i].className = cards[i].className.replace(/\s*is-selected/, '') + (cards[i].getAttribute('data-id') === state.selectedId ? ' is-selected' : '');
+    }
   }
 
   /* ── 对 Ruby 暴露的入口 ──────────────────────────────────────────── */
@@ -466,10 +1052,13 @@
     state.kindLabels = (data && data.kindLabels) ? data.kindLabels : {};
     state.insertableKinds = (data && data.insertableKinds) ? data.insertableKinds : ['model'];
     state.unsupportedHint = (data && data.unsupportedInsertHint) ? data.unsupportedInsertHint : '';
+    state.thumbsRoot = (data && data.thumbsRoot) ? String(data.thumbsRoot) : '';
     $('ver').textContent = (data && data.pluginVersion) ? ('v' + data.pluginVersion) : '';
     renderBanner(data || { ok: false, message: '没有数据' });
     renderNotes(data);
     renderFreshness();
+    renderSide();
+    renderChips();
     renderList();
     renderCount();
   }
@@ -479,7 +1068,7 @@
     setStatus: setStatus
   };
 
-  /* ── 事件绑定 ────────────────────────────────────────────────────── */
+  /* ── 事件绑定（事件委托）──────────────────────────────────────────── */
   $('q').addEventListener('input', function (event) {
     applyQuery(event.target.value);
   });
@@ -489,10 +1078,121 @@
     $('q').focus();
   });
   $('refresh').addEventListener('click', function () { refreshIndex(); });
+  $('banner').addEventListener('click', function () { refreshIndex(); });   /* P1-2：可点击提示条 */
+
+  $('list').addEventListener('click', function (event) {
+    var card = event.target;
+    while (card && card !== $('list') && !(card.className && card.className.indexOf('card') >= 0 && card.getAttribute('data-id'))) {
+      card = card.parentNode;
+    }
+    if (!card || !card.getAttribute('data-id')) { return; }
+    var id = card.getAttribute('data-id');
+    selectCard(id);
+    var record = findRecord(id);
+    if (!record) { return; }
+    var reason = blockReason(record);
+    if (reason) { setStatus({ message: reason, level: 'warn' }); return; }
+    insertRecord(id);
+  });
+
+  function findRecord(id) {
+    var data = state.data;
+    if (!data || !data.ok) { return null; }
+    var records = data.records || [];
+    for (var i = 0; i < records.length; i += 1) {
+      if (textOf(records[i].id) === textOf(id)) { return records[i]; }
+    }
+    return null;
+  }
+
+  $('side-nav').addEventListener('click', function (event) {
+    var item = event.target;
+    while (item && !item.getAttribute('data-kind')) { item = item.parentNode; }
+    if (!item) { return; }
+    state.activeKind = item.getAttribute('data-kind') || '';
+    renderSide();
+    renderChips();
+    renderList();
+    renderCount();
+  });
+
+  $('side-tree').addEventListener('click', function (event) {
+    var item = event.target;
+    while (item && !item.getAttribute('data-category')) { item = item.parentNode; }
+    if (!item) { return; }
+    state.activeCategory1 = item.getAttribute('data-category') || '';
+    renderSide();
+    renderChips();
+    renderList();
+    renderCount();
+  });
+
+  /* chips 无浮层（React 能力），降级为点击循环切换，三态 class 保留 */
+  $('chips').addEventListener('click', function (event) {
+    var chip = event.target;
+    while (chip && !chip.getAttribute('data-chip')) { chip = chip.parentNode; }
+    if (!chip) { return; }
+    var which = chip.getAttribute('data-chip');
+    if (which === 'reset') {
+      state.activeKind = '';
+      state.activeCategory1 = '';
+      state.sortKey = 'default';
+    } else if (which === 'type') {
+      var keys = [];
+      for (var i = 0; i < KIND_GROUPS.length; i += 1) { keys.push(KIND_GROUPS[i].key); }
+      state.activeKind = nextIn(keys, state.activeKind);
+    } else if (which === 'category') {
+      var names = [''];
+      var categories = topCategories();
+      for (var j = 0; j < categories.length; j += 1) { names.push(categories[j].name); }
+      state.activeCategory1 = nextIn(names, state.activeCategory1);
+    } else if (which === 'sort') {
+      state.sortKey = nextIn(SORT_KEYS, state.sortKey);
+    }
+    renderSide();
+    renderChips();
+    renderList();
+    renderCount();
+  });
+
+  function nextIn(list, current) {
+    var index = list.indexOf(current);
+    return list[(index + 1) % list.length];
+  }
+
+  /* 分段控件：仅切换网格 / 单列展示（卡片 markup 不变） */
+  document.querySelector('.seg').addEventListener('click', function (event) {
+    var btn = event.target;
+    while (btn && !btn.getAttribute('data-view')) { btn = btn.parentNode; }
+    if (!btn) { return; }
+    state.viewMode = btn.getAttribute('data-view');
+    var buttons = document.querySelectorAll('.seg-btn');
+    for (var i = 0; i < buttons.length; i += 1) {
+      buttons[i].className = 'seg-btn' + (buttons[i].getAttribute('data-view') === state.viewMode ? ' is-active' : '');
+    }
+    renderList();
+  });
+
+  /* ESC：无既有 *_close 实现可继承；本卡新增「取消 chips 筛选」语义 */
+  document.addEventListener('keydown', function (event) {
+    var key = textOf(event && event.key);
+    if (key !== 'Escape' && key !== 'Esc') { return; }
+    if (!state.activeKind && !state.activeCategory1 && state.sortKey === 'default') { return; }
+    state.activeKind = '';
+    state.activeCategory1 = '';
+    state.sortKey = 'default';
+    renderSide();
+    renderChips();
+    renderList();
+    renderCount();
+    setStatus({ message: '已取消筛选（Esc）', level: 'info' });
+  });
 
   /* 新鲜度每 5 s 自刷新一次显示（纯本地计算，不请求任何数据） */
   setInterval(renderFreshness, 5000);
 
+  renderChips();
+  renderSide();
   renderList();
 
   /* 面板就绪：请 Ruby 推第一份数据 */
