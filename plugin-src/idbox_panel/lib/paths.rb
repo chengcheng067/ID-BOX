@@ -113,6 +113,19 @@ module IDBoxPanel
       File.join(appdata, 'idbox', 'plugin')
     end
 
+    # R-2（docs/42 §13 R-2，2026-11-06 裁定）：校验用的 root **必须由环境推导，不得来自 JSON**——
+    # 被校验对象本身是不可信输入（docs/39 §4.1#8），拿一个 JSON 值去校验另一个 JSON 值不成立。
+    # 真根 = 写入侧 `src/main/paths.ts:20-22` 的 `thumbsDir()`，即 %APPDATA%\idbox\thumbs。
+    # ⚠️ 不得用上面的 `plugin_dir` 当 root：它是索引快照目录，与 `thumbRel` 的实际归属不同根，
+    #    用它校验会恒判越界、双轨永久失效。
+    # 本方法只读 ENV、不碰盘、不抛异常；APPDATA 缺失 ⇒ 推 ''（**不回退**到 plugin_dir）。
+    # 拼接口径与 plugin_dir 一致（File.join，Windows 反斜杠形态可被 absolute_like? 判定）。
+    def thumbs_dir
+      appdata = Support.text(ENV['APPDATA'])
+      return '' if appdata.strip.empty?
+      File.join(appdata, 'idbox', 'thumbs')
+    end
+
     def manifest_path
       dir = plugin_dir
       dir.empty? ? '' : File.join(dir, MANIFEST_FILE)

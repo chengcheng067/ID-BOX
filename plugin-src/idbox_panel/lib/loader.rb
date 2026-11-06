@@ -61,15 +61,52 @@ module IDBoxPanel
       value
     end
 
-    # docs/42 §6.1 步 1（T04）：deny by default —— root 归属未裁定前一律推空字符串。
-    # 空值 ⇒ panel.html 的 cardFor() 走内联 SVG 占位（§6.3、A12 降级不判失败）。
-    # 裁定后的形状（届时才启用，本卡不提前实现）：
-    #   raw = Support.text(@manifest['thumbsRoot'])
-    #   return '' unless Paths.absolute_like?(raw)              # 拒相对路径
-    #   return '' unless Paths.within_root?(<裁定的 root>, raw) # 消 `..`、归一化小写
-    #   # 越界 → ErrCode::PATH_OUTSIDE（IDBOX-105）：由 notes 承载，不得把未校验路径拼进 HTML
+    # R-2 落地件（docs/42 §13 R-2，2026-11-06 裁定）：校验的 root **不得来自 JSON** ——
+    # 被校验对象本身是不可信输入（docs/39 §4.1#8：任何来自 JSON 的路径出参必须做 isWithinRoot
+    # 等价校验），拿一个 JSON 值去校验另一个 JSON 值不成立 ⇒ root 一律由**环境推导**：
+    # `Paths.thumbs_dir`（= ENV['APPDATA']/idbox/thumbs，写入侧 `src/main/paths.ts:20-22` `thumbsDir()`）。
+    # `Paths.plugin_dir` 不作 root（不同根，用它校验会恒判越界、双轨永久失效）。
+    #
+    # 形状（照 §6.1 步 1 预留口径）：
+    #   root = Paths.thumbs_dir                                    # 可信：环境推导
+    #   raw  = JSON 里的 thumbsRoot / record 的 thumbRel           # 不可信：只作被校验对象
+    #   拒相对路径（absolute_like?）→ 消 `..`、归一化小写、大小写不敏感（src/main/ipcGuard.ts:128-139）
+    #   越界 → ErrCode::PATH_OUTSIDE（IDBOX-105），由 notes 承载；
+    #   返回的永远是环境推导根本身（绝不回传 JSON 原值 ⇒ 不把未校验路径拼进 HTML）。
+    # APPDATA 缺失 ⇒ 仍推 ''（deny by default 不变 ⇒ A12 按降级口径：全部 SVG 占位并记录，不判失败）。
     def thumbs_root
-      ''
+      root = Paths.thumbs_dir
+      return '' if root.strip.empty?
+
+      raw = Support.text(@manifest['thumbsRoot']).strip
+      note = nil
+      if !raw.empty? && !(Paths.absolute_like?(raw) && Paths.within_root?(root, raw))
+        note = outside_note(raw)
+      end
+
+      # 记录级 thumbRel：`..` 逃逸同样拒（panel.html 靠它拼 <img> 前缀，拒后收空值即走 SVG 占位）
+      @records.each do |record|
+        rel = Support.text(record['thumbRel']).strip
+        next if rel.empty?
+        next if Paths.within_root?(root, File.join(root, rel))
+        note ||= outside_note(rel)
+      end
+
+      add_note(note) unless note.nil?
+      root
+    end
+
+    # A14 码表与文案不改（docs/42 §9）：这里只是把 IDBOX-105 按既有 Messages.with_code 组装
+    def outside_note(value)
+      Messages.with_code(
+        ErrCode::PATH_OUTSIDE,
+        '缩略图路径不可信，已拒绝使用（校验根由环境推导，不用 JSON 值）：' + Support.text(value)
+      )
+    end
+
+    # notes 去重：面板每 3 s 轮询会重复构造 payload，同一越界告警不能逐次累积
+    def add_note(note)
+      @notes << note unless @notes.include?(note)
     end
 
     def to_payload
@@ -87,17 +124,12 @@ module IDBoxPanel
         'appVersion' => Support.text(@manifest['appVersion']),
         'apiVersion' => Support.text(@manifest['apiVersion']),
         'libraryRoot' => Support.text(@manifest['libraryRoot']),
-        # T04（docs/42 §6.1 步 1）：payload 只增这一个字段（A8「只增不删」）。
-        # 本卡**先置空字符串** ⇒ 真机核实 `file:///` 可行性前 `<img>` 轨不启用；panel.html
-        # （T02 已写、本卡不可碰）的 `state.thumbsRoot = data.thumbsRoot || ''`（:1055）
-        # 收到空值即全走内联 SVG 占位，A12 按降级口径不判失败（docs/42 §6.3）。
-        # 【待裁定】安全口径（docs/39 §4.1#8）要求 isWithinRoot 等价校验（deny by default、
-        #   拒相对路径、消 `..`、归一化小写），越界 → IDBOX-105，且不得把未校验路径拼进 HTML。
-        #   校验需要一个 root，而 `thumbsRoot` 的实际归属是 `%APPDATA%/idbox/thumbs`
-        #   （src/main/paths.ts:20-22 的 `thumbsDir()`），与 `Paths.plugin_dir`
-        #   （`%APPDATA%/idbox/plugin`，paths.rb:110）**不同根** ⇒ 「以何为 root」待 team-lead 裁定；
-        #   裁定前不推真值。可复用件已存在（本卡不可写 paths.rb，只能调用）：
-        #   `Paths.absolute_like?`（paths.rb:127）、`Paths.within_root?`（paths.rb:146）。
+        # A8「只增不删」：payload 只增 `thumbsRoot` 这一个字段，字段总数仍 22（§12 C-5 不改索引快照字段）。
+        # R-2（docs/42 §13）落地后的取值口径：root 由**环境推导**（`Paths.thumbs_dir`），不用 JSON 值；
+        # 校验只判 JSON 里的 `thumbsRoot`/`thumbRel` 是否落在该根内，越界 → IDBOX-105 由 notes 承载，
+        # 且这里回传的永远是环境推导根本身（绝不回传 JSON 原值 ⇒ 不把未校验路径拼进 HTML）。
+        # APPDATA 缺失 ⇒ 仍推 '' ⇒ panel.html（T02 已写、本卡不可碰）的 `state.thumbsRoot = data.thumbsRoot || ''`
+        # （:1055）收到空值即全走内联 SVG 占位，A12 按降级口径不判失败（docs/42 §6.3）。
         'thumbsRoot' => thumbs_root,
         'stateError' => Support.text(@state_error),
         'notes' => @notes,

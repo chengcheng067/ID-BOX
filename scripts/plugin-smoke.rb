@@ -248,6 +248,46 @@ failures << '场景 B：show() 应为 false' unless ok2 == false
 failures << '场景 B：失败时应写出诊断文件' unless wrote2
 
 puts
+puts '── 场景 C：R-2 越界用例（root 必须来自 ENV，不得来自 JSON）──'
+env_root = IDBoxPanel::Paths.thumbs_dir
+puts "  ENV 推导根（可信）=> #{env_root.inspect}"
+
+# 被校验对象：manifest 里的 thumbsRoot 是「伪造的库根」，record 的 thumbRel 带 `..` 逃逸
+evil_manifest = { 'thumbsRoot' => 'C:\\evil\\not-thumbs' }
+evil_records = [{ 'id' => 'x1', 'thumbRel' => '../../evil/x.png' }]
+snap = IDBoxPanel::Snapshot.new(
+  :ok => true,
+  :manifest => evil_manifest,
+  :records => evil_records,
+  :notes => []
+)
+got = snap.thumbs_root
+puts "  thumbs_root 回传值 => #{got.inspect}"
+puts "  notes => #{snap.notes.inspect}"
+
+# 断言①：回传的必须是 ENV 推导根，绝不能是 JSON 里的值（JSON 值不可作 root）
+failures << '场景 C：回传的 root 应为 ENV 推导值，不是 JSON 值' unless got == env_root
+failures << '场景 C：JSON 伪造值不得出现在返回值里' if got.to_s.include?('evil') && env_root.to_s.empty?
+# 断言②：越界走 IDBOX-105，由 notes 承载
+notes_text = snap.notes.join(' ')
+failures << '场景 C：越界应由 notes 承载 IDBOX-105' unless notes_text.include?('IDBOX-105')
+# 断言③：`..` 逃逸被拒（校验口径本身）
+failures << '场景 C：`..` 逃逸应被 within_root? 判否' if
+  IDBoxPanel::Paths.within_root?(env_root, File.join(env_root, '../../evil/x.png'))
+# 断言④：plugin_dir 作 root 会恒判越界（R-2 的裁定理由，留一条反证打印）
+probe = File.join(env_root, 'ok.png')
+puts "  反证：用 plugin_dir 当 root 校验真文件 => #{IDBoxPanel::Paths.within_root?(IDBoxPanel::Paths.plugin_dir, probe).inspect}（应为 false）"
+puts "  正常记录（根内）=> #{IDBoxPanel::Paths.within_root?(env_root, File.join(env_root, 'ok.png')).inspect}（应为 true）"
+
+# 断言⑤：APPDATA 缺失 ⇒ 推 ''（不回退 plugin_dir），A12 降级口径不变
+saved_appdata = ENV['APPDATA']
+ENV['APPDATA'] = nil
+empty_root = IDBoxPanel::Paths.thumbs_dir
+puts "  APPDATA 缺失时 thumbs_dir => #{empty_root.inspect}（应为 \"\"）"
+failures << '场景 C：APPDATA 缺失应推空值（不回退 plugin_dir）' unless empty_root == ''
+ENV['APPDATA'] = saved_appdata
+
+puts
 if failures.empty?
   puts '冒烟通过（2/2）'
   exit 0
