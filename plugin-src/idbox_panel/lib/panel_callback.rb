@@ -15,7 +15,15 @@
 # 防误抄纪律（docs/42 §5.4 / api-report §16）：**抄机制、不抄分支**。
 #   api-report 里两段 toggle 片段是 show 语义（照抄会导致第二次点击关不掉）；
 #   正确机制是 `visible? ? close : (bind_callbacks + show)`。
-#   T01 阶段不写 toggle（属 T04），这里只提供机制。
+#   T04 已在 lib/panel_dialog.rb 落地 `close` / `visible?` / `toggle`（本层只提供机制）。
+#
+# 重绑安全性的依据（T04 补写，卡面要求必须在注释里写明）：
+#   【查证】官方 Note 只明文「closed ⇒ all callbacks to that instance are cleared，
+#     Attach or re-attach them before you show」——即官方预设「同实例重绑再 show」这条路径。
+#   【推断】同名回调是**覆盖而非叠加**：因此每次 show 前重复 bind 同一组名字不会累积多份
+#     handler、不会导致一次 click 触发两次 insertRecord。官方文档**没有**明文这条覆盖语义
+#     （api-report 全文 grep 未找到逐字依据）⇒ 本处如实标注为【推断】，不当作【查证】，
+#     列 QA 真机观测项（关窗再开、单次 click 只插一次）。
 #
 # 硬约束（不得放开）：
 #   - 回调契约只增不删（A8 / docs/42 §1.2 不变量 2）：

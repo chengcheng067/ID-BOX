@@ -10,12 +10,17 @@
 #   - `Panel#build_dialog` 的 rescue 纪律必须保留：失败必须留下**真实异常类 + message**，
 #     不得把 NoMethodError 折成「找不到 panel.html」（1.0.1 的真机教训，docs/39 §4.4）；
 #   - 成功路径零写盘（A6）：Diagnostics.write 只在 build_dialog 失败时调用；
-#   - `toggle` 与 `show` 的「关窗后重绑」语义属 **T04**，本卡不改：
-#     这里只把回调注册收口到 `PanelCallback.bind` 的调用点（T04 只需再调一次 bind），
-#     `show` 的 else 分支保留重绑调用点（机制就位，判据不变）。
-#   - `close` / `visible?` / `toggle` 三个方法名属 docs/42 §2 文件 7 的最终形状；
-#     本卡 `toggle` 不实现（T04 的裁定：`visible? ? close : (bind + show)`，
-#     ⚠️ 不得照抄 api-report 的 show 语义片段 —— 抄机制、不抄分支，docs/42 §5.4）。
+#   - T01 只做物理搬迁；**T04（本卡）落地 `close` / `visible?` / `toggle` 三个最小签名**
+#     （docs/42 §5.3，D5 归本卡，见 §8.4），并把 `show` 的 else 分支从「裸调 @dialog.show」
+#     改为「先重绑三个回调、必要时重新 set_file，再 show」——这是 api-report §15 D5 指出的
+#     潜在缺陷的**连带必需修复**（官方明文：HtmlDialog 被关闭后该实例的 callbacks 全部被清空），
+#     不是额外需求。
+#     ⚠️ **抄机制、不抄分支**（docs/42 §5.4）：api-report §10.3 / §15 那两段 `toggle` 是
+#     show 语义（照抄 → 第二次点击只置前、关不掉，A13 判据④失败）。正确分支是
+#     `visible? ? close : (bind + show)`；菜单项仍单独保留 `show`（已开则置前）。
+#   - `close` **不把 `@dialog` 置 nil、不 new 新实例**：D5 口径裁定（docs/42 §5.3）=
+#     「同一时刻 Panel 单例只持有 1 个 @dialog 槽位、屏幕上不出现第二个窗口」，
+#     **不是**「累计 `UI::HtmlDialog.new` 调用次数不增加」。`set_on_closed { stop_polling }` 保留。
 #
 # 硬约束（不得放开）：零网络 / 零原生件 / 零 token / 零端口 / 零后台服务（只有面板打开时的
 # 3 s 轮询，面板关闭即 stop_timer）；只用官方 HtmlDialog 方法（无 set_min_size、不用 hide、
@@ -64,14 +69,18 @@ module IDBoxPanel
         if @dialog.visible?
           @dialog.bring_to_front
         else
-          # 任务卡要求「`show` 内调用 `PanelCallback.bind` 的调用点要在」⇒ 这里就是那个调用点。
-          # 官方 Note【查证】（api-report §5）：「When an HtmlDialog is closed, all callbacks to
-          # that instance are cleared. Attach or re-attach them before you show the dialog.」
-          # ⇒ 在 show 之前 re-attach 是官方推荐动作；add_action_callback 对同名回调是覆盖而非
-          # 叠加，所以本卡加这一行不改变可观察行为（判据与 1.0.3 逐字一致）。
-          # ⚠️ T04 才在这里补「关窗后重绑」的完整语义（`visible? ? close : (bind + show)`），
-          #    本卡不写 toggle（抄机制、不抄分支，docs/42 §5.4）。
+          # T04 修正点（docs/42 §5.3）：这条 else 分支由「裸调 @dialog.show」改为
+          # 「必要时重新 set_file + 先重绑三个回调，再 show」。
+          # 依据【查证】官方 Note（api-report §5.1）：「When an HtmlDialog is closed, all
+          # callbacks to that instance are cleared. Attach or re-attach them before you show
+          # the dialog.」⇒ 关窗再开若不重绑，面板能开窗但 JS→Ruby 桥死（ready /
+          # refreshIndex / insertRecord 三个回调失效）。这是 close/toggle 的**连带必需修复**。
+          # 重绑安全性的依据【推断】：同名回调是**覆盖而非叠加**（官方未明文该覆盖语义，
+          # 如实标注为推断）⇒ 重复 bind 不会累积 handler、不改变可观察行为。
+          # ⚠️ 抄机制、不抄分支（docs/42 §5.4）：api-report 那两段 show 语义的 toggle 不照抄，
+          #    本文件的 toggle 见下方（`visible? ? close : show`）。
           # 冒烟场景 A 走的是上面的 bring_to_front 分支（桩 visible? 恒 true），判据未变。
+          reattach_file
           PanelCallback.bind(@dialog, self)
           @dialog.show
         end
@@ -85,6 +94,57 @@ module IDBoxPanel
       push_state
       start_polling
       true
+    end
+
+    # ── T04 生命周期最小签名（docs/42 §5.3；D5 归本卡，§8.4） ──────────────────
+    # 【查证】官方：HtmlDialog#visible? 「returns true if the dialog is open」；最小化 /
+    # 离屏仍返回 true（api-report §5.1）。这里加 @dialog.nil? 前置，因为「从未建过窗」
+    # 与「建过但已关闭」在官方语义里不可混为一谈。
+    def visible?
+      return false if @dialog.nil?
+      begin
+        @dialog.visible?
+      rescue StandardError
+        false
+      end
+    end
+
+    # D5 口径裁定（docs/42 §5.3）：close **只调 @dialog.close**（官方 SU 2017），
+    # **不把 @dialog 置 nil、不 new 新实例** —— 保留持久引用 ⇒ 同一时刻 Panel 单例
+    # 恒 1 个 @dialog 槽位、屏幕上不出现第二个 ID BOX 窗口（no duplicate）。
+    # 这不是「累计 UI::HtmlDialog.new 次数不增加」（那是 §10.1 第 2 条的观测项，不是判据）。
+    # 轮询纪律照现有口径收尾：面板关闭即 stop_polling（不占 CPU、不常驻，P0-4③）；
+    # build_dialog 里的 set_on_closed { stop_polling } 保留（用户手动点 X 关闭时同样生效）。
+    def close
+      return false if @dialog.nil?
+      begin
+        @dialog.close
+      rescue StandardError => error
+        # 只暴露真实异常，不写盘（A6 的唯一写盘例外只在 build_dialog 失败时）。
+        puts("[ID BOX] panel close failed: #{error.class}: #{error.message}")
+        return false
+      end
+      stop_polling
+      true
+    end
+
+    # 工具栏按钮专用：开 → 关。卡面口径 `visible? ? close : (bind + show)`，
+    # 这里走 `show` 是因为 bind 已收口在 show 的 else 分支里，且 @dialog 尚为 nil 时
+    # 必须先 build_dialog（不能直接 bind）⇒ 两种表述等价，以本实现为准（docs/42 §5.4 状态机）。
+    # ⚠️ 菜单项仍单独调 `show`（已开则置前），不改 `show` 的既有语义（P0-2 判据②⑥）。
+    def toggle
+      visible? ? close : show
+    end
+
+    # 「必要时重新 set_file」（docs/42 §5.3 的 show 修正项）：close 后复用同一实例时，
+    # 官方未明文 close 是否保留 set_file 的结果 ⇒ 重绑前再确认一次路径。
+    # 取不到 / 文件不在就保持原值，不抛异常、不写盘（A6）。
+    def reattach_file
+      html = Paths.html_path
+      return if html.empty? || !File.file?(html)
+      @dialog.set_file(html)
+    rescue StandardError
+      nil
     end
 
     def build_dialog

@@ -61,6 +61,17 @@ module IDBoxPanel
       value
     end
 
+    # docs/42 §6.1 步 1（T04）：deny by default —— root 归属未裁定前一律推空字符串。
+    # 空值 ⇒ panel.html 的 cardFor() 走内联 SVG 占位（§6.3、A12 降级不判失败）。
+    # 裁定后的形状（届时才启用，本卡不提前实现）：
+    #   raw = Support.text(@manifest['thumbsRoot'])
+    #   return '' unless Paths.absolute_like?(raw)              # 拒相对路径
+    #   return '' unless Paths.within_root?(<裁定的 root>, raw) # 消 `..`、归一化小写
+    #   # 越界 → ErrCode::PATH_OUTSIDE（IDBOX-105）：由 notes 承载，不得把未校验路径拼进 HTML
+    def thumbs_root
+      ''
+    end
+
     def to_payload
       {
         'ok' => ok?,
@@ -76,6 +87,18 @@ module IDBoxPanel
         'appVersion' => Support.text(@manifest['appVersion']),
         'apiVersion' => Support.text(@manifest['apiVersion']),
         'libraryRoot' => Support.text(@manifest['libraryRoot']),
+        # T04（docs/42 §6.1 步 1）：payload 只增这一个字段（A8「只增不删」）。
+        # 本卡**先置空字符串** ⇒ 真机核实 `file:///` 可行性前 `<img>` 轨不启用；panel.html
+        # （T02 已写、本卡不可碰）的 `state.thumbsRoot = data.thumbsRoot || ''`（:1055）
+        # 收到空值即全走内联 SVG 占位，A12 按降级口径不判失败（docs/42 §6.3）。
+        # 【待裁定】安全口径（docs/39 §4.1#8）要求 isWithinRoot 等价校验（deny by default、
+        #   拒相对路径、消 `..`、归一化小写），越界 → IDBOX-105，且不得把未校验路径拼进 HTML。
+        #   校验需要一个 root，而 `thumbsRoot` 的实际归属是 `%APPDATA%/idbox/thumbs`
+        #   （src/main/paths.ts:20-22 的 `thumbsDir()`），与 `Paths.plugin_dir`
+        #   （`%APPDATA%/idbox/plugin`，paths.rb:110）**不同根** ⇒ 「以何为 root」待 team-lead 裁定；
+        #   裁定前不推真值。可复用件已存在（本卡不可写 paths.rb，只能调用）：
+        #   `Paths.absolute_like?`（paths.rb:127）、`Paths.within_root?`（paths.rb:146）。
+        'thumbsRoot' => thumbs_root,
         'stateError' => Support.text(@state_error),
         'notes' => @notes,
         'records' => @records,
