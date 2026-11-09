@@ -1,4 +1,5 @@
 import type { AssetFile, AssetKind, CoverSource } from './types'
+import { MODEL_KIND_MEMBERS } from './modelFormat'
 import {
   findPbrSlotInStem,
   MATERIAL_PACK_REQUIRED_SLOTS,
@@ -26,7 +27,12 @@ export const EXT_KIND: Record<string, AssetKind> = {
   psd: 'texture', dds: 'texture', gif: 'texture', svg: 'texture', jfif: 'texture',
   // ── 材质预设 ──
   vismat: 'material', mat: 'material', mi: 'material', sbsar: 'material',
-  ies: 'material', vismat_preset: 'material', matlib: 'material'
+  ies: 'material', vismat_preset: 'material', matlib: 'material',
+  // ── D5 Render 资产包（V1.0，docs/48 §5） ──
+  // ⚠️ 只用于「识别 + 落盘分类」，**绝不能**加进 `extractor.ts` 的 `SUPPORTED_EXTS`：
+  // 加进去就等于解包（`.d5a` 内容是标准 ZIP，会被 7z/adm-zip 直接摊开），
+  // 而用户拍板是「整包存档不解包」。放行点在 `importer.ts#importOne` 的单文件分流。
+  d5a: 'd5a'
 }
 
 // ── 大类显示名 vs 磁盘目录名（2026-10-19 材质大类合并，docs/14 §2.1） ──────────
@@ -43,6 +49,9 @@ export const KIND_LABEL: Record<AssetKind, string> = {
   hdri: 'HDRI',
   material: '材质预设',
   cad: 'CAD图纸',
+  // D5 资产包：显示名与目录名**恰好同名**（都是 `D5A`），但仍然分两张表 ——
+  // 拼路径永远走 `kindFolder()`，别因为"两个值一样"就图省事用 `KIND_LABEL`。
+  d5a: 'D5A',
   other: '其他'
 }
 
@@ -60,6 +69,10 @@ export const KIND_FOLDER: Record<AssetKind, string> = {
   material: '材质',
   // CAD 独立大类目录（第 6 个顶层目录）：图纸与模型混放会让「模型」计数失真
   cad: 'CAD',
+  // D5A 独立大类目录（V1.0 第 7 个顶层目录，docs/46 §1.4）：
+  // 落 `D5A/未分类/未分类/<资产名>/`，整包以 1 个文件进库；
+  // `kindFromFolderName('D5A')` 靠本表遍历自动反解为 `d5a`，不需要额外分支。
+  d5a: 'D5A',
   other: '其他'
 }
 
@@ -99,9 +112,23 @@ export const KIND_GROUP_MEMBERS: Readonly<Record<KindGroup, readonly AssetKind[]
   materialGroup: ['texture', 'material']
 }
 
-/** 过滤语义的唯一入口：`null` = 不筛；`Set` = 命中任一即出 */
+/**
+ * 过滤语义的唯一入口：`null` = 不筛；`Set` = 命中任一即出。
+ *
+ * ⚠️ **`'model'` 不是"单一 kind"，而是「模型的全部格式」**（2026-11-09 用户回签）：
+ * 用户原话「D5a 本身属于模型格式」——`.d5a` 在**存储**上仍是独立 kind（独立落盘目录
+ * `D5A/`，不迁库），但在**筛选/导航/计数**口径上属于模型域 ⇒ `'model'` 返回
+ * `{model, d5a}`。这与 `materialGroup` 是 `{texture, material}` 完全同构：
+ * 一个筛选节点可以覆盖多个 kind，调用方**不需要**知道成员是谁。
+ *
+ * 为什么改这里而不是加一个 `'modelGroup'` 哨兵：侧栏/首页/网格用的都是
+ * `filters.kind === 'model'` 这个既有值，换成哨兵要同时改 UI 选中态、智能集合快照、
+ * 深链与 4 处守卫测试；而"model 就是模型的全部格式"本身就是用户口径，
+ * 在原入口上表达它就是最小改动、且不可能漏掉某个调用方。
+ */
 export function kindsOfFilter(f: KindFilter): ReadonlySet<AssetKind> | null {
   if (f === 'all') return null
+  if (f === 'model') return new Set(MODEL_KIND_MEMBERS)
   const members = (KIND_GROUP_MEMBERS as Readonly<Record<string, readonly AssetKind[]>>)[f]
   return new Set(members ?? [f as AssetKind])
 }
@@ -149,6 +176,9 @@ export const KIND_FILTER_CAPS: Record<AssetKind, KindFilterCaps> = {
   // CAD：图纸不是位图 → 没有"分辨率"；站方无风格轴 → 没有风格；
   // 模型格式筛选只认 skp/max（`getModelFormat`）→ CAD 不参与
   cad: { resolution: false, style: false, modelFormat: false },
+  // D5A（V1.0）：整包存档里只有一个 `.d5a`，没有可读的位图 / 风格轴 / 模型格式
+  // ⇒ 三个入口一律不给（与 CAD 同档）。给入口但筛不出东西是最坏的一种 UI 谎话。
+  d5a: { resolution: false, style: false, modelFormat: false },
   other: { resolution: false, style: false, modelFormat: false }
 }
 
@@ -196,8 +226,13 @@ export const KIND_NAV_ORDER: ReadonlyArray<AssetKind | KindGroup> = [
  *
  * `'cad'` 刻意排在 `'model'` **之后**：同时含 `.skp` 与 `.dwg` 的包应判 `'model'`
  * （模型是主内容、图纸是附件）；只有图纸、没有模型时才落到 `'cad'`。
+ *
+ * `'d5a'` 排在 `'texture'` 之后、`'other'` 之前：`.d5a` 是**整包存档**，包内条目永远不会
+ * 进 `files[]`（不解包），所以正常情况下 `files[]` 里只有它自己 —— 这个位置只是为了
+ * 万一将来某条路径把贴图混进了同一个 `files[]`（例如用户手工往资产目录塞了张预览图），
+ * 仍然优先认「有具体大类」的 `texture`，而不是把它算成 D5A。
  */
-const KIND_PRIORITY: AssetKind[] = ['model', 'cad', 'material', 'hdri', 'texture', 'other']
+const KIND_PRIORITY: AssetKind[] = ['model', 'cad', 'material', 'hdri', 'texture', 'd5a', 'other']
 
 // ── PBR 材质包识别（2026-10 用户装机反馈：Crystal/AmbientCG 样本 B） ──────────
 //
@@ -432,6 +467,11 @@ export function pickCover(files: AssetFile[], opts?: PickCoverOptions): CoverPic
  *
  * 顺序在 `model` **之后**：混合包（skp + dwg）里模型仍是主文件（与 `KIND_PRIORITY`
  * 同口径 —— 模型是主内容，图纸是附件）。
+ *
+ * ⚠️ **`d5a` 刻意不进任何一个显式分支**（V1.0，docs/46 §1.4）：整包资产的 `files[]`
+ * 恰 1 项（就是那个 `.d5a` 自己），三轮都不命中 → 退到 `files[0]`，语义正确。
+ * 反过来说，若把 `d5a` 加进 `PRIMARY_MODEL_EXTS`，它就会被当成"模型主文件"，
+ * 拖出 / 双击定位那两条链会开始按模型语义处理它 —— 直接违背「可读不可插入」。
  */
 export function pickPrimaryFile(files: AssetFile[]): AssetFile | undefined {
   if (files.length === 0) return undefined

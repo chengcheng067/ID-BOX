@@ -75,6 +75,15 @@ export default {
         max: token('--brand-max-text'),
         'cad-tint': token('--brand-cad-bg'),
         cad: token('--brand-cad-text'),
+        /**
+         * D5 Render 资产包占位色（V1.0，docs/48 §1 / docs/46 §1.5.2 M07）：
+         * - `d5`：「D5a」大字 / 文字色（浅 #9977F9 / 深 #B9A6FF）；
+         * - `d5-tint`：卡片封面占位底板（浅 #F7F4FF / 深 #2A2340）。
+         * ⛔ 全项目唯一的紫色例外，**只给 D5A 卡片封面占位用**；新增第二处使用须重新回签
+         * （口径见 styles.css 文件头的「显式例外」段）。不复用 `preview` / `preview-tint`。
+         */
+        'd5-tint': token('--d5-brand-tint'),
+        d5: token('--d5-brand'),
         /** 顶栏视图分段控件选中段底（§3.1：浅 #FFFFFF / 深 #2C2C2E，规范原文给值） */
         'seg-active': token('--seg-active'),
         /** 多选操作条底（§3.3：浅白卡 / 深 #242428） */

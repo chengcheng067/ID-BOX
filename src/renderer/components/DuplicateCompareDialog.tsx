@@ -21,7 +21,7 @@ import { undoGraceSuffix } from '../logic/graceText'
 import { useVault } from '../store'
 import { DEFAULT_UNDO_GRACE_MS } from '../../shared/undoGrace'
 import { Modal } from './Modal'
-import { IconCad, IconHdr, IconImage, IconMaterial, IconOther, IconTrash, IconBox } from '../icons'
+import { IconCad, IconD5a, IconHdr, IconImage, IconMaterial, IconOther, IconTrash, IconBox } from '../icons'
 import type { Asset, AssetKind } from '../../shared/types'
 
 const KIND_ICON: Record<AssetKind, typeof IconBox> = {
@@ -30,6 +30,9 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   hdri: IconHdr,
   material: IconMaterial,
   cad: IconCad,
+  // D5A 整包资产（V1.0）：六边形整包标记（正式封面在卡片上是紫色占位，图标只服务
+  // 「没有封面可看」的位：详情面板 / 对比弹窗 / 快览浮层的类型兜底）
+  d5a: IconD5a,
   other: IconOther
 }
 

@@ -20,10 +20,14 @@
 # 5) 不自删、不自升级。
 # 6) 纯读方：绝不 File.write / File.delete / File.rename 到 %APPDATA%\idbox\plugin\
 #    或 ID BOX 的任何数据目录。
-#    **唯一例外（用户 2026-11-05 批准）**：面板建窗失败时，向
+#    **例外一（用户 2026-11-05 批准）**：面板建窗失败时，向
 #    `%TEMP%\idbox_panel_diag.txt` 写一份诊断快照（环境 + 候选路径 + 真实异常），
 #    用于真机排障 —— 成功路径一个字都不写。见 lib/paths.rb 的 `Diagnostics` 模块。
 #    ⚠️ 菜单/工具栏**注册失败**不得写诊断（docs/42 §7.3），只 puts，否则破 A6。
+#    **例外二（2026-11-09 主理人批准，docs/48 §7）**：「导出至 IDBOX / 更新 IDBOX 中的这个
+#    模型」要产出 .skp + 截图，只能写 `%APPDATA%\idbox_export\`（与 `%APPDATA%\idbox` **同级**、
+#    不在其内部）。库目录、`plugin\`、`thumbs\`、settings / logs 仍然零写入，详见
+#    lib/exporter.rb 头注的「写盘边界」四条。
 # 7) 全部代码在本单一模块 IDBoxPanel 内；**禁止全局变量**（$x 一律不许出现）。
 # 8) 包内互相 require 用 Sketchup.require 'idbox_panel/xxx'（不带 .rb），不用 require_relative。
 # 9) `.rbz` 顶层恰好两项：根 `idbox_panel.rb` + 同名支持目录 `idbox_panel/`（A5）；
@@ -65,6 +69,31 @@ module IDBoxPanel
   #    这里保持注释而非空 require，是为了让「T03 只需补一行、不改 guard 块」这条可核对。
   Sketchup.require 'idbox_panel/lib/toolbar'
 
+  # 序 7：`Sketchup.require 'idbox_panel/lib/exporter'` —— 右键「导出至 IDBOX / 更新 IDBOX 中的
+  # 这个模型」（docs/48 §7）。只依赖 core / paths / loader（不引用 Panel / Toolbar），
+  # 所以放在工具栏之后不影响既有加载拓扑；它是本批唯一新增的 lib 文件。
+  Sketchup.require 'idbox_panel/lib/exporter'
+
+  # 序 8：`Sketchup.require 'idbox_panel/lib/usage_log'` —— **使用记录回传**
+  # （插入一次 = 用过一次，主程序累加计数）。只依赖 core / paths，不引用 Panel / Toolbar /
+  # Exporter，所以放在最后不影响既有加载拓扑。
+  # ⚠️ loader.rb（序 3）里调它，但那是**运行期**调用（点插入时才执行），
+  #    加载顺序不构成问题；`Inserter` 侧还加了 `defined?(UsageLog)` 守卫。
+  Sketchup.require 'idbox_panel/lib/usage_log'
+
+  # ── 版本号（用户 2026-11-09：「插件版本号应与 ID BOX 本体保持一致」，docs/48 §6）──
+  #
+  # 【单一常量】插件包版本的字面量**只允许出现在 lib/core.rb 的 PLUGIN_VERSION 一处**，
+  #   这里只是把它提升成对外的名字 VERSION，不写第二份字面量（否则迟早漏改一处）。
+  #
+  # 【面板显示的是哪个版本】面板左上角显示的是 **ID BOX 本体版本**，来源是
+  #   `payload.appVersion` ← `manifest.appVersion` ← 主进程 `app.getVersion()` ← `package.json.version`。
+  #   这条链是**运行期自动同步**的：主程序升版、重新导出索引，插件显示自动跟上，
+  #   不需要任何人工纪律，也不需要插件去读 package.json（.rbz 里没有这个文件）。
+  #   所以 VERSION 不参与面板显示，它只标识**插件包自身**（用于排查「用户装的是哪版插件」）。
+  #   ⚠️ 另需与之保持一致的是根注册文件 idbox_panel.rb 的 Registrar::EXT_VERSION（不同文件、不同编号用途）。
+  VERSION = PLUGIN_VERSION
+
   # ── 序 7：只挂一次（guard 块位于 main.rb 末尾、module IDBoxPanel 内） ────────
   #
   # 【查证】`file_loaded?` 是官方 Tools/sketchup.rb 的标准 guard，注释点名防
@@ -81,6 +110,15 @@ module IDBoxPanel
       # 工具栏预留：T01 不创建 lib/toolbar.rb，`defined?(Toolbar)` 为 false ⇒ 这里什么都不做；
       # T03 落地后自动生效，本行不需要改（这是 T01 特意留下的接口，见上面序 6 注释）。
       Toolbar.build if defined?(Toolbar)
+      # 右键菜单（V1.0，docs/48 §7）：handler 每次右键都会被回调，所以「更新」项是否出现
+      # 由 Exporter.build_menu 按**当次**状态（这个模型/组件能不能在库里认出身份）决定，
+      # 2026-11-09 起**不再要求先选中**（右键本来就是对着光标下实体的；SU 拿不到光标实体，
+      # 判据改成 选中 → 正在编辑的组件 → 当前文档 → 已放置的库内组件，见 exporter.rb 头注）。
+      # 不依赖 set_validation_proc 在 context menu 里是否被调用（官方无明文，见 probe 待核实 7）。
+      # ⚠️ 必须与上面的菜单/工具栏在**同一个** guard 块里，否则重载插件会重复注册 handler。
+      if defined?(Exporter)
+        UI.add_context_menu_handler { |menu| Exporter.build_menu(menu) }
+      end
     rescue StandardError => error
       puts("[ID BOX] registration failed: #{error.class}: #{error.message}")
     end

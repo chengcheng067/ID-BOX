@@ -119,7 +119,15 @@ describe('侧栏折叠 · 源码守卫（App 挂载与持久化接线）', () =>
     expect(app).toContain('overflow-hidden')
     expect(app).toContain('SIDEBAR_COLLAPSE_MS')
     expect(app).toMatch(/width \$\{SIDEBAR_COLLAPSE_MS\}ms ease/)
-    expect(app).toMatch(/aria-hidden=\{collapsed \|\| undefined\}/)
+    // 2026-11-09 侧栏换皮：折叠有两种形态 ——
+    //   ① 老形态（`railWidth` 为 0 / 未传）：0 宽 + visibility:hidden + aria-hidden，首页态走这条；
+    //   ② 轨道形态（`railWidth > 0`）：收成窄条但**保持可见可聚焦**，因此不得 aria-hidden。
+    // 所以断言从 `aria-hidden={collapsed || undefined}` 改为 `hidden`，并额外钉住「rail 不算 hidden」。
+    expect(app).toMatch(/aria-hidden=\{hidden \|\| undefined\}/)
+    expect(app).toMatch(/const asRail = collapsed && railWidth > 0/)
+    expect(app).toMatch(/const hidden = collapsed && !asRail/)
+    // 左栏传的是「首页 0 宽、其余 48 轨道」这条分叉
+    expect(app).toMatch(/railWidth=\{isHome \? 0 : SIDEBAR_RAIL_W\}/)
   })
 
   it('中栏两缘各有一颗唤出 / 收起按钮（左缘 + 右缘对称）', () => {

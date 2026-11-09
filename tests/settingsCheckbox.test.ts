@@ -172,7 +172,22 @@ describe('原有 5 个调用点的业务语义一字未改', () => {
     // 业务口径：开关关 = 主进程不落盘，插件读到「未开导出」（IDBOX-101）。
     // 渲染层不许绕过 `saveSettings` 直接 setState，也不许默认打开。
     expect(code).toMatch(/checked=\{settings\.pluginIndexEnabled === true\}/)
-    expect(code).toMatch(/onChange=\{\(next\) => \{\s*void saveSettings\(\{ pluginIndexEnabled: next \}\)/)
+    /**
+     * v1.0 · D-2（`docs/46 §1.7`）修订：勾**开**时同一次 `saveSettings` 里会顺带写
+     * `pluginIndexGuideShown: true`（用户自己开了写盘 = 引导使命完成，不再出现）。
+     * 因此这里不再钉死 `{ pluginIndexEnabled: next }` 这个字面量，改成守**更强的两条性质**：
+     * ① 仍然是 `void saveSettings(...)` 这**唯一**写入口（不是 setState）；
+     * ② 打开与关闭两个分支都必须显式带 `pluginIndexEnabled`，且「开」分支还要带引导位
+     *    （单向：只有开的时候带，关的时候不许回写引导位）。
+     */
+    expect(code).toMatch(/onChange=\{\(next\) => \{[\s\S]{0,700}?void saveSettings\(/)
+    expect(code).toMatch(/pluginIndexEnabled:\s*true,\s*pluginIndexGuideShown:\s*true/)
+    expect(code).toMatch(/pluginIndexEnabled:\s*false\s*\}/)
+    // 「关」分支：对象字面量里**只有** pluginIndexEnabled 一个键
+    // （不许回写引导位，否则用户"关掉再打开"就再也看不到提示了）
+    const off = /\{\s*pluginIndexEnabled:\s*false\s*\}/.exec(code)
+    expect(off, '找不到「关」分支的对象字面量').not.toBeNull()
+    expect(off![0]).not.toContain('pluginIndexGuideShown')
     expect(code).toContain('为 SketchUp 插件导出索引快照')
     expect(code).toContain('未开导出')
   })

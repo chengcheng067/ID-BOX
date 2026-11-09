@@ -22,9 +22,11 @@ import path from 'node:path'
 import type { Asset, AssetFile } from '../src/shared/types'
 import {
   getModelFormat,
+  isModelKind,
   MODEL_FORMAT_BADGE_LABEL,
   MODEL_FORMAT_NAME,
-  MODEL_FORMAT_OPTIONS
+  MODEL_FORMAT_OPTIONS,
+  MODEL_KIND_MEMBERS
 } from '../src/shared/modelFormat'
 import { KIND_FILTER_CAPS, capsOfFilter } from '../src/shared/classify'
 import {
@@ -100,6 +102,25 @@ describe('getModelFormat · 按文件扩展名识别模型格式', () => {
   it('fbx/obj 等其它模型格式本批不区分 → null', () => {
     expect(getModelFormat([f('fbx'), f('obj')])).toBeNull()
   })
+
+  /**
+   * `.d5a`（2026-11-09 用户回签「D5a 本身属于模型格式」）。
+   *
+   * 优先级 **skp > max > d5a** —— 沿用既有"skp 立即返回"的写法，d5a 只在
+   * 没有 skp/max 时兜底。这个顺序不是随手排的：`.d5a` 资产包里恰有 1 个文件
+   * （就是那个 `.d5a` 自己），所以实际语义是"整包存档里没有别的模型主文件时，
+   * 它自己就是模型格式"，与压缩包路径的判定一致。
+   */
+  it('只有 .d5a → d5a（整包存档也是模型格式）', () => {
+    expect(getModelFormat([f('d5a', 'd5a')])).toBe('d5a')
+    expect(getModelFormat([{ ext: 'D5A' }])).toBe('d5a')
+  })
+
+  it('优先级 skp > max > d5a：多格式包按更"具体"的那个算', () => {
+    expect(getModelFormat([f('skp'), f('max'), f('d5a', 'd5a')])).toBe('skp')
+    expect(getModelFormat([f('d5a', 'd5a'), f('max')])).toBe('max')
+    expect(getModelFormat([f('d5a', 'd5a'), f('png', 'texture')])).toBe('d5a')
+  })
 })
 
 // ── ② 徽标文案与 AssetGrid 源码守卫 ──────────────────────────────
@@ -112,9 +133,16 @@ describe('格式徽标 · 文案表与源码守卫', () => {
     expect(MODEL_FORMAT_NAME.max).toBe('3DMAX')
   })
 
-  it('筛选选项表：全部 / SU / 3DMAX（单选，含「全部」= null 档）', () => {
-    expect(MODEL_FORMAT_OPTIONS.map((o) => o.label)).toEqual(['全部', 'SU', '3DMAX'])
-    expect(MODEL_FORMAT_OPTIONS.map((o) => o.value)).toEqual([null, 'skp', 'max'])
+  it('筛选选项表：全部 / SU / 3DMAX / D5A（单选，含「全部」= null 档）', () => {
+    // 2026-11-09 用户：「D5a 本身属于模型格式，但在模型的格式里面又找不到 D5a 的选择」
+    // ⇒ 追加 D5A 档，位置在 3DMAX 之后（顺序即产品口径：先全格式、再按常用度）
+    expect(MODEL_FORMAT_OPTIONS.map((o) => o.label)).toEqual(['全部', 'SU', '3DMAX', 'D5A'])
+    expect(MODEL_FORMAT_OPTIONS.map((o) => o.value)).toEqual([null, 'skp', 'max', 'd5a'])
+  })
+
+  it('D5A 档的徽标 / 显示名（大写品牌缩写，与 SU / CAD 同类）', () => {
+    expect(MODEL_FORMAT_BADGE_LABEL.d5a).toBe('D5A')
+    expect(MODEL_FORMAT_NAME.d5a).toBe('D5A')
   })
 
   it('AssetGrid 源码守卫：max 占位图标 + 双格式徽标 + .max 文件封面', () => {
@@ -236,10 +264,34 @@ describe('模型格式筛选 · 匹配 / 归一化 / 快照 / 入口', () => {
     expect(matchesFilters(both, filters({ modelFormat: 'max' }))).toBe(false)
   })
 
-  it('只对 kind=model 的资产生效：贴图 / HDR 不受模型格式条件约束', () => {
+  it('只对「模型域」生效：贴图 / HDR / CAD 不受模型格式条件约束', () => {
     const texture = asset({ kind: 'texture', files: [f('png', 'texture')] })
     expect(matchesFilters(texture, filters({ modelFormat: 'max' }))).toBe(true)
     expect(matchesFilters(texture, filters({ modelFormat: 'skp' }))).toBe(true)
+    // 2026-11-09 收口：`d5a` 属于模型域（`isModelKind`）⇒ **必须**吃格式条件，
+    // 否则在模型视图选 D5A 会筛出空集（它"漏网"就等于筛不出来）
+    const d5a = asset({ kind: 'd5a', files: [f('d5a', 'd5a')] })
+    expect(matchesFilters(d5a, filters({ modelFormat: 'd5a' }))).toBe(true)
+    expect(matchesFilters(d5a, filters({ modelFormat: 'skp' }))).toBe(false)
+    expect(matchesFilters(d5a, filters({ modelFormat: 'max' }))).toBe(false)
+    // CAD 不是模型域（图纸不是模型），照旧不受格式条件约束
+    const cad = asset({ kind: 'cad', files: [f('dwg', 'cad')] })
+    expect(matchesFilters(cad, filters({ modelFormat: 'd5a' }))).toBe(true)
+  })
+
+  it('`isModelKind` 是模型域唯一判定（model + d5a）', () => {
+    expect(isModelKind('model')).toBe(true)
+    expect(isModelKind('d5a')).toBe(true)
+    for (const k of ['texture', 'material', 'hdri', 'cad', 'other'] as const) {
+      expect(isModelKind(k)).toBe(false)
+    }
+    expect([...MODEL_KIND_MEMBERS]).toEqual(['model', 'd5a'])
+  })
+
+  it('D5A 档能被智能集合存住并还原（归一化白名单不再是手写两项）', () => {
+    const snap = snapshotFilters(filters({ kind: 'model', modelFormat: 'd5a' }))
+    expect(snap.modelFormat).toBe('d5a')
+    expect(filtersFromSavedView({ filters: snap }).modelFormat).toBe('d5a')
   })
 
   it('判不出格式的模型资产不进任何格式档（与分辨率"未知不进档"同一口径）', () => {
@@ -257,6 +309,7 @@ describe('模型格式筛选 · 匹配 / 归一化 / 快照 / 入口', () => {
   })
 
   it('能力表：只有 model 视图开放模型格式维度（材质 / HDR / 其他不显示入口）', () => {
+    // 「模型」节点 = 模型域（model + d5a），格式维度对它开放 ⇒ D5A 档有入口
     expect(capsOfFilter('model', 'modelFormat')).toBe(true)
     for (const kind of ['texture', 'material', 'hdri', 'other'] as const) {
       expect(capsOfFilter(kind, 'modelFormat')).toBe(false)

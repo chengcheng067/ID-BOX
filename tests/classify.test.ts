@@ -257,12 +257,16 @@ describe('侧栏导航序 + 筛选分组哨兵（docs/14 §2.4）', () => {
     expect(kindsOfFilter(MATERIAL_GROUP)).toEqual(new Set(['texture', 'material']))
     expect(kindsOfFilter('material')).toEqual(new Set(['material']))
     expect(kindsOfFilter('texture')).toEqual(new Set(['texture']))
-    expect(kindsOfFilter('model')).toEqual(new Set(['model']))
+    // 2026-11-09 收口：`'model'` = 「模型的**全部格式**」= {model, d5a}
+    // （用户口径「D5A 本身属于模型格式」；d5a 在存储上仍是独立 kind、不迁库）
+    expect(kindsOfFilter('model')).toEqual(new Set(['model', 'd5a']))
     expect(kindsOfFilter('all')).toBeNull()
   })
 
-  it('kindsOfFilter：对 6 个 AssetKind 逐一与旧语义（单值等值判断）等价', () => {
+  it('kindsOfFilter：除模型域外，其余 kind 仍与旧语义（单值等值判断）等价', () => {
     // 2026-10-29 加 `'cad'`：五元 → 六元（cad 是单 kind，不属于任何分组）
+    // 2026-11-09 加 `'d5a'`：七元；其中 d5a **并入模型域**，所以这一轮把它排除在
+    // 「单 kind = 单元素集」的等价断言之外（它有自己的专项断言，见上一条与下一段）。
     const kinds: AssetKind[] = ['model', 'texture', 'hdri', 'material', 'cad', 'other']
     for (const f of kinds) {
       const set = kindsOfFilter(f)
@@ -271,6 +275,9 @@ describe('侧栏导航序 + 筛选分组哨兵（docs/14 §2.4）', () => {
         expect(set!.has(a)).toBe(a === f)
       }
     }
+    // d5a 单独看：它自己的筛选节点仍只命中自己（`filters.kind === 'd5a'` 语义不变，
+    // 只是界面上不再有它的入口 —— 入口走「模型 + 格式=D5A」）
+    expect(kindsOfFilter('d5a')).toEqual(new Set(['d5a']))
   })
 
   it('kindFilterLabel：all→全部；AssetKind→显示名；materialGroup→材质（目录名）', () => {

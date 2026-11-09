@@ -123,6 +123,24 @@ import {
 import { rescanLibrary } from './rescan'
 import { renameAssetFolders } from './rename'
 import { ArchiveWatcher } from './watcher'
+import { inboxIncomingDir, ackInboxJob, startInboxWatcher, stopInboxWatcher } from './inbox'
+import { applyInboxSkpUpdate } from './inboxUpdate'
+import type { InboxAckPayload, InboxApplyUpdatePayload } from '../shared/inbox'
+import {
+  dispatchStoredInboxUsage,
+  removeUsageFile,
+  resolveInboxUsageDir,
+  startInboxUsageWatcher,
+  stopInboxUsageWatcher,
+  type InboxUsageDeps,
+  type InboxUsageWatchHandle
+} from './inboxUsage'
+import {
+  isInboxUsageFileName,
+  type InboxUsageAckPayload,
+  type InboxUsageAckResult,
+  type InboxUsageEvent
+} from '../shared/inboxUsage'
 import { registerVaultScheme, serveVault } from './protocol'
 import { normalizeTargetWidth, prepareHdrFile } from './hdrDecode'
 import { isHdrExt } from '../shared/hdrExts'
@@ -565,6 +583,94 @@ function restartWatcher(): void {
 }
 
 /**
+ * SketchUp 插件收件箱（`docs/probe/su-export-to-idbox.md` 方案 A）的启动入口。
+ *
+ * 三件事：① 起 chokidar 监听 `%APPDATA%\idbox_export\incoming`；② 启动扫描存量
+ * （插件在 ID BOX 没开时写下的任务）；③ 每发现一个完整任务就 `send` 给渲染层。
+ *
+ * 派发是 **at-least-once**：渲染层还没订阅时 `webContents.send` 会静默丢弃，所以
+ * `inbox.ts` 里的派发器会每 3 秒重发直到收到 `inbox:ack`（渲染层按 jobId 去重）。
+ * 这里只负责把"发到哪个窗口"接上 —— 窗口重建 / 尚未创建时返回即可，重发会兜住。
+ *
+ * 与库目录无关：`incoming` 在 `%APPDATA%` 下，库目录没设置也照常监听（任务先攒着，
+ * 等用户选完库再点更新/导入）。所以这里**不加任何 `if (settings.libraryDir)` 分支**。
+ */
+function startInbox(): void {
+  void startInboxWatcher((job) => {
+    const target = win
+    if (!target || target.isDestroyed()) return
+    try {
+      target.webContents.send(IPC.inboxJob, job)
+    } catch {
+      /* 渲染进程正在重启：下一次重发会补上 */
+    }
+  }).catch((err: unknown) => {
+    // 监听起不来不致命：下次启动的存量扫描仍会把任务收下
+    logWarn('inbox:start-failed', { err: err instanceof Error ? err.message : String(err) })
+  })
+}
+
+// ── SketchUp 插件「使用记录」回传（插入一次 = 用过一次，累加计数）──────────────
+
+/**
+ * `%APPDATA%\idbox_export\usage` 的绝对路径（`appData` 在**主进程**解析后注入）。
+ *
+ * ⚠️ 用 `app.getPath('appData')` 而**不是** `userData`：契约要求 `idbox_export\` 与
+ * `idbox\` **同级**，而 `userData` 恰好就是 `%APPDATA%\idbox`（与 `inbox.ts:inboxRootDir` 同款）。
+ */
+function inboxUsageDir(): string {
+  return resolveInboxUsageDir(app.getPath('appData'))
+}
+
+/** 日志注入（`main/inboxUsage.ts` 刻意不 import electron，见该文件头注） */
+const inboxUsageDeps: InboxUsageDeps = {
+  warn: (message, context) => logWarn(message, context),
+  info: (message, context) => logInfo(message, context)
+}
+
+/** 使用记录 watcher 句柄（`will-quit` 里关掉） */
+let inboxUsageWatcher: InboxUsageWatchHandle | null = null
+
+/** 派发到主窗口（窗口重建 / 尚未创建时直接返回：文件没被 ack 就不会删，下次启动会重发） */
+function sendInboxUsage(ev: InboxUsageEvent): void {
+  const target = win
+  if (!target || target.isDestroyed()) return
+  target.webContents.send(IPC.inboxUsage, ev)
+}
+
+/**
+ * 使用记录通道的启动入口：① 起**独立的** watcher 只盯 `usage\`；② 扫一遍存量并逐条 send。
+ *
+ * 顺序是**先起 watcher 再扫存量**（与 `startInbox` → `startInboxWatcher` 内部同款）：
+ * 反过来的话，两步之间插件写下的那一条会漏（扫描已走完、watcher 还没听）。
+ * 两步之间重复发同一条由 `main/inboxUsage.ts` 的 `dispatched` 集合挡住
+ * —— 重复 send 会让用户的使用次数被多算一次，这是本功能**唯一**不可接受的错误。
+ *
+ * 与库目录无关（`usage\` 在 `%APPDATA%` 下）：库目录没设置也照常收，攒着等渲染层消费。
+ *
+ * ⚠️ **绝不与 `incoming\` 的 watcher 共用**：`startInboxWatcher` 一行未改，
+ * 本函数只是**新增**的一条并行链路（零回归风险是硬要求）。
+ */
+function startInboxUsage(): void {
+  const dir = inboxUsageDir()
+  void startInboxUsageWatcher(dir, sendInboxUsage, inboxUsageDeps)
+    .then((handle) => {
+      inboxUsageWatcher = handle
+      // 起不来（active:false）时**仍然扫描**：存量记录不该因为监听失败而丢。
+      return dispatchStoredInboxUsage(dir, sendInboxUsage, inboxUsageDeps)
+    })
+    .then((r) => {
+      if (r.sent > 0 || r.bad > 0) {
+        logInfo('inbox:usage:started', { dir, ...r, watchActive: inboxUsageWatcher?.active === true })
+      }
+    })
+    .catch((err: unknown) => {
+      // 使用统计是附属行为：任何异常都只 warn，绝不影响启动与导出通道
+      logWarn('inbox:usage:start-failed', { err: err instanceof Error ? err.message : String(err) })
+    })
+}
+
+/**
  * 拖出图标的**最后兜底**：把 `resources/drag-icon.png`（64×64 RGBA）以 base64 内嵌，
  * 保证即使打包漏带资源 / 用户删了文件，拖出也不会因为缺 icon 而失败。
  */
@@ -968,6 +1074,14 @@ function bootstrap(): void {
     trashSweepTimer.unref?.()
     createWindow()
     restartWatcher()
+    // SketchUp 插件收件箱（docs/48 §7 / 勘察方案 A）：监听 + 启动存量扫描。
+    // 放在 createWindow() 之后：`startInboxWatcher` 的派发是 at-least-once（每 3s 重发
+    // 直到 ack），窗口晚一点就绪也不会丢任务。
+    startInbox()
+
+    // SketchUp 插件「使用记录」回传（插入一次 = 用过一次）：独立 watcher + 存量扫描。
+    // 同样放在 `createWindow()` 之后；与导出通道互不影响（见 `startInboxUsage` 头注）。
+    startInboxUsage()
 
     // ── 插件写盘排期器（docs/39 §2.2 / §6 A1）──────────────────────────────
     // 必须在 `createWindow()` 之后：渲染层的 `init()` 会在窗口加载后跑，它的启动上报
@@ -1028,6 +1142,13 @@ if (!gotSingleInstanceLock) {
 app.on('window-all-closed', () => {
   void cleanupStaging(settings.libraryDir).catch(() => {})
   if (process.platform !== 'darwin') app.quit()
+})
+
+// 退出前停掉收件箱监听与派发重发：不能留着定时器在 exit 流程里继续 `webContents.send`
+app.on('will-quit', () => {
+  stopInboxWatcher()
+  // 使用记录 watcher 一并停（独立实例；`stopInboxWatcher` 不会碰它）
+  void stopInboxUsageWatcher()
 })
 
 // ── IPC ──────────────────────────────────────────────────────────
@@ -1572,6 +1693,102 @@ ipcMain.handle(
 
 ipcMain.handle(IPC.rescan, () => rescanLibrary(settings.libraryDir))
 ipcMain.handle(IPC.sevenZipPath, () => settings.sevenZipPath ?? findSevenZip())
+
+// ── SketchUp 插件收件箱（docs/probe/su-export-to-idbox.md · 方案 A）─────────
+//
+// 两条通道的分工（**不要合并**）：
+//   `inbox:ack`         → 只搬目录（处理完了 / 失败了，任务从 incoming 归档走）
+//   `inbox:applyUpdate` → 只覆盖库内那一个 `.skp`（更新通道的真实落盘）
+// 搬运与覆盖分开是刻意的：覆盖失败时任务目录必须留在 incoming 供排查，而 ack 才是
+// "可以搬走了"的唯一信号 —— 两者由渲染层按处理结果分别调用。
+
+/**
+ * 任务处理完 → 把 `incoming\<jobId>\` 整目录搬到 `done\` / `failed\`。
+ *
+ * 幂等（重复 ack 返回 `archivedTo: null`）、**绝不删除**（归档目录留给用户排查）。
+ * 失败原因写进 `failed\<jobId>\error.txt`，一律记 info 便于对账。
+ */
+ipcMain.handle(IPC.inboxAck, async (_e, payload: InboxAckPayload) => {
+  const result = await ackInboxJob(payload)
+  logInfo('inbox:ack', {
+    jobId: typeof payload?.jobId === 'string' ? payload.jobId : null,
+    ok: payload?.ok === true,
+    archivedTo: result.archivedTo,
+    archiveOk: result.ok
+  })
+  return result
+})
+
+/**
+ * 「更新 ID BOX 中的这个模型」：把任务里的 `.skp` **就地覆盖**库内同名 `.skp`。
+ *
+ * 安全边界全在 `main/inboxUpdate.ts`：① jobId 必须合法且源文件必须直接躺在
+ * `incoming\<jobId>\` 里（渲染层传的路径不可信）；② `targetRelFolder` 逐段校验后用
+ * **主进程的** `settings.libraryDir` 重算目标路径；③ 落点再过一遍 `isWithinRoot`；
+ * ④ 只覆盖一个文件（`.tmp` → rename），失败删 tmp、旧文件原样保留。
+ *
+ * ⛔ 绝不复用 `import:paths` 的覆盖档 —— 那会把旧目录整个送进回收站并丢掉
+ * `renderParams` / `renderShape` / 自定义封面（勘察 §Q4-3 / §风险 R5）。
+ */
+ipcMain.handle(IPC.inboxApplyUpdate, async (_e, payload: InboxApplyUpdatePayload) => {
+  const result = await applyInboxSkpUpdate(payload, {
+    libraryDir: settings.libraryDir,
+    incomingDir: inboxIncomingDir()
+  })
+  if (result.ok) {
+    logInfo('inbox:applyUpdate', {
+      targetAbs: result.targetAbs,
+      targetName: result.targetName,
+      bytes: result.bytes,
+      selection: result.selection
+    })
+  } else {
+    logWarn('inbox:applyUpdate:rejected', {
+      jobId: typeof payload?.jobId === 'string' ? payload.jobId : null,
+      targetRelFolder: typeof payload?.targetRelFolder === 'string' ? payload.targetRelFolder : null,
+      reason: result.reason
+    })
+  }
+  return result
+})
+
+// ── SketchUp 插件「使用记录」ack（插入一次 = 用过一次）─────────────────────────
+
+/**
+ * 渲染层报告一条使用记录已处理。
+ *
+ * 安全边界（**只有这一条**，不要放松）：
+ * - 渲染层只能传**文件名**，路径由主进程用 `inboxUsageDir()` 自己拼；
+ * - 文件名必须过 `isInboxUsageFileName()`（单段、`YYYYMMDD-HHmmss-<4位随机>.json`，
+ *   天然不含 `\` / `/` / `..`）⇒ 渲染层被注入后也**无法**借这个通道删任意文件；
+ * - `ok !== true`（渲染层没落库）时**保留文件**，下次启动重放 —— 宁可重试，
+ *   也不能把一条"用户真的用过"的记录吞掉。
+ *
+ * 永不 reject：`removeUsageFile` 自己吞掉所有 IO 错误，失败只体现在返回值里。
+ */
+ipcMain.handle(
+  IPC.inboxUsageAck,
+  async (_e, payload: InboxUsageAckPayload): Promise<InboxUsageAckResult> => {
+    const raw = typeof payload === 'object' && payload !== null ? payload : ({} as InboxUsageAckPayload)
+    const fileName = typeof raw.fileName === 'string' ? raw.fileName.trim() : ''
+    if (!isInboxUsageFileName(fileName)) {
+      logWarn('inbox:usageAck:rejected', {
+        fileName: fileName.length > 0 ? fileName : null,
+        hint: '文件名不是 YYYYMMDD-HHmmss-<4位随机>.json，拒删'
+      })
+      return { ok: false, removed: false, reason: '文件名不合法' }
+    }
+    if (raw.ok !== true) {
+      logInfo('inbox:usageAck:kept', { fileName, hint: '渲染层未落库，文件保留待下次启动重试' })
+      return { ok: true, removed: false, reason: '未落库，文件保留' }
+    }
+    const removed = await removeUsageFile(inboxUsageDir(), fileName, inboxUsageDeps)
+    if (!removed) {
+      return { ok: false, removed: false, reason: '删除 usage 文件失败（可能被占用）' }
+    }
+    return { ok: true, removed: true }
+  }
+)
 
 // ── T04 新增：拖出 / 缩略图 / 磁盘 / 索引备份 ─────────────────────
 
@@ -2259,6 +2476,7 @@ function checkUpdateWithCache(force: boolean): Promise<UpdateInfo> {
         url: null,
         assetUrl: null,
         publishedAt: null,
+        notes: null,
         checkedAt: Date.now(),
         error: 'network'
       }

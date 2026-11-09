@@ -61,6 +61,11 @@ const { db } = await import('../src/renderer/db')
 
 const fakeAssets = {
   put: vi.fn(async (a: Asset) => a.id),
+  // `update` 是使用统计（`recordAssetUse`）唯一的写库方法：这两条 action 现在会顺带
+  // 打点一次，假表必须把 `update` 也提供出来，否则 `db.assets.update is not a function`
+  // 会被当成"主流程坏了"。真实契约（只写两个字段、绝不用 `put`）在
+  // `tests/useStats.test.ts` 里逐字钉死。
+  update: vi.fn(async () => 1),
   bulkPut: vi.fn(async (list: Asset[]) => list.length),
   bulkDelete: vi.fn(async (ids: string[]) => ids.length),
   toArray: vi.fn(async () => [])

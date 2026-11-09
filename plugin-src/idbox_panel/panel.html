@@ -9,7 +9,9 @@
   硬约束（改这个文件时不得放开，docs/39 §4.1）：
     - 零网络：不发起任何网络请求，不用 CDN、远程资源、外部字体或图片。
       所有样式与脚本都内联在这一个文件里；图片只允许 base64 内联或本地路径拼接。
-    - 零上报：不打点、不写本地存储、不写浏览器存储。
+    - 零上报：不打点、不上报、不联网。
+    - 本地存储只有**一处**：`localStorage['idbox.panel.density']` 记住「大/中/小」预览档
+      （2026-11-09 用户要求，面板里唯一允许的持久化；**绝不写盘文件**，也绝不写 ID BOX 数据）。
     - 搜索与筛选纯前端：只在内存里过滤 Ruby 推下来的记录。
     - 只读：面板从不调用任何写文件的 Ruby 回调（Ruby 侧也没有这样的回调）。
 
@@ -17,14 +19,33 @@
     sketchup.ready()                → 面板就绪，请求数据
     sketchup.refreshIndex()         → 强制重读索引文件（新增调用点：提示条）
     sketchup.insertRecord(id)       → 插入一条记录（新增调用点：卡片单击）
+    sketchup.applyMaterial(id)      → 双击材质：建材质 + 设当前材质（**不贴面**，V1.0）
+    sketchup.setPanelSize(flag)     → 折叠 / 展开窗口（flag = true 折叠），调 dialog.set_size
+    sketchup.closePanel()           → 关闭面板，调 dialog.close
   Ruby 侧调用（execute_script）：
-    window.IDBOX.render(payload)    → 渲染整份数据（payload 只增字段：thumbsRoot）
+    window.IDBOX.render(payload)    → 渲染整份数据（payload 只增字段：thumbsRoot、materialKinds）
     window.IDBOX.setStatus(obj)     → 底部状态行 { message, level }
 
   必须保留的 11 个 DOM id：
     banner clear count empty fresh list notes q refresh status ver
+  本版新增（不计入 11 个）：win-fold（折叠）。自绘的「关闭」按钮已被用户拍板删除
+  （2026-11-09 B′：它与系统标题栏的 × 完全重复，留着就是"两排按钮打架"）——别再加回来。
+
+  窗口控件说明（docs/48 §6 + 2026-11-09 B′ 拍板）：只保留**自绘「折叠」**一个按钮，
+  放在顶栏左侧（logo 右侧），与右上的系统按钮在空间上彻底错开；**不做最大化**
+  （HtmlDialog 没有真正的最大化语义）、**不做伪置顶**（无官方 API）。
+  折叠 = 整个窗口收成一条窄栏（高度由 Ruby 侧 set_size 收到 60px），不是「只把内容藏起来」。
+  关闭只有两条路，都不经过自绘按钮：系统标题栏的 ×、以及菜单/工具栏里的关闭
+  （两条都走 Ruby 的 close → set_on_closed → stop_polling）。
 
   物理尺寸口径：960×680 / 最小 760×520（CSS 承担下限，见 body）。
+  折叠态例外：html/body 的 min-width / min-height 在 .is-collapsed 下放开（否则收不成窄栏）。
+
+  缩略图结论（2026-11-09 实测，可对外解释）：路径拼装与缩略图文件本身**都没有问题**
+  —— 用真实索引在 Chromium 里渲染本页，102/102 张封面全部加载成功（broken 0）。
+  用户那台机器"没有缩略图"的唯一成因是 payload 的 thumbsRoot 为空（旧插件包
+  `Snapshot#thumbs_root` 恒返回空串）⇒ 本页按设计降级为类型图标。1.1.1 已修该根因；
+  renderNotes 也会把「缩略图根未下发」明写出来，不再是一片图标让人猜。
 -->
 <style>
   /* ══ 语义覆盖集 S（34 变量）· 浅色档 ══════════════════════════════════════
@@ -202,12 +223,16 @@
     flex: 0 0 auto; height: 56px; display: flex; align-items: center; gap: 10px;
     padding: 0 14px; background: var(--bg-canvas); border-bottom: 1px solid var(--border-panel);
   }
+  /* 插件自己的 Logo（不是主程序 Logo）：取 assets/toolbar.svg 的图形做**单色内联版**，
+     不新增位图、不引用外部文件（零外链约束）。颜色走 token，随主题变。 */
   .logo {
-    width: 22px; height: 22px; flex: 0 0 auto; border-radius: var(--radius-logo);
-    background: var(--accent); display: flex; align-items: center; justify-content: center;
-    color: var(--accent-tint); font-size: var(--fs-micro); font-weight: 600; letter-spacing: .06em;
+    width: 24px; height: 24px; flex: 0 0 auto; border-radius: var(--radius-logo);
+    background: var(--accent-tint); color: var(--accent-text);
+    display: flex; align-items: center; justify-content: center;
   }
+  .logo-svg { width: 18px; height: 18px; display: block; }
   .brand { font-size: 15px; font-weight: 600; letter-spacing: .04em; color: var(--text-primary); flex: 0 0 auto; }
+  .brand .ver { margin-left: 6px; }
   .search-wrap { position: relative; display: flex; align-items: center; flex: 1 1 auto; min-width: 180px; }
   .search-wrap .icon { position: absolute; left: 9px; color: var(--text-tertiary); }
   .search {
@@ -232,16 +257,70 @@
   }
   .seg-btn:hover { color: var(--text-primary); }
   .seg-btn.is-active { background: var(--seg-active); color: var(--accent-text); }
-  .density { font-size: var(--fs-caption); color: var(--text-muted); letter-spacing: .06em; white-space: nowrap; }
+  /* ── 预览密度（大 / 中 / 小）────────────────────────────────────────────
+     2026-11-09 修：这里原来是一个纯文本 <span>（title 里就写着"本批不接行为"）——
+     用户点不动**不是被遮挡，而是它从来不是按钮**。现在改成与顶栏 .seg 同构的
+     分段控件（同一套 token），三档只切 body 上的 density-* class，
+     CSS 变量 --grid-cols 决定列数，卡片 markup / 渲染逻辑都不变。 */
+  .density {
+    display: flex; align-items: center; gap: 2px; padding: 2px;
+    background: var(--pill-bg); border-radius: var(--radius-seg-group); flex: 0 0 auto;
+  }
+  .density-btn {
+    display: flex; align-items: center; justify-content: center;
+    min-width: 22px; height: 22px; padding: 0 6px; border: none;
+    border-radius: var(--radius-seg); background: transparent;
+    color: var(--text-tertiary); cursor: pointer; font-family: inherit;
+    font-size: var(--fs-caption); letter-spacing: .06em; line-height: 1;
+  }
+  .density-btn:hover { color: var(--text-primary); }
+  .density-btn.is-active { background: var(--seg-active); color: var(--accent-text); }
+  .density-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-  .status-area { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
-  .fresh { font-size: var(--fs-caption); color: var(--text-muted); max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 顶栏右侧是「新鲜度 + 刷新」，窄窗口时不能让它们被挤出可视区：
+     .status-area 允许收缩、.fresh 允许缩到省略号（原来两者都是 0 0 auto，760px 下会溢出）。 */
+  .status-area { display: flex; align-items: center; gap: 10px; flex: 0 1 auto; min-width: 0; }
+  .fresh { flex: 0 1 auto; min-width: 0; font-size: var(--fs-caption); color: var(--text-muted); max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .fresh.stale { color: var(--text-secondary); }
   .ver { font-size: var(--fs-caption); color: var(--text-muted); font-variant-numeric: tabular-nums; }
 
-  /* ══ 提示条（P1-2）：≤ 单行可点击 ═════════════════════════════════════════ */
+  /* ── 自绘窗口控件：只剩「折叠」一个（2026-11-09 用户拍板 B′）───────────────
+     为什么搬到顶栏**左侧**：右上是系统标题栏的最小化/最大化/关闭，自绘按钮原来贴在
+     它们正下方，视觉上就是"两排按钮打架"。搬到 logo 右侧后两套控件在空间上彻底错开。
+     为什么删掉自绘「关闭」：它与系统标题栏的 × **完全重复**（同样走 dialog.close →
+     set_on_closed → stop_polling），留着只增加歧义。
+     视觉：辅助控件——默认 --text-tertiary，hover 才提亮，**不抢「刷新」的注意力**。 */
+  .win-controls { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+  .win-btn {
+    width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+    border: none; border-radius: var(--radius-chip); background: transparent;
+    color: var(--text-tertiary); cursor: pointer; padding: 0; font-family: inherit;
+  }
+  .win-btn .icon { width: 12px; height: 12px; }
+  .win-btn:hover { background: var(--bg-elevated); color: var(--text-primary); }
+
+  /* ── 折叠态：整个窗口收成一条窄栏（窗口高度由 Ruby set_size 收到 60px）──────
+     只留「logo + 折叠（此时是展开）+ 品牌 + 版本」；其余块全部不渲染。
+     注意 html 上的 min-width / min-height 也必须放开，否则窗口收不下去（min-width 760）。 */
+  html.is-collapsed, body.is-collapsed { min-width: 0; min-height: 0; }
+  body.is-collapsed .topbar { border-bottom: none; }
+  body.is-collapsed .search-wrap,
+  body.is-collapsed .seg,
+  body.is-collapsed .density,
+  body.is-collapsed .status-area,
+  body.is-collapsed .banner,
+  body.is-collapsed #notes,
+  body.is-collapsed .shell,
+  body.is-collapsed .statusbar { display: none !important; }
+  /* 折叠态下「折叠」按钮换成「展开」图标（JS 换 use 的 href，CSS 只管留位） */
+
+  /* ══ 提示条（P1-2）：≤ 单行可点击 ═════════════════════════════════════════
+     ⚠️ 2026-11-09 修：这里原来写的是 `display: none`，而 renderBanner 显示时给的是
+     `class="banner warn"` / `"banner error"`（**不含** hidden），两个变体又都没重设 display
+     ⇒ 提示条**永远不可见**（IDBOX-101、只读态、写入侧报错三条全部哑掉）。
+     现在改成 `display: flex`，隐藏改由 `.hidden`（renderBanner 无条件先加）负责。 */
   .banner {
-    flex: 0 0 auto; display: none; align-items: center; gap: 6px;
+    flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
     padding: 7px 14px; font-size: var(--fs-caption); cursor: pointer;
     border-bottom: 1px solid var(--border-panel); background: var(--danger-tint); color: var(--danger);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -252,6 +331,9 @@
 
   #notes { flex: 0 0 auto; padding: 0 14px; }
   .note { font-size: var(--fs-micro); color: var(--text-muted); padding: 4px 0 0; white-space: pre-wrap; }
+  /* 需要用户动手处理 / 会改变观感的说明（如 thumbsRoot 未下发导致封面全降级）：
+     比普通 note 亮一档，但不占用 danger 色（那留给真正的错误）。 */
+  .note-warn { color: var(--text-secondary); font-weight: 500; }
 
   /* ══ 主体两列 ═════════════════════════════════════════════════════════════ */
   .shell { flex: 1 1 auto; display: flex; min-height: 0; }
@@ -307,9 +389,15 @@
   /* ── ④ 卡片网格 ── */
   .grid {
     flex: 1 1 auto; overflow-y: auto; padding: 10px 14px 12px;
-    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gap-card);
+    display: grid; grid-template-columns: repeat(var(--grid-cols, 3), minmax(0, 1fr)); gap: var(--gap-card);
     align-content: start;
   }
+  /* 预览密度三档：大 2 列 / 中 3 列 / 小 4 列。
+     列数写死 + minmax(0,1fr) ⇒ 任何窗口宽度下都不会横向溢出，也不会出现半列空位。
+     ⚠️ 单列视图（.view-list）在自己的规则里覆盖列数，不受这三档影响。 */
+  body.density-lg { --grid-cols: 2; }
+  body.density-md { --grid-cols: 3; }
+  body.density-sm { --grid-cols: 4; }
   .card {
     position: relative; display: flex; flex-direction: column;
     background: var(--surface-card); border: 1px solid transparent;
@@ -366,9 +454,23 @@
   .status.ok { color: var(--success); }
   .status.error { color: var(--danger); }
   .status.warn, .status.info { color: var(--text-secondary); }
+  /* 撤销胶囊（三态，docs/46 §1.6）：平时隐藏 / 插入成功显示 5 s / 到时自动收起。
+     显隐刻意**不用 display:none**：硬切没法配 transition，而 display 变化会让 44px 状态行
+     在显示-收起时抖一下。用 opacity + visibility（后者延迟到透明结束再切，收起才看得见淡出），
+     尺寸保持不动 ⇒ 显隐不引起任何布局位移。隐藏态同时脱离无障碍树（visibility:hidden 的副作用，正好）。 */
   .undo-pill {
     flex: 0 0 auto; display: flex; align-items: center; height: 28px; padding: 0 10px;
     border-radius: var(--radius-toast-undo); background: var(--accent-tint);
+    opacity: 1; visibility: visible;
+    transition: opacity 150ms ease-out, visibility 0s linear 0s;
+  }
+  .undo-pill.is-hidden {
+    opacity: 0; visibility: hidden;
+    transition: opacity 150ms ease-out, visibility 0s linear 150ms;
+  }
+  /* 减少动效：不做过渡，直接显 / 隐（用户明确要求减少动画时的口径） */
+  @media (prefers-reduced-motion: reduce) {
+    .undo-pill, .undo-pill.is-hidden { transition: none; }
   }
   .undo-inner {
     display: flex; align-items: center; height: 20px; padding: 0 8px;
@@ -435,6 +537,13 @@
   <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
     <path d="M18 6L6 18M6 6l12 12"/>
   </symbol>
+  <!-- 折叠 / 展开（自绘窗口控件；两个方向的双箭头，语义是「收成一条 / 放回原样」） -->
+  <symbol id="i-collapse" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M7 13l5-5 5 5"/><path d="M7 19l5-5 5 5"/>
+  </symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M7 11l5 5 5-5"/><path d="M7 5l5 5 5-5"/>
+  </symbol>
   <symbol id="i-empty-library" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
     <path d="M3 12v7a2 2 0 002 2h14a2 2 0 002-2v-7"/>
     <path d="M3 12h4M17 12h4"/>
@@ -459,7 +568,24 @@
 
   <!-- ① 顶栏 56px -->
   <header class="topbar">
-    <div class="logo" aria-hidden="true">ID</div>
+    <!-- 插件自己的 Logo：assets/toolbar.svg 图形的单色内联版（ID 字标），不引外链、不引位图 -->
+    <span class="logo" aria-hidden="true">
+      <svg class="logo-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M7.2 9.8V17.4"/>
+        <path d="M11.6 6.6V17.4"/>
+        <path d="M11.6 6.6h2.4a2.2 2.2 0 010 4.4h-2.4"/>
+        <path d="M11.6 11h2.6a3.2 3.2 0 010 6.4h-2.6"/>
+        <circle cx="7.2" cy="6.6" r="1.4" fill="currentColor" stroke="none"/>
+      </svg>
+    </span>
+    <!-- 折叠（辅助控件，2026-11-09 B′：放 logo 右侧，与右上的系统按钮错开；
+         自绘「关闭」已删——系统标题栏的 × 与它 100% 重复） -->
+    <div class="win-controls">
+      <button id="win-fold" class="win-btn" type="button" title="折叠为窄条（省屏幕空间）" aria-label="折叠面板">
+        <svg class="icon" aria-hidden="true"><use href="#i-collapse"></use></svg>
+      </button>
+    </div>
     <div class="brand">ID BOX<span id="ver" class="ver"></span></div>
     <div class="search-wrap">
       <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
@@ -476,7 +602,12 @@
         <svg class="icon" aria-hidden="true"><use href="#i-list"></use></svg>
       </button>
     </div>
-    <span class="density" title="静态密度字样，本批不接行为">大 中 小</span>
+    <!-- 预览密度：大 / 中 / 小（分段控件，点击切换网格列数 + localStorage 记忆） -->
+    <div class="density" data-role="density" role="group" aria-label="预览大小">
+      <button class="density-btn" type="button" data-density="lg" title="大卡片（2 列）" aria-pressed="false">大</button>
+      <button class="density-btn" type="button" data-density="md" title="中卡片（3 列）" aria-pressed="false">中</button>
+      <button class="density-btn" type="button" data-density="sm" title="小卡片（4 列）" aria-pressed="false">小</button>
+    </div>
     <div class="status-area">
       <div id="fresh" class="fresh">正在读取索引…</div>
       <button id="refresh" class="chip chip-ghost" type="button" title="重新读取索引文件（只读，不会改动 ID BOX 数据）">
@@ -496,7 +627,7 @@
       <div class="side-scroll">
         <div class="group-head">素材大类</div>
         <nav id="side-nav"></nav>
-        <div class="group-head">一级分类</div>
+        <div class="group-head" data-role="l1-head">一级分类</div>
         <nav id="side-tree" class="nav-tree"></nav>
       </div>
       <div class="side-foot">
@@ -533,7 +664,10 @@
       <svg class="icon icon-10"><use href="#i-check"></use></svg>
     </span>
     <span id="status" class="status"></span>
-    <span class="undo-pill" title="面板不实现撤销计时；撤销在 SketchUp 里用 Ctrl+Z">
+    <!-- 撤销胶囊：默认 is-hidden（三态见 docs/46 §1.6 与上方 CSS 的 .undo-pill 注释）。
+         #undo 是本批**唯一**新增的 DOM id（第 12 个），11 个既有 id 一个都没动。
+         正文「撤销 Ctrl+Z」是定稿文案（42 §12 C-7），不改；title 只说清「提示会收起」与「撤销在哪」。 -->
+    <span id="undo" class="undo-pill is-hidden" title="提示会在 5 秒后收起；撤销始终在 SketchUp 里用 Ctrl+Z">
       <span class="undo-inner">撤销 Ctrl+Z</span>
     </span>
   </div>
@@ -543,23 +677,50 @@
 (function () {
   'use strict';
 
+  /* 撤销胶囊的计时器与时长（docs/46 §1.6.2）：
+     - 计时器放在 IIFE 闭包内，不挂 window、不用全局变量（与 Ruby 侧「无全局变量」同款纪律）；
+     - 只此一个变量 ⇒ 天然覆盖式：每次重新起计都先 clearTimeout，不会叠出第二个计时器/第二颗胶囊
+       （DOM 里也只有一个 #undo，不 new 节点）。 */
+  var undoTimer = null;
+  var UNDO_PILL_MS = 5000;
+
   var state = {
     data: null,
     query: '',
     kindLabels: {},
     insertableKinds: ['model'],
+    materialKinds: ['texture', 'material'],
     unsupportedHint: '',
     selectedId: '',        /* 单值，不是数组（§5.2 裁定 2） */
     activeKind: '',        /* '' = 全部；展示分组见 KIND_GROUPS */
     activeCategory1: '',
     sortKey: 'default',
     thumbsRoot: '',        /* 来自 payload（T04 才落字段），本卡默认空 ⇒ 首屏全 SVG 占位 */
-    viewMode: 'grid'
+    viewMode: 'grid',
+    density: 'md',         /* 预览密度 lg/md/sm（= 网格 2/3/4 列，localStorage 记忆） */
+    collapsed: false,      /* 自绘窗口控件的折叠态（只影响本页面样式 + 通知 Ruby 改窗口尺寸） */
+    thumbFail: 0,          /* 本轮渲染里封面加载失败的张数（只用于合并上报，见 noteThumbFailure） */
+    thumbFailFirst: ''     /* 首张失败的 src —— 分流「file:// 被 CEF 拦 / 文件不存在」的关键证据 */
   };
 
-  /* 左栏 5 个展示分组 → KINDS 6 值（「材质 = texture + material」，§10.2 风险 8 建议口径） */
+  /* ══ 显示范围白名单（V1.0，docs/48 §6 拍板）═════════════════════════════════
+     HDR / CAD / D5A 本版**不显示**（不是置灰，是完全不出现）。
+     要放开某一类：把它加进这个数组即可 —— 左栏分组、筛选、计数、卡片列表
+     全部由它派生（allowedGroups() / matches()），不需要再改别处。
+     `other` 同样不在白名单里：面板只做「模型 + 材质」两件事。 */
+  var ALLOWED_KINDS = ['model', 'texture', 'material'];
+
+  /* 可「双击创建材质」的 kind。Ruby 是权威（core.rb 的 MATERIAL_KINDS），
+     这里只是默认值；payload 带 materialKinds 时以 Ruby 为准。 */
+  var MATERIAL_KINDS = ['texture', 'material'];
+
+  /* 左栏展示分组 → KINDS 6 值（「材质 = texture + material」，§10.2 风险 8 建议口径）。
+     分组表保留全部 6 类，实际显示哪些由 ALLOWED_KINDS 派生 ——
+     这样「放开 HDR」只需改上面一行，不用回来动这里。
+     all: true 的那一项是**聚合项**（「全部」），只用于展示与筛选复位，
+     **不参与 groupOf 归类**（否则每条记录都会先命中它，导致 模型/材质 计数恒为 0）。 */
   var KIND_GROUPS = [
-    { key: '', label: '全部', icon: 'i-grid', kinds: ['model', 'texture', 'material', 'hdri', 'cad', 'other'] },
+    { key: '', label: '全部', icon: 'i-grid', all: true, kinds: ['model', 'texture', 'material', 'hdri', 'cad', 'other'] },
     { key: 'model', label: '模型', icon: 'i-box', kinds: ['model'] },
     { key: 'material', label: '材质', icon: 'i-material', kinds: ['texture', 'material'] },
     { key: 'hdri', label: 'HDR', icon: 'i-hdr', kinds: ['hdri'] },
@@ -569,6 +730,11 @@
 
   var SORT_KEYS = ['default', 'name', 'category1', 'fileCount'];
   var SORT_LABELS = { default: '默认排序', name: '按名称', category1: '按分类', fileCount: '按文件数' };
+
+  /* 一级分类里「没有 category1」那一档的显示名。
+     口径对齐 ID BOX 本体（logic/category.ts::countLevel1）：按 category1 分组计数，
+     空值归入「未分类」，且**未分类恒排最后**。 */
+  var UNCLASSIFIED_LABEL = '未分类';
 
   function $(id) { return document.getElementById(id); }
 
@@ -585,6 +751,100 @@
 
   function hasSketchupCallback(name) {
     return !!(window.sketchup && typeof window.sketchup[name] === 'function');
+  }
+
+  /* ── 显示范围（唯一开关 = ALLOWED_KINDS + 模型主文件扩展名白名单）──────────
+     ⚠️ 两层，别合并：
+       · kind 层：model / texture / material（HDR / CAD / other 本版完全不显示）；
+       · **主文件扩展名层**：kind = model 的还必须是 SketchUp 能打开的格式。
+         `.skp` 与 `.max` 在索引里的 kind **都是 model**（主程序 EXT_KIND 两者都映射 model，
+         也都落在「模型」目录），只按 kind 过滤会把 3ds Max 文件放进 SketchUp 插件
+         （2026-11-09 用户实测：「3DMAX 的文件也会出现在 SketchUp 的插件里面」）。
+         判据写成**白名单**（只放行 .skp）而不是黑名单 .max：将来真要支持别的格式，
+         只改 MODEL_MAIN_EXTS 这一处即可。 */
+  function isAllowedKind(kind) {
+    return ALLOWED_KINDS.indexOf(textOf(kind)) >= 0;
+  }
+
+  /* kind = model 时允许显示的主文件扩展名（小写、不带点）。**白名单**：只放 .skp。 */
+  var MODEL_MAIN_EXTS = ['skp'];
+
+  /* 取主文件扩展名（小写、不带点）。
+     数据来源 = payload 记录的 mainFile 字段（Ruby 侧 Snapshot#normalize_record 已经给了它，
+     panel 的插入前置校验也在用它）——**不要**拿 files[0] 盲取，文件顺序不保证。
+     兼容 Windows 反斜杠与形如 "a/b/c.skp" 的相对路径；没有扩展名返回 ''。 */
+  function mainExtOf(record) {
+    var main = textOf(record && record.mainFile).trim();
+    if (!main) { return ''; }
+    var slash = Math.max(main.lastIndexOf('/'), main.lastIndexOf('\\'));
+    var name = slash >= 0 ? main.slice(slash + 1) : main;
+    var dot = name.lastIndexOf('.');
+    return dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
+  }
+
+  /* 「这条记录能不能显示」= kind 白名单 + 模型主文件扩展名白名单。
+     ⚠️ **这是唯一判据入口**（下方 scopedRecords 用它，计数/分类/列表/空态全部派生自那里），
+     不要在各处再写一份，否则「列表里没了但计数还在」这种不一致一定会出现。 */
+  function isDisplayableRecord(record) {
+    if (!record) { return false; }
+    if (!isAllowedKind(record.kind)) { return false; }
+    if (textOf(record.kind) === 'model') {
+      return MODEL_MAIN_EXTS.indexOf(mainExtOf(record)) >= 0;
+    }
+    return true;
+  }
+
+  /* 左栏可见分组：「全部」恒在；其余分组只要它包含任一白名单 kind 才出现。
+     ⇒ 放开 HDR 时不用改这里，HDR 分组会自动出现。 */
+  function allowedGroups() {
+    var out = [];
+    for (var i = 0; i < KIND_GROUPS.length; i += 1) {
+      var group = KIND_GROUPS[i];
+      if (group.key === '') { out.push(group); continue; }
+      var hit = false;
+      for (var j = 0; j < group.kinds.length; j += 1) {
+        if (isAllowedKind(group.kinds[j])) { hit = true; break; }
+      }
+      if (hit) { out.push(group); }
+    }
+    return out;
+  }
+
+  /* 当前作用域内的记录（kind 白名单 + 模型主文件扩展名白名单过滤后的全量）。
+     所有计数 / 分类树 / 卡片 / 空态都从它派生，保证「共 N 项」的 N 与用户能看到的条目一致
+     （不会把隐藏的 HDR/CAD 算进去，也不会把 .max 这类 SketchUp 打不开的模型算进去）。 */
+  function scopedRecords() {
+    var data = state.data;
+    if (!data || !data.ok) { return []; }
+    var records = data.records || [];
+    var out = [];
+    for (var i = 0; i < records.length; i += 1) {
+      if (isDisplayableRecord(records[i])) { out.push(records[i]); }
+    }
+    return out;
+  }
+
+  /* 「库里 kind=model 但主文件不是 SketchUp 格式」的条数 —— 只给空态文案区分用
+     （库里只有 .max 时要说「没有可插入的 SketchUp 模型」，不能说「库为空」）。 */
+  function unsupportedModelCount() {
+    var data = state.data;
+    if (!data || !data.ok) { return 0; }
+    var records = data.records || [];
+    var count = 0;
+    for (var i = 0; i < records.length; i += 1) {
+      if (textOf(records[i].kind) === 'model' && !isDisplayableRecord(records[i])) { count += 1; }
+    }
+    return count;
+  }
+
+  /* 这条记录是否属于「双击建材质」的类别（texture / material） */
+  function isMaterialRecord(record) {
+    if (!record) { return false; }
+    return state.materialKinds.indexOf(textOf(record.kind)) >= 0;
+  }
+
+  function kindLabelOf(kind) {
+    return state.kindLabels[textOf(kind)] || textOf(kind);
   }
 
   /* 精灵表渲染：复制 #icon-tpl 模板 + 改 use 的 href。
@@ -606,17 +866,65 @@
     return 'i-other';
   }
 
+  /* ── 撤销胶囊显隐（三态，docs/46 §1.6）───────────────────────────────────
+        **唯一**出口。只有 level === 'ok' 才显示并起 5 s 计时；任何其它 level
+        （error / warn / info / 空）立刻收起并清计时。连续两次成功 = 先清旧计时再起新的
+        ⇒ 覆盖式重新计满 5 s（不会叠出第二个计时器，DOM 里也只有一颗 #undo）。 */
+  function updateUndoPill(level) {
+    var pill = $('undo');
+    if (!pill) { return; }
+    if (undoTimer !== null) {
+      clearTimeout(undoTimer);
+      undoTimer = null;
+    }
+    if (textOf(level) !== 'ok') {
+      pill.classList.add('is-hidden');
+      return;
+    }
+    pill.classList.remove('is-hidden');
+    undoTimer = setTimeout(function () {
+      undoTimer = null;
+      pill.classList.add('is-hidden');
+    }, UNDO_PILL_MS);
+  }
+
+  /* 用户在浏览/操作面板（重绘、搜索、选中）时不等自然到期，先收起来。
+     只是 updateUndoPill 的语义化别名，**不新增第二套显隐逻辑**。 */
+  function dismissUndoPill() {
+    updateUndoPill('');
+  }
+
   /* ── 状态行（⑥，#status 是 44px 行里的文字节点） ─────────────────────── */
   function setStatus(payload) {
     var node = $('status');
-    if (!node) { return; }
     var message = textOf(payload && payload.message);
     var level = textOf(payload && payload.level) || 'info';
-    node.className = 'status ' + level;
-    node.textContent = message;
+    if (node) {
+      node.className = 'status ' + level;
+      node.textContent = message;
+    }
+    /* 签名不变（{message, level}），这里只多这一处联动 */
+    updateUndoPill(level);
   }
 
   /* ── 提示条（③ 索引未开 / IDBOX-101）───────────────────────────────── */
+  /* 只读原因按行去重：Ruby 侧两侧（清单 / 内容）各给一句，文案现在两句话完全一致，
+     不去重就会在单行提示条里出现「同一句话两遍 ……」被截断，看起来像渲染坏了。 */
+  function readOnlyText(data) {
+    var raw = textOf(data && data.readOnlyReason);
+    if (!raw) { return ''; }
+    var lines = raw.split('\n');
+    var seen = {};
+    var out = [];
+    for (var i = 0; i < lines.length; i += 1) {
+      var line = lines[i].trim();
+      if (!line || seen[line]) { continue; }
+      seen[line] = true;
+      out.push(line);
+    }
+    return out.join(' ');
+  }
+
   function renderBanner(data) {
     var banner = $('banner');
     banner.className = 'banner hidden';
@@ -640,7 +948,7 @@
     }
     if (data.readOnly) {
       banner.className = 'banner warn';
-      banner.appendChild(document.createTextNode(textOf(data.readOnlyReason) || '已切换为只读展示，插入被禁用。'));
+      banner.appendChild(document.createTextNode(readOnlyText(data) || '已切换为只读展示，插入被禁用。'));
     }
   }
 
@@ -652,6 +960,12 @@
     for (var i = 0; i < notes.length; i += 1) {
       box.appendChild(make('div', 'note', textOf(notes[i])));
     }
+    /* 缩略图根未下发 ⇒ 封面只能全部降级成类型图标，用户看到的是「一片图标」却不知道为什么。
+       这条提示由**条件**驱动（不是一次性 flag）：下一份 payload 带上 thumbsRoot 就自动消失，
+       不会变成常驻噪音。索引不可用时不出这条（那时顶部提示条才是该看的东西）。 */
+    if (data && data.ok && thumbRootMissing()) {
+      box.appendChild(make('div', 'note note-warn', '缩略图路径没下发——封面降级为类型图标'));
+    }
   }
 
   /* ── 新鲜度 ────────────────────────────────────────────────────────── */
@@ -659,7 +973,11 @@
     var iso = textOf(data && data.generatedAt);
     var parsed = iso ? Date.parse(iso) : NaN;
     if (!iso || isNaN(parsed)) {
-      return { text: '索引时间未知（manifest.generatedAt 缺失）', stale: true };
+      /* P2-1（用户 2026-11-09 拍板）：**界面上不得出现内部字段名**。
+         这里原先写「索引时间未知（manifest.generatedAt 缺失）」—— 用户不知道
+         manifest.generatedAt 是什么，只会以为软件在报错。改成使用者语言：
+         说清「这份索引没带写入时间」，不出现任何字段名。 */
+      return { text: '索引时间未知（这份索引没带写入时间）', stale: true };
     }
     var ageSeconds = Math.max(0, Math.round((Date.now() - parsed) / 1000));
     var limit = Number(data.freshnessHintSeconds);
@@ -707,18 +1025,24 @@
 
   function unsupportedHintFor(kind) {
     if (kind === 'cad' || kind === 'other') {
-      return 'V1.0 只支持插入模型（kind = model）；CAD / 其他类型暂不支持';
+      /* 这句会进 card.title 等用户可见位置 ⇒ 只说结论，不提 ALLOWED_KINDS 这类开发常量
+         （2026-11-09 A 级文案收口）。 */
+      return '这类资产本版不显示（只做模型与材质）';
     }
-    return state.unsupportedHint || '材质/贴图取用待真机验证，暂不支持';
+    return state.unsupportedHint || '这类资产暂不支持插入';
   }
 
+  /* 拦截原因（空串 = 可以动作）。材质的拦截在点击/双击处单独判（动作不同）。 */
   function blockReason(record) {
     var data = state.data || {};
-    if (data.readOnly) { return '索引版本与插件不匹配（apiVersion 不是 "1"），插入已禁用'; }
+    /* 只读态：说清「禁用了什么动作」+「怎么办」，不出现任何内部字段名与版本数值。
+       与 core.rb 的 Messages.api_mismatch 是同一套话术（用户在两处看到一致的说法）。 */
+    if (data.readOnly) { return 'ID BOX 与插件版本不匹配，插入已禁用；请把主程序与插件升级到同一版本'; }
+    if (isMaterialRecord(record)) { return ''; }
     if (state.insertableKinds.indexOf(textOf(record.kind)) < 0) {
       return unsupportedHintFor(textOf(record.kind));
     }
-    if (!textOf(record.mainFile)) { return '该记录没有主文件（mainFile 为空），无法插入'; }
+    if (!textOf(record.mainFile)) { return '该记录没有主文件，无法插入'; }
     return '';
   }
 
@@ -727,8 +1051,42 @@
     return encodeURIComponent(segment);
   }
 
+  /* ── 封面降级的可诊断性（不碰路径拼装、不加请求，只加「看得见」）───────────
+     事故背景：用户装的插件包里 thumbsRoot 恒为 ''，面板静默降级成一片类型图标，
+     用户无法自证原因。两条反馈各管一件事：
+       ① 根没下发（成因在数据侧）→ 由 renderNotes 的条件提示承担，见上；
+       ② 单张图加载失败（成因在加载侧）→ 由下面的合并上报承担。 */
+
+  /* 缩略图根是否未下发。thumbSrc / renderNotes 共用同一个判据，避免两处口径漂移。 */
+  function thumbRootMissing() {
+    return !textOf(state.thumbsRoot);
+  }
+
+  var thumbFailTimer = null;
+
+  /* 封面加载失败上报：400ms 内合并成一条。
+     为什么合并：网格常态 100+ 张卡，若 file:/// 整体被拦，逐张 setStatus 会把状态行刷爆，
+     反而看不出「全挂了」这件事。合并后单张给具体 src、多张给张数 + 首张 src ——
+     有 src 才能分流「file:/// 被 SU 内嵌 CEF 拦住」与「文件真的不存在」。 */
+  function noteThumbFailure(src) {
+    state.thumbFail += 1;
+    if (state.thumbFail === 1) { state.thumbFailFirst = textOf(src); }
+    if (thumbFailTimer) { return; }
+    thumbFailTimer = setTimeout(function () {
+      thumbFailTimer = null;
+      var count = state.thumbFail;
+      if (count <= 0) { return; }
+      var message = (count === 1)
+        ? ('封面加载失败：' + state.thumbFailFirst)
+        : ('封面加载失败 ' + count + ' 张（首张：' + state.thumbFailFirst + '）');
+      setStatus({ message: message, level: 'warn' });
+    }, 400);
+  }
+
   function thumbSrc(record) {
-    if (!state.thumbsRoot) { return ''; }
+    /* 不为空时也不能静默：根未下发是「封面全降级」的唯一已知成因，
+       提示由 renderNotes 显示（见上），这里保留显式判据让两处同源。 */
+    if (thumbRootMissing()) { return ''; }
     var rel = textOf(record.thumbRel);
     if (!rel) { return ''; }
     var root = textOf(state.thumbsRoot).replace(/\\/g, '/').replace(/\/+$/, '');
@@ -754,7 +1112,11 @@
     var kind = textOf(record.kind) || 'other';
     var card = make('div', 'card' + (reason ? ' card-disabled' : '') + (state.selectedId === textOf(record.id) ? ' is-selected' : ''));
     card.setAttribute('data-id', textOf(record.id));
-    card.title = reason || textOf(record.mainFile) || '单击插入到当前模型（可 Ctrl+Z 撤销）';
+    /* 提示语按动作分：模型 = 单击插入；材质/贴图 = 双击建材质（不贴面） */
+    var hint = isMaterialRecord(record)
+      ? '双击：在当前模型里创建材质并设为当前材质（不会自动贴到任何面上）'
+      : '单击插入到当前模型（可 Ctrl+Z 撤销）';
+    card.title = reason ? (reason + '\n' + hint) : hint;
 
     var frame = make('div', 'card-cover-frame');
     var placeholder = make('div', 'card-ph');
@@ -769,6 +1131,9 @@
         /* 加载失败 → 隐藏破图、显示同卡内预置的 SVG 占位层 */
         img.className = 'card-cover is-hidden';
         placeholder.className = 'card-ph is-on';
+        /* 并且**说出来**：把「file:/// 被 SU 内嵌 CEF 拦截」和「文件不存在」当场分流
+           （两者在画面上都是同一片图标，只有 src 能区分）。合并上报，见 noteThumbFailure。 */
+        noteThumbFailure(src);
       });
       frame.appendChild(img);
     } else {
@@ -776,7 +1141,7 @@
     }
 
     frame.appendChild(placeholder);
-    frame.appendChild(make('span', 'badge', state.kindLabels[kind] || kind));
+    frame.appendChild(make('span', 'badge', kindLabelOf(kind)));
     card.appendChild(frame);
 
     var body = make('div', 'card-body');
@@ -793,18 +1158,30 @@
     return card;
   }
 
+  /* 记录 → 所属展示分组（跳过聚合项「全部」，否则每条都归 ''，模型/材质计数恒 0）。
+     注意 matches() 里 activeKind === '' 表示「不筛选」，走不到这里，语义不受影响。 */
   function groupOf(record) {
     var kind = textOf(record.kind);
     for (var i = 0; i < KIND_GROUPS.length; i += 1) {
+      if (KIND_GROUPS[i].all) { continue; }
       if (KIND_GROUPS[i].kinds.indexOf(kind) >= 0) { return KIND_GROUPS[i].key; }
     }
     return 'other';
   }
 
-  /* 纯前端内存过滤：搜索 + 左栏分组 + 一级分类（不请求任何数据） */
+  /* 纯前端内存过滤：搜索 + 左栏分组 + 一级分类（不请求任何数据）
+     第一道就是**显示范围白名单**：HDR/CAD/其他 在这里被挡掉，后续计数与卡片都不会看到它们。 */
   function matches(record) {
+    if (!isAllowedKind(record.kind)) { return false; }
     if (state.activeKind && groupOf(record) !== state.activeKind) { return false; }
-    if (state.activeCategory1 && textOf(record.category1) !== state.activeCategory1) { return false; }
+    if (state.activeCategory1) {
+      var category1 = textOf(record.category1).trim();
+      if (state.activeCategory1 === UNCLASSIFIED_LABEL) {
+        if (category1) { return false; }          /* 未分类节点 = category1 为空 */
+      } else if (category1 !== state.activeCategory1) {
+        return false;
+      }
+    }
     var query = state.query.trim().toLowerCase();
     if (!query) { return true; }
     var fields = [textOf(record.name), textOf(record.category1), textOf(record.category2)];
@@ -815,9 +1192,8 @@
   }
 
   function visibleRecords() {
-    var data = state.data;
-    if (!data || !data.ok) { return []; }
-    var records = data.records || [];
+    if (!state.data || !state.data.ok) { return []; }
+    var records = scopedRecords();
     var shown = [];
     for (var i = 0; i < records.length; i += 1) {
       if (matches(records[i])) { shown.push(records[i]); }
@@ -851,13 +1227,30 @@
       return;
     }
 
-    var records = data.records || [];
+    /* ①② 都以**白名单过滤后**的记录为准：HDR / CAD / DALL·E 之类不在 ALLOWED_KINDS 里的大类、
+       以及主文件不是 SketchUp 格式的模型（.max 之类），既不参与「共 N 项」，
+       也不触发「库为空」的误导文案。 */
+    var records = scopedRecords();
     if (records.length === 0) {
-      /* ① 库为空 */
+      var all = (state.data && state.data.records) ? state.data.records.length : 0;
+      var otherModels = unsupportedModelCount();
       empty.className = 'empty';
       empty.appendChild(iconEl('i-empty-library', 'icon-40'));
-      empty.appendChild(make('div', 'empty-lead', '库为空'));
-      empty.appendChild(make('div', 'empty-text', '请在 ID BOX 里导入素材并开启插件索引，\n然后回到这里点「刷新」。'));
+      if (otherModels > 0) {
+        /* ①c 库里有模型，但都不是 SketchUp 能打开的格式（例如只有 3ds Max 文件）：
+           必须和「库为空」区分开 —— 否则用户会以为自己没导入成功。
+           ⚠️ 文案里不写具体扩展名（避免用黑名单措辞引导后来者改判据），只说"其它格式"。 */
+        empty.appendChild(make('div', 'empty-lead', '没有可插入的 SketchUp 模型'));
+        empty.appendChild(make('div', 'empty-text', '这些模型不是 SketchUp 格式（例如 3ds Max），插件里不显示。\n请在 ID BOX 里换成 SketchUp 模型，或先另存 / 转换一份。'));
+      } else if (all > 0) {
+        /* ①b 库里有资产，但本版不显示这些大类 */
+        empty.appendChild(make('div', 'empty-lead', '本版只显示模型与材质'));
+        empty.appendChild(make('div', 'empty-text', '库里暂时没有模型或材质资产。\nHDR / CAD / D5A 本版不显示。'));
+      } else {
+        /* ①a 库为空 */
+        empty.appendChild(make('div', 'empty-lead', '库为空'));
+        empty.appendChild(make('div', 'empty-text', '请在 ID BOX 里导入素材并开启插件索引，\n然后回到这里点「刷新」。'));
+      }
       return;
     }
     if (shown === 0) {
@@ -874,6 +1267,10 @@
     var list = $('list');
     list.textContent = '';
     list.className = 'grid' + (state.viewMode === 'list' ? ' view-list' : '');
+
+    /* 每轮重绘重置失败计数：上一次渲染的失败不能被算进这一轮（否则张数会虚高） */
+    state.thumbFail = 0;
+    state.thumbFailFirst = '';
 
     var data = state.data;
     if (!data) { renderEmpty(0); return; }
@@ -892,7 +1289,8 @@
     if (!node) { return; }
     var data = state.data;
     if (!data || !data.ok) { node.textContent = '—'; return; }
-    var records = data.records || [];
+    /* 口径 = 白名单过滤后的记录数（用户看到的「共 N 项」就是他能翻到的条数） */
+    var records = scopedRecords();
     var shown = visibleRecords().length;
     node.textContent = (shown === records.length)
       ? ('共 ' + records.length + ' 项')
@@ -901,10 +1299,10 @@
 
   /* ── ② 左栏 + ③ chips ─────────────────────────────────────────────── */
   function groupCounts() {
-    var data = state.data;
     var counts = {};
-    if (!data || !data.ok) { return counts; }
-    var records = data.records || [];
+    var records = scopedRecords();
+    /* 聚合项「全部」的计数 = 作用域内总数（它不对应具体 kind，不能靠 groupOf 统计） */
+    counts[''] = records.length;
     for (var i = 0; i < records.length; i += 1) {
       var key = groupOf(records[i]);
       counts[key] = (counts[key] || 0) + 1;
@@ -912,22 +1310,59 @@
     return counts;
   }
 
-  function topCategories() {
-    var data = state.data;
-    if (!data || !data.ok) { return []; }
-    var records = data.records || [];
+  /* 一级分类（2026-11-09 用户实测反馈后的口径，对齐 ID BOX 本体 Sidebar.tsx:407-429）：
+       · **只在选中某个大类之后才出现**（本体：`l1Nodes = openKind ? countLevel1(...) : []`）；
+         「全部」是"大类的上一层"，此时**一行一级分类都不渲染**；
+       · 计数范围 = **该大类自己的记录**（本体 countLevel1(activeAssets, openScope)），
+         绝不跨类合并 —— 之前这里用全量 scopedRecords 统计，导致「全部」下把模型的
+         灯具/软装陈设/家具 和材质的 木纹/涂料/瓷砖 混成一张表（用户原话：「一级分类可是
+         模型和材质混杂在一起的哟」）；
+       · 材质分组 = texture + material，由 groupOf 把两类都归到 'material' 天然合并计数。
+     返回 [{ name, count }]，count 降序、「未分类」恒最后。
+
+     ⚠️ **本面板只做到一级分类，这是有意的取舍、不是漏做**（2026-11-09 team-lead 拍板）：
+        面板是"浏览 + 插入"的高频窄场景，960px 窗口里左栏只有 216px，再挂本体那样的
+        二级树（以及材质组的「贴图/材质」单类 chip）会把侧栏挤爆、把用户要看的卡片压没。
+        用户说的「和本体一样」= **一级的展开逻辑一致**（全部不显示 / 点大类才展开 / 计数按
+        该大类范围 / 材质两类合并）。二级留到确有需要时单独立卡，届时要同时补上
+        activeCategory2 的筛选维度与空态文案，不要只加 DOM。
+
+     「未分类」节点**保留且可点**（2026-11-09 team-lead 拍板）：本体也是这样，
+       点它筛出 category1 为空的那批（`matches()` 里对 UNCLASSIFIED_LABEL 走特判）。 */
+  function groupRecords(key) {
+    var records = scopedRecords();
+    var groupKey = textOf(key);
+    if (!groupKey) { return []; }
+    var out = [];
+    for (var i = 0; i < records.length; i += 1) {
+      if (groupOf(records[i]) === groupKey) { out.push(records[i]); }
+    }
+    return out;
+  }
+
+  function topCategories(kindKey) {
+    /* kindKey 省略 ⇒ 用当前选中的大类；显式传 '' ⇒ 明确要「全部」作用域（= 空列表） */
+    var key = (kindKey === undefined) ? state.activeKind : textOf(kindKey);
+    if (!key) { return []; }
+
+    var records = groupRecords(key);
     var counts = {};
     for (var i = 0; i < records.length; i += 1) {
-      var first = textOf(records[i].category1);
-      if (!first) { continue; }
-      counts[first] = (counts[first] || 0) + 1;
+      var first = textOf(records[i].category1).trim();
+      var name = first || UNCLASSIFIED_LABEL;
+      counts[name] = (counts[name] || 0) + 1;
     }
     var list = [];
-    for (var name in counts) {
-      if (Object.prototype.hasOwnProperty.call(counts, name)) { list.push({ name: name, count: counts[name] }); }
+    for (var label in counts) {
+      if (Object.prototype.hasOwnProperty.call(counts, label)) { list.push({ name: label, count: counts[label] }); }
     }
-    list.sort(function (a, b) { return b.count - a.count; });
-    return list.slice(0, 8);
+    list.sort(function (a, b) {
+      if (a.name === UNCLASSIFIED_LABEL) { return 1; }
+      if (b.name === UNCLASSIFIED_LABEL) { return -1; }
+      if (b.count !== a.count) { return b.count - a.count; }
+      return a.name.localeCompare(b.name);
+    });
+    return list;
   }
 
   function renderSide() {
@@ -938,10 +1373,11 @@
 
     var counts = groupCounts();
     var data = state.data;
-    var total = (data && data.ok) ? ((data.records || []).length) : 0;
 
-    for (var i = 0; i < KIND_GROUPS.length; i += 1) {
-      var group = KIND_GROUPS[i];
+    /* 只渲染白名单覆盖到的分组 ⇒ HDR / CAD / 其他 三个 nav 项**完全不出现**（不是置灰） */
+    var groups = allowedGroups();
+    for (var i = 0; i < groups.length; i += 1) {
+      var group = groups[i];
       var item = make('div', 'nav-item' + (state.activeKind === group.key ? ' is-active' : ''));
       item.setAttribute('data-kind', group.key);
       item.appendChild(iconEl(group.icon, 'icon-nav'));
@@ -951,6 +1387,10 @@
     }
 
     var categories = topCategories();
+    /* 「一级分类」这个分组标题也只在有内容时出现 —— 选「全部」时它不该占一行空白 */
+    var head = document.querySelector('[data-role="l1-head"]');
+    if (head) { head.hidden = categories.length === 0; }
+    tree.hidden = categories.length === 0;
     for (var j = 0; j < categories.length; j += 1) {
       var row = make('div', 'tree-item' + (state.activeCategory1 === categories[j].name ? ' is-active' : ''));
       row.setAttribute('data-category', categories[j].name);
@@ -964,7 +1404,23 @@
     libPath.textContent = (data && textOf(data.libraryRoot)) || '（库路径未知）';
     libPath.title = libPath.textContent;
     var version = $('side-version');
-    version.textContent = (data && data.pluginVersion ? 'v' + data.pluginVersion : '—') + ' · 本地库';
+    var info = versionInfo(data);
+    version.textContent = (info.primary ? 'v' + info.primary : '—') + ' · 本地库';
+    version.title = info.title;
+  }
+
+  /* 版本号口径（用户 2026-11-09：插件版本号必须与 ID BOX 本体一致）：
+     **显示 appVersion**（payload.appVersion ← manifest.appVersion ← 主进程 app.getVersion()
+     ← package.json.version）—— 同一来源、运行期自动同步，插件侧不写死第二份。
+     pluginVersion 只在 appVersion 缺失时兜底（老索引 / 手写 manifest）。 */
+  function versionInfo(data) {
+    var app = textOf(data && data.appVersion).trim();
+    var plugin = textOf(data && data.pluginVersion).trim();
+    var primary = app || plugin;
+    var title = [];
+    if (app) { title.push('ID BOX 本体 v' + app); }
+    if (plugin) { title.push('插件包 v' + plugin); }
+    return { primary: primary, title: title.join(' · ') };
   }
 
   function renderChips() {
@@ -1029,9 +1485,73 @@
     window.sketchup.refreshIndex();
   }
 
+  /* 双击材质：请 Ruby 建材质并设为当前材质（**不贴面**，docs/48 §6）。
+     真正的结果由 Ruby 通过 window.IDBOX.setStatus 回填（成功 / 半成功 / 失败都有文案）。 */
+  function applyMaterial(id) {
+    if (!hasSketchupCallback('applyMaterial')) {
+      setStatus({ message: '面板未连接到 SketchUp（回调不可用），请重开面板。', level: 'error' });
+      return;
+    }
+    setStatus({ message: '正在创建材质…', level: 'info' });
+    window.sketchup.applyMaterial(id);
+  }
+
+  /* ── 自绘窗口控件：折叠 / 关闭（docs/48 §6，只有两个按钮）──────────────
+     折叠 = 页面切到 .is-collapsed（只留窄栏）+ 请 Ruby 把窗口 set_size 到 60px。
+     顺序很重要：先切样式再改窗口尺寸，收缩过程中不会出现「内容被压扁」的一帧；
+     展开相反：先改窗口尺寸再切样式，避免「窗口还没变大就把内容画出来」。 */
+  function applyCollapsedClass(collapsed) {
+    var cls = 'is-collapsed';
+    var nodes = [document.documentElement, document.body];
+    for (var i = 0; i < nodes.length; i += 1) {
+      if (collapsed) { nodes[i].classList.add(cls); } else { nodes[i].classList.remove(cls); }
+    }
+    var btn = $('win-fold');
+    var use = btn.querySelector('use');
+    if (use) { use.setAttribute('href', collapsed ? '#i-expand' : '#i-collapse'); }
+    btn.title = collapsed ? '展开面板（恢复完整界面）' : '折叠为窄条（省屏幕空间）';
+    btn.setAttribute('aria-label', collapsed ? '展开面板' : '折叠面板');
+  }
+
+  function setCollapsed(collapsed) {
+    var next = collapsed ? true : false;
+    if (next === state.collapsed) { return; }
+    state.collapsed = next;
+    if (next) {
+      applyCollapsedClass(true);
+      requestPanelSize(true);
+    } else {
+      requestPanelSize(false);
+      applyCollapsedClass(false);
+    }
+  }
+
+  function requestPanelSize(collapsed) {
+    if (!hasSketchupCallback('setPanelSize')) {
+      /* Ruby 没接线时不能静默：页面已折叠但窗口没缩，用户会以为按钮坏了 */
+      setStatus({ message: '窗口尺寸回调不可用，折叠只改了页面布局（未改窗口大小）。', level: 'warn' });
+      return;
+    }
+    window.sketchup.setPanelSize(collapsed ? true : false);
+  }
+
+  /* JS → Ruby 的关闭桥。
+     ⚠️ 自绘「关闭」按钮已按用户拍板（2026-11-09 B′）删除，本函数**故意保留**：
+       · Ruby 侧 `closePanel` 回调（panel_dialog.rb 的 bind_window_callbacks）仍在，
+         菜单 / 工具栏关闭走的是同一条 Ruby 路径，删这个桥会让将来任何页面侧入口断掉；
+       · 现在页面里没有调用点（唯一的调用者就是被删的那个按钮），属**有意保留的接口**。 */
+  function closePanel() {
+    if (!hasSketchupCallback('closePanel')) {
+      setStatus({ message: '面板未连接到 SketchUp（回调不可用），请重开面板。', level: 'error' });
+      return;
+    }
+    window.sketchup.closePanel();
+  }
+
   function applyQuery(value) {
     state.query = textOf(value);
     $('clear').className = state.query ? 'clear' : 'clear hidden';
+    dismissUndoPill();     /* 搜索属于「用户在浏览」⇒ 不用等 5 s 自然收 */
     renderList();
     renderCount();
   }
@@ -1039,6 +1559,7 @@
   /* ⑤ 选中：与插入是同一次 click（单值 state.selectedId） */
   function selectCard(id) {
     state.selectedId = textOf(id);
+    dismissUndoPill();     /* 选中新卡＝新的操作意图，旧的成功提示立刻让位 */
     var list = $('list');
     var cards = list.querySelectorAll('.card');
     for (var i = 0; i < cards.length; i += 1) {
@@ -1049,11 +1570,17 @@
   /* ── 对 Ruby 暴露的入口 ──────────────────────────────────────────── */
   function render(data) {
     state.data = data || null;
+    /* 每次整份数据重绘（首开 ready / 手动刷新 / 轮询发现索引变化）都收起胶囊：
+       旧的成功提示不该跨一次「重新读索引」继续显示。 */
+    dismissUndoPill();
     state.kindLabels = (data && data.kindLabels) ? data.kindLabels : {};
     state.insertableKinds = (data && data.insertableKinds) ? data.insertableKinds : ['model'];
+    state.materialKinds = (data && data.materialKinds) ? data.materialKinds : MATERIAL_KINDS;
     state.unsupportedHint = (data && data.unsupportedInsertHint) ? data.unsupportedInsertHint : '';
     state.thumbsRoot = (data && data.thumbsRoot) ? String(data.thumbsRoot) : '';
-    $('ver').textContent = (data && data.pluginVersion) ? ('v' + data.pluginVersion) : '';
+    var info = versionInfo(data);
+    $('ver').textContent = info.primary ? ('v' + info.primary) : '';
+    $('ver').title = info.title;
     renderBanner(data || { ok: false, message: '没有数据' });
     renderNotes(data);
     renderFreshness();
@@ -1068,6 +1595,51 @@
     setStatus: setStatus
   };
 
+  /* ── 预览密度（大 / 中 / 小）────────────────────────────────────────────
+     三档 = 网格 2 / 3 / 4 列（CSS：body.density-* 上的 --grid-cols）。
+     持久化**只**用 localStorage（面板里唯一允许的持久化，绝不写盘文件）；
+     file:// 或隐私模式下 localStorage 可能直接抛异常 ⇒ 全部 try/catch，
+     读不到就退回默认「中」，存不了只影响下次启动。 */
+  var DENSITY_KEY = 'idbox.panel.density';
+  var DENSITY_VALUES = ['lg', 'md', 'sm'];
+
+  function normalizeDensity(value) {
+    return DENSITY_VALUES.indexOf(textOf(value)) >= 0 ? textOf(value) : 'md';
+  }
+
+  function readDensity() {
+    try {
+      return normalizeDensity(window.localStorage.getItem(DENSITY_KEY));
+    } catch (error) {
+      return 'md';
+    }
+  }
+
+  /* 只动 body 的 class 与三个按钮的状态，不重绘网格（列数由 CSS 变量驱动） */
+  function applyDensity(value) {
+    var next = normalizeDensity(value);
+    state.density = next;
+    var body = document.body;
+    body.classList.remove('density-lg', 'density-md', 'density-sm');
+    body.classList.add('density-' + next);
+    var buttons = document.querySelectorAll('.density-btn');
+    for (var i = 0; i < buttons.length; i += 1) {
+      var on = buttons[i].getAttribute('data-density') === next;
+      buttons[i].className = 'density-btn' + (on ? ' is-active' : '');
+      buttons[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+    return next;
+  }
+
+  function setDensity(value) {
+    var next = applyDensity(value);
+    try {
+      window.localStorage.setItem(DENSITY_KEY, next);
+    } catch (error) {
+      /* 存不了不影响本次会话 */
+    }
+  }
+
   /* ── 事件绑定（事件委托）──────────────────────────────────────────── */
   $('q').addEventListener('input', function (event) {
     applyQuery(event.target.value);
@@ -1080,19 +1652,64 @@
   $('refresh').addEventListener('click', function () { refreshIndex(); });
   $('banner').addEventListener('click', function () { refreshIndex(); });   /* P1-2：可点击提示条 */
 
-  $('list').addEventListener('click', function (event) {
+  /* 自绘窗口控件：只剩「折叠」（2026-11-09 B′：关闭交给系统 × / 菜单，不再有自绘关闭按钮） */
+  $('win-fold').addEventListener('click', function () { setCollapsed(!state.collapsed); });
+
+  /* 预览密度：大 / 中 / 小（分段控件，toggle 语义 = 点已选中的那档不取消，只是保持） */
+  var densityRoot = document.querySelector('[data-role="density"]');
+  if (densityRoot) {
+    densityRoot.addEventListener('click', function (event) {
+      var btn = closestWithAttr(event.target, 'data-density');
+      if (!btn) { return; }
+      var next = btn.getAttribute('data-density');
+      if (next === state.density) { return; }
+      setDensity(next);
+    });
+  }
+
+  /* 从点击事件里找回卡片节点（单击 / 双击共用） */
+  function cardFrom(event) {
     var card = event.target;
-    while (card && card !== $('list') && !(card.className && card.className.indexOf('card') >= 0 && card.getAttribute('data-id'))) {
+    var list = $('list');
+    while (card && card !== list && !(card.className && card.className.indexOf('card') >= 0 && card.getAttribute('data-id'))) {
       card = card.parentNode;
     }
-    if (!card || !card.getAttribute('data-id')) { return; }
+    if (!card || card === list || !card.getAttribute('data-id')) { return null; }
+    return card;
+  }
+
+  $('list').addEventListener('click', function (event) {
+    var card = cardFrom(event);
+    if (!card) { return; }
     var id = card.getAttribute('data-id');
     selectCard(id);
     var record = findRecord(id);
     if (!record) { return; }
+    /* 材质/贴图：单击只做选中 + 提示（真正的动作在双击，见下面 dblclick） */
+    if (isMaterialRecord(record)) {
+      setStatus({
+        message: '双击这张' + kindLabelOf(record.kind) + '：在当前模型里创建材质并设为当前材质（不会自动贴到面上）',
+        level: 'info'
+      });
+      return;
+    }
     var reason = blockReason(record);
     if (reason) { setStatus({ message: reason, level: 'warn' }); return; }
     insertRecord(id);
+  });
+
+  /* 双击材质 → 建材质（docs/48 §6）。模型保持「单击即插入」不变（A14 不变量）。 */
+  $('list').addEventListener('dblclick', function (event) {
+    var card = cardFrom(event);
+    if (!card) { return; }
+    var record = findRecord(card.getAttribute('data-id'));
+    if (!record || !isMaterialRecord(record)) { return; }
+    var data = state.data || {};
+    if (data.readOnly) {
+      setStatus({ message: 'ID BOX 与插件版本不匹配，建材质已禁用；请把主程序与插件升级到同一版本', level: 'warn' });
+      return;
+    }
+    applyMaterial(textOf(record.id));
   });
 
   function findRecord(id) {
@@ -1105,11 +1722,28 @@
     return null;
   }
 
+  /* 从事件目标往上找「带某个属性的元素」。
+     ⚠️ 不能用 `!el.getAttribute(x)` 判存在：`data-kind=""`（「全部」那一项）是**空字符串、
+     但属性存在**，旧写法会一直往上爬到 null，于是「全部」点了没反应。 */
+  function closestWithAttr(node, attr) {
+    var el = node;
+    while (el && el.getAttribute) {
+      if (el.hasAttribute(attr)) { return el; }
+      el = el.parentNode;
+    }
+    return null;
+  }
+
+  /* 左栏大类：点一次展开（显示它自己的一级分类），再点同一个 → 收起回「全部」。
+     展开态（= 一级分类树）与本体同构：`activeKind` 非空才有一级分类。 */
   $('side-nav').addEventListener('click', function (event) {
-    var item = event.target;
-    while (item && !item.getAttribute('data-kind')) { item = item.parentNode; }
+    var item = closestWithAttr(event.target, 'data-kind');
     if (!item) { return; }
-    state.activeKind = item.getAttribute('data-kind') || '';
+    var key = item.getAttribute('data-kind') || '';
+    /* 再点当前大类 ⇒ 收起（回到「全部」）；切到别的大类 ⇒ 旧的一级分类必须清掉，
+       否则会出现「材质分组 + 灯具」这种空列表（跨类的 category1 不成立）。 */
+    state.activeKind = (key !== '' && key === state.activeKind) ? '' : key;
+    state.activeCategory1 = '';
     renderSide();
     renderChips();
     renderList();
@@ -1117,10 +1751,11 @@
   });
 
   $('side-tree').addEventListener('click', function (event) {
-    var item = event.target;
-    while (item && !item.getAttribute('data-category')) { item = item.parentNode; }
+    var item = closestWithAttr(event.target, 'data-category');
     if (!item) { return; }
-    state.activeCategory1 = item.getAttribute('data-category') || '';
+    var name = item.getAttribute('data-category') || '';
+    /* 再点同一个一级分类 ⇒ 取消该分类（留在当前大类里） */
+    state.activeCategory1 = (name === state.activeCategory1) ? '' : name;
     renderSide();
     renderChips();
     renderList();
@@ -1139,8 +1774,11 @@
       state.sortKey = 'default';
     } else if (which === 'type') {
       var keys = [];
-      for (var i = 0; i < KIND_GROUPS.length; i += 1) { keys.push(KIND_GROUPS[i].key); }
+      var groups = allowedGroups();
+      for (var i = 0; i < groups.length; i += 1) { keys.push(groups[i].key); }
       state.activeKind = nextIn(keys, state.activeKind);
+      /* 换大类 ⇒ 旧的一级分类不再属于当前范围（否则会筛出一个空列表） */
+      state.activeCategory1 = '';
     } else if (which === 'category') {
       var names = [''];
       var categories = topCategories();
@@ -1173,10 +1811,16 @@
     renderList();
   });
 
-  /* ESC：无既有 *_close 实现可继承；本卡新增「取消 chips 筛选」语义 */
+  /* ESC：折叠态下先展开（用户下意识按 Esc 想退出窄条）；
+     否则沿用「取消 chips 筛选」语义。 */
   document.addEventListener('keydown', function (event) {
     var key = textOf(event && event.key);
     if (key !== 'Escape' && key !== 'Esc') { return; }
+    if (state.collapsed) {
+      setCollapsed(false);
+      setStatus({ message: '已展开面板（Esc）', level: 'info' });
+      return;
+    }
     if (!state.activeKind && !state.activeCategory1 && state.sortKey === 'default') { return; }
     state.activeKind = '';
     state.activeCategory1 = '';
@@ -1191,9 +1835,16 @@
   /* 新鲜度每 5 s 自刷新一次显示（纯本地计算，不请求任何数据） */
   setInterval(renderFreshness, 5000);
 
+  /* 预览密度初值：先按记忆值把 body class 与按钮态摆好，再渲染列表
+     （列数由 CSS 变量决定，首帧就是用户上次选的那档，不会先闪一下 3 列） */
+  applyDensity(readDensity());
+
   renderChips();
   renderSide();
   renderList();
+
+  /* 折叠态图标初值（展开态 = 折叠图标 + 对应的 title / aria-label） */
+  applyCollapsedClass(false);
 
   /* 面板就绪：请 Ruby 推第一份数据 */
   if (hasSketchupCallback('ready')) {

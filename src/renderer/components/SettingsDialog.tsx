@@ -43,7 +43,7 @@ import {
 import { Modal } from './Modal'
 import { useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
-import { IconCheck, IconDownload, IconRefresh } from '../icons'
+import { IconCheck, IconClose, IconDownload, IconRefresh } from '../icons'
 import { isUnclassified } from '../logic/triageFlow'
 // 品牌资源（2026-10 用户要求「图标 logo 换一下」「关于页做上打赏和反馈」）：
 // 三张图都由 `scripts/build-app-icon.cjs` 从 `resources/brand/` 的原图生成，
@@ -627,7 +627,7 @@ function AliasRow({
     <div className="flex items-center gap-2 border-b border-line/60 px-2 py-1.5 last:border-0">
       <code
         className="min-w-0 flex-1 truncate rounded bg-canvas px-1.5 py-0.5 text-[11px] text-secondary"
-        title={`原名：${record.key}\n归一化 key：${normalizedKey}`}
+        title={`原名：${record.key}\n匹配用：${normalizedKey}`}
       >
         {normalizedKey}
       </code>
@@ -818,7 +818,7 @@ function AliasTab() {
         title="别名映射表"
         note={
           <>
-            左边是归一化后的原名（大小写 / 空格 / 下划线 / 「4K」尾巴 / 知末 ID 都会被抹平），
+            左列是原文件名（大小写 / 空格 / 下划线 / 「4K」尾巴 / 知末 ID 都会被忽略），
             一条词典对所有同名资产生效；右侧「显示名」失焦即保存。共 {aliases.length} /{' '}
             {MAX_ALIASES} 条。别名只参与「自动分类」匹配，不进落盘路径。
           </>
@@ -832,7 +832,7 @@ function AliasTab() {
         {/* ── 表格：原名 → 显示名（逐行可编辑 / 可删） ───────────────── */}
         <div className="mb-3 overflow-hidden rounded-btn border border-line">
         <div className="flex items-center gap-2 border-b border-line bg-canvas/60 px-2 py-1.5 text-[10px] text-muted">
-          <span className="min-w-0 flex-1">原名（归一化后的 key）</span>
+          <span className="min-w-0 flex-1">原名（忽略大小写和符号差异）</span>
           <span className="w-4 shrink-0" />
           <span className="w-40 shrink-0">显示名</span>
           <span className="w-6 shrink-0" />
@@ -901,16 +901,16 @@ function AliasTab() {
           className="btn !py-1 text-xs"
           disabled={aliases.length === 0}
           onClick={exportJson}
-          title="导出当前别名表为 [{key,name}] JSON（可换机导入）"
+          title="导出别名表，可在另一台机器导入"
         >
-          导出 JSON
+          导出别名表
         </button>
         <button
           className="btn !py-1 text-xs"
           onClick={() => fileRef.current?.click()}
-          title="导入 [{key,name}] JSON；非法行会被跳过"
+          title="导入别名表；格式不对的行会跳过"
         >
-          导入 JSON
+          导入别名表
         </button>
         <input
           ref={fileRef}
@@ -1016,6 +1016,20 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
    * 单测能直接证明「folder 旧根 + libraryDir 新根 → 提示出现」。
    */
   const driftWarning = libraryDriftWarning(libraryDrift)
+  /**
+   * D-2 首启引导是否显示（V1.0，docs/46 §1.7，用户 2026-11-08 回签「设置页内嵌一次性提示带」）。
+   *
+   * 两个条件**必须同时成立**：还没露过脸（`pluginIndexGuideShown !== true`）**且**写盘开关
+   * 还没开（`pluginIndexEnabled !== true`）。用 `!== true` 而不是 `=== false`：这两个字段
+   * 在老档 / 脏值里可能是 `undefined`，而「没读到」和「没看过」在引导语义上是同一件事 ——
+   * 写成 `=== false` 会让老用户（键缺失）永远看不到这条引导。
+   *
+   * 为什么要有这条引导（用户会撞上的真空白）：插件面板的数据来自主程序导出到
+   * `%APPDATA%\idbox\plugin\` 的两个 JSON，写盘开关默认关闭，而界面上原先没有任何地方
+   * 解释这件事 —— 用户第一次打开插件看到空列表，只会以为插件坏了。
+   */
+  const showPluginIndexGuide =
+    settings?.pluginIndexGuideShown !== true && settings?.pluginIndexEnabled !== true
   const [tab, setTab] = useState<SettingsTab>('appearance')
   const [version, setVersion] = useState('')
   // 自动检查更新（关于页）：结论 + 进行中标志都来自 logic/updateState.ts 的模块级 store。
@@ -1465,7 +1479,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     try {
       const r = await window.modvault.exportPluginRbz().catch(() => null)
       if (!r) {
-        setRbzExport({ kind: 'error', message: '导出失败（主进程无响应）' })
+        setRbzExport({ kind: 'error', message: '导出失败（程序没有响应，请重试）' })
         return
       }
       // 用户取消：不提示、不置红（他不是做错事，只是改了主意）
@@ -1489,7 +1503,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     try {
       const r = await window.modvault.exportLogs().catch(() => null)
       if (!r) {
-        useVault.setState({ notice: '日志导出失败（主进程无响应）' })
+        useVault.setState({ notice: '日志导出失败（程序没有响应，请重试）' })
         return
       }
       if (r.canceled) return
@@ -1748,6 +1762,25 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               checked={settings.showDuplicates !== false}
               onChange={(v) => {
                 void saveSettings({ showDuplicates: v })
+                flash()
+              }}
+            />
+          }
+        />
+      </SettingsCard>
+
+      <SettingsCard
+        title="首页"
+        note="首页封面页（侧栏第一项「首页」）的显示项。关闭后该块不占位。"
+      >
+        <SettingsRow
+          title="数据卡片"
+          desc="首页右上角显示「本月入库 / 库总量 / 待补分类」三个数字"
+          actions={
+            <Toggle
+              checked={settings.showHomeStats !== false}
+              onChange={(v) => {
+                void saveSettings({ showHomeStats: v })
                 flash()
               }}
             />
@@ -2177,7 +2210,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                       ? '另一条分类通道正在跑，请稍候'
                       : zhimoCandidateCount === 0
                         ? '当前没有「未分类」且带知末 ID 的资产'
-                        : '按知末站方分类重排；会真实移动目录，移动前自动备份，可撤销（备份前缀 zhimo-reclass-）'
+                        : '按知末站方分类重排；会真实移动目录，移动前会自动备份，可撤销'
                 }
               >
                 <IconRefresh />
@@ -2197,7 +2230,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 title={
                   zhimoReclassBackupCount === 0
                     ? '还没有知末重排备份：每次重排移动前会自动备份一份'
-                    : '把上次「按站方分类重排」移动过的资产按原分类搬回去（备份前缀 zhimo-reclass-，与「重跑自动分类」的 reclass- 互不干扰）'
+                    : '把上次重排移动过的资产按原分类搬回去（与「重跑自动分类」的备份互不影响）'
                 }
               >
                 <IconRefresh />
@@ -2690,18 +2723,75 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         />
         <SettingsRow
           title="导出索引快照"
-          desc="分类 / 标签 / 备注导出为 JSON，不含素材本体"
+          // A 级文案收口：原「分类 / 标签 / 备注导出为 JSON」把内部格式名印在界面上，
+          // 改成用户能听懂的「一份表格文件」（导出物没变，只是不再点名格式）。
+          desc="分类 / 标签 / 备注导出成一份表格文件，不含素材本体"
           actions={
             <button className="btn !py-1 text-xs" onClick={() => void exportIndex()}>
               导出…
             </button>
           }
         />
+        {/* ── D-2 首启引导（V1.0，docs/46 §1.7）────────────────────────────────
+            位置：**写盘开关正上方**。放在卡底 note 或页面顶端都更远 —— 用户是看到
+            「插件面板」这一行才想起来"为什么插件是空的"，提示必须在同一屏、同一段视线里。
+
+            三个硬约束（改之前必读）：
+            ① **不新增卡片样式**：复用 `SettingsCard` 里的行节奏 + 既有 `notice` 那种
+               `rounded-lg border + bg-canvas` 的浅条语言，只多一个右上角关闭按钮；
+            ② **绝不替用户勾选**：本提示带的任何交互都不写 `pluginIndexEnabled`
+               （只有下面的 CheckRow 会写，且是用户自己点）；
+            ③ 点关闭 / 用户自己勾开写盘，两者都只把 `pluginIndexGuideShown` 置 true —— 
+               「看过了」与「已经开了」是两个事实，不互相反写。
+
+            深浅两主题都走 token（`bg-canvas` / `border-line` / `text-secondary`），
+            **不用 `dark:` 变体**（本项目主题是 `[data-theme]` 属性切换，`dark:` 会跟系统）。 */}
+        {showPluginIndexGuide && (
+          <div className="mt-2 rounded-lg border border-line bg-canvas px-3 py-2.5 text-[11px] leading-relaxed text-secondary">
+            <div className="flex items-start gap-2">
+              <div className="min-w-0 flex-1">
+                <div className="text-[12px] font-medium text-primary">插件面板是空的？</div>
+                <div className="mt-1">
+                  {/* A 级文案收口（用户可见文本不出现字段名与文件名）：正文只说
+                      「电脑上的 idbox\plugin 文件夹」，**完整路径保留在 title 里** ——
+                      想去找文件的人悬停即可看到并抄走，不必把 `%APPDATA%\...` 这种写法
+                      印在所有人脸上。（docs/48 裁定：主程序界面不出现文件名与字段名。）
+                      排版注意：换行处不加 `{' '}` —— JSX 会吃掉含换行的空白，中文正文
+                      不需要空格；只有刻意要英文间距的地方才写显式空格。 */}
+                  插件读的是 ID BOX 导出的一份素材清单，只在确有变化时刷新；文件就放在
+                  <span
+                    className="text-secondary"
+                    title="完整路径：%APPDATA%\idbox\plugin\"
+                  >
+                    电脑上的 idbox\plugin 文件夹
+                  </span>
+                  里，共两个素材清单文件（只读，不含素材本体）。
+                </div>
+                <div className="mt-1">
+                  写盘开关默认关闭，<span className="font-medium text-secondary">由你主动勾选</span>
+                  才会开始导出（我们不会自动替你开）；未勾开时插件会显示「未开导出」，不是坏了。
+                </div>
+              </div>
+              <button
+                type="button"
+                title="知道了，不再提示"
+                aria-label="知道了，不再提示"
+                className="-mr-1 -mt-1 shrink-0 rounded p-1 text-muted transition hover:bg-elevated/60 hover:text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/20"
+                onClick={() => {
+                  // 只写引导位：不动写盘开关、不触发重扫、不开任何副作用
+                  void saveSettings({ pluginIndexGuideShown: true })
+                }}
+              >
+                <IconClose width={14} height={14} />
+              </button>
+            </div>
+          </div>
+        )}
         {/* SketchUp 插件（docs/38 §8.1 / docs/39 §3）：开关必须能在这里打开——关着时
             主进程不落盘，插件读到的是「未开导出」（IDBOX-101），而不是读到空文件。 */}
         <SettingsRow
           title="SketchUp 插件"
-          desc="为 SketchUp 插件持续导出索引快照（UTF-8 JSON，只读）。"
+          desc="为 SketchUp 插件持续导出索引快照（只读）。"
           notice="关闭时插件会提示「未开导出」；打开后只在确有变化时落盘，最迟 5 秒写一次。落盘位置：用户目录下的 idbox/plugin/。"
           actions={
             <CheckRow
@@ -2709,7 +2799,15 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               align="start"
               title="为 SketchUp 插件导出索引快照"
               onChange={(next) => {
-                void saveSettings({ pluginIndexEnabled: next })
+                // 用户**自己**勾开写盘 ⇒ 这条引导的使命完成，顺手记一笔"已看过"
+                //（否则关掉写盘后提示会再次冒出来，属于噪音）。
+                // ⚠️ 只允许 引导位跟着写盘位走，**绝不反向**：任何地方都不得因为引导位
+                //    变化而写 `pluginIndexEnabled`（"由你主动勾选"是用户拍板的口径）。
+                void saveSettings(
+                  next
+                    ? { pluginIndexEnabled: true, pluginIndexGuideShown: true }
+                    : { pluginIndexEnabled: false }
+                )
                 flash()
               }}
             >
@@ -2762,8 +2860,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           title="一键重扫 · 从知末获取封面"
           desc={
             <>
-              对<span className="text-secondary">没有 cover 文件</span>的模型资产，从知末详情页抓主图存为
-              资产同名 cover 文件 · 当前{' '}
+              对<span className="text-secondary">还没有封面</span>的模型资产，从知末详情页抓主图存为
+              同名封面图 · 当前{' '}
               <b className="font-semibold text-primary">{zhimoBackfillCandidateCount}</b> 个可补
             </>
           }
@@ -2776,7 +2874,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 setZhimoBackfillCancelled(false)
                 void runZhimoCoverBackfill().then((r) => setZhimoBackfillResult(r))
               }}
-              title="只补没有 cover 文件的资产；已有封面（含你手动设置的一律不动，绝不重抓）"
+              title="只补没有封面的资产；已有封面（含你手动设置的）一律不动"
             >
               <IconRefresh />
               {zhimoCoverBackfill.running

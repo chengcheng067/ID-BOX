@@ -82,6 +82,11 @@ module IDBoxPanel
           # 冒烟场景 A 走的是上面的 bring_to_front 分支（桩 visible? 恒 true），判据未变。
           reattach_file
           PanelCallback.bind(@dialog, self)
+          bind_window_callbacks
+          # 折叠态是「窗口变矮」，而面板 HTML 每次 set_file 都会回到展开布局 ⇒
+          # 关窗（折叠中）再打开时窗口可能还停在 60px 高，必须先把尺寸恢复成展开态，
+          # 否则用户看到一个 60px 高的窗口里塞着完整内容（= 坏掉的样子）。
+          reset_expanded_size
           @dialog.show
         end
       rescue StandardError
@@ -163,9 +168,12 @@ module IDBoxPanel
         :height => DIALOG_HEIGHT,
         # min 尺寸只能走构造函数 options（官方支持的唯一写法）。
         # ⚠️ UI::HtmlDialog **没有** set_min_size（docs/39 §4.4：1.0.1 因此白跑两轮）。
-        # 物理上的内容下限同时由 panel.html 的 CSS min-width/min-height 承担（T02）。
+        # :min_width 保持 DIALOG_MIN_WIDTH（宽度不参与折叠）；
+        # :min_height 例外地取**折叠高度**（V1.0，docs/48 §6「折叠」）：
+        #   系统的 min 高度是 set_size 的硬钳制，若维持 520，折叠后窗口缩不下去 ⇒ 白折叠。
+        #   展开态的物理下限由 panel.html 的 CSS（body min-height: 520px）承担。
         :min_width => DIALOG_MIN_WIDTH,
-        :min_height => DIALOG_MIN_HEIGHT,
+        :min_height => DIALOG_COLLAPSED_HEIGHT,
         :style => UI::HtmlDialog::STYLE_DIALOG
       }
       @dialog = UI::HtmlDialog.new(options)
@@ -178,6 +186,9 @@ module IDBoxPanel
       @dialog.set_file(html)
       # 回调注册收口到 PanelCallback（注册 + 可重绑；名字与 panel.html 契约逐字一致，A8）。
       PanelCallback.bind(@dialog, self)
+      # V1.0 新增的两组窗口级回调（关闭 / 折叠 / 双击建材质）与 A8 那三个回调**同源同命**：
+      # 关窗后一样会被清空 ⇒ 必须一起重绑（见上方 show 的 else 分支）。
+      bind_window_callbacks
       @dialog.set_on_closed { stop_polling }
       true
     rescue StandardError => error
@@ -221,7 +232,7 @@ module IDBoxPanel
         return
       end
       if snapshot.read_only?
-        push_status('索引版本与插件不匹配（apiVersion 不是 "1"），插入已禁用。', 'error')
+        push_status('ID BOX 与插件版本不匹配，插入已禁用；请把主程序与插件升级到同一版本。', 'error')
         return
       end
       record = snapshot.find(record_id)
@@ -243,6 +254,100 @@ module IDBoxPanel
       end
     rescue StandardError => error
       push_status(Messages.insert_exception(error.message), 'error')
+    end
+
+    # 双击材质 → 在模型里创建材质并设为当前材质（docs/48 §6 用户逐字口径）。
+    # ⚠️ 绝不自动贴面：贴到哪里由用户决定，见 lib/loader.rb 的 Materializer 头注。
+    # 失败/半成功一律走**底部状态行**（用户要求「要有可见反馈，不要静默」）；
+    # 这里刻意不弹 messagebox —— 双击是高频动作，弹窗会打断手感。
+    def on_apply_material(record_id)
+      snapshot = @snapshot
+      if snapshot.nil? || !snapshot.ok?
+        push_status('索引当前不可用，请先点「刷新」。', 'error')
+        return
+      end
+      # 与 on_insert 同口径：apiVersion 不匹配 ⇒ 只读展示，动作一律禁用
+      # （JS 侧也拦了一次，但 JS 可能是旧的，Ruby 侧必须自己再判一次）
+      if snapshot.read_only?
+        push_status('ID BOX 与插件版本不匹配，建材质已禁用；请把主程序与插件升级到同一版本。', 'error')
+        return
+      end
+      record = snapshot.find(record_id)
+      if record.nil?
+        push_status('这条记录已不在当前索引里，请点「刷新」后重试。', 'error')
+        return
+      end
+      unless MATERIAL_KINDS.include?(Support.text(record['kind']))
+        push_status('这条记录不是材质/贴图，无法创建材质。', 'warn')
+        return
+      end
+      outcome = Materializer.apply(record, snapshot.manifest)
+      level = Support.text(outcome[:level])
+      if !outcome[:ok]
+        level = 'error'
+      elsif level.empty?
+        level = 'ok'
+      end
+      push_status(Support.text(outcome[:message]), level)
+    rescue StandardError => error
+      push_status(Messages.material_exception(error.message), 'error')
+    end
+
+    # 折叠 / 展开：JS 只发一个布尔标志，尺寸由这里用常量决定。
+    #
+    # 为什么不让 JS 把「当前宽高」带上来：UI::HtmlDialog **没有 get_size**（【查证】尺寸方法只有
+    # set_size / set_content_size），JS 只能拿 window.innerWidth / outerWidth —— 前者是内容区宽、
+    # 后者含窗口边框，**两者都不等于 SU 的 :width 口径**。用它们回写会造成每次折叠/展开都
+    # 差一个边框宽度的**累积漂移**。所以这里一律用常量：折叠 960×60，展开 960×680。
+    #
+    # ⚠️ 代价二（已由 team-lead 2026-11-09 拍板接受，**不要改成"记住用户尺寸"**）：
+    #    折叠一次会把用户手动拖过的窗口尺寸重置为默认 960×680。
+    #    任何"记住尺寸"的写法都只能靠 JS 侧的 innerWidth/outerWidth 回写 ⇒ 上面那条
+    #    累积漂移（每次差一个边框宽，越折越小或越折越大），比重置更难排查。
+    #    宁可"折叠后回默认大小"，也不要"折两次窗口就小一圈"。
+    def on_set_panel_size(collapsed)
+      return false if @dialog.nil?
+      flag = (collapsed == true || Support.text(collapsed) == 'true')
+      if flag
+        @dialog.set_size(DIALOG_WIDTH, DIALOG_COLLAPSED_HEIGHT)
+      else
+        @dialog.set_size(DIALOG_WIDTH, DIALOG_HEIGHT)
+      end
+      true
+    rescue StandardError => error
+      puts("[ID BOX] panel resize failed: #{error.class}: #{error.message}")
+      false
+    end
+
+    # 自绘「关闭」按钮 → 与菜单/工具栏的关闭同一条路径（close 里含 stop_polling）
+    def on_close_panel
+      close
+    end
+
+    # V1.0 的窗口级回调（只增不删，A8）：名字必须与 panel.html 的调用逐字一致。
+    # 为什么不放进 PanelCallback：那边的 CALLBACK_NAMES 是 A8 定稿的三件套，
+    # 本卡不改它（三件套的注释与顺序都是验收对象），窗口控件与材质是新增的一组。
+    def bind_window_callbacks
+      return false if @dialog.nil?
+      @dialog.add_action_callback('setPanelSize') do |_context, collapsed|
+        on_set_panel_size(collapsed)
+      end
+      @dialog.add_action_callback('closePanel') { |_context| on_close_panel }
+      @dialog.add_action_callback('applyMaterial') { |_context, record_id| on_apply_material(record_id) }
+      true
+    rescue StandardError => error
+      # 注册失败只暴露真实异常，不写盘（A6）；面板仍可用，只是这几个按钮没接线。
+      puts("[ID BOX] window callback bind failed: #{error.class}: #{error.message}")
+      false
+    end
+
+    # 关窗再开：把窗口尺寸拉回展开态（折叠态下关窗 ⇒ 窗口停在 60px 高）
+    def reset_expanded_size
+      return false if @dialog.nil?
+      @dialog.set_size(DIALOG_WIDTH, DIALOG_HEIGHT)
+      true
+    rescue StandardError
+      false
     end
 
     # ── 数据流 ─────────────────────────────────────────────────────────────

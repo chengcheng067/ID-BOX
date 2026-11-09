@@ -455,7 +455,7 @@ describe('runZhimoCoverBackfill（编排过滤 + 落库）', () => {
 
     expect(summary.total).toBe(0)
     expect(fetchZhimoCoverMock).not.toHaveBeenCalled()
-    expect(useVault.getState().notice).toContain('没有需要从知末补封面的资产')
+    expect(useVault.getState().notice).toContain('没有需要补封面的资产')
   })
 
   it('抓取失败计入 failed，不中断整批', async () => {

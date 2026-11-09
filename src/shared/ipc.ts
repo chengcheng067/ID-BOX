@@ -283,5 +283,67 @@ export const IPC = {
    * 返回 `PluginRbzExportResult`：成功带路径（主进程会顺手 `shell.showItemInFolder`），
    * 取消带 `canceled:true`，失败带中文 `error`（含「先开启插件索引导出」这一类前置校验）。
    */
-  pluginExportRbz: 'plugin:exportRbz'
+  pluginExportRbz: 'plugin:exportRbz',
+  // ── SketchUp 插件收件箱（docs/probe/su-export-to-idbox.md · 方案 A）────────
+  //
+  // 插件把「业务产物」写到 `%APPDATA%\idbox_export\incoming\<jobId>\`（manifest 最后
+  // 用 `.tmp` → rename 落下），主进程负责发现 + 搬运，渲染层负责导入 / 覆盖 + 写 Dexie。
+  // 契约与纯校验规则见 `shared/inbox.ts`。
+  /**
+   * 主进程 → 渲染进程：收件箱里有一个**完整且已通过校验**的任务（Payload = `InboxJob`）。
+   *
+   * `InboxJob` 里的 `jobDir` / `skpPath` / `coverPath` 都是主进程算好并 stat 过的绝对路径
+   * —— 渲染层没有 Node 能力，不要自己拼。
+   *
+   * ⚠️ **at-least-once**：渲染层没就绪时主进程会每 3 秒重发一次（最长约 2 分钟），直到收到
+   * `inboxAck`。消费方必须按 `jobId` 去重（同一 jobId 只处理一次，重复到达时补一次 ack）。
+   */
+  inboxJob: 'inbox:job',
+  /**
+   * 渲染进程 → 主进程：这个任务处理完了（**成功和失败都要调**，否则目录会一直堆在
+   * `incoming\` 里）。主进程把 `<incoming>\<jobId>\` 整目录搬到 `<done>\<jobId>\`
+   * 或 `<failed>\<jobId>\`，失败时在目录内写 `error.txt`（人类可读中文原因）。
+   *
+   * 幂等：目录已不在 incoming（重复 ack / 上一轮已搬走）返回 `archivedTo: null`，**不是错误**。
+   * 绝不删除任何文件 —— 归档目录留给用户排查。
+   */
+  inboxAck: 'inbox:ack',
+  /**
+   * 渲染进程 → 主进程：把任务里的 `.skp` **就地覆盖**库内同名 `.skp`（「更新」通道）。
+   *
+   * 只覆盖那一个文件：`<name>.skp.tmp` → `rename` 原子替换；**绝不**动目录里其它文件，
+   * **绝不**动 `renderParams` / `renderShape` / 分类 / 自定义封面（用户口径 `docs/48 §7`）。
+   *
+   * ⛔ 与 `import:paths` 的覆盖档是两件事：那条路会把旧目录整个送进回收站且只继承 12 个
+   * 字段（`importer.ts:replaceAssetFolder` / `applyOverwriteInherit`），用在「更新」上
+   * 会丢渲染参数与自定义封面（勘察 §Q4-3 / §风险 R5）。
+   *
+   * 返回 `InboxApplyUpdateResult`（**不抛错**，失败原因在 `reason` 里，可直接展示）。
+   */
+  inboxApplyUpdate: 'inbox:applyUpdate',
+  // ── SketchUp 插件「使用记录」回传（插入一次 = 用过一次，累加计数）──────────────
+  //
+  // 独立目录 `%APPDATA%\idbox_export\usage\<jobId>.json`（一个文件 = 一条记录），
+  // 与 `incoming\` 的导出通道**完全隔离**（互不读对方的目录、互不共用 watcher）。
+  // 契约与纯校验规则见 `shared/inboxUsage.ts`。
+  /**
+   * 主进程 → 渲染进程：插件用过一次某个模型（Payload = `InboxUsageEvent`）。
+   *
+   * 语义与 `inboxJob` **刻意不同**：没有重发定时器，**文件本身就是队列** —
+   * 渲染层不 `ackInboxUsage` 就不会删文件，下次启动扫描会再发一次。所以：
+   * - 进程内**至多一次**（主进程按 `fileName` 去重，同一次插入不会被算成两次）；
+   * - 跨启动**至少一次**（没消费的成功记录会被重放）。
+   * 消费方按 `fileName` 去重、处理完（成功或失败）都要 ack。
+   */
+  inboxUsage: 'inbox:usage',
+  /**
+   * 渲染进程 → 主进程：这条使用记录处理完了（Payload = `InboxUsageAckPayload`）。
+   *
+   * `ok:true` → 删掉 `usage\<fileName>`（幂等：文件已不在也算成功）；
+   * `ok:false` → **保留文件**，下次启动重试（Dexie 写失败时不能把记录吞掉）。
+   *
+   * ⚠️ 主进程只接受**文件名**，且必须过 `isInboxUsageFileName`（单段、无分隔符）——
+   * 这是本通道唯一的安全边界，防止渲染层被注入后借它删任意文件。
+   */
+  inboxUsageAck: 'inbox:usageAck'
 } as const

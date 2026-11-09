@@ -49,6 +49,18 @@ import type {
   UpdateInfo
 } from '../shared/types'
 import type { PluginRbzExportResult, PluginSnapshotPayload } from '../shared/pluginSnapshot'
+import type {
+  InboxAckPayload,
+  InboxAckResult,
+  InboxApplyUpdatePayload,
+  InboxApplyUpdateResult,
+  InboxJob
+} from '../shared/inbox'
+import type {
+  InboxUsageAckPayload,
+  InboxUsageAckResult,
+  InboxUsageEvent
+} from '../shared/inboxUsage'
 
 /**
  * 渲染进程可用的全部 API（T05 照此签名写渲染层）。
@@ -499,7 +511,72 @@ const api = {
    * 前置校验在主进程：`pluginIndexEnabled` 关着时**直接返回错误**，不产出一个"装了也只会
    * 显示『未开导出』"的包。用户取消 → `canceled:true`（界面不应说"失败"）。
    */
-  exportPluginRbz: (): Promise<PluginRbzExportResult> => ipcRenderer.invoke(IPC.pluginExportRbz)
+  exportPluginRbz: (): Promise<PluginRbzExportResult> => ipcRenderer.invoke(IPC.pluginExportRbz),
+
+  // ── SketchUp 插件收件箱（docs/probe/su-export-to-idbox.md · 方案 A）──────
+  /**
+   * 订阅「收件箱来了一个完整任务」。
+   *
+   * ⚠️ 派发是 **at-least-once**：主进程在渲染层还没就绪时会每 3 秒重发一次，
+   * 直到收到 `ackInboxJob`。消费方**必须按 `job.jobId` 去重**，并在重复到达时
+   * 补一次 ack（否则主进程会一直重发到上限）。
+   *
+   * 返回退订函数（与其它 `on*` 同款）；`store.init()` 里有模块级守卫保证只订阅一次。
+   */
+  onInboxJob: (cb: (job: InboxJob) => void): (() => void) => {
+    const handler = (_: unknown, job: InboxJob) => cb(job)
+    ipcRenderer.on(IPC.inboxJob, handler)
+    return () => {
+      ipcRenderer.off(IPC.inboxJob, handler)
+    }
+  },
+  /**
+   * 报告任务已处理完（成功 / 失败都要调）：主进程把任务目录从 `incoming\` 搬到
+   * `done\` / `failed\`。幂等 —— 目录已经不在 incoming 时返回 `archivedTo: null`。
+   *
+   * 失败时请带上**可指导用户动作**的中文 `reason`：它会写进 `failed\<jobId>\error.txt`。
+   */
+  ackInboxJob: (payload: InboxAckPayload): Promise<InboxAckResult> =>
+    ipcRenderer.invoke(IPC.inboxAck, payload),
+  /**
+   * 「更新」通道：把任务里的 `.skp` 就地覆盖库内同名 `.skp`（原子替换，只碰这一个文件）。
+   *
+   * 分类 / 渲染参数 / 自定义封面一律不动（用户口径 `docs/48 §7`）——覆盖完成后
+   * 渲染层只需 `rescan()` 让 `files` / `size` 跟上磁盘。
+   * **不抛错**：失败原因在 `reason` 里，可直接拼进 notice。
+   */
+  applyInboxUpdate: (payload: InboxApplyUpdatePayload): Promise<InboxApplyUpdateResult> =>
+    ipcRenderer.invoke(IPC.inboxApplyUpdate, payload),
+
+  // ── SketchUp 插件「使用记录」回传（插入一次 = 用过一次）─────────────────
+  /**
+   * 订阅「插件用过一次某个模型」。
+   *
+   * 语义与 `onInboxJob` **刻意不同**：主进程**没有**重发定时器，文件本身就是队列
+   * （不 ack 就不删文件，下次启动会重放）。所以这里是
+   * - 进程内至多一次（主进程按 `fileName` 去重）；
+   * - 跨启动至少一次（没消费的会被重放）⇒ 消费方仍需按 `fileName` 去重，
+   *   并在处理完（成功或失败）后调 `ackInboxUsage`。
+   *
+   * 返回退订函数（与其它 `on*` 同款）。渲染层必须做能力探测（`typeof !== 'function'`
+   * 就跳过），否则旧版 preload 会让 `init()` 直接炸在订阅这一行
+   * —— 与 `ensureInboxSubscribed` 同一口径（`store.ts:454-465`）。
+   */
+  onInboxUsage: (cb: (ev: InboxUsageEvent) => void): (() => void) => {
+    const handler = (_: unknown, ev: InboxUsageEvent) => cb(ev)
+    ipcRenderer.on(IPC.inboxUsage, handler)
+    return () => {
+      ipcRenderer.off(IPC.inboxUsage, handler)
+    }
+  },
+  /**
+   * 报告一条使用记录已处理。
+   *
+   * `ok:true` → 主进程删掉 `usage\<fileName>`（幂等）；`ok:false` → 保留文件下次重试。
+   * **永不因它抛错而影响主流程**（调用方请自行 `.catch`）：使用统计是附属行为。
+   */
+  ackInboxUsage: (payload: InboxUsageAckPayload): Promise<InboxUsageAckResult> =>
+    ipcRenderer.invoke(IPC.inboxUsageAck, payload)
 }
 
 contextBridge.exposeInMainWorld('modvault', api)

@@ -142,9 +142,26 @@ describe('排序浮层：交互与行为不变', () => {
     expect(src.slice(start, end)).toContain('setSortPanel(false)')
   })
 
-  it('取值域与 SORT_OPTIONS 完全不变（顺序 / 值 / 文案都钉住）', () => {
-    expect(SORT_OPTIONS.map((o) => o.value)).toEqual(['recent', 'name', 'size', 'su'])
-    expect(SORT_OPTIONS.map((o) => o.label)).toEqual(['按导入时间', '按名称', '按大小', '按 SU 版本'])
+  it('取值域与 SORT_OPTIONS 逐项钉住（顺序 / 值 / 文案）', () => {
+    // 2026-10 变化：「最近使用 / 最常使用」**插在最前两项**（用户这次要的主角，
+    // 藏到末尾等于没做）。老四项相对顺序不变，只是整体后移两位 ——
+    // 浮层键盘高亮下标随之改变，所以这里必须按新顺序重钉，而不是把新项塞到末尾。
+    expect(SORT_OPTIONS.map((o) => o.value)).toEqual([
+      'lastUsed',
+      'mostUsed',
+      'recent',
+      'name',
+      'size',
+      'su'
+    ])
+    expect(SORT_OPTIONS.map((o) => o.label)).toEqual([
+      '最近使用',
+      '最常使用',
+      '按导入时间',
+      '按名称',
+      '按大小',
+      '按 SU 版本'
+    ])
   })
 
   it('胶囊仍显示当前排序名，且不再是写死的「按导入时间」', () => {

@@ -87,6 +87,7 @@ function assetActions(): AssetMenuActions & { hits: string[]; favoriteNext: bool
     favoriteNext,
     onEnterFolder: () => hits.push('enterFolder'),
     onPreviewHdr: () => hits.push('previewHdr'),
+    onRename: () => hits.push('rename'),
     onReveal: () => hits.push('reveal'),
     onChangeCover: () => hits.push('changeCover'),
     onCustomRender: () => hits.push('customRender'),
@@ -279,6 +280,7 @@ describe('assetMenuItems —— 整体顺序 / 末尾危险项', () => {
     const items = assetMenuItems([a, b], [a.id], assetActions())
     expect(labelsOf(items)).toEqual([
       '进入文件夹',
+      '重命名…',
       '更换封面…',
       '自定义渲染…',
       '指派分类…',
@@ -298,6 +300,7 @@ describe('assetMenuItems —— 整体顺序 / 末尾危险项', () => {
     expectCleanSeparators(items)
     expect(labelsOf(items)).toEqual([
       '进入文件夹',
+      '重命名…',
       '更换封面…',
       '指派分类…',
       '收藏',
@@ -306,6 +309,48 @@ describe('assetMenuItems —— 整体顺序 / 末尾危险项', () => {
       '打开文件位置',
       '删除…'
     ])
+  })
+
+  /**
+   * 「重命名…」（2026-11-09 用户 P0：「idbox 本体目前是没有右键重命名的选择的，
+   * 只有在右侧边栏区，那很显然不符合大家使用的逻辑嘛」）。
+   *
+   * 三条断言：① 靠前（紧跟第一项「打开」，在「更换封面 / 打开文件位置」之前）；
+   * ② 单选多选都可用（多选走的是既有批量弹窗，不是禁用）；③ 回收站里不出现。
+   */
+  it('「重命名…」紧跟在第一项之后（靠前，不压在一堆复制项下面）', () => {
+    for (const kind of ['model', 'texture', 'material', 'hdri', 'other'] as const) {
+      const a = kind === 'texture' || kind === 'material' ? materialAsset({ kind }) : asset({ kind })
+      const labels = labelsOf(assetMenuItems([a], [a.id], assetActions()))
+      // 第一项永远是「打开」（按 kind 变形态），重命名紧随其后
+      expect(labels[0]).not.toBe('重命名…')
+      expect(labels[1]).toBe('重命名…')
+      expect(labels.indexOf('重命名…')).toBeLessThan(labels.indexOf('更换封面…'))
+      expect(labels.indexOf('重命名…')).toBeLessThan(labels.indexOf('复制文件夹路径'))
+    }
+  })
+
+  it('「重命名…」点了走既有链路（注入的 onRename 被调一次）', () => {
+    const a = asset({ kind: 'model' })
+    const actions = assetActions()
+    itemOf(assetMenuItems([a], [a.id], actions), '重命名…').onClick()
+    expect(actions.hits).toEqual(['rename'])
+  })
+
+  it('多选时「重命名…」可用且带项数（复用批量重命名弹窗，不禁用）', () => {
+    const a = asset({ kind: 'model' })
+    const b = asset({ kind: 'model' })
+    const items = assetMenuItems([a, b], [a.id, b.id], assetActions())
+    const item = itemOf(items, '重命名（2 项）…')
+    expect(item.disabled).toBeUndefined()
+    expectCleanSeparators(items)
+  })
+
+  it('回收站里的资产（deletedAt 是数字）不出现「重命名…」', () => {
+    const trashed = asset({ kind: 'model', deletedAt: 1_700_000_000_000 })
+    const labels = labelsOf(assetMenuItems([trashed], [trashed.id], assetActions()))
+    expect(labels).not.toContain('重命名…')
+    expectCleanSeparators(assetMenuItems([trashed], [trashed.id], assetActions()))
   })
 
   it('ids 全都不存在 → 空数组（不给"幽灵菜单"）', () => {

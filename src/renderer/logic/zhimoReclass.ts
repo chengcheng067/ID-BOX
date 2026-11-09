@@ -338,7 +338,11 @@ export function s2OfMeta(
 ): S2Parsed | null {
   const crumbs: StationCrumb[] = meta.breadcrumb ?? []
   if (crumbs.length === 0) return null
-  if (kind === 'hdri' || kind === 'other') return null
+  // `d5a`（V1.0 D5 资产包）与 `hdri` / `other` 同档：**本通道不接**。
+  // D5 Render 的资产不进知末、也没有对应的词表册 ⇒ `mapZhimoCategory` 没有它的路由、
+  // `isLevel1AllowedForKind('d5a', …)` 恒 false。这里显式返回 null 而不是"强转 kind 去凑
+  // 一个 S2"，理由与下方 hdri 那段逐字一致：猜出来的站方结论比没有结论更危险。
+  if (kind === 'hdri' || kind === 'other' || kind === 'd5a') return null
   if (kind === 'cad') return s2FromBreadcrumb(crumbs, 'cad')
   return s2FromBreadcrumbGeneric(crumbs, kind)
 }

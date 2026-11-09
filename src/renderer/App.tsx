@@ -1,8 +1,15 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReactNode, SVGProps } from 'react'
 import { useVault, useVisibleAssets, SAVED_VIEW_LIMIT } from './store'
 import { Sidebar } from './components/Sidebar'
 import { Toolbar } from './components/Toolbar'
+import { HomeCover } from './components/home/HomeCover'
+import type { HomeFolderItem, HomeStatsData } from './components/home/HomeCover'
+// 首页 → 分类库的过场（卡片长成全屏 → 淡出 → 露出库）。类型来自 GlassFolder：
+// 那是**量起点矩形**的地方，App 只是接力播放，不自己定义一份坐标契约。
+import { HomeOutro } from './components/home/HomeOutro'
+import type { GlassFolderOpenPayload } from './components/home/GlassFolder'
+import type { HomeSearchGroup, HomeSearchItem } from './components/home/HomeSearchCommand'
 import { AssetGrid } from './components/AssetGrid'
 import { DetailPanel } from './components/DetailPanel'
 import { DropOverlay } from './components/DropOverlay'
@@ -66,10 +73,29 @@ const QuickLookOverlayLazy = lazy(() =>
 const TriageOverlayLazy = lazy(() =>
   import('./components/TriageOverlay').then((m) => ({ default: m.TriageOverlay }))
 )
-import { formatBytes } from '../shared/format'
+
+/**
+ * 「发现新版本」弹窗（2026-11，Release 发布说明）：同样懒加载 —— 大多数启动都是
+ * "已是最新"，没必要把 Markdown 解析器和弹窗并进主包。
+ *
+ * 挂载条件由 `useUpdateDialogOpen()` 决定（`logic/updateState.ts` 里的纯函数判定：
+ * 有新版本 + 没跳过着一版 + 本次启动没点稍后）。**只在这里挂一次** —— 弹窗占一层 Esc 栈，
+ * 挂两个实例会出现"按一次 Esc 只关掉其中一个"。
+ */
+const UpdateNotesDialogLazy = lazy(() =>
+  import('./components/UpdateNotesDialog').then((m) => ({ default: m.UpdateNotesDialog }))
+)
+import { formatBytes, thumbVaultUrl } from '../shared/format'
 import { resolveTheme } from '../shared/theme'
 import { displayName } from '../shared/naming'
-import { capsOfFilter, kindFilterLabel, kindsOfFilter } from '../shared/classify'
+import {
+  KIND_LABEL,
+  MATERIAL_GROUP,
+  capsOfFilter,
+  kindFilterLabel,
+  kindsOfFilter
+} from '../shared/classify'
+import { HOME_FOLDER_KEYS } from './logic/homeKinds'
 import { MODEL_FORMAT_OPTIONS } from '../shared/modelFormat'
 import {
   SIZE_PRESET_BYTES,
@@ -77,9 +103,12 @@ import {
   TIME_PRESET_LABEL,
   activeImportedRange,
   activeSizeRange,
+  allViewFilterPatch,
   describeNumericFilters,
+  effectiveSortDesc,
   helpHintText,
   hiddenActiveFilterLabels,
+  isAllViewActive,
   resolutionChipTitle,
   resolutionOptionsFor,
   resolutionPanelTitle,
@@ -95,11 +124,13 @@ import { summarizeAsset } from './logic/fileView'
 import { isAllSelected } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
 import { isCategoryIncomplete } from './logic/category'
+import type { AssetKind } from '../shared/types'
 import { hasAssetDragPayload } from './logic/dragAssign'
 import { isInternalDragOut, resetInternalDragOut } from './logic/dragOut'
 import { pathsOutsideLibrary } from './logic/libraryPath'
 import type { SortKey } from './logic/filters'
 import { IconDownload, IconEmptyLibrary, IconPlus } from './icons'
+import { useUpdateDialogOpen } from './logic/updateState'
 
 /**
  * 中栏头快速筛选浮层的展开态（体积 / 时间 / 色标；null = 收起）
@@ -157,6 +188,15 @@ const STYLE_PANEL_WIDTH = 248
 const SIDEBAR_W = 216
 /** 右栏宽（与 `DetailPanel.tsx` 的 `w-[300px]` 必须一致） */
 const DETAIL_W = 300
+/**
+ * 左栏「折叠成轨道」后的宽（px）。
+ *
+ * 2026-11-09 侧栏换皮（钩线轨道）：折叠不再等于"整列消失"，而是收成一根只留图标与
+ * 轨道的窄条 —— 与 `sidebar-hook.css` 的 `.sidebar-hook.is-collapsed { width: 48px }`
+ * 必须一致（动画两端都要对齐它）。
+ * **首页态例外**：首页要整块干净的封面，左栏在那时仍按 0 宽 + 隐藏处理（见调用处）。
+ */
+const SIDEBAR_RAIL_W = 48
 /** 宽度过渡时长（ms，规范口径 150-200ms ease） */
 const SIDEBAR_COLLAPSE_MS = 180
 /** 中栏边缘竖向唤出按钮的宽（px）；高度 56 居中，hover 走 tint */
@@ -180,32 +220,44 @@ const IconChevronRight = (p: SVGProps<SVGSVGElement>) => (
 
 /**
  * 可折叠侧栏的包裹层：外层动画宽度 + 裁切，内层（children）保持固定宽 ——
- * 内容永不挤压变形；完全折叠后 `visibility:hidden` 把它从焦点 / 无障碍树里拿掉。
+ * 内容永不挤压变形。
+ *
+ * 两种折叠形态（2026-11-09 起）：
+ * - `railWidth` 未传或为 0 → 老形态：宽度归 0 + 动画结束后 `visibility:hidden`
+ *   （把它从焦点 / 无障碍树里彻底拿掉）。首页态用这条。
+ * - `railWidth > 0` → 轨道形态：收到 `railWidth` 宽，**保持可见**（左栏折叠成只留
+ *   图标与钩线轨道的窄条），不做 aria-hidden —— 它仍然可点、可聚焦。
  */
 function CollapsibleColumn({
   id,
   collapsed,
   width,
+  railWidth = 0,
   children
 }: {
   id: string
   collapsed: boolean
   width: number
+  /** 折叠后保留的宽度（px）。0 = 完全收起（老形态）；>0 = 收成轨道窄条 */
+  railWidth?: number
   children: ReactNode
 }) {
+  const asRail = collapsed && railWidth > 0
+  const hidden = collapsed && !asRail
   return (
     <div
       id={id}
       className="flex shrink-0 overflow-hidden"
       style={{
-        width: collapsed ? 0 : width,
-        visibility: collapsed ? 'hidden' : 'visible',
-        // 折叠：内容滑出的 180ms 里保持可见，动画结束才隐藏；展开：立即可见随宽度滑入
-        transition: collapsed
+        width: collapsed ? railWidth : width,
+        visibility: hidden ? 'hidden' : 'visible',
+        // 折叠：内容滑出的 180ms 里保持可见，动画结束才隐藏；展开：立即可见随宽度滑入。
+        // 轨道形态不需要延迟隐藏（它一直可见），所以只用宽度过渡。
+        transition: hidden
           ? `width ${SIDEBAR_COLLAPSE_MS}ms ease, visibility 0s linear ${SIDEBAR_COLLAPSE_MS}ms`
           : `width ${SIDEBAR_COLLAPSE_MS}ms ease, visibility 0s`
       }}
-      aria-hidden={collapsed || undefined}
+      aria-hidden={hidden || undefined}
     >
       {children}
     </div>
@@ -247,6 +299,56 @@ function SidebarEdgeToggle({
       )}
     </button>
   )
+}
+
+/**
+ * 首页过场相关的约束值（2026-11 用户第三轮口径：「第一，文件夹移动，而不是我们的
+ * 缩略图移动。第二，移动到比如模型的这个文件夹时，它应该是中心消隐的，而不是瞬间
+ * 不见的」）。
+ *
+ * 时间轴（主人分散在三个文件里，但只有一张表，见 `HomeCover.tsx` 的 EXIT_* 常量）：
+ *   0 ── 360 到中心 ── 600 停留完 ── 880 消隐完 ── 880 切视图（库卡片随即滑入）
+ *        飞 360ms        停 240ms        消隐 280ms
+ * 飞行与消隐发生在**真实文件夹节点**上（`GlassFolder` + `glass-folder.css`，由
+ * `HomeCover` 驱动 rAF），本文件只关心「**什么时候切视图**」。
+ *
+ * 为什么切点是 880：
+ * · 360ms 之前切 = 文件夹刚起飞画面就换了；360–600 切 = 用户明确要的那口"停留"被吃掉；
+ * · 600–880 切 = 消隐做到一半就被换掉，等于"瞬间不见"，正是用户这次否掉的观感；
+ * · 880 之后切 → 文件夹已经彻底化开、屏幕上空着等网格，会闪一帧空屏。
+ * 所以切点必须**卡在消隐结束那一刻**：上一帧它刚好化完，下一帧库已经在那儿了。
+ */
+const HOME_OUTRO_SWITCH_MS = 880
+
+/**
+ * 切视图后 `enterFromHome` 挂多久（ms，**从切视图那一刻起算**）。
+ *
+ * ⚠️ 2026-11-09 起语义收窄：它**不再是**「唯一会触发卡片入场的东西」，而只是
+ * `AssetGrid` 四个入场边沿之一（另三个是首挂载、导航身份变化、从文件视图返回）。
+ * 入场的主判据已经搬进 `AssetGrid` 内部的「网格出现请求」（`enterSeq` + `enterNavKey`），
+ * 所以正常导航（侧栏 / 搜索 / 进分类 / 从文件夹返回）**现在也会播入场**，不再"零行为"。
+ *
+ * 这里是"来源标记"不是动画时长：`AssetGrid` 只取它的**上升沿**（1100ms 后置 false 的
+ * 下降沿不触发）。留长一点的唯一目的是不要在动画尾巴上改父级 state（那会让网格跟着
+ * 重渲染一次）。1100 与 `AssetGrid` 侧注释里的数字一致。
+ */
+const HOME_GRID_ENTER_MS = 1100
+
+/**
+ * 读一次「减少动效」系统偏好（**不订阅**）。
+ *
+ * 为什么另开一份而不是复用 `HomeCover` / `GlassFolder` 里那两个 hook：
+ * 那两处是各自组件私有的实现（没有导出），为了一个 `matchMedia(...).matches`
+ * 去改别人的文件、或者新开一个 hooks 文件，代价都比收益大。**两处各读一次**，
+ * 语义完全一致（都是系统级偏好，不跟随变化 —— 过场最长 700ms，中途改设置不需要改道）。
+ *
+ * @returns 当前是否要求「减少动效」
+ */
+function readPrefersReducedMotion(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return false
+  }
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
 export default function App() {
@@ -730,6 +832,17 @@ export default function App() {
    */
   const triageActive = useVault((s) => s.triageActive)
 
+  /**
+   * 「发现新版本」弹窗是否显示（2026-11）。
+   *
+   * 判定全部在 `logic/updateState.ts` 的 `shouldShowUpdateDialog()`（纯函数，7 条规则）：
+   * 这里只拿一个布尔，不参与任何逻辑。启动自动检查落结论 → `emit()` → 本值变 true，
+   * 弹窗自然出现；用户点「稍后」/「跳过这个版本」→ 同样靠 `emit()` 变回 false。
+   * ⚠️ 它**不会**在自动检查刚发起时就变 true（那时 state 还是 null），
+   * 所以不会出现"刚启动就冒一个空弹窗"。
+   */
+  const updateDialogOpen = useUpdateDialogOpen()
+
   // A 线 T-03：舞台单例（球从卡片飞进顶栏）。状态机在 logic/ballStage.ts，这里只做订阅。
   const stageState = useSyncExternalStore(
     stageController.subscribe,
@@ -773,6 +886,14 @@ export default function App() {
   const setFilter = useVault((s) => s.setFilter)
   /** 色标是「属性筛选」，而重复资产是「换视图」：点色标时退出重复视图（与侧栏旧行为一致） */
   const setDupOnly = useVault((s) => s.setDupOnly)
+  /**
+   * 「重复资产」是视图模式而非筛选条件（`store.dupOnly`）。
+   *
+   * ⚠️ 必须**先订阅成普通变量**再参与判据：`useVault` 是 hook，若写成
+   * `a && b && !useVault(...)`，短路求值会让这个 hook 在某些渲染里不被调用
+   * → hook 顺序漂移，React 直接抛错。任何"用 store 值做布尔判据"的地方都遵守这条。
+   */
+  const dupOnly = useVault((s) => s.dupOnly)
   /** 设置里关掉色标入口时，中栏头这个 chip 不渲染（settings 未加载 → 按默认显示） */
   const showColorTagsEntry = useVault((s) => s.settings?.showColorTags !== false)
   /**
@@ -809,19 +930,309 @@ export default function App() {
     const st = useVault.getState()
     if (st.folderViewAssetId) st.closeFolderView()
   }, [searchQuery])
+  // ── 首页封面页（v0.9.4）：判据放在中栏头标题**之前** ─────────────────────
+  /**
+   * 首页 = 「全部」过滤态 + **无搜索词** + 非重复资产视图 + 未打开文件视图。
+   *
+   * 为什么搜索词必须单独判一次：`isAllViewActive` 把 `query` 当作"自己看得见的态"
+   * （搜索框就在用户眼前，他知道自己搜了什么），所以「有搜索词、其余维度都干净」
+   * 在它看来仍是「全部视图」——侧栏也确实该把「首页」高亮着。但首页**没有网格、也没有
+   * 搜索态**：打第一个字就必须立刻离开首页去看搜索结果（产品口径 Q-R），否则用户会在
+   * 一块没有结果列表的封面上看到一个"字打进去了、什么都没发生"的死界面。
+   *
+   * ⚠️ 不要在组件里手写多维 `&&` 链（仓库纪律）：维度语义统一由
+   * `logic/filters.ts#isAllViewActive` 给出，这里只补它刻意不涵盖的三条
+   * （`kind` / `query` / 视图）。
+   *
+   * ★ 2026-11-09 用户报「点文件夹只展开、缩不回」的**真正根因**就在这里：
+   * `isAllViewActive()` 的实现是 `activeFilterDimensions(f).every(d => d.key === 'kind'
+   * || d.key === 'query')` —— 它**刻意把 `kind` 和 `query` 排除在外**（那两个维度在
+   * 侧栏有各自的可视入口，所以"只剩它们生效"时仍算全库视图）。于是点「模型」文件夹后
+   * `filters.kind` 变成 `'model'`，`isAllViewActive` 仍返回 true → `isHome` 仍为 true
+   * → `HomeCover` **不卸载** → 文件夹的 `data-open` 翻盖动画播完停在展开态，
+   * 而跳转本该由"封面卸载"完成，于是表现成"点了只展开、永远展着"。
+   * 这不是 `GlassFolder` 的动效 bug，是首页判据漏了一个维度。
+   */
+  const isHome =
+    libraryView === 'assets' &&
+    isAllViewActive(filters) &&
+    // `kind` 必须显式为 `'all'`：它是"首页"与"某个分类"之间的**唯一分界**，
+    // `isAllViewActive` 不看它（理由见上），所以这里必须自己补，否则点分类不生效。
+    filters.kind === 'all' &&
+    filters.query.trim() === '' &&
+    !dupOnly &&
+    !folderViewAssetId
+
   // 大类筛选可能是分组哨兵（materialGroup）→ 显示名统一走 kindFilterLabel
   const headerTitle =
     libraryView === 'trash'
       ? '最近删除'
-      : filters.category2 || filters.category1 || (filters.kind !== 'all' ? kindFilterLabel(filters.kind) : '全部')
+      : filters.category2 ||
+        filters.category1 ||
+        // 兜底名的口径（v0.9.4 侧栏第一项由「全部」改名「首页」）：
+        // 首页态走不到这里（渲染树里首页分支排在前面，不渲染中栏头），所以按 `isHome` 分档
+        // 只是"口径一致"的意思；真正会落到这条兜底的是**搜索中**与**重复资产视图**两个可到达态
+        // —— 那时网格里装的是全库的子集/重复组，标题写「首页」会是错的，必须仍是「全部」。
+        (filters.kind !== 'all' ? kindFilterLabel(filters.kind) : isHome ? '首页' : '全部')
   const trashMode = libraryView === 'trash'
   // 「待补」计数：当前这批可见资产里还有多少要补分类（判据源在 logic/category.ts，
   // 套当前筛选；与侧栏分类树的「未分类」节点、整理流水线的双未分类都不是同一集合）。
   // 刻意不叫「未分类」—— docs/25「未分类三口径」已按语义统一，见该文件与三口径条目。
   const pendingCategory = assets.filter(isCategoryIncomplete).length
 
-  // v0.4 数值筛选摘要（体积 / 导入时间）：无生效条件时返回 ''，不渲染、不占位。
-  // 纯函数在 logic/filters.ts（可单测），组件只负责摆位置。
+  /**
+   * 首页文件夹排的数据：**与侧栏导航同序同源**（`HOME_FOLDER_KEYS` = `KIND_NAV_ORDER`
+   * + 没进导航序但有落盘大类的那几类），计数只统计在库资产（软删的不算，与侧栏 /
+   * 网格同一口径）。
+   *
+   * ── 为什么是 `HOME_FOLDER_KEYS` 而不是 `KIND_NAV_ORDER`（2026-11-09 P0）──────
+   * 用户拖进来的 `.d5a` 导入成功（磁盘 + Dexie 都在、`deletedAt` 为空），但首页
+   * 4 张卡里没有它、侧栏轨道也没有它（U-1 回签：导航序不含 D5A）→ 界面上零入口，
+   * 用户原话「拖进去不在了，我找不到它」。现在候选集由 `logic/homeKinds.ts` 从
+   * `KIND_FOLDER` 派生补齐（今天只补 `d5a`），**导航序与侧栏一个字节都没动**。
+   *
+   * ── 为什么末尾要 `.filter((f) => f.count > 0)`（用户 2026-11-09 原话）────────
+   * 「我们目前其实没有其他选项的文件，那就把这个文件夹取消掉，变成下方 4 个文件夹」
+   *
+   * 落地口径是**通用规则**，不是硬删「其他」这个 key：**0 个素材的分类不占首页入口**。
+   *   · 映射完再过滤，而不是把 `other` 从候选集里删掉 ——
+   *     删 key 会波及侧栏导航（同一份 `KIND_NAV_ORDER` 驱动）与 `kind` 筛选，
+   *     而且将来库里真出现「其他」素材时，入口还得再加回来。
+   *   · 现在库是 4 类有素材（模型 / CAD图纸 / 材质 / HDRI）→ 首页排 4 张卡；
+   *     哪天出现「其他」或 `.d5a` 素材，`count > 0` 自动把第 5 张卡带回来，
+   *     无需改代码（用户库里有 1 个 D5A 时就是这条规则在生效）。
+   *   · 卡片排布：`HomeCover` 的行宽上限是 820px（见该文件注释），
+   *     1440 下 4×151 = 604 → 3 个间隙各 ≈72px，是"紧凑但不散架"的读数；
+   *     第 5 张卡时 1440 下 5×151 = 755 ≤ 820 仍放得下，
+   *     间隙缩到 ≈16px（(820−755)/4）—— 密但不重叠，属可接受，故不必为"5 张"再设特例。
+   *   · 副作用（有意为之）：搜索面板的「分类」组与看板的分类数据都吃这份结果，
+   *     空分类自然不会出现在搜索结果里（点进去也只会是空网格，本就不该有入口）。
+   *
+   * 缩略图取 3 张：优先"有可用缩略图"的，再按 `importedAt` 倒序（最新的在最前），
+   * 不足 3 张补 `null` —— `GlassFolder` 的 `thumbs` 契约是**长度恒为 3**，
+   * 由数据侧保证长度，组件侧就不用再判长度。
+   */
+  const homeFolders = useMemo<HomeFolderItem[]>(() => {
+    const active = allAssets.filter((a) => !isDeletedAsset(a))
+    return HOME_FOLDER_KEYS.map((node) => {
+      /**
+       * 成员集走 `kindsOfFilter`（**唯一语义入口**），不要在这里写
+       * `node === MATERIAL_GROUP ? [...] : [node]`：
+       * ① 材质分组 = texture + material；
+       * ② 「模型」= model + **d5a**（2026-11-09 收口：d5a 是模型的一种格式，
+       *    不是独立大类 —— 卡上的数字必须等于点进去后网格里的条数，否则用户会说
+       *    「卡上写 62，进去 63」）。
+       */
+      const members = kindsOfFilter(node)
+      const rows = members === null ? active : active.filter((a) => members.has(a.kind))
+      const withThumb = rows
+        .filter((a) => a.thumbStatus === 'ready' && a.thumbPath)
+        .sort((x, y) => y.importedAt - x.importedAt)
+      const thumbs: Array<string | null> = withThumb
+        .slice(0, 3)
+        .map((a) => thumbVaultUrl(a.thumbPath as string))
+      while (thumbs.length < 3) thumbs.push(null)
+      return {
+        key: node as HomeFolderItem['key'],
+        // 分组哨兵没有 KIND_LABEL（它是 texture + material 的导航合并节点）→ 手写「材质」；
+        // 其余一律用 KIND_LABEL（「CAD图纸」「HDRI」「其他」都是既有 UI 文案，不要另写中文）
+        label: node === MATERIAL_GROUP ? '材质' : KIND_LABEL[node as AssetKind],
+        count: rows.length,
+        thumbs
+      }
+    })
+      // 空分类不占入口（见函数上方 doc：「其他」在库为空时自动收掉，有素材时自动回来）。
+      // 放在 map 之后而不是 map 之前：`count` 是 map 内算出来的，过滤要读它。
+      .filter((f) => f.count > 0)
+  }, [allAssets])
+
+  /** 首页数据看板：本月入库 / 库总量 / 待补分类（全部按在库资产统计） */
+  const homeStats = useMemo<HomeStatsData>(() => {
+    const active = allAssets.filter((a) => !isDeletedAsset(a))
+    const now = new Date()
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
+    return {
+      monthImports: active.filter((a) => a.importedAt >= monthStart).length,
+      totalAssets: active.length,
+      pendingCategory: active.filter(isCategoryIncomplete).length
+    }
+  }, [allAssets])
+
+  /**
+   * 点首页文件夹 → 进对应分类。
+   *
+   * 顺序有意固定：先关文件视图（否则中栏会被 `folderAsset` 分支继续占住），
+   * 再退出回收站（首页判据已含 `libraryView === 'assets'`，这里兜住"从回收站回来"），
+   * 最后落筛选。`allViewFilterPatch()` 会把 `kind` 锁成 `'all'`（它是"回到全库"的语义），
+   * 所以**必须在它之后**覆盖 `kind`，否则点文件夹会回到首页而不是那个分类。
+   * `kind` 接受分组哨兵 `'materialGroup'`，与侧栏「材质」节点完全同一套值。
+   */
+  const openKindFromHome = (key: HomeFolderItem['key']): void => {
+    const st = useVault.getState()
+    if (st.folderViewAssetId) st.closeFolderView()
+    if (st.libraryView !== 'assets') st.setLibraryView('assets')
+    setDupOnly(false)
+    setFilter({
+      ...allViewFilterPatch(),
+      kind: key === MATERIAL_GROUP ? MATERIAL_GROUP : key,
+      query: ''
+    })
+  }
+
+  // ── 首页 → 分类库的过场（2026-11 第三轮口径：文件夹**本体**飞中 + 中心消隐）──────
+  //
+  // 手绘画像：双击文件夹 → 它自己（玻璃本体 + 三张扇形卡 + 名字）飞到屏幕正中停住
+  // → 其余信息向屏幕边缘退开 → 停 240ms → 从中心挖洞化开 → 切视图 → 库里的卡片从两侧
+  // 滑入。分三段实现：
+  //   ① `GlassFolder` 卸载前量好起点矩形 + 背板缩略图（`GlassFolderOpenPayload`）；
+  //   ② `HomeCover` 用这份矩形算退场几何，交给那个文件夹自己飞（CSS transform）并驱动
+  //      rAF 做中心消隐；`<HomeOutro>` 只负责铺一块**透明遮罩**吃点击；
+  //   ③ 消隐结束（880ms）那一刻才真正切视图，并把 `enterFromHome` 交给 `AssetGrid`
+  //      播「卡片从两侧滑入」。
+  /** 非 null = 过场进行中（`HomeOutro` 播完回调里清回 null） */
+  const [homeOutro, setHomeOutro] = useState<GlassFolderOpenPayload | null>(null)
+  /**
+   * 刚才是从首页转场进来的（`AssetGrid` 据此播"卡片从两侧边缘滑入"）。
+   *
+   * 生命周期：切视图那一帧置 true（与 `openKindFromHome` 同批 → 网格**挂载时就带着它**，
+   * 入场动画从第一帧开始跑）；`HOME_GRID_ENTER_MS` 后置 false。
+   * 必须在卸载时清定时器（下面那个 effect 与 `outroTimersRef` 共用），否则切走之后
+   * 还会对已卸载组件 setState。
+   */
+  const [gridEnterFromHome, setGridEnterFromHome] = useState<boolean>(false)
+  /** 过场期间排的定时器：卸载时**必须**全清（否则切走后还会 setState / 二次跳转） */
+  const outroTimersRef = useRef<number[]>([])
+  /** 减少动效：双击 / Enter 直接进库，不铺遮罩（读一次即可，理由见 readPrefersReducedMotion） */
+  const [prefersReducedMotion] = useState<boolean>(readPrefersReducedMotion)
+
+  useEffect(() => {
+    return () => {
+      for (const id of outroTimersRef.current) window.clearTimeout(id)
+      outroTimersRef.current = []
+    }
+  }, [])
+
+  /**
+   * 双击 / Enter 某个首页文件夹 → 带过场地进入该分类。
+   *
+   * 与 `openKindFromHome` 的分工：这里只管**节奏**，落筛选仍然调它 ——
+   * 保证「点文件夹进分类」「从搜索进分类」「侧栏点分类」落到同一套筛选组合上，
+   * 不会出现两套口径。
+   *
+   * 两个短路条件：
+   * · `prefersReducedMotion`：系统要求减少动效 → 直接切，不铺遮罩、不传 `enterFromHome`
+   *   （无障碍优先；网格那边也有一层同样的兜底）；
+   * · `homeOutro !== null`：已经在过场里了（遮罩会吃点击，理论上进不来）→
+   *   直接切，绝不叠第二层动画。第二条同时兜住"连按两次 Enter"。
+   *
+   * 两个定时器（都在 `outroTimersRef` 里，卸载时统一清）：
+   * · `HOME_OUTRO_SWITCH_MS`（600）：切视图 + 置 `enterFromHome=true`；
+   * · `HOME_GRID_ENTER_MS`（1100，从切视图算）：清回 false。
+   * 两个 setState 与 `openKindFromHome` 在同一个回调里 → React 18 合并成一次渲染，
+   * 所以网格挂载那一帧就已经拿到了 `enterFromHome`，不会出现"先挂载再改标记"的闪烁。
+   */
+  const activateKindFromHome = (key: HomeFolderItem['key'], payload: GlassFolderOpenPayload): void => {
+    if (prefersReducedMotion || homeOutro !== null) {
+      openKindFromHome(key)
+      return
+    }
+    setHomeOutro(payload)
+    outroTimersRef.current.push(
+      window.setTimeout(() => {
+        setGridEnterFromHome(true)
+        openKindFromHome(key)
+        outroTimersRef.current.push(
+          window.setTimeout(() => {
+            setGridEnterFromHome(false)
+          }, HOME_GRID_ENTER_MS)
+        )
+      }, HOME_OUTRO_SWITCH_MS)
+    )
+  }
+
+  /**
+   * 首页搜索面板取结果的纯函数（`HomeSearchCommand` 每次按键调一次）。
+   *
+   * 为什么返回「函数」而不是数组：查询词由搜索组件内部持有（受控输入框），
+   * 父级不该为每一次按键重渲染整个首页。这里交出的是「给我词、我给你分组」，
+   * 用 `useCallback` 固定引用，`activeAssets` 不变时函数引用也不变。
+   *
+   * 分组口径（产品定义，改动需走需求）：
+   * - 「分类」：5 个首页文件夹节点，按 label 命中；
+   * - 「素材」：在库资产按名称命中，最多 8 条 —— 面板是「跳过去」的入口，
+   *   不是结果页，再多就该去网格里搜了；
+   * - 空查询返回**全部**两组（组件一展开就必须有内容，否则像个坏掉的面板）。
+   */
+  const activeForSearch = useMemo(() => allAssets.filter((a) => !isDeletedAsset(a)), [allAssets])
+
+  const homeSearchGroups = useCallback(
+    (rawQuery: string): HomeSearchGroup[] => {
+      const q = rawQuery.trim().toLowerCase()
+      const hit = (text: string): boolean => q === '' || text.toLowerCase().includes(q)
+
+      const folderItems: HomeSearchItem[] = homeFolders
+        .filter((f) => hit(f.label))
+        .map((f) => ({
+          id: `kind:${f.key}`,
+          label: f.label,
+          meta: `${f.count} 个素材`
+        }))
+
+      const assetItems: HomeSearchItem[] =
+        q === ''
+          ? []
+          : activeForSearch
+              .filter((a) => hit(a.name))
+              .slice(0, 8)
+              .map((a) => ({
+                id: `asset:${a.id}`,
+                label: a.name,
+                // 二级分类优先（更具体），没有就退回大类中文名
+                meta: a.category2 && a.category2 !== '未分类' ? a.category2 : KIND_LABEL[a.kind],
+                /* 行首 36×36 缩略图（v0.10.x 用户反馈：「如果给的是纯文字版，
+                 * 不会特别直观，也不会快」）。与网格卡片封面**完全同源**：
+                 * 只有缩略图已经生成好（thumbStatus==='ready'）才给 URL，
+                 * 否则给 null —— 组件那边会把没有 thumb 的行退化成 44px 纯文字行，
+                 * 不渲染空槽。分类条目刻意**不给** thumb：它是导航，不是素材。 */
+                thumb:
+                  a.thumbStatus === 'ready' && a.thumbPath ? thumbVaultUrl(a.thumbPath) : null
+              }))
+
+      const groups: HomeSearchGroup[] = [
+        { title: '分类', items: folderItems },
+        { title: '素材', items: assetItems }
+      ]
+      // 空分组不发出去：否则面板会渲染一个只有标题没有内容的段落
+      return groups.filter((g) => g.items.length > 0)
+    },
+    [homeFolders, activeForSearch]
+  )
+
+  /**
+   * 搜索面板选中某一项。
+   *
+   * `kind:` 前缀 → 与点文件夹完全同一条路径（`openKindFromHome`），
+   * 保证「从搜索进分类」和「点文件夹进分类」落到同一个筛选组合上。
+   * `asset:` 前缀 → 直接开该资产的文件夹视图，比先跳网格再让人自己找少一步。
+   */
+  const pickFromHomeSearch = (item: HomeSearchItem): void => {
+    const sep = item.id.indexOf(':')
+    const type = item.id.slice(0, sep)
+    const value = item.id.slice(sep + 1)
+    if (type === 'kind') {
+      openKindFromHome(value as HomeFolderItem['key'])
+      return
+    }
+    if (type === 'asset') {
+      const st = useVault.getState()
+      if (st.libraryView !== 'assets') st.setLibraryView('assets')
+      setDupOnly(false)
+      setFilter({ ...allViewFilterPatch(), query: '' })
+      st.openFolderView(value)
+    }
+  }
+
+  // v0.4 数值筛选摘要（体积 / 导入时间）：无生效条件时返回 ''，不渲染、不占位。  // 纯函数在 logic/filters.ts（可单测），组件只负责摆位置。
   // 2026-10：摘要跟着中栏头的「体积 / 时间」按钮走（侧栏那块已移除）。
   const numericSummary = describeNumericFilters(filters)
   const sizeFilterActive = activeSizeRange(filters) !== null
@@ -907,6 +1318,14 @@ export default function App() {
   const sortLabel = SORT_OPTIONS.find((o) => o.value === filters.sort)?.label ?? '排序'
   /** 当前生效项在 `SORT_OPTIONS` 里的下标（键盘高亮初始位置） */
   const sortActiveIndex = SORT_OPTIONS.findIndex((o) => o.value === filters.sort)
+  /**
+   * 当前**实际生效**的方向（`sortDesc === null` → 该键的自然方向）。
+   * 按钮的图标浓淡 / `title` / `aria-label` 全读这一个值：原始 `sortDesc` 是三态，
+   * 直接渲染会出现"按大小明明是降序，按钮却显示升序"的错位。
+   */
+  const sortDescNow = effectiveSortDesc(filters.sort, filters.sortDesc)
+  /** 方向按钮唯一的说明文案（`title` 与 `aria-label` 同源，避免两处漂移） */
+  const sortDirHint = sortDescNow ? '当前降序，点击切换为正序' : '当前正序，点击切换为降序'
 
   /**
    * 打开浮层：按**触发按钮**矩形定位（右对齐，避免顶出窗口右缘），
@@ -938,8 +1357,21 @@ export default function App() {
 
   /** 选中一项：写回 `filters.sort`（取值域与 `SortKey` 不变）并立即收起 */
   const applySort = (value: SortKey): void => {
+    // 只写 `sort`：**换键时方向回自然方向**这条规则落在 store 的 `setFilter` 里
+    // （`sortChangePatch` 是它的纯函数内核），这样任何设置 sort 的入口都自动遵守，
+    // 不会出现「popover 重置了、恢复集合没重置」这种两套行为。
     setFilter({ sort: value })
     setSortPanel(false)
+  }
+
+  /**
+   * 方向按钮：**只翻方向，不收起浮层**（用户常在「选键 → 试方向」之间来回点）。
+   *
+   * 写的是**生效值取反**，不是三态轮转：`sortDesc === null`（= 自然方向）时按大小
+   * 本来就是降序，第一次点击必须真的变成升序，否则按钮看起来"按了没反应"。
+   */
+  const toggleSortDesc = (): void => {
+    setFilter({ sortDesc: !sortDescNow })
   }
 
   /**
@@ -970,15 +1402,38 @@ export default function App() {
   // 布局（规范 §3.1）：顶栏全窗宽（含窗口控制），其下 左栏 / 中栏 / 右栏 三列
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      <Toolbar view={view} onView={setView} />
+      {/* 顶栏搜索（v0.10.x）：与首页**同一个**变形搜索框组件，`variant="toolbar"`
+          让它从左上角向右下展开；查询词受控写回 `filters.query`，中栏靠它实时过滤。
+          `groups` / `onPick` 与首页 `HomeCover` 共用同一对，口径完全一致。 */}
+      <Toolbar
+        view={view}
+        onView={setView}
+        homeMode={isHome}
+        searchGroups={homeSearchGroups}
+        onPickSearch={pickFromHomeSearch}
+      />
 
       <div className="flex min-h-0 flex-1">
-        {/* 0.8.3 左栏折叠：包裹层动画宽度 + 裁切，Sidebar 内容保持 216 固定宽不变形 */}
-        <CollapsibleColumn id="sidebar-left" collapsed={sidebarLeftCollapsed} width={SIDEBAR_W}>
-          <Sidebar onOpenSettings={() => setSettingsOpen(true)} />
+        {/* 0.8.3 左栏折叠：包裹层动画宽度 + 裁切，Sidebar 内容保持 216 固定宽不变形。
+            v0.9.4 首页态：左栏**始终折起**（传 `isHome || 用户偏好`，180ms 滑动动画复用
+            `CollapsibleColumn` 既有实现，不做第二套动效）。
+            2026-11-09 侧栏换皮后语义分叉：**用户手动折叠 = 收成 48px 轨道窄条**（只留
+            图标与钩线，仍可点）；**首页态 = 仍按 0 宽隐藏**（封面页要干净）。判据就是
+            `isHome ? 0 : SIDEBAR_RAIL_W`。 */}
+        <CollapsibleColumn
+          id="sidebar-left"
+          collapsed={isHome || sidebarLeftCollapsed}
+          width={SIDEBAR_W}
+          railWidth={isHome ? 0 : SIDEBAR_RAIL_W}
+        >
+          <Sidebar onOpenSettings={() => setSettingsOpen(true)} collapsed={sidebarLeftCollapsed && !isHome} />
         </CollapsibleColumn>
-        {/* 左栏折叠后的唤出按钮（展开时可点它收起），位于中栏最左缘 */}
-        <SidebarEdgeToggle side="left" collapsed={sidebarLeftCollapsed} onToggle={toggleLeftSidebar} />
+        {/* 左栏折叠后的唤出按钮（展开时可点它收起），位于中栏最左缘。
+            首页态**不渲染**：封面页要干净，两枚边缘唤出箭头会把「一整块封面」割成三段。
+            `collapsed` 入参跟着传 `isHome || 原值`，保证图标方向与真实折叠态一致。 */}
+        {!isHome && (
+          <SidebarEdgeToggle side="left" collapsed={isHome || sidebarLeftCollapsed} onToggle={toggleLeftSidebar} />
+        )}
 
         {/* 2026-10：中栏 + 右栏包一层 `relative`，用来挂舞台遮罩（`#stage-veil`）。
             flex 分配不变 —— wrapper 接管中栏原来的 `min-w-0 flex-1`，内部再分给中栏与右栏。
@@ -987,6 +1442,18 @@ export default function App() {
         <div className="flex min-w-0 flex-1 flex-col">
           {!ready ? (
             <div className="flex flex-1 items-center justify-center text-sm text-muted">正在加载素材库…</div>
+          ) : isHome ? (
+            /* 首页封面页（v0.9.4）：**排在 `empty` 之前** —— 空库也要渲染封面页
+               （文件夹显示 0 + 「还没有素材」），不能被"拖压缩包进来"的 CTA 顶掉：
+               首页是导航第一项，任何时候点它都该回到同一块封面。 */
+            <HomeCover
+              folders={homeFolders}
+              stats={homeStats}
+              searchGroups={homeSearchGroups}
+              onPickSearch={pickFromHomeSearch}
+              onOpenKind={activateKindFromHome}
+              onOpenSettings={() => setSettingsOpen(true)}
+            />
           ) : empty ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-4">
               {/* 图标规格 A：空态图形走统一 SVG（40px、单色 currentColor） */}
@@ -1144,8 +1611,10 @@ export default function App() {
                           分辨率
                         </button>
                       )}
-                      {/* 模型格式（2026-10「3DMAX 支持」）：全部 / SU / 3DMAX 单选。
-                          与分辨率同一族（单选、点完即收起），只对 kind=model 的资产生效；
+                      {/* 模型格式（2026-10「3DMAX 支持」，2026-11-09 加 D5A）：
+                          全部 / SU / 3DMAX / D5A 单选。
+                          与分辨率同一族（单选、点完即收起），只对**模型域**（model + d5a）生效
+                          —— 判定在 `shared/modelFormat.isModelKind`，本组件不重复 kind 名单；
                           材质 / HDR / 其他视图不渲染（能力表 `capsOfFilter`），
                           切走时残留值由 store 的 `sanitizeFiltersForKind` 清掉。 */}
                       {showModelFormatEntry && (
@@ -1160,7 +1629,7 @@ export default function App() {
                           title={
                             trashMode
                               ? '回收站不支持模型格式筛选（返回资产视图后可用）'
-                              : '按模型格式筛选（SU / 3DMAX；只对模型资产生效）'
+                              : '按模型格式筛选（SU / 3DMAX / D5A；只对模型资产生效）'
                           }
                           onClick={toggleExtraPanel('format')}
                         >
@@ -1448,8 +1917,11 @@ export default function App() {
                           </div>
 
                           {/* 模型格式：与分辨率面板同构（单选、点完即收起、active 高亮同色）。
-                              选项表在 `shared/modelFormat`（全部 / SU / 3DMAX），
-                              与卡片徽标文案同源。 */}
+                              选项表在 `shared/modelFormat`（全部 / SU / 3DMAX / **D5A**），
+                              与卡片徽标文案同源。
+                              ⚠️ 本组件**不硬编码档位** —— 2026-11-09 用户要求「D5A 属于模型格式，
+                              格式里要能选到」，只在 `MODEL_FORMAT_OPTIONS` 加一项即可，
+                              弹层/摘要/空态文字全部自动跟随。 */}
                           {extraPanel === 'format' &&
                             MODEL_FORMAT_OPTIONS.map((opt) => {
                               const active = filters.modelFormat === opt.value
@@ -1552,7 +2024,7 @@ export default function App() {
                         容器 / 定位 / 尺寸沿用同排「体积 / 时间 / 分辨率」浮层那一套：
                         fixed + 打开时取按钮矩形、`rounded-btn border border-line bg-card p-1
                         shadow-modal`、行高 h-7、`rounded-nav`、选中 `bg-accent-tint`。 */}
-                    <div ref={sortRef} className="relative shrink-0" onKeyDown={onSortKeyDown}>
+                    <div ref={sortRef} className="relative inline-flex shrink-0 items-center gap-1" onKeyDown={onSortKeyDown}>
                       <button
                         ref={sortButtonRef}
                         type="button"
@@ -1567,6 +2039,50 @@ export default function App() {
                         <span aria-hidden className="pointer-events-none text-[9px] text-tertiary">
                           ▾
                         </span>
+                      </button>
+
+                      {/* 排序方向（2026-11 用户反馈：「时间的筛选上应该是正序和倒序」）。
+                          与胶囊同处 `sortRef` 容器内：浮层的「点外面关闭」判据是
+                          `sortRef.contains(target)`，放在容器里 → 点方向按钮时浮层不会被
+                          自己挤掉，用户可以「选键 → 就地试方向」。
+                          图标是上下双向箭头，**当前方向那支不透明、反向那支 35%**，
+                          所以深色主题下也能一眼看出现在哪个方向（不靠颜色差异，靠明度）。
+                          配色只走既有语义 token：`text-secondary`（`--text-secondary`）在
+                          浅底 `--pill-bg #f1f5f9` 上是 6.9:1、深底 `--pill-bg #1c1c1e` 上是
+                          5.9:1（均为不透明主支，≥ 4.5:1 正文级）。主题切换由 token 自己跟，
+                          ⛔ 不用 `dark:` 变体（`darkMode` 是 media，会跟系统而不是应用主题，
+                          见 styles.css 文件头）。 */}
+                      <button
+                        type="button"
+                        className="inline-flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-pill-header bg-pill text-secondary transition-colors hover:text-primary"
+                        title={sortDirHint}
+                        aria-label={sortDirHint}
+                        aria-pressed={sortDescNow}
+                        // Enter 在这枚按钮上是"切换方向"（原生 click 负责），不能被外层容器的
+                        // `onSortKeyDown` 抢去"应用高亮项"——它是同容器里排序浮层的键盘处理。
+                        // ↑/↓ 不拦：在方向按钮上按 ↓ 想翻浮层是合理意图，让它照常冒泡。
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') e.stopPropagation()
+                        }}
+                        onClick={toggleSortDesc}
+                      >
+                        <svg
+                          width="12"
+                          height="12"
+                          viewBox="0 0 12 12"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden
+                          className="pointer-events-none"
+                        >
+                          {/* 左支：向上（升序） */}
+                          <path d="M3.2 9.4V2.6M3.2 2.6 1.6 4.2M3.2 2.6 4.8 4.2" opacity={sortDescNow ? 0.35 : 1} />
+                          {/* 右支：向下（降序） */}
+                          <path d="M8.8 2.6v6.8M8.8 9.4 7.2 7.8M8.8 9.4 10.4 7.8" opacity={sortDescNow ? 1 : 0.35} />
+                        </svg>
                       </button>
 
                       {sortPanel && sortPos && (
@@ -1648,17 +2164,28 @@ export default function App() {
                   {helpHintText(filters.kind)}
                 </div>
               )}
-              <AssetGrid view={view} />
+              {/* `enterFromHome`：首页过场的后半段（切视图那一帧 true，1100ms 后 false）。
+                  它只是 `AssetGrid` 入场请求的四个边沿之一（另三个：首挂载、导航身份变化、
+                  从文件视图返回）。所有进入网格的场景都会让卡片从各自那半边边缘滑入，
+                  详见 `AssetGrid.tsx` 的「网格出现请求」两个 effect。 */}
+              <AssetGrid view={view} enterFromHome={gridEnterFromHome} />
             </>
           )}
         </div>
 
-        {/* 0.8.3 右栏折叠：与左栏同构（动画宽度 + 固定 300 内容宽 + visibility 收尾） */}
-        <CollapsibleColumn id="detail-panel" collapsed={sidebarRightCollapsed} width={DETAIL_W}>
+        {/* 0.8.3 右栏折叠：与左栏同构（动画宽度 + 固定 300 内容宽 + visibility 收尾）。
+            v0.9.4 首页态：与左栏同一判据，右栏也始终折起。 */}
+        <CollapsibleColumn
+          id="detail-panel"
+          collapsed={isHome || sidebarRightCollapsed}
+          width={DETAIL_W}
+        >
           <DetailPanel />
         </CollapsibleColumn>
-        {/* 右栏折叠后的唤出按钮，位于中栏最右缘（与左缘对称） */}
-        <SidebarEdgeToggle side="right" collapsed={sidebarRightCollapsed} onToggle={toggleRightSidebar} />
+        {/* 右栏折叠后的唤出按钮，位于中栏最右缘（与左缘对称）；首页态不渲染（同左缘理由） */}
+        {!isHome && (
+          <SidebarEdgeToggle side="right" collapsed={isHome || sidebarRightCollapsed} onToggle={toggleRightSidebar} />
+        )}
 
         {/* 舞台遮罩（2026-10）：双击出球时盖住中栏+右栏，随球落地淡出 →
             「内容逐渐浮现」。`opacity:0` 是**静止值**；动画由 MaterialStage 用 WAAPI
@@ -1698,6 +2225,14 @@ export default function App() {
 
       <DropOverlay active={dragging} />
       <ImportQueue />
+      {/* 2026-11：启动时检测到新版本 → 弹窗展示 GitHub Release 的发布说明。
+          内容只来自 `UpdateInfo.notes`（受限 Markdown 解析成 token，见 logic/releaseNotes.ts），
+          全应用只挂这一个实例；点「稍后」/「跳过这个版本」/ Esc / 点遮罩都会关掉它。 */}
+      {updateDialogOpen && (
+        <Suspense fallback={null}>
+          <UpdateNotesDialogLazy />
+        </Suspense>
+      )}
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       {/* P0-16 删除安全：二次确认弹窗 + 5 秒撤销提示条 */}
       <ConfirmDialog />
@@ -1733,6 +2268,14 @@ export default function App() {
       )}
       {/* 规范 §3.5：底部合并 toast（左=轻提示 / 右=删除撤销条），替代原 NoticeToast+UndoToast 两个浮窗 */}
       <NoticeToast />
+
+      {/* 首页 → 分类库的过场遮罩（最后渲染 = 文档最末 = 叠在所有兄弟之上，z-index 70）。
+          它必须**在根节点内部最后**：过场期间任何下面的浮层都不该探出来。
+          时间轴：0–360 文件夹本体飞到屏幕正中（×1.5）→ 360–600 停住 → 600–880 从中心
+          挖洞化开 → 880 切视图（本组件上方那个定时器）→ 库卡片从两侧滑入。
+          它自己只做一件事：0–880ms 挡住误触（飞行/消隐都在 `HomeCover` + `GlassFolder`
+          身上，见 `HomeOutro.tsx` 文件头）。卸载时机由它自己的 `onDone` 决定。 */}
+      {homeOutro ? <HomeOutro onDone={() => setHomeOutro(null)} /> : null}
     </div>
   )
 }

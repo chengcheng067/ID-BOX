@@ -5,7 +5,17 @@
 #
 # 职责（docs/42 §2 文件 4）：「路径与诊断」这一横切关注点合并在一层：
 #   - Paths：多候选支持目录 + 插件数据目录 + isWithinRoot 等价越界校验（docs/39 §4.1#8）；
-#   - Diagnostics：**全包唯一允许写盘的地方**（用户 2026-11-05 批准，只在建窗失败时调用）。
+#   - Diagnostics：建窗失败时的诊断落点（用户 2026-11-05 批准，只在建窗失败时调用）。
+#
+# ⚠️ 写盘点（2026-11-09 经主理人批准的有意松绑，docs/48 §7；2026-11 增补第③点）：
+#   全包有**且仅有三个**写盘落点 ——
+#     ① 本文件的 `Diagnostics.write` → %TEMP%\idbox_panel_diag.txt（仅建窗失败）；
+#     ② lib/exporter.rb → %APPDATA%\idbox_export\（仅「导出至 IDBOX」的作业产物）；
+#     ③ lib/usage_log.rb → %APPDATA%\idbox_export\usage\（仅「插入一次 = 用过一次」的
+#        一条使用记录，几十字节、原子写、失败静默）。
+#   除此之外一律不写：**绝不写库目录、绝不写 %APPDATA%\idbox\plugin\、绝不改动任何既有资产文件**。
+#   `export_root` / `inbox_dir` 是落点②的**唯一定义处**，`export_root` 同时是落点③的根
+#   （exporter.rb / usage_log.rb 都不得自己拼 `%APPDATA%`）。
 #
 # ⚠️ A7 纪律：本文件顶层必须在 `module IDBoxPanel` 内、无全局变量；
 # `Paths` 保持 `module_function`（`def self.` 语义）—— 冒烟场景 B（smoke:116-122）
@@ -131,6 +141,49 @@ module IDBoxPanel
       dir.empty? ? '' : File.join(dir, MANIFEST_FILE)
     end
 
+    # ── 导出收件箱（docs/48 §7 / docs/probe/su-export-to-idbox.md Q2）──────────
+    #
+    # `%APPDATA%\idbox_export` 是 `%APPDATA%\idbox` 的**同级兄弟目录**，不在它内部。
+    # 这样「插件会写盘」这件事被物理限制在一个独立根里：`idbox\plugin\`（索引快照）、
+    # `idbox\thumbs\`（缩略图）、`idbox\settings.json` / `logs\` 仍然**零写入**，
+    # 也没有任何路径能拼到库目录里去（库根只读，见 exporter.rb 的边界校验）。
+    #
+    # 契约（已由主理人钉死，不得自行改动）：
+    #   根       = %APPDATA%\idbox_export
+    #   收件箱   = 根\incoming\<jobId>\  ← jobId = YYYYMMDD-HHmmss-<4 位随机>
+    #   job 内容 = <baseName>.skp / <baseName>.cover.png / manifest.json（**最后写**）
+    # 只读 ENV、不碰盘、不抛异常；APPDATA 缺失 ⇒ 推 ''（与 plugin_dir / thumbs_dir 同口径，
+    # 绝不回退到任何其它根 —— 拿不准路径时宁可不写）。
+    def export_root
+      appdata = Support.text(ENV['APPDATA'])
+      return '' if appdata.strip.empty?
+      File.join(appdata, 'idbox_export')
+    end
+
+    def inbox_dir
+      root = export_root
+      root.empty? ? '' : File.join(root, 'incoming')
+    end
+
+    # 递归建目录（不用 FileUtils：插件 require 白名单只有 sketchup.rb / extensions.rb /
+    # json / digest，见 docs/39 §4.1#3 与 main.rb 头注）。只建**目录**、不写任何文件；
+    # 已存在直接算成功。永不抛异常，失败一律 false。
+    def ensure_dir(path)
+      dir = Support.text(path)
+      return false if dir.strip.empty?
+      return true if File.directory?(dir)
+      parent = File.dirname(dir)
+      return false if parent == dir          # 到达盘符根却仍不是目录 ⇒ 放弃
+      return false unless ensure_dir(parent)
+      begin
+        Dir.mkdir(dir)
+        true
+      rescue StandardError
+        # 并发/权限：只要最终确实是目录就算成功（另一个实例可能刚建好）
+        File.directory?(dir)
+      end
+    end
+
     def index_path
       dir = plugin_dir
       dir.empty? ? '' : File.join(dir, INDEX_FILE)
@@ -176,9 +229,10 @@ module IDBoxPanel
     end
   end
 
-  # ── 失败诊断（**唯一允许写盘的地方**，用户 2026-11-05 批准） ────────────────
+  # ── 失败诊断（写盘点①，用户 2026-11-05 批准） ──────────────────────────────
   #
   # ⚠️ 只允许在面板建窗失败时调用，成功路径一个字都不写（A6）。
+  #   （写盘点② 是 lib/exporter.rb 的导出作业目录，见本文件头注；两者互不相干。）
   # 工具栏/菜单**注册失败**属注册阶段，不得调用本方法 —— 只 puts（docs/42 §7.3），
   # 否则用户正常启动 SketchUp 时也会产生诊断文件，破 A6。
   #

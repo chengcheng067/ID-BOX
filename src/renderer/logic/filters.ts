@@ -14,7 +14,13 @@ import type {
 } from '../../shared/types'
 import { COLOR_TAGS, COLOR_TAG_LABEL } from '../../shared/types'
 import { formatDate } from '../../shared/format'
-import { getModelFormat, MODEL_FORMAT_BADGE_LABEL, type ModelFormat } from '../../shared/modelFormat'
+import {
+  getModelFormat,
+  isModelKind,
+  MODEL_FORMAT_BADGE_LABEL,
+  MODEL_FORMAT_OPTIONS,
+  type ModelFormat
+} from '../../shared/modelFormat'
 import {
   KIND_FOLDER,
   KIND_LABEL,
@@ -44,7 +50,13 @@ export type LibraryView = 'assets' | 'trash'
  * 那会让 `kind: 'materialGroup'` 在渲染层被当成非法值（docs/14 §2.4 / §11-9）。
  */
 export type { KindFilter } from '../../shared/classify'
-export type SortKey = 'recent' | 'name' | 'size' | 'su'
+/**
+ * 排序键。
+ *
+ * `lastUsed` / `mostUsed`（2026-10「使用统计」）读的是 `Asset.useCount` /
+ * `Asset.lastUsedAt`（口径见 `shared/types.ts` 的两个字段注释）。
+ */
+export type SortKey = 'recent' | 'name' | 'size' | 'su' | 'lastUsed' | 'mostUsed'
 
 /**
  * 分辨率档位（**渲染层口径**，4 档）。
@@ -58,9 +70,22 @@ export type SortKey = 'recent' | 'name' | 'size' | 'su'
  */
 export type ResolutionBucket = SharedResolutionBucket | '8k' | '16k'
 
-/** 排序选项（走查 v0.2.2：排序控件从顶栏移到中栏头，见画布 `2:83` / 深 `2:361`）。
- * 放在纯逻辑层：中栏头与测试共用，避免组件里重复定义。 */
+/**
+ * 排序选项（走查 v0.2.2：排序控件从顶栏移到中栏头，见画布 `2:83` / 深 `2:361`）。
+ * 放在纯逻辑层：中栏头与测试共用，避免组件里重复定义。
+ *
+ * ## 为什么两项「使用统计」排在最前（2026-10）
+ *
+ * 这两个键是用户这次要的主角（「用的越多的模型就越靠前，也会有个"最近使用"的排序」，原话见
+ * 需求）—— 塞到第五、第六位等于做完用户看不见。代价是浮层的键盘高亮下标整体后移两格，
+ * `tests/sortMenu.test.ts` 里按下标断言的期望值跟着改，**不为迁就测试把新项挪到末尾**。
+ *
+ * 出厂默认排序仍是 `'recent'`（见 `DEFAULT_FILTERS` 注释）：多出两档选择，但存量用户的
+ * 首次打开看到的顺序一个像素都不变。
+ */
 export const SORT_OPTIONS: { value: SortKey; label: string }[] = [
+  { value: 'lastUsed', label: '最近使用' },
+  { value: 'mostUsed', label: '最常使用' },
   { value: 'recent', label: '按导入时间' },
   { value: 'name', label: '按名称' },
   { value: 'size', label: '按大小' },
@@ -125,6 +150,21 @@ export interface Filters {
   modelFormat: ModelFormat | null
   query: string
   sort: SortKey
+  /**
+   * 排序方向覆盖（2026-11 用户反馈「时间的筛选上应该是正序和倒序」）。
+   *
+   * 三态，**不是**普通布尔：
+   * - `null`（默认）= 用该键的**自然方向**，也就是本功能上线前的行为
+   *   （`recent` 新→旧 / `name` A→Z / `size` 大→小 / `su` 新版本→旧版本）；
+   * - `true` = 强制降序；`false` = 强制升序。
+   *
+   * 语义对四个键**统一**：`false` 一律是「小→大 / 旧→新 / A→Z」，不存在
+   * 「按名称的 ascending 和按大小的 ascending 相反」这种暗规则。
+   *
+   * ⚠️ `null` 不能退化成 `false`：那样默认排序会整体翻个个儿（回归）。
+   * 自然方向表只有 `NATURAL_SORT_DESC` 一份，`sortAssets` 与 UI 都读它。
+   */
+  sortDesc: boolean | null
 }
 
 export const DEFAULT_FILTERS: Filters = {
@@ -144,7 +184,13 @@ export const DEFAULT_FILTERS: Filters = {
   minResolution: null,
   modelFormat: null,
   query: '',
-  sort: 'recent'
+  // ⚠️ 出厂默认**保持 `'recent'`**（2026-10 加「最近使用 / 最常使用」两档时也不改）：
+  // 新增两个排序键是"多给两个选择"，不是"换默认"。改成 `lastUsed` 会让存量用户升级后
+  // 首次打开看到的顺序整体变一次（而且大批从没用过的资产会被挤到后面）——
+  // 这不是用户要的"越用越活"，是"升级就翻脸"。守门用例见 `tests/usageSort.test.ts`。
+  sort: 'recent',
+  // null = 每个键走自然方向（= 本功能上线前的默认排序，逐元素不变）
+  sortDesc: null
 }
 
 /**
@@ -620,9 +666,14 @@ export function matchesFilters(
   }
   // 0.6.0 分辨率：任一图片文件长边达标即出；未知尺寸不进这两档（见 matchesResolution）
   if (!matchesResolution(a, f.minResolution)) return false
-  // 模型格式（2026-10）：**只约束 kind=model 的资产**——非模型资产不受影响
-  //（「全部」视图筛 3DMAX，贴图 / HDR 照常显示）。格式由文件扩展名纯函数派生。
-  if (f.modelFormat && a.kind === 'model' && getModelFormat(a.files) !== f.modelFormat) {
+  // 模型格式（2026-10）：**只约束「模型域」的资产**——贴图 / 材质 / HDR / CAD 不受影响
+  //（「全部」视图筛 D5A，其它大类照常显示）。格式由文件扩展名纯函数派生。
+  //
+  // ⚠️ 判据是 `isModelKind(a.kind)` 而**不是**裸 `a.kind === 'model'`（2026-11-09 收口）：
+  // 用户口径「D5A 本身属于模型格式」⇒ `.d5a` 资产也必须吃这个条件，否则在模型视图里
+  // 选「D5A」会筛出空集（d5a 属于模型域，不吃格式条件就永远"漏网"）。这个判定只有一处实现
+  // （`shared/modelFormat.isModelKind`），别在下面的 if 里再手写一遍 kind 名单。
+  if (f.modelFormat && isModelKind(a.kind) && getModelFormat(a.files) !== f.modelFormat) {
     return false
   }
   // v0.4 导入时间区间（**含等号**：正好等于阈值的资产要被命中）
@@ -635,35 +686,227 @@ export function matchesFilters(
   return true
 }
 
-/** 排序（不修改入参）：recent=最近导入 / name=中文名 / size=大小降序 / su=SU 版本新→旧 */
-export function sortAssets(list: Asset[], sort: SortKey): Asset[] {
+/**
+ * 每个排序键的**自然方向**（`sortDesc === null` 时采用的方向）。
+ *
+ * 这张表是"默认行为零变化"的唯一真相源：`recent` / `size` / `su` / `lastUsed` /
+ * `mostUsed` 的自然方向是降序，`name` 是升序 —— 与加 `sortDesc` 之前各分支写死的方向
+ * 逐项对应。`sortAssets` 与 UI（方向按钮的 aria-label）都读它，不各自记一份。
+ *
+ * 两个使用统计键的自然方向 = 降序，语义直觉：「最近使用」= 最新用过的在最上；
+ * 「最常使用」= 分数最高的在最上。用户点一下方向按钮即可翻成"最久没用 / 最少用"。
+ */
+export const NATURAL_SORT_DESC: Readonly<Record<SortKey, boolean>> = {
+  recent: true,
+  name: false,
+  size: true,
+  su: true,
+  lastUsed: true,
+  mostUsed: true
+}
+
+/**
+ * 「最常使用」的分数**半衰期**（天）。
+ *
+ * 语义：一次使用在 `14` 天后只值半分，28 天后值 1/4 …… 于是"上周用了 3 次"能压过
+ * "半年前用过 20 次"，老的偏好会自然淡出，用户的排序结果跟着他的真实习惯走。
+ *
+ * ⚠️ 这是**可调参数，不是定律**：14 天是"做项目的节奏"（一个方案从选材到定稿大约两周）
+ * 拍的。将来若发现重度用户的历史偏好掉得太快，改这一个数字即可，别去改打分公式的形状。
+ */
+export const USAGE_HALF_LIFE_DAYS = 14
+
+/** 一天的毫秒数（打分与时间衰减用；不要在各处再写 86400000 这个魔数） */
+const MS_PER_DAY = 86_400_000
+
+/**
+ * 一次「使用统计」的加权分（「最常使用」排序的唯一打分公式）。
+ *
+ * ```
+ * score = useCount * 2 ** (-ageDays / USAGE_HALF_LIFE_DAYS)
+ * ageDays = (now - lastUsedAt) / MS_PER_DAY
+ * ```
+ *
+ * 边界（每条都有用例，见 `tests/usageSort.test.ts`）：
+ * - `useCount` 为 `undefined` / `0`（或非正数 / NaN）→ `0`：**没使用过就没有分**，
+ *   不能因为 `lastUsedAt` 有值就给分（两个字段是脏数据时的兜底）；
+ * - `lastUsedAt` 为 `undefined` / 非有限数 → `0`：从未使用过的时间不可知；
+ * - `ageDays < 0`（`lastUsedAt` 在未来，通常是系统时钟被回拨）→ **按 0 处理**，
+ *   否则负指数会让分数**大于** `useCount`，一次时钟故障就能把某个资产顶成"最常用"。
+ *
+ * @param useCount 累计使用次数（`Asset.useCount`，可能 undefined）
+ * @param lastUsedAt 最近使用时间戳 ms（`Asset.lastUsedAt`，可能 undefined）
+ * @param now 计算基准时间（**由调用方传入**：同一批排序必须共用一个 `now`，
+ *            否则比较函数里反复调 `Date.now()` 会让结果在 O(n log n) 次比较中漂移）
+ */
+export function usageScore(
+  useCount: number | undefined,
+  lastUsedAt: number | undefined,
+  now: number
+): number {
+  const count = useCount ?? 0
+  // `!(count > 0)` 同时挡掉 0 / 负数 / NaN（`undefined` 已被 ?? 兜掉）
+  if (!(count > 0)) return 0
+  if (typeof lastUsedAt !== 'number' || !Number.isFinite(lastUsedAt)) return 0
+  const rawAgeDays = (now - lastUsedAt) / MS_PER_DAY
+  const ageDays = rawAgeDays > 0 ? rawAgeDays : 0
+  return count * 2 ** (-ageDays / USAGE_HALF_LIFE_DAYS)
+}
+
+/**
+ * 「从未使用」的时间哨兵：`-Infinity`（"比任何真实时间都早"）。
+ *
+ * **这是「最近使用」排序最容易写反的一处**：若把 `undefined` 当 `0` 处理，`0` 就是
+ * `1970-01-01`，与"真的从没用过"混成同一档 —— 一旦 `lastUsedAt` 里混进 0
+ * （历史脏数据 / 被人为写成 0），它就永远稳稳占住时间轴的最左端，谁也看不出它是脏的。
+ * 用 `-Infinity` 把"没有数据"表示成一个**不可能是真实时间戳**的值，语义就分得开。
+ *
+ * ⚠️ 语义上它**不是**"最久以前用过"，而是"时间轴上没有位置"，所以 `sortAssets` 的
+ * `lastUsed` 分支会显式把这类资产排到**两个方向的末尾**（见那里的注释），
+ * 而不是让 `sign` 把它在升序里翻到最前面。
+ *
+ * 注意 `-Infinity - -Infinity = NaN`：两个都没用过的资产相减得到 NaN，
+ * 所以 `lastUsed` 的比较写成 `sign * (a - b) || 次级键` —— `NaN` 是 falsy，会自然落到次级键。
+ */
+const NEVER_USED_AT = Number.NEGATIVE_INFINITY
+
+/** 取「最近使用时间」，从未使用 → `NEVER_USED_AT`（见其注释） */
+function lastUsedAtOf(a: Asset): number {
+  const t = a.lastUsedAt
+  return typeof t === 'number' && Number.isFinite(t) ? t : NEVER_USED_AT
+}
+
+/**
+ * 排序（不修改入参）。
+ *
+ * @param list 待排资产
+ * @param sort 排序键
+ * @param sortDesc 方向覆盖：`null`（默认）= 该键的自然方向；`true` = 降序；`false` = 升序。
+ * @param now 「最常使用」打分的基准时间（默认 `Date.now()`，**只取一次**）。
+ *            测试必须显式传入固定值，否则用例会随日历漂移。
+ *
+ * 实现只算**一次**方向符号 `sign`，再乘到"升序差值"上：
+ * - `sign = +1` → 小→大 / 旧→新 / A→Z；
+ * - `sign = -1` → 大→小 / 新→旧 / Z→A。
+ *
+ * 六个键的**升序差值**统一定义（这是"`false` 语义统一"的落点）：
+ * `recent` = `a.importedAt - b.importedAt`、`size` = `a.size - b.size`、
+ * `su` = `suMajorOf(a) - suMajorOf(b)`、`name` = `localeCompare(zh-CN)`、
+ * `lastUsed` = `lastUsedAtOf(a) - lastUsedAtOf(b)`（未使用 = `-Infinity`，且**显式垫底**，
+ * 见该分支注释）、`mostUsed` = `usageScore(a) - usageScore(b)`。
+ *
+ * 「最常使用」里"没用过"是**明确的最低分 0**（有值），所以它参与方向翻转；
+ * 「最近使用」里"没用过"是**没有数据**（无值），所以它恒定垫底 —— 两者的差别不是笔误。
+ *
+ * **次级**键（`su` 同版本号按名称 / `lastUsed` 平局按名称 / `mostUsed` 平局先按最近
+ * 使用时间降序再按名称）**都不跟着方向反**：两个方向下次级顺序都一样，
+ * 这样降序时与改动前逐元素相同（自然方向 = 降序，sign=-1 完全复刻旧分支）。
+ */
+export function sortAssets(
+  list: Asset[],
+  sort: SortKey,
+  sortDesc: boolean | null = null,
+  now: number = Date.now()
+): Asset[] {
   const out = [...list]
+  const sign = effectiveSortDesc(sort, sortDesc) ? -1 : 1
   switch (sort) {
     case 'name':
-      out.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+      out.sort((a, b) => sign * a.name.localeCompare(b.name, 'zh-CN'))
       break
     case 'size':
-      out.sort((a, b) => b.size - a.size)
+      out.sort((a, b) => sign * (a.size - b.size))
       break
     case 'su':
       out.sort(
-        (a, b) => suMajorOf(b) - suMajorOf(a) || a.name.localeCompare(b.name, 'zh-CN')
+        (a, b) => sign * (suMajorOf(a) - suMajorOf(b)) || a.name.localeCompare(b.name, 'zh-CN')
       )
+      break
+    case 'lastUsed':
+      out.sort((a, b) => {
+        // 「从未使用」在时间轴上**没有位置**（不是"最久以前用过"）→ 两个方向都垫底。
+        // 只靠 `NEVER_USED_AT` 参与 `sign * (a - b)` 是不够的：那样升序时它会跑到最前面，
+        // 用户想找"最久没用过的"却先看到一堆从没碰过的。这里显式把它变成排序尾部。
+        const aNever = lastUsedAtOf(a) === NEVER_USED_AT
+        const bNever = lastUsedAtOf(b) === NEVER_USED_AT
+        if (aNever !== bNever) return aNever ? 1 : -1
+        // 两个都没用过时差值是 NaN（-Inf - -Inf），falsy → 落到名称升序
+        return sign * (lastUsedAtOf(a) - lastUsedAtOf(b)) || a.name.localeCompare(b.name, 'zh-CN')
+      })
+      break
+    case 'mostUsed':
+      out.sort((a, b) => {
+        // 用 `> 0 / < 0` 两个比较而不是 `!== 0`：万一 `now` 传成 NaN（调用方手滑），
+        // 分数差会是 NaN，而 `NaN !== 0` 为 true 会把 NaN 当比较结果返回 ——
+        // 比较函数返回 NaN 的行为是实现相关的。两个比较都为 false 时自然落到平局分支。
+        const byScore =
+          sign * (usageScore(a.useCount, a.lastUsedAt, now) - usageScore(b.useCount, b.lastUsedAt, now))
+        if (byScore > 0) return 1
+        if (byScore < 0) return -1
+        // 平局①：最近用过的在前（**不跟 sign 反**：这是"更近 = 更相关"的事实排序）
+        const byRecent = lastUsedAtOf(b) - lastUsedAtOf(a)
+        if (byRecent > 0) return 1
+        if (byRecent < 0) return -1
+        // 平局②：名称 A→Z（同样不跟 sign 反）
+        return a.name.localeCompare(b.name, 'zh-CN')
+      })
       break
     case 'recent':
     default:
-      out.sort((a, b) => b.importedAt - a.importedAt)
+      out.sort((a, b) => sign * (a.importedAt - b.importedAt))
       break
   }
   return out
+}
+
+/** 某个键的自然方向是否为降序（UI 用来把 `sortDesc === null` 翻译成人能读的方向） */
+export function naturalSortDesc(sort: SortKey): boolean {
+  return NATURAL_SORT_DESC[sort] ?? true
+}
+
+/**
+ * 当前**实际生效**的方向（把三态 `sortDesc` 归一成布尔）。
+ *
+ * - `sortDesc === true / false` → 原样（用户手动选的方向永远压过自然方向）；
+ * - `sortDesc === null` → 该键的自然方向。
+ *
+ * UI 只认这个值：`null` 与 `true` 在"按大小"上没有肉眼区别，按钮若只读原始字段会
+ * 出现"看起来是倒序、点一下却没反应"的错觉。
+ */
+export function effectiveSortDesc(sort: SortKey, sortDesc: boolean | null): boolean {
+  return sortDesc === null ? naturalSortDesc(sort) : sortDesc
+}
+
+/**
+ * 切换排序键时该写进 `filters` 的补丁（**方向重置的唯一实现点**）。
+ *
+ * 规则：**换了键 → 方向回到该键的自然方向**（`sortDesc: null`），不继承上一个键的反向。
+ * 用户从「按大小倒序」切到「按名称」期望看到 A→Z，而不是莫名的 Z→A。
+ *
+ * 键没变（重复点同一项 / 键盘回车落在当前项）→ 只写 `sort`、**不动方向**：
+ * 那一下不表达"换键"，把用户刚调好的方向清掉纯属多余。
+ *
+ * @param current 当前 `filters.sort`
+ * @param next 目标键
+ * @returns 可直接交给 `setFilter` 的增量补丁
+ */
+export function sortChangePatch(
+  current: SortKey,
+  next: SortKey
+): Pick<Filters, 'sort'> | Pick<Filters, 'sort' | 'sortDesc'> {
+  if (current === next) return { sort: next }
+  return { sort: next, sortDesc: null }
 }
 
 /**
  * 过滤 + 排序（`useVisibleAssets` 的纯函数内核）。
  *
  * `view` 默认 `'assets'`（老调用方的行为 = 只排除软删记录，其余完全不变）。
- * 回收站视图的排序特例：`sort: 'recent'` 按**删除时间**倒序（最近删的在最上面），
- * 其余档位仍按用户选的键（名称 / 大小 / SU 版本）——「按导入时间」对回收站没有意义。
+ * 回收站视图的排序特例：`sort: 'recent'` 按**删除时间**排序（自然方向 = 倒序，最近删的在
+ * 最上面），其余档位仍按用户选的键（名称 / 大小 / SU 版本）——「按导入时间」对回收站没有意义。
+ *
+ * 方向覆盖（`f.sortDesc`）对这条特例**同样生效**：`trash + recent + sortDesc === false`
+ * 时按 `deletedAt` **升序**（先删的在上）。不跟随就会出现"方向按钮在回收站里按了没反应"。
  */
 export function applyFilters(
   assets: Asset[],
@@ -673,9 +916,10 @@ export function applyFilters(
   const q = f.query.trim().toLowerCase()
   const filtered = assets.filter((a) => matchesFilters(a, f, q, view))
   if (view === 'trash' && f.sort === 'recent') {
-    return filtered.sort((a, b) => (b.deletedAt ?? 0) - (a.deletedAt ?? 0))
+    const sign = effectiveSortDesc('recent', f.sortDesc) ? -1 : 1
+    return filtered.sort((a, b) => sign * ((a.deletedAt ?? 0) - (b.deletedAt ?? 0)))
   }
-  return sortAssets(filtered, f.sort)
+  return sortAssets(filtered, f.sort, f.sortDesc)
 }
 
 /**
@@ -997,8 +1241,11 @@ export function filtersFromSavedView(
     typeof raw.minResolution === 'string' && VALID_RESOLUTIONS.has(raw.minResolution)
       ? (raw.minResolution as ResolutionBucket)
       : null
-  next.modelFormat =
-    raw.modelFormat === 'skp' || raw.modelFormat === 'max' ? raw.modelFormat : null
+  // 合法值集合 = `MODEL_FORMAT_OPTIONS` 里除掉「全部」档 —— 加一档格式时这里自动跟随，
+  // 不再维护第二张字面量表（2026-11-09 加 `'d5a'` 就是因为这张表漏写而白排查一轮）。
+  next.modelFormat = MODEL_FORMAT_OPTIONS.some((o) => o.value === raw.modelFormat)
+    ? (raw.modelFormat as ModelFormat)
+    : null
   next.query = typeof raw.query === 'string' ? raw.query : ''
   // 排序：`SavedView.sort` 优先；它非法时退回快照里的 sort；都不合法才用默认
   if (typeof view.sort === 'string' && VALID_SORTS.has(view.sort)) {
@@ -1006,6 +1253,14 @@ export function filtersFromSavedView(
   } else if (typeof raw.sort === 'string' && VALID_SORTS.has(raw.sort)) {
     next.sort = raw.sort as SortKey
   }
+  // 排序方向：**只接受布尔字面量**。缺省 / 字符串 / 数字 / null / 垃圾值一律落 `null`
+  // （= 该键的自然方向）。为什么不宽松（`raw.sortDesc === true` 那样会把 `'yes'` 也当假）：
+  // 方向是"反着来"的状态，猜错会让用户看到一份顺序莫名其妙的列表，比丢掉这个偏好更糟。
+  //
+  // 本版 `snapshotFilters` **不写** `sortDesc`（套用集合 = 回到自然方向；方向的入口是
+  // 中栏头那枚按钮，不是集合）。这条校验服务的是手工改过的 settings.json，
+  // 以及将来允许"集合带方向"时存量数据的兼容 —— 它必须**先**存在。
+  next.sortDesc = raw.sortDesc === true ? true : raw.sortDesc === false ? false : null
   // 存量视图可能存着「大类 + 该大类不支持的维度」这种非法组合
   // （例如 `kind: 'hdri' + minResolution: '2k'`：HDR 表里没有 2K 档）→ 套用即归一化
   // 两道归一化，顺序不能反：

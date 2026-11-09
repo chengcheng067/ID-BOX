@@ -11,9 +11,11 @@
  * 这样同一份菜单逻辑可以被单测、也可以被将来的其它入口复用。
  */
 import type { Asset } from '../../shared/types'
+import { isModelKind } from '../../shared/modelFormat'
 import { duplicatesOf } from './duplicates'
 import { activeFilterDimensions, type Filters } from './filters'
 import { effectiveMaterialSlots } from './materialBall'
+import { isDeletedAsset } from './trashView'
 
 /* ────────────────────────────────────────────────────────────────────────────
  * 菜单项的数据结构
@@ -66,6 +68,15 @@ export const MENU_ICON = {
   tag: 'M20.6 13.4 12.4 5.2a1.6 1.6 0 0 0-1.1-.5H5.8A1.6 1.6 0 0 0 4.2 6.3v5.5c0 .4.2.8.5 1.1l8.2 8.2a1.6 1.6 0 0 0 2.3 0l5.4-5.4a1.6 1.6 0 0 0 0-2.3zM7.6 8.6h.01',
   star: 'M12 3.4l2.7 5.5 6 .88-4.35 4.24 1.03 5.98L12 17.2l-5.38 2.82 1.03-5.98L3.3 9.78l6-.88z',
   copy: 'M9 9h9.5v9.5a1.5 1.5 0 0 1-1.5 1.5H9a1.5 1.5 0 0 1-1.5-1.5V10.5A1.5 1.5 0 0 1 9 9zM6.5 15H5a1.5 1.5 0 0 1-1.5-1.5V4.5A1.5 1.5 0 0 1 5 3h9a1.5 1.5 0 0 1 1.5 1.5V6',
+  /**
+   * 铅笔（「重命名…」，2026-11-09 用户：「本体目前是没有右键重命名的选择的」）。
+   * 与 `MENU_ICON.copy` / `MENU_ICON.file` 同一套 24×24 网格 + 线性描边：
+   * 笔身一个闭合路径（笔尖到笔尾），再加一笔笔尖折线，14px 下也认得出来。
+   */
+  pencil: [
+    'M4.2 19.8h3.5l10-10a2.5 2.5 0 0 0-3.5-3.5l-10 10z',
+    'M14.2 7.6l2.4 2.4'
+  ],
   file: [
     'M14 3.5H7A1.5 1.5 0 005.5 5v14A1.5 1.5 0 007 20.5h10a1.5 1.5 0 001.5-1.5V8z',
     'M13.8 3.5V8h4.5'
@@ -152,7 +163,13 @@ export interface AssetMenuActions {
   onEnterFolder: () => void
   /** 「预览 HDR」：hdri（应绑 openHdrPreview） */
   onPreviewHdr: () => void
-  /** 「打开文件位置」：other 的第一项 **与** 第 8 项共用（应绑 reveal） */
+  /**
+   * 「重命名…」：复用**既有**批量重命名链路（`store.openRenameDialog(ids)` →
+   * `RenameDialog` → `store.applyRenames` → `main/rename.ts`），不在这里另写一套。
+   * 单选 / 多选都交给那个弹窗（它本来就支持 N 条 + 预览表 + 冲突禁用）。
+   */
+  onRename: () => void
+  /** 「打开文件位置」：other 的第一项 **与**「复制 / 定位」簇里那一项共用（应绑 reveal） */
   onReveal: () => void
   /** 「更换封面…」（应打开既有 CoverPicker） */
   onChangeCover: () => void
@@ -174,7 +191,7 @@ export type AssetOpenMode = 'folder' | 'hdr' | 'reveal' | 'multi'
 /**
  * 第一项该做什么。
  *
- * - `model` / `texture` / `material` / `cad` → 进入软件内文件夹视图；
+ * - `model`（含 `.d5a`）/ `texture` / `material` / `cad` → 进入软件内文件夹视图；
  * - `hdri` → 直接进 HDR 预览（与双击一致：HDR 没有"文件夹里翻文件"的诉求）；
  * - `other` / 未知 → 只能落到系统资源管理器；
  * - 多选 → 没法定"进哪个文件夹"，退回"打开第一个所在文件夹"。
@@ -182,12 +199,16 @@ export type AssetOpenMode = 'folder' | 'hdr' | 'reveal' | 'multi'
  * ⚠️ `'cad'` 必须在这里（2026-10-29）：CAD 资产同样是**独占一个文件夹**的资产
  * （`.dwg` + 配套预览图），"在文件夹中显示"只是兜底入口。漏掉它会让右键第一项
  * 从「进入文件夹」退化成「打开文件位置」，与双击行为不一致。
+ *
+ * ⚠️ `d5a` 也要走「进入文件夹」（2026-11-09）：它现在是**模型的一种格式**（`isModelKind`
+ * 覆盖 model + d5a），双击就是进文件夹视图（`.d5a` 是整包存档，文件夹里就那一个文件）。
+ * 用 `isModelKind` 而不是手写 `kind === 'model' || kind === 'd5a'` —— 模型域只认那一张表。
  */
 export function assetOpenModeOf(targets: readonly Asset[]): AssetOpenMode {
   if (targets.length !== 1) return 'multi'
   const kind = targets[0]?.kind
   if (kind === 'hdri') return 'hdr'
-  if (kind === 'model' || kind === 'texture' || kind === 'material' || kind === 'cad') {
+  if (isModelKind(kind) || kind === 'texture' || kind === 'material' || kind === 'cad') {
     return 'folder'
   }
   return 'reveal'
@@ -251,13 +272,36 @@ export function assetMenuItems(
     })
   }
   /**
-   * 第一项已经是「打开文件位置」时，第 8 项不再重复出现。
+   * 第一项已经是「打开文件位置」时，「复制 / 定位」那一簇里不再重复出现。
    * （`other` 单选的 mode 就是 `reveal`、多选也是 reveal —— 同一个动作摆两遍
    * 只会让菜单变长并让人以为有什么不同。）
    */
   const firstIsReveal = mode === 'reveal' || mode === 'multi'
 
-  /* ② 更换封面（单选；多选时灰掉 —— CoverPicker 一次只服务一个资产） */
+  /**
+   * ② 重命名（2026-11-09 用户原话：「idbox 本体目前是没有右键重命名的选择的，
+   * 只有在右侧边栏区，那很显然不符合大家使用的逻辑嘛」）。
+   *
+   * 为什么放在**这里**（第一项「打开」之后、更换封面之前）：改名是"对这张卡做的第一件事"
+   * 级别的高频动作，压在「复制文件夹路径 / 打开文件位置」那一簇下面等于没加。
+   *
+   * 条件与既有菜单项**同一套口径**（不新造规则）：
+   * - 回收站视图（`deletedAt` 是有限数字）不出现 —— 那里目录已经在 `.trash/<id>/`，
+   *   改名会让"还原"找不到原路径；删除 / 指派分类等项在回收站里本来也走专门的链路，
+   *   这里不给一个会破坏数据一致性的入口。
+   * - 多选**不禁用**：`RenameDialog` 本来就是批量改名弹窗（模板 + 预览表 + 冲突禁用），
+   *   网格底部的「重命名…」对多选用的就是这条链路，菜单里保持同一行为。
+   */
+  const allDeleted = targets.every((a) => isDeletedAsset(a))
+  if (!allDeleted) {
+    items.push({
+      label: `重命名${countSuffix(count)}…`,
+      icon: MENU_ICON.pencil,
+      onClick: actions.onRename
+    })
+  }
+
+  /* ③ 更换封面（单选；多选时灰掉 —— CoverPicker 一次只服务一个资产） */
   items.push({
     label: '更换封面…',
     icon: MENU_ICON.image,
@@ -265,14 +309,14 @@ export function assetMenuItems(
     onClick: actions.onChangeCover
   })
 
-  /* ③ 自定义渲染（仅材质族且有 baseColor；单选专属） */
+  /* ④ 自定义渲染（仅材质族且有 baseColor；单选专属） */
   if (canCustomRender(single)) {
     items.push({ label: '自定义渲染…', icon: MENU_ICON.sliders, onClick: actions.onCustomRender })
   }
 
   items.push('separator')
 
-  /* ④⑤ 分类 / 收藏 */
+  /* ⑤⑥ 分类 / 收藏 */
   items.push({ label: '指派分类…', icon: MENU_ICON.tag, onClick: actions.onAssignCategory })
   items.push({
     label: `${allFavorite ? '取消收藏' : '收藏'}${countSuffix(count)}`,
@@ -282,7 +326,7 @@ export function assetMenuItems(
 
   items.push('separator')
 
-  /* ⑥⑦⑧ 复制 / 定位 */
+  /* ⑦⑧⑨ 复制 / 定位 */
   items.push({
     label: '复制资产名',
     icon: MENU_ICON.file,
@@ -299,7 +343,7 @@ export function assetMenuItems(
     items.push({ label: '打开文件位置', icon: MENU_ICON.folder, onClick: actions.onReveal })
   }
 
-  /* ⑨ 保留这份（单选 + 真有副本） */
+  /* ⑩ 保留这份（单选 + 真有副本） */
   if (single !== null && dupCopies.length > 0) {
     items.push('separator')
     items.push({
@@ -309,7 +353,7 @@ export function assetMenuItems(
     })
   }
 
-  /* ⑩ 删除（危险项永远最后，且前面一定有分隔线） */
+  /* ⑪ 删除（危险项永远最后，且前面一定有分隔线） */
   items.push('separator')
   items.push({
     label: `删除${countSuffix(count)}…`,

@@ -42,6 +42,9 @@ const { db } = await import('../src/renderer/db')
 Object.defineProperty(db, 'assets', {
   value: {
     put: vi.fn(async () => undefined),
+    // `openFolderView` 会顺带做一次使用统计打点（`db.assets.update`）；
+    // 打点形状与失败隔离在 `tests/useStats.test.ts` 里单独钉死，这里只要它不炸。
+    update: vi.fn(async () => 1),
     bulkPut: vi.fn(async () => 0),
     bulkDelete: vi.fn(async () => 0)
   },

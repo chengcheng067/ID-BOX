@@ -170,7 +170,20 @@ describe('设置页接线：开关 / 手动入口 / 进度 / 取消 / 撤销', (
     expect(section).toContain('只保留最近 3 份')
   })
 
-  it('备份通道前缀在 UI 里可见（zhimo-reclass-），不会和 reclass- 混为一谈', () => {
+  /**
+   * v1.0 修订（A 级文案收口，2026-11-09）：原文断言「备份前缀在 UI 里可见」，
+   * 但用户可见文本已明确**不得出现备份前缀**（`zhimo-reclass-` / `reclass-` 属于内部实现；
+   * 见 `docs/48` 的口径：主程序界面不出现文件名与字段名）。
+   * ⇒ 断言**反向化**，但把原来那条的真正意图（两条通道互不消费对方备份）钉得更死：
+   *   ① 去注释后的**代码**里不许出现前缀字面量（= UI 字符串里不会有）；
+   *   ② 代码里必须仍然通过常量 `ZHIMO_RECLASS_BACKUP_PREFIX` 传递前缀（不手抄、不写死），
+   *      这才是「两条通道互不干扰」的技术保证。
+   */
+  it('备份前缀不出现在用户可见文案里，但仍只从常量取（两条通道互不干扰）', () => {
+    expect(code).not.toContain('zhimo-reclass-')
+    expect(code).not.toContain('reclass-')
+    expect(code).toContain('ZHIMO_RECLASS_BACKUP_PREFIX')
+    // 注释里保留出处说明是允许的（不给用户看）
     expect(dialog).toContain('zhimo-reclass-')
   })
 })

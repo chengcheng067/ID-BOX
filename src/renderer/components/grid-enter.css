@@ -1,0 +1,67 @@
+/* 网格入场：卡片从两侧边缘向内滑入（由 `AssetGrid` 的「网格出现」信号驱动）
+ *
+ * 用户口径（2026-11-09，逐字）：「现阶段从模型的文件夹返回上一步，到所有模型的集合界面时，
+ * 过渡动画相当不自然，像是卡顿了一样。我建议这个返回上一步的动画，直接让所有的卡片从边缘
+ * 向内划入」；拍板见 `docs/48-V1.0拍板台账-20261109.md` §4 —— 作用范围是**所有进入网格的
+ * 场景**（文件夹返回 / 侧栏切换 / 搜索 / 分类跳转），不只是「首页 → 网格」这一路。
+ *
+ * 分工：
+ * - 前端过场（封面退场 / 文件夹飞中 / 停留 / 消隐）在 `HomeCover` + `HomeOutro` + `App`；
+ * - 文件视图的进出场（Win8 磁贴）在 `styles.css` 的 `.folder-stage*`；
+ * - **本文件只管一件事**：网格卡片从"自己所在那半边"的边缘滑进自己的位置。
+ *
+ * 两个变量由 `AssetGrid` 的入场 effect 逐张写在内联 style 上：
+ *   --edge-x   ：起始水平偏移（左半边 -64px / 右半边 +64px）
+ *   --enter-i  ：错峰序号（0..20，再往后统一 20）
+ * 动画结束后 effect 会摘掉 `data-enter` 与这两个内联变量，让卡片回到自己的规则
+ * （尤其是 `.card-hover:hover` 的 `translateY(-2px)` 上浮：动画来源的优先级高于普通声明，
+ * 不摘的话那份"收尾 transform"会把:hover 的上浮整块盖掉）。
+ *
+ * ⚠️ 为什么由属性触发、而不是给每张卡加 class：卡片是虚拟滚动切片，滚动时会一批批新建成
+ * DOM 节点；属性挂在**卡片的直接父容器**上（`> *`），新进入窗口的卡片天然继承同一套规则，
+ * 不用逐个 per-card 记账。
+ *
+ * ⚠️ 只动 `transform` / `opacity`，不碰 `pointer-events`：动画期间卡片必须照样能点、能双击
+ * （用户口径「动画不能阻塞交互」）。
+ */
+
+[data-enter='true'] > * {
+  animation: idbox-enter-from-edge 480ms cubic-bezier(.2, .8, .2, 1) both;
+  animation-delay: calc(var(--enter-i, 0) * 18ms);
+}
+
+@keyframes idbox-enter-from-edge {
+  from {
+    opacity: 0;
+    transform: translateX(var(--edge-x, 0px)) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+/* 系统「减少动效」：**位移整块不做**，退化成一次很短的纯淡入。
+ *
+ * 这是第二道兜底 —— JS 侧（`AssetGrid.requestGridEnter`）在命中时根本就不会发请求，
+ * 所以正常情况下这条规则根本轮不到。留着它是为了「动画跑到一半，用户在系统设置里
+ * 打开减少动效」这一刻：媒体查询的响应比 React 状态更早，能立刻把位移掐掉。
+ * 时长同样要更短（190ms），与文件视图那套 reduced 口径一致。
+ */
+@media (prefers-reduced-motion: reduce) {
+  [data-enter='true'] > * {
+    animation-name: idbox-enter-fade;
+    animation-duration: 190ms;
+    animation-timing-function: linear;
+    animation-delay: 0ms;
+  }
+}
+
+@keyframes idbox-enter-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

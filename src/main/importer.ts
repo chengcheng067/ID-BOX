@@ -6,6 +6,7 @@ import { checkSpaceFor } from './disk'
 import {
   cleanStaging,
   createStaging,
+  dropInboxProtocolManifest,
   listTopLevel,
   moveDir,
   pathExists,
@@ -595,8 +596,14 @@ function conflictNote(
 
 /**
  * `done` 事件的补充文案（§3.2.4）：覆盖档有两种情形必须**显式告诉用户**，不能静默 ——
- * ① 旧版本没能进回收站（被 DCC 占用等）→ 已暂存为 `.idbox-old-*`；
+ * ① 旧版本没能进回收站（被 DCC 占用等）→ 旧目录就地在同目录下改名留着；
  * ② 走了退化分支（旧目录已不存在 / 不在库内 / kind 变了）→ 按新素材落盘。
+ *
+ * ⚠️ ① 的用户可见文案说「原名.旧版本」，但**磁盘上的真实后缀仍然是 `.idbox-old-`**
+ * （`<原名>.idbox-old-<id>`，见 `replaceAssetFolder`）。刻意**不改**真实后缀：
+ * 它是 `rescan` / `watcher` 的跳过判据（`.` 开头）与既有资产的兼容前提，改一个字
+ * 都会让历史遗留目录被重新扫进索引。文案只负责让用户在资源管理器里**认出**它
+ * （"斜杠"那种内部命名不该出现在 toast 上，A14 收口）。
  */
 function doneMessage(
   decision: ConflictDecision | null,
@@ -604,7 +611,9 @@ function doneMessage(
 ): string | undefined {
   if (!decision || decision.resolution !== 'overwrite') return undefined
   if (!replace) return '已覆盖（原目录已不存在，按新素材落盘）'
-  if (!replace.oldDirTrashed) return '已覆盖；旧版本未能移入回收站，已暂存为 .idbox-old-*'
+  if (!replace.oldDirTrashed) {
+    return '已覆盖；旧版本没能移进回收站，已改名成「原名.旧版本」留在同一个文件夹里，确认没用可以自己删'
+  }
   return undefined
 }
 
@@ -797,6 +806,22 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
     // 漏掉这一项 → 单个 `.dwg` 会掉进下面的 `extractArchive` → 报「不是压缩包」。
     // `importModelOne` 内部自己用 `kindOfExt(ext)` 算 kind，不写死 `'model'`。
     const extKind = kindOfExt(ext)
+
+    // ── D5A 整包存档（V1.0，docs/48 §5 / docs/46 §1.3 L1）───────────────
+    //
+    // `.d5a` 的**内容**是标准 ZIP（前 4 字节 `PK\x03\x04`），但用户拍板「整包存档、
+    // 不解包」：包内是 D5 私有的 `1.d5mesh` / `d5material.xml` / `textures/*`，
+    // 解出来既不能预览也不能插入。⇒ 必须在**这里**（分流层）拦下，走与 HDR 同构的
+    // 单文件直导，让后面的 `createStaging` / `extractArchive`（见下方 `if (isDir) else`
+    // 分支）**一次都不执行** —— 这才是「放行但不解包」的实现。
+    //
+    // ⛔ 两个反面做法都是错的：
+    //  ① 把 `.d5a` 加进 `extractor.ts` 的 `SUPPORTED_EXTS`（那等于解包）；
+    //  ② 把 `.d5a` 交给 `importModelOne`（会当成模型主文件 → 破坏「可读不可插入」，
+    //     而且模型路径会给它生成封面 / 读 skp 头，全是白跑）。
+    // 放行顺序也重要：`extKind === 'd5a'` 必须先于下面的 model/cad 判定。
+    if (extKind === 'd5a') return importMediaOne(src, st, deps, 'd5a', batch)
+
     if (extKind === 'model' || extKind === 'cad') return importModelOne(src, st, deps, batch)
   }
 
@@ -833,6 +858,13 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
   try {
     if (isDir) {
       await fs.cp(src, staging, { recursive: true })
+      // ── SketchUp 插件收件箱的协议文件留在库外（docs/48 §7 的 create 通道）──────
+      // 插件把 `manifest.json` 和 `.skp` / `.cover.png` 写在同一个 job 目录里，而
+      // create 通道是**文件夹导入** → 不处理的话它会跟着素材一起进用户的库。
+      // 判据是"文件名 + 内容"双条件（`isInboxManifestJson`）：用户自己素材包里带的
+      // manifest.json 必须原样保留 —— 删用户的文件是不可逆事故。
+      // 放在 `listTopLevel` / `walkFiles` **之前**：files[] / size / 分类输入一并干净。
+      await dropInboxProtocolManifest(staging)
     } else {
       const res = await extractArchive(src, staging, {
         sevenZipPath: deps.sevenZipPath,
@@ -1205,21 +1237,27 @@ async function importOne(src: string, deps: ImportDeps, batch: ImportBatch): Pro
 }
 
 /**
- * 单个媒体文件直导为独立资产（2026-10 任务 2 图片 / 0.6.5 HDR）。
+ * 单个媒体文件直导为独立资产（2026-10 任务 2 图片 / 0.6.5 HDR / V1.0 D5A）。
  *
  * 链路：空间预检 → autoClassify 预分类 → mkdir → **复制**入文件 → 建资产记录 →
  * 按 `deps.archiveDisposal` 处置源文件（keep / recycle / delete）。
  * - 资产名 = 文件名去扩展名（清洗/水印剥离与压缩包同规则）
- * - `kind` 由调用方给：图片 `texture` / HDR 类 `hdri`（`kindFolder()` 决定落盘大类）
+ * - `kind` 由调用方给：图片 `texture` / HDR 类 `hdri` / D5 资产包 `d5a`
+ *   （`kindFolder()` 决定落盘大类）
  * - 图片：cover = 该图片本身（`coverSource='named'`）
- *   HDR：**不给封面**（`cover=undefined` + `coverSource='placeholder'`）——
+ *   HDR / **D5A**：**不给封面**（`cover=undefined` + `coverSource='placeholder'`）——
  *   `.hdr/.exr` 不是 `<img>` / `createImageBitmap` 能解码的格式，塞进 cover 只会让
- *   网格和详情面板出现一张碎图；UI 走 `IconHdr` 类型占位。
+ *   网格和详情面板出现一张碎图；`.d5a` 同理（它是 ZIP 存档，不是位图，强塞给
+ *   `nativeImage.createFromPath` 只会得到破图 + 一条 `thumbStatus='failed'` 足迹）。
+ *   UI 分别走 `IconHdr` / D5A 紫色占位。两者的判据合并成 `isCoverless`（见函数体首行）。
  * - HDR：文件名里的**全景对齐参数**提取成一行写进 `note`（见 `panoramaNoteFromName`）
+ *   ⚠️ 只有 HDR 走这条，**不是** `isCoverless` —— D5A 没有全景参数这回事。
  * - 文件夹 = `<大类>/<一级>/<二级>/<资产名>`，与压缩包走同一 autoClassify 规则
  *   （`hdri` 有一级册 `HDRI_LEVEL1_LIST` 5 项，名字命中「天空/城市/小区/室内/户外」才落
  *   `HDRI/<xx>HDR/未分类`；没命中仍落 `未分类/未分类` —— 绝大多数 HDR 文件名是
  *   `古月视觉HDR-偏移U：0.23` 这种纯参数名，**落未分类是预期**，不报错）
+ *   （`d5a` **没有**词表册 → `classifyAssetName` 恒返回双 `未分类`，落
+ *   `D5A/未分类/未分类/<资产名>/`，这是设计结论、不是缺陷）
  * - **源文件处置三档与压缩包完全一致**（复用同一个 `disposeArchive`）：
  *   `keep` 原地保留、`recycle` 进回收站、`delete` 删除。
  *   历史缺陷：本函数曾无条件 rename 源文件（见下方复制段的注释）。
@@ -1236,6 +1274,21 @@ async function importMediaOne(
 ): Promise<Asset | null> {
   const itemName = path.basename(src)
   const isHdr = kind === 'hdri'
+  /**
+   * 「这个文件拿不到任何封面 / 缩略图」——**一个判据管四处**（V1.0 修正的施工陷阱）。
+   *
+   * 为什么必须显式区分（docs/46 §1.4 施工注）：本函数原先把整条"无封面"路径挂在
+   * `isHdr` 上。若 `.d5a` 以 `isHdr=false` 进来，就会：
+   * ① 把 8 MB 的 ZIP 存档本身设为 `cover`（→ 破图）；
+   * ② 调 `ensureThumb(id, coverAbs)` 让主进程 `nativeImage` 去解码一个 ZIP（→ 白跑一次
+   *    解码 + 留一条 `thumbStatus='failed'` 足迹，且每次启动都可能重试）。
+   * 从用户可见面看，这就是一张碎图 —— 直接违反 D-1「不留白、不显示纹理或二维码」。
+   *
+   * ⚠️ `isHdr` 仍**单独**控制两件事，不得换成 `isCoverless`：
+   *  - emit 文案（HDR 说「正在读取 HDR…」）；
+   *  - `panoramaNoteFromName` 的全景参数抄写（D5A 没有这回事）。
+   */
+  const isCoverless = isHdr || kind === 'd5a'
 
   // P0-3 空间预检（压缩包路径同款，必须早于 mkdir）
   const space = await checkSpaceFor(src, deps.libraryDir, {
@@ -1259,7 +1312,10 @@ async function importMediaOne(
     item: src,
     itemName,
     status: 'extracting',
-    message: isHdr ? '正在读取 HDR…' : '正在读取图片…'
+    // ⚠️ 文案按 kind 分档。`.d5a` **不是**图片 —— 套用「正在读取图片…」会让用户在
+    // 大包（样本 8 MB）导入慢时以为程序把存档当图在解码。
+    // 注意这里用 `kind` 判、不用 `isCoverless`：后者含 HDR，文案要各说各的。
+    message: isHdr ? '正在读取 HDR…' : kind === 'd5a' ? '正在读取 D5A…' : '正在读取图片…'
   })
 
   const ext = path.extname(itemName).slice(1).toLowerCase()
@@ -1414,11 +1470,14 @@ async function importMediaOne(
   const { id, finalName, target } = placement
   const relFolder = placement.relFolder
   const destFile = path.join(target, itemName)
-  // HDR 不做缩略图：`.hdr` 不是图片解码器能吃的格式，传给 ensureThumb 只会白跑一次
-  // 解码并留下一条 failed 足迹（UI 本来就显示类型占位）。
-  const coverAbs = isHdr ? null : destFile
+  // HDR / D5A 不做缩略图：`.hdr` / `.d5a` 都不是图片解码器能吃的格式，传给 ensureThumb
+  // 只会白跑一次解码并留下一条 failed 足迹（UI 本来就显示类型占位）。
+  // 判据统一走 `isCoverless`（= HDR ‖ D5A）—— 见函数头 `isCoverless` 的说明。
+  const coverAbs = isCoverless ? null : destFile
 
   // 0.6.0 分辨率筛选：单图直导的资产也带宽高（同一份头部解析，失败静默）
+  // ⚠️ HDR / D5A 也照调：`fillImageSizes` 内部按 `IMAGE_FILE_EXTS` / `isHdrExt` 白名单
+  // 逐个跳过，`.d5a` 不在任何一张表里 → 天然 no-op，**不会**去读 ZIP 头当图片尺寸。
   await fillImageSizes(target, [file])
 
   // P0-9 缩略图（注入，失败只降级不阻断）
@@ -1439,9 +1498,10 @@ async function importMediaOne(
   // 知末商品 ID（0.6.3）：单文件路径同压缩包路径 —— 源文件名优先，其次资产名。
   // 已在判重点按 `assetName` 算好（§1.3），这里不再用 finalName 重算。
 
-  // 全景对齐参数（0.6.5）：只对 HDR 生效。名字里写的「偏移U/V、平铺N」是用户
-  // 在 DCC 里的对齐设定，丢了就得回原站查 —— 顺手抄一行到 note（不结构化）。
-  const note = isHdr ? panoramaNoteFromName(itemName) : ''
+    // 全景对齐参数（0.6.5）：只对 HDR 生效。名字里写的「偏移U/V、平铺N」是用户
+    // 在 DCC 里的对齐设定，丢了就得回原站查 —— 顺手抄一行到 note（不结构化）。
+    // ⚠️ 用 `isHdr` 而**不是** `isCoverless`：D5A 没有全景参数，误套会把文件名当参数解析。
+    const note = isHdr ? panoramaNoteFromName(itemName) : ''
 
   const now = Date.now()
   const fresh: Asset = {
@@ -1451,10 +1511,11 @@ async function importMediaOne(
     source: deps.defaultSource,
     folder: target,
     relFolder,
-    // HDR 不做封面：`.hdr/.exr` 不能当 `<img>` 解码，塞进去只会得到碎图。
-    // `pickCover` 也不参与（单文件路径不调它）→ 走 `IconHdr` 类型占位。
-    cover: isHdr ? undefined : itemName,
-    coverSource: isHdr ? 'placeholder' : 'named',
+    // HDR / D5A 不做封面：`.hdr/.exr` 不能当 `<img>` 解码；`.d5a` 是 ZIP 存档、
+    // 同样不是位图 —— 塞进去只会得到碎图。
+    // `pickCover` 也不参与（单文件路径不调它）→ HDR 走 `IconHdr`、D5A 走紫色占位。
+    cover: isCoverless ? undefined : itemName,
+    coverSource: isCoverless ? 'placeholder' : 'named',
     thumbPath,
     thumbStatus,
     files: [file],

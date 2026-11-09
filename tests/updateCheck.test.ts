@@ -12,9 +12,11 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import {
   GITHUB_LATEST_RELEASE_URL,
+  MAX_NOTES_CHARS,
   UPDATE_CHECK_TIMEOUT_MS,
   compareVersions,
   fetchLatestRelease,
+  normalizeReleaseNotes,
   normalizeVersion,
   type UpdateFetchInit
 } from '../src/main/updateCheck'
@@ -128,6 +130,8 @@ describe('fetchLatestRelease（全部路径都不抛错）', () => {
       assetUrl:
         'https://github.com/chengcheng067/ID-BOX/releases/download/v0.6.9/IDBOX-Setup-0.6.9.exe',
       publishedAt: '2026-10-26T10:00:00Z',
+      // 这份 fixture 没有 `body` 字段 → 发布说明为 null（不是空串，不是 undefined）
+      notes: null,
       checkedAt: 1_700_000_000_000,
       error: null
     })
@@ -230,6 +234,69 @@ describe('fetchLatestRelease（全部路径都不抛错）', () => {
     const info = await fetchLatestRelease({ current: 'v0.6.8', fetcher })
     expect(info.current).toBe('0.6.8')
     expect(info.hasUpdate).toBe(true)
+  })
+})
+
+// ── ②b Release 发布说明（2026-11，弹窗展示更新内容） ────────────────────
+describe('发布说明 notes（原样 Markdown，归一化 + 限长，绝不清洗语义）', () => {
+  it('body 是字符串 → 原样带出（Markdown 一个字符都不改）', async () => {
+    const body = '## 新功能\n\n- 支持 **HDR** 环境贴图\n- 见 [文档](https://example.com/d)\n\n---'
+    const { fetcher } = recordingFetcher(async () => fakeResponse(releaseBody({ body })))
+    const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+    expect(info.notes).toBe(body)
+  })
+
+  it('body 缺失 / 不是字符串 / 空白 → null（不是空串，弹窗据此显示"没写说明"）', async () => {
+    for (const body of [undefined, null, 42, {}, [], '', '   \n\t ', true]) {
+      const { fetcher } = recordingFetcher(async () => fakeResponse(releaseBody({ body })))
+      const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+      expect(info.notes).toBeNull()
+    }
+  })
+
+  it('CRLF 会被归一化成 LF（`\\r` 不进渲染层）', async () => {
+    const { fetcher } = recordingFetcher(async () =>
+      fakeResponse(releaseBody({ body: '## 标题\r\n- 甲\r\n- 乙' }))
+    )
+    const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+    expect(info.notes).toBe('## 标题\n- 甲\n- 乙')
+    expect(info.notes ?? '').not.toContain('\r')
+  })
+
+  it('超长 body 被截断到上限内，并追加中文提示（不能让几十万字过 IPC）', async () => {
+    const long = '正'.repeat(MAX_NOTES_CHARS + 5_000)
+    const { fetcher } = recordingFetcher(async () => fakeResponse(releaseBody({ body: long })))
+    const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+    const notes = info.notes ?? ''
+    expect(notes.length).toBeLessThanOrEqual(MAX_NOTES_CHARS)
+    expect(notes).toContain('已截断显示')
+    // 截断仍保留原文的开头（不是整段丢掉）
+    expect(notes.startsWith('正')).toBe(true)
+  })
+
+  it('恰好等于上限时不截断（边界不多不少）', async () => {
+    const exact = 'a'.repeat(MAX_NOTES_CHARS)
+    const { fetcher } = recordingFetcher(async () => fakeResponse(releaseBody({ body: exact })))
+    const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+    expect(info.notes).toBe(exact)
+  })
+
+  it('normalizeReleaseNotes 是纯函数：脏输入一律 null，不抛错', () => {
+    expect(normalizeReleaseNotes(undefined)).toBeNull()
+    expect(normalizeReleaseNotes(Symbol('x'))).toBeNull()
+    expect(normalizeReleaseNotes(() => 'x')).toBeNull()
+    expect(normalizeReleaseNotes('  ok  ')).toBe('ok')
+  })
+
+  it('失败路径的 notes 一律 null（network / http / parse）', async () => {
+    const noFetch = await fetchLatestRelease({ current: '0.6.8', fetcher: null })
+    expect(noFetch.notes).toBeNull()
+    const { fetcher: http404 } = recordingFetcher(async () => fakeResponse({}, false, 404))
+    expect((await fetchLatestRelease({ current: '0.6.8', fetcher: http404 })).notes).toBeNull()
+    const { fetcher: badTag } = recordingFetcher(async () =>
+      fakeResponse(releaseBody({ tag_name: 'nightly', body: '## 说明' }))
+    )
+    expect((await fetchLatestRelease({ current: '0.6.8', fetcher: badTag })).notes).toBeNull()
   })
 })
 

@@ -33,10 +33,25 @@ module IDBoxPanel
     # 支持目录名必须与根 .rb 同名（去掉 .rb），否则 SketchupExtension 找不到入口。
     ENTRY_POINT = 'idbox_panel/main'.freeze
     EXT_NAME = 'ID BOX Panel'.freeze
-    # 1.0.3 → 1.1.0（docs/42 §11.1）：本批新增真工具栏 + 六块 UI + lib/ 实际拆分。
-    # 必须与 lib/core.rb 的 PLUGIN_VERSION 同步（两处版本号是不同编号体系：
-    # 插件版本 1.1.0，文档版本 docs/39 v1.6；线上发布仍是 0.9.2，本卡不 push）。
-    EXT_VERSION = '1.1.0'.freeze
+    # 插件包版本。**必须与 lib/core.rb 的 PLUGIN_VERSION 同值**（两处都是本插件包的版本，
+    # 不是文档版本、也不是主程序版本；面板左上角显示的是主程序 appVersion，见 main.rb 的 VERSION 注释）。
+    #
+    # 1.1.0 → 1.1.1（2026-11-09）：1.1.0 是 R-2 修复之前的快照（`Snapshot#thumbs_root` 恒返回空串
+    # ⇒ 面板封面全部降级成类型图标）；1.1.1 才含该修复 + 本批 UI 改动。
+    # 1.1.1 → 1.2.0（2026-11-09）：功能性新增（右键「导出至 IDBOX / 更新 IDBOX 中的这个模型」），
+    # 按语义化版本升 minor。⚠️ 必须与 lib/core.rb 的 PLUGIN_VERSION 同值（那边也有同样的提示）。
+    # 1.2.0 → 1.2.1（2026-11-09 装机实测反馈）：行为修复（右键更新判据 / 导出先命名 / 材质当前材质
+    # 从未生效 / 面板侧栏分类 + 大中小预览档），按语义化版本升 patch。
+    # 1.2.1 → 1.2.2（2026-11-09 用户实测）：材质双击后自动切油漆桶工具，升 patch。
+    # 1.2.2 → 1.2.3（2026-11-09 用户实测）：插件里只显示 SketchUp 模型（屏蔽 3ds Max 等格式），升 patch。
+    #
+    # 为什么这里不能直接引用 `IDBoxPanel::PLUGIN_VERSION`（试过，不安全）：
+    #   本文件是**扩展入口**，它在 `Registrar.register`（文件末尾）这一行才触发
+    #   `Sketchup.register_extension(meta, true)`，而 core.rb 是由 `main.rb` 被加载时才
+    #   `Sketchup.require` 进来的 —— 也就是说 `apply_metadata` 执行时 PLUGIN_VERSION **还不存在**。
+    #   而「根 .rb 只做注册、不得加载额外文件」是硬约束（docs/42 §2 文件 1），
+    #   不能为了取一个版本号提前 require core。⇒ 只能保持字面量 + 人工同步。
+    EXT_VERSION = '1.3.0'.freeze
     EXT_CREATOR = 'ID BOX'.freeze
     EXT_COPYRIGHT = 'ID BOX'.freeze
     EXT_DESCRIPTION =

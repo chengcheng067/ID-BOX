@@ -17,6 +17,7 @@ import {
 } from '../../shared/taxonomy'
 import { composeRelFolder } from '../../shared/naming'
 import { kindFolder } from '../../shared/classify'
+import { isModelKind } from '../../shared/modelFormat'
 import { pathSepFor } from './assetPath'
 
 /** 资产的两级分类（v3 之前的老数据可能缺字段 → 哨兵兜底，全链路不读 undefined） */
@@ -197,7 +198,12 @@ export function duplicatedLevel2Names(assets: Asset[], kind: KindScope): Set<str
  * `other` 无词表 → [] → UI 自由输入。 */
 export function level1OptionsFor(kind: AssetKind): readonly string[] {
   if (kind === 'texture' || kind === 'material') return MERGED_MATERIAL_LEVEL1
-  if (kind === 'model') return CHANNEL_LEVEL1.model
+  // ⚠️ `isModelKind` 而**不是** `kind === 'model'`（2026-11-09 修）：
+  // D5A 是「模型的一种格式」（`shared/modelFormat.ts` 的 `MODEL_KIND_MEMBERS`），
+  // 它的分类必须跟模型共用同一套一级词表。写成裸 `=== 'model'` 时 `.d5a` 资产
+  // 在整理浮层 / 详情面板里一级下拉只剩下「未分类」，用户根本没法给它分类 ——
+  // 这是真机上被用户当场抓到的缺陷，不是理论风险。
+  if (isModelKind(kind)) return CHANNEL_LEVEL1.model
   if (kind === 'cad') return CHANNEL_LEVEL1.cad
   if (kind === 'hdri') return CHANNEL_LEVEL1.hdri
   return []
@@ -223,8 +229,12 @@ export function level2OptionsFor(category1: string, kind?: AssetKind): readonly 
 
 /** 风格筛选选项：model/texture 用各自的册，kind=all 用并集；其余大类无词表 → [] */
 export function styleOptionsFor(kind: AssetKind | 'all'): readonly string[] {
-  if (kind === 'model' || kind === 'texture') return styleListOf(kind)
+  // 顺序要紧：`'all'` 不是 `AssetKind`，必须先挡掉，`isModelKind` 只吃 AssetKind。
   if (kind === 'all') return styleListAll()
+  // D5A 归模型域 ⇒ 吃模型那一册风格。裸 `=== 'model'` 会让 .d5a 资产的
+  // 「风格」多选区整个消失（不是空的，是连控件都不出）。
+  if (isModelKind(kind)) return styleListOf('model')
+  if (kind === 'texture') return styleListOf(kind)
   return []
 }
 

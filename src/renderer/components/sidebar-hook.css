@@ -1,0 +1,353 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 侧栏 · 钩线轨道（2026-11-09 拍板 §3「主程序 · 侧栏换皮」）
+ *
+ * 参考实现（MIT，本仓已抓取，未联网）：
+ *   docs/probe/tuneshape/src-hook-sidebar.ts        （引擎：path / hoverStart / spring）
+ *   docs/probe/tuneshape/src-hook-sidebar-spec.ts   （各态口径）
+ * 关键口径（逐条对应参考源）：
+ *   ① 轨道 = **一条竖直主线 + 选中项一段圆角折线**（不是伪元素高亮块）；
+ *   ② 灰线（悬停 / 焦点）在选中项**下方**时接在其后，在**上方**时只画弯钩，避免与强调轨重叠；
+ *   ③ 强调色只用本仓 token `--accent`（浅 #007AFF / 深 #0A84FF），
+ *      **不照抄**参考里的 `#fc4c01` / `#0152fe` 字面值；
+ *   ④ 减少动效时：轨道直接到位（JS 侧 `snap`），标签不做滑入（本文件末尾的 media query）。
+ *
+ * 颜色纪律：本文件**不含任何硬编码色值**，全部走 `--bg-*` / `--text-*` / `--border` / `--accent`。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+.sidebar-hook {
+  /* 侧栏内容宽度：与 App 的 SIDEBAR_W 一致；折叠态（可选 prop）压到图标宽 */
+  width: 216px;
+}
+
+.sidebar-hook.is-collapsed {
+  width: 48px;
+}
+
+.sidebar-hook-head {
+  padding: 14px 12px 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+}
+
+/* 滚动容器：只在这里滚，轨道会随内容一起滚（轨道 SVG 属于内容坐标系） */
+.sidebar-hook-nav {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 8px 8px;
+}
+
+/* 轨道坐标系：`position: relative` 是 `offsetTop` 的基准，别去掉 */
+.hook-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+/* 轨道本体：13px 宽的 SVG 贴在列表左缘；`overflow: visible` 让子层的水平段
+   （比 13px 更长的 `H`）仍然画得出来 —— 参考实现同样依赖这一点。 */
+.hook-lines {
+  position: absolute;
+  top: 0;
+  left: 2px;
+  width: 13px;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.hook-line {
+  fill: none;
+  stroke-width: 1;
+  /* 参考默认 `dashed: true`（seo-hook-sidebar.html 的 hookSidebar 配置） */
+  stroke-dasharray: 2 2;
+}
+
+.hook-line-muted {
+  /* 参考：浅 #bcbcbc / 深 #626262 → 本仓对应档位是 --text-muted */
+  stroke: var(--text-muted);
+}
+
+.hook-line-accent {
+  stroke: var(--accent);
+}
+
+/* ── 分组小标题：轨道从它左侧穿过（轨道是一整根，不被标题切断） ── */
+.hook-group {
+  padding: 14px 10px 2px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+}
+
+.hook-group-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+/* ── 行 ──────────────────────────────────────────────────────────────
+ * 行内左内边距 = 轨道的水平段终点 + 7.5px 间隙：
+ *   顶层 20px（参考 `padding: 6px 8px 6px 20px`，水平段终点 12.5）
+ *   一级 32px / 二级 44px（每深一级让 12px，与 .hook-line 的 endX 增量同值）
+ * 缩进**只改左内边距**，不改 list 的 padding —— offsetTop 保持在同一坐标系。
+ */
+.hook-row {
+  --hook-dim: 0.7;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 8px 6px 20px;
+  border: 0;
+  border-radius: var(--radius-nav);
+  background: none;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color 160ms ease,
+    background-color 160ms ease;
+}
+
+.hook-row[data-row-depth='1'] {
+  --hook-dim: 0.78;
+  padding-left: 32px;
+}
+
+.hook-row[data-row-depth='2'] {
+  --hook-dim: 0.78;
+  padding-left: 44px;
+  font-size: 12px;
+}
+
+.hook-row:hover {
+  color: var(--text-primary);
+}
+
+.hook-row[data-active='1'] {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* 分类族（大类 / 一级 / 二级）的选中行走 accent 字色：轨道指出位置，字色点出语义 */
+.hook-row[data-tone='accent'][data-active='1'] {
+  color: var(--accent-text);
+}
+
+/* 拖拽归类的投放命中（替换原来的 `bg-accent-tint` 工具类，避免与 hover 打架） */
+.hook-row[data-drop='1'] {
+  background: var(--accent-tint);
+  color: var(--accent-text);
+  font-weight: 500;
+}
+
+.hook-row[data-disabled='1'] {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.hook-row[data-disabled='1']:hover {
+  color: var(--text-secondary);
+}
+
+.hook-ico {
+  flex: 0 0 auto;
+  color: var(--text-tertiary);
+}
+
+.hook-row[data-active='1'] .hook-ico,
+.hook-row[data-drop='1'] .hook-ico {
+  color: currentColor;
+}
+
+/* ── 标签滑入（拍板 §3「选中项：轨道接到标签，标签滑入」）──
+ * 未选中：向左偏 4px + 压暗；选中 / 悬停：回到位 + 全不透明。
+ * 参考源（src-hook-sidebar.ts:43）用的是 `opacity .5/.8/1` 的纯明暗分级，
+ * 这里在明暗之外补了 4px 位移 —— 拍板原文要求"滑入"，两档叠加读起来更明确。 */
+.hook-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: var(--hook-dim);
+  transform: translateX(-4px);
+  transition:
+    transform 220ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    opacity 180ms ease;
+}
+
+.hook-row:hover .hook-label,
+.hook-row[data-active='1'] .hook-label,
+.hook-row[data-drop='1'] .hook-label {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+/* 计数徽标：贴轨道右侧（行尾），不参与轨道几何 */
+.hook-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.hook-row[data-active='1'] .hook-count {
+  color: var(--text-tertiary);
+}
+
+/* 展开指示（只有带子层的大类行有）：靠 CSS 旋转，不换图标 */
+.hook-caret {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  transition: transform 180ms ease;
+}
+
+.hook-caret[data-open='1'] {
+  transform: rotate(90deg);
+}
+
+/* ── 子层容器：一级 / 二级 / 材质 chip 都挂在它下面 ── */
+.hook-sub {
+  display: flex;
+  flex-direction: column;
+}
+
+.hook-subrow {
+  display: flex;
+  align-items: center;
+}
+
+.hook-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 8px 4px 32px;
+}
+
+/* ── 智能集合的行尾删除（替代原来的 absolute 悬停浮层）── */
+.hook-row-x {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 140ms ease,
+    color 140ms ease;
+}
+
+.hook-row-x:hover {
+  color: var(--danger);
+}
+
+.group:hover .hook-row-x,
+.hook-row-x:focus-visible {
+  opacity: 1;
+}
+
+/* ── 底部（导入 / 设置 / 库路径 / 版本号）：沿用既有 token，不参与轨道 ── */
+.hook-foot {
+  /* 与换皮前的 `border-t border-line/60` 同档：60% 描边，不是实线 */
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  padding: 8px;
+}
+
+.hook-foot-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-nav);
+  background: none;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color 160ms ease,
+    background-color 160ms ease;
+}
+
+.hook-foot-row:hover {
+  background: color-mix(in srgb, var(--bg-elevated) 60%, transparent);
+  color: var(--text-primary);
+}
+
+.hook-foot-path {
+  width: 100%;
+  padding: 2px 10px;
+  border: 0;
+  background: none;
+  font-size: 10px;
+  color: var(--text-muted);
+  text-align: left;
+  cursor: pointer;
+  transition: color 160ms ease;
+}
+
+.hook-foot-path:hover {
+  color: var(--text-secondary);
+}
+
+.hook-foot-version {
+  padding: 0 10px 2px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* ── 折叠态（可选 prop `collapsed`）：只留轨道与图标，隐藏标签 / 计数 / 组头 ──
+ * ⚠️ 当前 App 的折叠是**整列宽度归零**（`CollapsibleColumn`），本类只有
+ * 在 App 改成传 `collapsed` + 窄宽度后才生效；见交付报告「需要 App.tsx 配合」。
+ */
+.sidebar-hook.is-collapsed .hook-label,
+.sidebar-hook.is-collapsed .hook-count,
+.sidebar-hook.is-collapsed .hook-caret,
+.sidebar-hook.is-collapsed .hook-group,
+.sidebar-hook.is-collapsed .hook-chips,
+.sidebar-hook.is-collapsed .hook-row-x,
+.sidebar-hook.is-collapsed .sidebar-hook-head,
+.sidebar-hook.is-collapsed .hook-foot-path,
+.sidebar-hook.is-collapsed .hook-foot-version {
+  display: none;
+}
+
+.sidebar-hook.is-collapsed .hook-row {
+  justify-content: center;
+  padding: 6px 4px;
+}
+
+/* ── 减少动效（系统「动画效果」关闭）：轨道直接到位、标签不做滑入 ──
+ * 参考 spec 原文：「选中项和焦点轨道直接到位，关闭自动往返演示；
+ * 点击与键盘仍可操作」。JS 侧另有 `useReducedMotion` → `snap()` 双保险。
+ */
+@media (prefers-reduced-motion: reduce) {
+  .hook-row,
+  .hook-label,
+  .hook-caret,
+  .hook-foot-row,
+  .hook-foot-path,
+  .hook-row-x {
+    transition: none;
+  }
+
+  .hook-label {
+    transform: none;
+  }
+}

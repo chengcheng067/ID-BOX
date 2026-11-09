@@ -393,7 +393,10 @@ async function requestOneBatch(
     }
 
     const content = readChatContent(payload)
-    if (!content) return { ...empty, error: '响应缺少 choices[0].message.content' }
+    // 文案收口（A15）：这里说的是**模型的返回结构**，`choices[0].message.content`
+    // 是 OpenAI 兼容协议里的字段名，用户（和未来的我们）在 toast 上看到它只会一脸问号。
+    // 原文保留在 `readChatContent` 的实现与日志上下文里，界面只说人话。
+    if (!content) return { ...empty, error: '模型返回的内容里没有分类结果' }
 
     const parsed = parseAiClassifyContent(content)
     if (!parsed) return { ...empty, error: '模型输出里没有可解析的 JSON 数组' }

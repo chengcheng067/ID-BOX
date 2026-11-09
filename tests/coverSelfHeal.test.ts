@@ -435,7 +435,7 @@ describe('runZhimoCoverBackfill —— 跳过明细分票展示（0.8.3 B）', (
     }))
   }
 
-  it('锁内重查发现已有 cover 文件 → notice 单列「跳过 1（已有 cover 文件）」', async () => {
+  it('锁内重查发现已有封面 → notice 单列「跳过 1 个（已有封面）」', async () => {
     const a = asset({ id: 'a', name: '沙发AID_1111111111', zhimoId: '1111111111' })
     const b = asset({ id: 'b', name: '沙发BID_2222222222', zhimoId: '2222222222' })
     useVault.setState({ assets: [a, b] })
@@ -453,7 +453,7 @@ describe('runZhimoCoverBackfill —— 跳过明细分票展示（0.8.3 B）', (
     expect(summary).toMatchObject({ ok: 1, failed: 0, skipped: 1, total: 2 })
     expect(modvault.fetchZhimoCover).toHaveBeenCalledTimes(1) // B 一个请求都没发
     expect(useVault.getState().notice).toContain('成功 1 / 失败 0')
-    expect(useVault.getState().notice).toContain('跳过 1（已有 cover 文件）')
+    expect(useVault.getState().notice).toContain('跳过 1 个（已有封面）')
     expect(useVault.getState().notice).not.toContain('手动封面')
   })
 
@@ -472,7 +472,7 @@ describe('runZhimoCoverBackfill —— 跳过明细分票展示（0.8.3 B）', (
 
     expect(summary).toMatchObject({ ok: 1, failed: 0, skipped: 1 })
     expect(useVault.getState().notice).toContain('跳过 1（手动封面）')
-    expect(useVault.getState().notice).not.toContain('已有 cover 文件')
+    expect(useVault.getState().notice).not.toContain('已有封面')
   })
 
   it('补抓写盘失败（write-failed）→ WARN 带 folder', async () => {

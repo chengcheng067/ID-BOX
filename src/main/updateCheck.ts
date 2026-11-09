@@ -9,6 +9,9 @@
  *    这样 `tests/*.test.ts`（node 环境）可以直接 import 本文件而不需要 electron 运行时。
  * 4. 未认证请求（不带 Authorization）：GitHub 限流 60 次/小时/IP，
  *    每次启动 1 次 + 手动点击少量，足够；带 token 反而会把用户凭据写进源码。
+ * 5. **发布说明（`body`）原样透传**（2026-11）：本模块只做类型收敛 + 换行归一化 + 限长，
+ *    **不做任何 HTML/脚本清洗** —— 那是渲染层的事（`logic/releaseNotes.ts` 把它解析成
+ *    结构化 token，永不拼 HTML）。在"数据搬运层"做半套清洗只会让人误以为安全。
  */
 import type { UpdateInfo } from '../shared/types'
 
@@ -24,6 +27,50 @@ export const UPDATE_CHECK_TIMEOUT_MS = 8_000
 /** 安装包资产名规则：`IDBOX-Setup-<version>.exe`（见 package.json 的 artifactName） */
 const ASSET_PREFIX = 'IDBOX-Setup-'
 const ASSET_SUFFIX = '.exe'
+
+/**
+ * Release 说明（`body`）的长度上限（字符数，UTF-16 码元）。
+ *
+ * 为什么要设上限：这段字符串要**过 IPC**（结构化克隆，每个字符都要复制）并常驻渲染层
+ * 内存 + 进 React 渲染树。Release body 理论上可以写几十万字，不设限时一次检查就可能
+ * 把几十 MB 文案塞进渲染进程 —— 而用户能看到的只有弹窗里那几屏。
+ *
+ * 20k 字符 ≈ 700 行中文，足够覆盖任何正常的版本说明；超出部分由
+ * `NOTES_TRUNCATED_SUFFIX` 明确告知用户去 Release 页面看全文。
+ */
+export const MAX_NOTES_CHARS = 20_000
+
+/** 截断后追加的中文提示（用户可见，所以措辞直白；长度算进上限） */
+const NOTES_TRUNCATED_SUFFIX = '\n\n（说明过长，已截断显示，完整内容见 Release 页面）'
+
+/**
+ * 解析 `body` 字段 → 展示用 Markdown 文本。
+ *
+ * **不做任何 Markdown 清洗 / 转义 / 转 HTML** —— 这是渲染层的职责
+ * （`logic/releaseNotes.ts` 产出结构化 token，永不拼 HTML）。主进程只负责三件事：
+ * 1. 类型收敛：只接受 `string`，其余（null / number / object / 缺失）→ `null`；
+ * 2. 换行归一化：去掉 `\r`。GitHub 的 body 来自 Windows 编辑器时是 `\r\n`，
+ *    残留的 `\r` 会让渲染层按行切分后每行末尾都粘一个回车（表现为行尾多一个方块）；
+ * 3. 长度封顶：超长截断 + 中文提示（见 `MAX_NOTES_CHARS`）。
+ *
+ * @param value GitHub release JSON 里的 `body` 原始值
+ * @returns 归一化后的 Markdown；`null` = 没有说明（trim 后为空也算没有）
+ */
+export function normalizeReleaseNotes(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  // `\r\n` 与孤立的 `\r` 统一成 `\n`（先归一化再判空：纯 `\r\n` 的 body 等于空）
+  const normalized = value.replace(/\r\n?/g, '\n').trim()
+  if (!normalized) return null
+  if (normalized.length <= MAX_NOTES_CHARS) return normalized
+  // 预留后缀的位置：截断后的总长度仍然 ≤ MAX_NOTES_CHARS
+  const room = Math.max(0, MAX_NOTES_CHARS - NOTES_TRUNCATED_SUFFIX.length)
+  let cut = normalized.slice(0, room)
+  // 不把代理对（emoji 等）切一半：切点落在高位代理上就再退一个码元，
+  // 否则渲染层会拿到孤立代理并显示成 ▯（U+FFFD）
+  const tail = cut.charCodeAt(cut.length - 1)
+  if (tail >= 0xd800 && tail <= 0xdbff) cut = cut.slice(0, -1)
+  return `${cut}${NOTES_TRUNCATED_SUFFIX}`
+}
 
 /**
  * 最小化的 fetch 形参类型：真实 `fetch` 可直接赋值（参数/返回值双向兼容），
@@ -180,6 +227,8 @@ function emptyInfo(current: string, checkedAt: number, error: UpdateInfo['error'
     url: null,
     assetUrl: null,
     publishedAt: null,
+    // 失败 / 无数据时没有说明可展示（弹窗据此显示「这个版本没有写更新说明」）
+    notes: null,
     checkedAt,
     error
   }
@@ -262,6 +311,9 @@ export async function fetchLatestRelease(
     url: optionalString(release.html_url),
     assetUrl: pickAssetUrl(release.assets),
     publishedAt: optionalString(release.published_at),
+    // 发布说明：原样 Markdown（归一化 + 限长，见 normalizeReleaseNotes）。
+    // 渲染层会把它解析成结构化 token —— 本模块不碰 HTML、不转义、不清洗语法。
+    notes: normalizeReleaseNotes(release.body),
     checkedAt,
     error: null
   }

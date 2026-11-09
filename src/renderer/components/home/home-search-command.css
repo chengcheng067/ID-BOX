@@ -1,0 +1,582 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 首页搜索命令面板 · home-search-command.css
+ *
+ * 形态参考 skiper-92（Vercel Command Search）：**不是下拉**，是同一个盒子在连续
+ * 缩放中变更宽高（收起 240×32 → 展开 560×(49+列表高)），内部子元素各自反向补偿。
+ * 因为整块面板是 scale 变换，所以：
+ *   - 面板自己只写 width/height/left/top + transform: scale(sx, sy)；
+ *   - 每个子元素由 JS 写 translate+scale 反算回自己的自然尺寸（见 .tsx 的
+ *     projectChild），这里只负责**自然布局盒**的位置与尺寸必须与 JS 传入的
+ *     natural 完全一致 —— 改下面任何一个 left/top/width/height 都要同步改 .tsx。
+ *
+ * 纪律：
+ *   - transform-origin 一律 0 0（否则从中心缩放，变形方向就反了）；
+ *   - 颜色全部走 token，不硬编码主题色；
+ *   - 唯一的渐变是列表底部的**功能性遮罩** mask-image（不是装饰渐变）；
+ *   - box-shadow 不是渐变，允许；面板描边用 0 0 0 1px 的外阴影画，
+ *     避免 border 参与布局把内部坐标系推偏 1px。
+ *
+ * ⛔ 全局禁令与**本文件的第二处玻璃拟态豁免**（必读）
+ *   `src/renderer/styles.css:9` 写着「⛔ 全局禁用：橙色/棕色高亮、紫色系、
+ *   玻璃拟态 backdrop-blur、渐变」。全局第一处豁免是 `glass-folder.css`（首页
+ *   那 5 个文件夹）。
+ *   2026-11 用户（设计师）对首页搜索条的原话是「搜索框现在过于透明了，要给它
+ *   加一个磨砂玻璃的底板」—— 这是**用户点名的显式要求**，所以这里开第二处豁免：
+ *     · 玻璃只出现在**收起态触发条的底板** `.hsc-trigger::before` 上；
+ *     · 面板 `.hsc-panel` 是**不透明卡片**，刻意**不加** backdrop-filter
+ *       （加了会和里面的结果列表、分隔线打架，也会让整块面板发灰）；
+ *     · 深色主题用系统灰 3/rgba(44,44,46) 打底，不用「白色低透明」——
+ *       那样在深色背景上会糊成一层灰雾；
+ *     · 有 `@supports not` 降级：不支持 backdrop-filter 时换成接近实色的底，
+ *       不留透明窟窿。
+ *   ⚠️ 豁免范围**仅限本文件**。别处（尤其是新页面）不许照抄这几行 glass token，
+ *   要玻璃先去找用户确认，并回到 styles.css:9 那条纪律里登记。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* ── 收起态磨砂玻璃底板 token（前缀 --hsc-，不污染全局命名）───────────────
+ * 深浅两套都写死在这里：底板是「叠在粒子背景上的半透明层」，用主题 token
+ * 拼不出来（--surface-card 是不透明的白/灰卡），所以只能给这一处自建三档。 */
+:root,
+[data-theme='light'] {
+  --hsc-glass-bg: rgba(255, 255, 255, 0.72);
+  --hsc-glass-border: rgba(15, 23, 42, 0.1);
+  --hsc-glass-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 8px 24px -12px rgba(15, 23, 42, 0.22);
+}
+
+[data-theme='dark'] {
+  /* 系统灰 3（#2C2C2E）0.62：深色下用「白色低透明」会发灰雾，必须用暗底 + 高模糊 */
+  --hsc-glass-bg: rgba(44, 44, 46, 0.62);
+  --hsc-glass-border: rgba(255, 255, 255, 0.12);
+  --hsc-glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 10px 28px -12px rgba(0, 0, 0, 0.7);
+}
+
+/* 降级：不支持 backdrop-filter（旧内核 / 关掉了 GPU 合成）时换成准实色底。
+ * 这里改的是 token 本身，所以 `::before` 的其它声明一个字都不用动，
+ * 也不会出现「只有描边、中间透空」的窟窿。 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root,
+  [data-theme='light'] {
+    --hsc-glass-bg: rgba(255, 255, 255, 0.97);
+  }
+
+  [data-theme='dark'] {
+    --hsc-glass-bg: rgba(44, 44, 46, 0.96);
+  }
+}
+
+/* ── 根：收起态就是 240×32 这一个盒子。面板溢出它，靠祖先不裁切 ──
+ *
+ * `data-variant` 只由 JS 打标（'center' / 'toolbar'），**当前没有配套规则** ——
+ * 面板的展开锚点是纯几何计算（见 .tsx 的 commandProjection），CSS 不需要参与。
+ * 留着这个属性是给「库内顶栏」接线用的钩子：工具栏位姿下面板会往右下溢出
+ * 顶栏，若届时需要给祖先补 overflow / z-index，从这里选就行，不用再改组件。 */
+.hsc-root {
+  position: relative;
+  /* 必须与 HomeSearchCommand.tsx 的 COLLAPSED_W 一致（现为 240） */
+  width: 240px;
+  height: 32px;
+  flex: none;
+  font-family: inherit;
+  z-index: 30;
+}
+
+/* ── 收起态触发条 ─────────────────────────────────────────────────────────
+ * 它**不再**被 JS 缩放（面板改成从画面中心长出来之后，条子原地淡出），
+ * 所以这里没有 scale 相关的职责；transform-origin 仍留 0 0 作为纪律兜底。
+ *
+ * ⚠️ 这里**没有** `overflow: hidden`：玻璃底板的投影长在 `::before` 上，
+ * 而投影会溢出 240×32 的框，父级一旦裁切，那道 `0 8px 24px` 就整条消失。
+ * 原本它挡的「过长的占位文字」由 `.hsc-trigger-label` 自己的 ellipsis 负责
+ * （见下），三个子元素也都在框内，所以去掉它没有副作用。 */
+.hsc-trigger {
+  position: absolute;
+  inset: 0;
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transform-origin: 0 0;
+  /* 只剩 opacity 在动（transform 已被 JS 置 none），别留一个空的合成层 */
+  will-change: opacity;
+  z-index: 1;
+}
+
+/* 磨砂玻璃底板：1px 描边 + 半透明底 + 轻投影 + 16px 背景模糊，全在本文件的
+ * 玻璃豁免范围内（详见文件头「全局禁令与豁免」）。
+ * 仍然用伪元素画，而不是给 .hsc-trigger 加 border —— 边框参与布局会把内部
+ * 三个子元素的 1px 坐标推偏，而 .tsx 里的 natural 盒是写死的整数。 */
+.hsc-trigger::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--hsc-glass-border);
+  border-radius: 10px;
+  background: var(--hsc-glass-bg);
+  box-shadow: var(--hsc-glass-shadow);
+  backdrop-filter: blur(16px) saturate(1.6);
+  -webkit-backdrop-filter: blur(16px) saturate(1.6);
+  pointer-events: none;
+  transition: border-color 120ms ease;
+}
+
+/* hover：描边提到「比玻璃描边更实」的一档。
+ * 原来这里切 `--border-panel`（浅色下是 #e8edf2），它比玻璃描边还浅，
+ * 底板变成半透明之后那样切会让 hover 反而更没存在感。 */
+.hsc-trigger:hover::before {
+  border-color: color-mix(in srgb, var(--text-muted) 30%, transparent);
+}
+
+.hsc-trigger:focus-visible {
+  outline: none;
+}
+
+.hsc-trigger:focus-visible::before {
+  border-color: var(--accent);
+}
+
+/* 收起态放大镜：自然布局盒 = { x:8, y:8, w:16, h:16 } */
+.hsc-trigger-icon {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+  transform-origin: 0 0;
+}
+
+.hsc-trigger-icon svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+/* 收起态占位文字：自然布局盒 = { x:32, y:0, w:动态, h:32 }
+ * 宽度由 JS 按键帽实际宽度算好后写成内联 width（见 .tsx measureNaturals），
+ * 所以这里不写 width —— 别在这里加死宽度。 */
+.hsc-trigger-label {
+  position: absolute;
+  left: 32px;
+  top: 0;
+  height: 32px;
+  line-height: 32px;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  transform-origin: 0 0;
+  pointer-events: none;
+}
+
+/* 收起态键帽：right:5px → 自然 x = 240 - 5 - offsetWidth（JS 读 offsetWidth 反推） */
+.hsc-key {
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  height: 22px;
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  padding: 0 5px;
+  /* 键帽：`--border` 在白底上几乎看不见（#e2e8f0），收起态会读成"裸字符贴在
+     文字后面"。这里按 --text-muted 掺色自建一档更实的描边+底色，深浅主题都能读出来。 */
+  border: 1px solid color-mix(in srgb, var(--text-muted) 38%, transparent);
+  background: color-mix(in srgb, var(--text-muted) 9%, transparent);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
+    'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-muted);
+  white-space: nowrap;
+  transform-origin: 0 0;
+  pointer-events: none;
+}
+
+/* ── 命令面板 ─────────────────────────────────────────────────────────────
+ * 展开态真实尺寸由 JS 每帧写（width/height/left/top/transform）。
+ * left/top 会被算成负数：center 模式下面板要居中于视口，早就在 240×32 那条框的
+ * 左上角之外（toolbar 模式是 x 走到 -16、y 恒 0，只往右下长）。两种模式都靠
+ * 祖先 overflow:visible 溢出显示 —— 祖先链上**不能**出现 overflow:hidden。
+ * 这里的 560×349 只是首帧之前（JS 还没跑）的兜底值，等于展开终态。
+ *
+ * ⚠️ 面板**刻意不加** `backdrop-filter`：它是不透明卡片（--surface-card），
+ * 加模糊只会让里面的列表与 1px 分隔线发灰，而且和收起条的玻璃底板在视觉上
+ * 抢同一层「材质」。玻璃只做在收起态那条 240×32 上。 */
+.hsc-panel {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 560px;
+  height: 349px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-card);
+  border-radius: 10px;
+  box-shadow: 0 0 0 1px var(--border), 0 12px 32px -12px rgba(15, 23, 42, 0.18);
+  overflow: hidden;
+  opacity: 0;
+  transform-origin: 0 0;
+  will-change: transform, opacity;
+  z-index: 2;
+}
+
+[data-theme='dark'] .hsc-panel {
+  box-shadow: 0 0 0 1px var(--border), 0 16px 40px -12px rgba(0, 0, 0, 0.7);
+}
+
+/* 头部：固定 49px（含 1px 分隔线），列表从 y=49 起 —— 这个 49 是几何常量 */
+.hsc-head {
+  position: relative;
+  flex: none;
+  height: 49px;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+}
+
+/* 头部放大镜的外槽（48×48 定宽），图标本体是里面 16×16 的自然盒 */
+.hsc-head-slot {
+  position: relative;
+  flex: none;
+  width: 48px;
+  height: 48px;
+}
+
+/* 头部放大镜：自然布局盒 = { x:16, y:16, w:16, h:16 } */
+.hsc-head-icon {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+  transform-origin: 0 0;
+}
+
+.hsc-head-icon svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+/* 输入容器：自然布局盒 = { x:48, y:6, w:面板宽-96, h:36 }
+ * 收起时被压到 0.6x 左右（里面是空的，看不见）；展开时回到 1:1。 */
+.hsc-center {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  transform-origin: 0 0;
+}
+
+.hsc-input {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-primary);
+}
+
+.hsc-input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+/* 一键清词（v0.10.x 补回旧顶栏那个 ×）：输入容器右端、Esc 徽标左边。
+ * 20×20 命中区 / 12px 图标 / 无边框无底色 —— 它是"把手"，不是按钮组的一员，
+ * 加边框会和右侧的 Esc 徽标抢层级。颜色只走 token（tertiary → hover secondary），
+ * 深浅两套自动跟随，不新增色板。
+ * 只在 query 非空时渲染（见 .tsx 里的条件渲染）：占位会让输入框可用宽度凭空变窄。 */
+.hsc-clear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  margin: 0 2px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.hsc-clear:hover {
+  color: var(--text-secondary);
+}
+
+/* 刻意**不写** `:focus-visible { outline: none }`：这颗按钮是原生 button、
+ * 没加 tabIndex，键盘 Tab 能到达它，抹掉焦点环就等于让键盘用户看不见焦点在哪。
+ * 默认焦点环保持原样（这一处不跟 `.hsc-trigger` 的自绘焦点走，因为那是块 240×32
+ * 的玻璃底板、有 ::before 可以改描边，这颗 20×20 的无底按钮没有可承载的边）。 */
+
+.hsc-clear svg {
+  display: block;
+  width: 12px;
+  height: 12px;
+}
+
+/* Esc 徽标容器：自然布局盒 = { x:面板宽-48, y:0, w:48, h:48 } */
+.hsc-word {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 48px;
+  height: 48px;
+  padding-right: 4px;
+  transform-origin: 0 0;
+}
+
+.hsc-esc {
+  flex: none;
+  margin: 0;
+  padding: 2px 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
+    'Courier New', monospace;
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: -0.4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.hsc-esc:hover {
+  border-color: var(--border-panel);
+  color: var(--text-primary);
+}
+
+/* 列表：自然布局盒 = { x:0, y:49, w:面板宽, h:列表高 }
+ * position:relative 是为了让条目 offsetTop 相对列表算（滚动定位用）。
+ * 底部 mask 是**功能性**遮罩（让被裁切的下一行自然消隐），不是装饰渐变。
+ *
+ * ⚠️ max-height 必须与 HomeSearchCommand.tsx 的 LIST_MAX_H（300）一致 —— 那边
+ * 用它夹列表高度，这里用它兜底（JS 没跑之前那一帧）。
+ *
+ * 300 这个数在行变高之后复核过（用户要求「至少露出 4 行缩略图行」）：
+ *   分组内边距 4 + 分组标题 28 + 4 行 × 56 = 224 + 内边距 4 → 260
+ * 260 < 300，且底部 28px 的 mask 从 272 才开始，第 4 行**完整露出**。
+ * 所以保持 300，不需要抬到 320（多出来只会露出第 5 行的半截）。 */
+.hsc-list {
+  position: relative;
+  flex: none;
+  max-height: 300px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  padding: 0;
+  transform-origin: 0 0;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 0,
+    #000 calc(100% - 28px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(to bottom, #000 0, #000 calc(100% - 28px), transparent 100%);
+}
+
+.hsc-group {
+  padding: 4px;
+}
+
+.hsc-group + .hsc-group {
+  border-top: 1px solid var(--border);
+}
+
+.hsc-group-title {
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+/* ── 结果行 / 最近搜索行：两种行高 ─────────────────────────────────────────
+ * v0.10.x 第二轮用户原话：「弹出的应该是最小号的缩略图…因为对于我们找素材来说，
+ * 如果给的是纯文字版，不会特别直观，也不会快」。所以：
+ *   data-thumb="true"  → 56px 行：36×36 缩略图 + 单行 label + 右侧 meta
+ *   data-thumb="false" → 44px 行：纯文字（最近搜索），**不渲染**缩略图槽
+ *
+ * 为什么纯文字行不留 36×36 空槽：分组之间本来就有标题分隔，两种行高不会读成
+ * 「没对齐」；硬塞一个空槽反而让每行文字都从 52px 之后才开始，等于用一整段
+ * 水平空间换一个看不出来的对齐。文字一律从行首（8px 内边距）开始。
+ *
+ * 高度直接写死而不是 min-height：行高是列表高度的计算前提（.hsc-list 的预算
+ * 就是按 56/44 算的），min-height 会让长 label 把行撑成两行、把预算打乱。
+ * label 自己 white-space: nowrap + ellipsis，永远不会换行。 */
+.hsc-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  width: 100%;
+  height: 44px;
+  min-height: 44px;
+  margin: 0;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+/* 有缩略图的行：56 = 36(图) + 上下各 10 的呼吸。
+ * 用 align-items: center 垂直居中，所以**不写垂直 padding** —— 写 px 只会让
+ * 36px 的图被挤到 16px，行高就白算了。 */
+.hsc-item[data-thumb='true'] {
+  height: 56px;
+  min-height: 56px;
+}
+
+/* 高亮覆盖**整行含缩略图**：accent 底画在 .hsc-item 自身上（不是 label 上），
+ * 所以 36×36 的图和右侧 meta 一起被圈进选中态里。 */
+.hsc-item[data-selected='true'] {
+  background: var(--accent-tint);
+  color: var(--accent-text);
+}
+
+/* 缩略图槽：36×36、6px 圆角、等比裁切。
+ * `background` 不是装饰 —— 它就是图片加载失败 / 尚未加载时留下的那块空底，
+ * 保证「失败」和「还没到」长得一模一样，不会出现破图框或塌陷的行高。 */
+.hsc-thumb {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.hsc-thumb-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 6px;
+  object-fit: cover;
+  /* 图片解码出来之前别让浏览器按原尺寸撑开槽（槽本身是定宽的，这只是双保险） */
+  max-width: 100%;
+  max-height: 100%;
+}
+
+/* 空历史的提示行：跟普通行同高同内边距，但**不可点**、无 hover、无选中态。
+ * 它不进 flat 数组（不是 role="option"），所以 ↑↓ 永远停不到它上面。 */
+.hsc-recent-empty {
+  display: flex;
+  align-items: center;
+  height: 44px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-muted);
+  cursor: default;
+  user-select: none;
+}
+
+.hsc-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hsc-item-meta {
+  flex: none;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.hsc-item[data-selected='true'] .hsc-item-meta {
+  color: var(--accent-text);
+  opacity: 0.72;
+}
+
+.hsc-item-shortcut {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
+    'Courier New', monospace;
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+}
+
+.hsc-item[data-selected='true'] .hsc-item-shortcut {
+  color: var(--accent-text);
+  opacity: 0.72;
+}
+
+.hsc-empty {
+  padding: 28px 24px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-muted);
+}
+
+/* 门外点击层：铺满视口、完全透明，只吃点击（面板本身 z-index 更高）
+ *
+ * ⚠️ **不许盖住顶栏那一行**（2026-11-09 用户 P0：「大中小三个预览的选择也是无法被
+ * 选中的」）。
+ *
+ * 现场取证（第二实例 + CDP，`document.elementFromPoint`）：面板展开时
+ * `.hsc-shade` 是 `position: fixed; inset: 0`，而它挂在 `.hsc-root`（`z-index: 30`）
+ * 里、`.hsc-root` 又长在顶栏（`header.topbar … z-20`）内 —— 于是整个视口被一张透明层
+ * 盖住，顶栏右侧那些**静态定位**的兄弟节点（视图切换、密度三档「大 / 中 / 小」、
+ * 以及自绘的三个窗口控制钮）全部落在它下面：
+ *   elementFromPoint(密度-大/中/小) === DIV.hsc-shade  （而不是 button 自己）
+ * 点下去只会"关面板"，控件本身收不到 click —— 表现就是完全点不动。
+ *
+ * 修法只动这一处：把遮罩的**上边界压到顶栏以下**（`--hsc-chrome-h` = 顶栏 `h-14` = 56）。
+ * 顶栏是搜索框自己的宿主（面板就锚在这一行），本来就不该被当成"门外"；
+ * 面板本体仍在遮罩之上（`.hsc-panel` 的 z-index），所以"点空白关面板"的语义不变。 */
+.hsc-shade {
+  --hsc-chrome-h: 56px;
+  position: fixed;
+  inset: var(--hsc-chrome-h) 0 0 0;
+  z-index: 0;
+  background: transparent;
+}
+
+/* 展开时触发条让位（它已经透明到 0，再留着会挡住面板头部的输入框） */
+.hsc-root[data-open='true'] .hsc-trigger {
+  pointer-events: none;
+}
+
+/* 收起时面板让位 */
+.hsc-root[data-open='false'] .hsc-panel {
+  pointer-events: none;
+}

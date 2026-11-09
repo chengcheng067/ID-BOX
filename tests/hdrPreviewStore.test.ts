@@ -1,6 +1,6 @@
 /// <reference lib="dom" />
 // ↑ 与 savedViewStore.test.ts 同因：tests/** 走 tsconfig.node，而 store 用到 `window`。
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ModVaultApi } from '../src/preload/index'
 import { DEFAULT_SETTINGS } from '../src/shared/types'
 import type { Asset } from '../src/shared/types'
@@ -19,11 +19,19 @@ declare global {
  * store 的同一个 `openHdrPreview`，所以"能不能打开、打开的是哪一个"只需要在这里
  * 钉死一次；组件里再复制一份 state 就是 bug（会出现两个弹窗 / 关不掉的幽灵窗）。
  *
- * 边界桩：本组 action 完全不碰 IPC / Dexie，只需要一个空 `window.modvault`。
+ * 边界桩：本组 action 不碰 IPC；Dexie 只碰 `db.assets.update`（`openHdrPreview` 会顺带
+ * 打一次使用统计，见 `recordAssetUse`），所以只需要一个空 `window.modvault` + 一张
+ * 只有 `update` 的假表。打点本身的形状与失败隔离在 `tests/useStats.test.ts` 里钉死。
  */
 ;(globalThis as unknown as { window: { modvault: unknown } }).window = {
   modvault: {} as unknown as ModVaultApi
 }
+
+const { db } = await import('../src/renderer/db')
+Object.defineProperty(db, 'assets', {
+  value: { update: vi.fn(async () => 1) },
+  configurable: true
+})
 
 const { useVault } = await import('../src/renderer/store')
 

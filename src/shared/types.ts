@@ -15,8 +15,18 @@ export const SEVEN_ZIP_DOWNLOAD_URL = 'https://7-zip.org/'
  *
  * ⚠️ 优先级刻意**低于** `'model'`（见 `classify.ts` 的 `KIND_PRIORITY`）：一个包里
  * 同时有 `.skp` 与 `.dwg` 时，模型是主内容、图纸是附件 → 仍判 `'model'`。
+ *
+ * `'d5a'`（V1.0 新增，docs/48 §5 / docs/46 §1.4）：D5 Render 的资产包 `.d5a`。
+ * **整包存档、不解包** —— 包内是「`1.d5mesh` + `d5material.xml` + `textures/*`」的私有
+ * 结构，没有公开格式规范，解出来既不能预览也不能插入。因此它按**单文件资产**入库
+ * （与 HDR 同构：1 个文件、`files[]` 恰 1 项、封面留空走紫色占位），
+ * 见 `main/importer.ts#importMediaOne` 的 `isCoverless`。
+ *
+ * ⚠️ `'d5a'` 与 `'model'` 的边界是**刻意隔离**的：`d5a` 不进 `PRIMARY_MODEL_EXTS`、
+ * 不进解压白名单，所以插件侧 `INSERTABLE_KINDS`（`%w[model]`）永远拒绝它 ——
+ * 「可读不可插入」是用户拍板的语义，不是为了省事。
  */
-export type AssetKind = 'model' | 'texture' | 'hdri' | 'material' | 'cad' | 'other'
+export type AssetKind = 'model' | 'texture' | 'hdri' | 'material' | 'cad' | 'd5a' | 'other'
 
 /**
  * 原压缩包处置三档（P0-5，替代旧布尔值 `trashArchiveAfterImport`）：
@@ -347,6 +357,47 @@ export interface Asset {
    * 非索引字段（不参与筛选）——与 `renderParams` 同处理，不需要升 Dexie 版本。
    */
   renderShape?: BallRenderShape
+  /**
+   * 累计使用次数（「使用统计」，2026-10）。排序键「最常使用」的数据来源。
+   *
+   * ## 什么算「一次使用」
+   *
+   * **用户主动打开这个资产去看 / 去用**，具体三个入口（全在 store 的
+   * `recordAssetUse` 里打点）：
+   * ① 空格 Quick Look 全屏快览（`openQuickLook`）；
+   * ② 双击卡片进入软件内文件夹视图（`openFolderView`）；
+   * ③ 双击 HDRI 卡片进预览弹窗（`openHdrPreview`）。
+   * 另有一条**留待组件层**（本轮不动）：把卡片拖出到建模软件。
+   *
+   * **选中、Ctrl+A、悬停、鼠标划过、出现在筛选结果里、被缩略图队列处理 —— 都不算。**
+   * 那些是「浏览」不是「使用」：把它们计进来，「最常使用」会退化成「最常路过」，
+   * 用户按一次全选就能把整库刷成同一档，统计立刻失去意义。
+   *
+   * ## 缺省语义
+   *
+   * `undefined` = **从未使用**（不是 0）。与 `deletedAt` 同一处理方式：
+   * 缺失即零值语义，**不回填、不补 0**。存量库很大，回填等于一次全表写；
+   * 而且 0 与 undefined 在排序里本来就同档，补值纯属写放大。
+   *
+   * ## 为什么**不升 Dexie 版本**
+   *
+   * 非索引字段（不参与筛选、不参与 `.where()` / 索引查询），与 `renderParams` /
+   * `renderShape` 完全同处理：`assets` 的索引串里没有它，Dexie 读写普通属性不需要
+   * 任何 schema 声明。**后来人不要好心加 version(6)** —— 升版只会多跑一次
+   * `toCollection().modify()` 的全表写，换不来任何查询能力。
+   */
+  useCount?: number
+  /**
+   * 最近一次使用的时间戳（ms，`Date.now()`）。排序键「最近使用」的数据来源。
+   *
+   * `undefined` = 从未使用。与 `useCount` **由同一次打点同时写入**
+   * （`recordAssetUse`），只有一边有值 = 脏数据。
+   *
+   * 非索引字段，**不升 Dexie 版本**（理由见 `useCount`）。也**不要**为它建索引：
+   * 「最近使用」排序是内存排序（`sortAssets` 吃整个 `assets[]`），项目里
+   * 0 处 `.where()`，建索引只会白占空间并让每次写库多维护一棵 B 树。
+   */
+  lastUsedAt?: number
   /**
    * 软删时间戳（C 线「最近删除」）。`undefined` = 未删除。
    *
@@ -707,6 +758,15 @@ export interface Settings {
   showColorTags: boolean
   showDuplicates: boolean
   /**
+   * 首页右上「本月入库 / 库总量 / 待补分类」那张数据卡的显示开关（默认**开**）。
+   *
+   * 用户 2026-11-09 的口径：「有很多用户可能只用我们的"材质"和"模型"文件夹，另外几个
+   * 文件夹可能就不存在，那就不显示了。所以这个问题是需要考虑到的。」—— 对一个只有
+   * 两三个分类的小库，右上那三个数字既不好看也没信息量，所以给开关。
+   * 关掉后首页右上留空，其余（粒子 / 搜索 / 文件夹 / 提示 / 齿轮）一个都不动。
+   */
+  showHomeStats: boolean
+  /**
    * 记录详细日志（诊断日志的 debug 级开关，默认 false）。
    * 关闭时只落 info/warn/error；开启后额外落 debug（更啰嗦，仅排查问题时开）。
    */
@@ -790,6 +850,27 @@ export interface Settings {
    * （`.optional().catch(false)`）——一个脏值只让这一项回落，绝不拖垮整份 settings.json。
    */
   pluginIndexEnabled: boolean
+  /**
+   * 「插件需要你主动开启写盘」这条引导**是否已经露过一次脸**（V1.0 D-2，docs/46 §1.7）。
+   *
+   * 背景（用户会撞上的真空白）：插件面板的数据来自主程序导出的一份索引
+   * （`%APPDATA%\idbox\plugin\` 下的 `manifest.json` + `index.json`），而这个写盘开关
+   * （`pluginIndexEnabled`）**默认是关的**。界面上原先没有任何地方告诉用户这件事 ——
+   * 第一次打开插件看到空列表，只会以为插件坏了。
+   *
+   * 语义（三条，改动前必读）：
+   * - `false`（默认）= 还没露过脸 → 设置页「插件」卡里显示一次引导提示带；
+   *   用户点掉它、或自己勾开写盘开关，都置 `true`，跨重启不再出现；
+   * - **与 `pluginIndexEnabled` 是两个独立字段，互不反写**：本字段只记"看过了"，
+   *   绝不因为置 true 就把写盘开关打开（用户拍板：由你主动勾选）；
+   * - **不入写快照触发集**（`main/pluginSnapshot.ts` 的触发字段里没有它）——
+   *   它纯粹是本地 UI 状态，写进索引没有意义。
+   *
+   * 归一化方向与 `pluginIndexEnabled` 相反：这一项缺键 / 脏值都回落 **false**
+   * （= 宁可在老用户那里多显示一次引导，也不要因为读到脏值就永久吞掉它），
+   * 且单项降级不拖垮整份 settings.json。
+   */
+  pluginIndexGuideShown: boolean
   /** @deprecated 仅用于读取旧 settings.json，读到后映射为 archiveDisposal */
   trashArchiveAfterImport?: boolean
 }
@@ -822,6 +903,8 @@ export const DEFAULT_SETTINGS: Settings = {
   showFavorites: true,
   showColorTags: true,
   showDuplicates: true,
+  // 首页右上数据卡默认显示（关掉后首页右上留空，见 Settings.showHomeStats 注释）
+  showHomeStats: true,
   // 诊断日志：默认只记 info 及以上（debug 需用户显式开启，见设置·数据与备份）
   verboseLogging: false,
   // AI 辅助分类默认关闭：未配置 = 零网络请求（词表命不中时保持「未分类」，与旧行为一致）
@@ -849,7 +932,10 @@ export const DEFAULT_SETTINGS: Settings = {
   sidebarLeftCollapsed: false,
   sidebarRightCollapsed: false,
   // 插件索引导出默认关（docs/39 §2.2）：写盘是新增副作用，必须用户显式开启
-  pluginIndexEnabled: false
+  pluginIndexEnabled: false,
+  // D-2 引导**默认未展示**（V1.0，docs/46 §1.7）：装上先让用户看到一次"插件为什么要你手动勾"，
+  // 点掉或勾开写盘后置 true。与上面一项互相独立，绝不联动改值。
+  pluginIndexGuideShown: false
 }
 
 // ── T06 分类体系 IPC 载荷（shared 定义，main 与 preload 共用，避免 preload 反向 import main） ──
@@ -1574,6 +1660,18 @@ export interface UpdateInfo {
   assetUrl: string | null
   /** Release 发布时间（ISO 字符串，原样透传，仅展示用） */
   publishedAt: string | null
+  /**
+   * Release 说明（GitHub Release 的 `body` 字段）**原样的 Markdown 源码**。
+   *
+   * ⚠️ 这是**外部输入**，不是 HTML，也**绝不能**当 HTML 用：
+   * 1. 渲染前必须走受限解析器 `logic/releaseNotes.ts`（产出结构化 token，由 React 渲染）；
+   *    **禁止 `dangerouslySetInnerHTML`** —— body 里可以有任何东西（`<script>` / `<img onerror>`）。
+   * 2. 中文换行已归一化成 `\n`（主进程去掉了 `\r`），单行长度无保证。
+   * 3. 长度上限见 `main/updateCheck.ts` 的 `MAX_NOTES_CHARS`（超长会截断并追加中文提示）。
+   *
+   * `null` = 该 Release 没写说明 / 拉取失败 / 字段不是字符串 —— 与"空说明"同义。
+   */
+  notes: string | null
   /** 本次检查的时间戳（毫秒） */
   checkedAt: number
   /** 失败原因；`null` = 检查成功（不代表"有更新"，看 `hasUpdate`） */

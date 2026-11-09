@@ -28,7 +28,7 @@ import { PurgeConfirmDialog } from './PurgeConfirmDialog'
 import { CustomRenderDialog } from './CustomRenderDialog'
 import { ColorTagPicker, StarIcon, StarRating } from './MarkControls'
 import {
-  IconBox, IconCad, IconExternal, IconFile, IconFolder, IconHdr, IconImage,
+  IconBox, IconCad, IconD5a, IconExternal, IconFile, IconFolder, IconHdr, IconImage,
   IconMaterial, IconOther, IconTrash, IconClose, IconEmptyPointer, IconRefresh
 } from '../icons'
 import type { Asset, AssetFile, AssetKind } from '../../shared/types'
@@ -40,6 +40,9 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   hdri: IconHdr,
   material: IconMaterial,
   cad: IconCad,
+  // D5A 整包资产（V1.0）：六边形整包标记（正式封面在卡片上是紫色占位，图标只服务
+  // 「没有封面可看」的位：详情面板 / 对比弹窗 / 快览浮层的类型兜底）
+  d5a: IconD5a,
   other: IconOther
 }
 
@@ -88,9 +91,11 @@ function FileRow({ asset, file, readOnly = false }: { asset: Asset; file: AssetF
     // 统一走 beginSystemDrag：第一步 preventDefault 取消渲染进程自己的 HTML5 拖拽，
     // 否则会与主进程 startDrag 的 OLE 拖拽重入 → Windows 原生崩溃（2026-10 闪退事故）。
     const cardPng = cachedDragCard(cardKey)
-    beginSystemDrag(e, file.name, abs, asset.thumbPath ?? null, (path, thumb) =>
+    beginSystemDrag(e, file.name, abs, asset.thumbPath ?? null, (path, thumb) => {
       window.modvault.startDrag(path, thumb, cardPng)
-    )
+      // 从详情面板把文件拖进建模软件 = 一次真实使用（口径见 `types.ts` 的 `useCount`）
+      useVault.getState().recordAssetUse(asset.id)
+    })
   }
   return (
     <div

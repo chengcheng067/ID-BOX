@@ -1,0 +1,210 @@
+/**
+ * `HomeOutro` 的样式（首页 → 分类库的**过场遮罩**），以及**首页退场**那段共用的规则
+ * （`HomeCover` 的 `hc-*` 类，见文件末尾那一节）。
+ *
+ * v4 的结构只剩一层：
+ *   `.ho-shield`  ← 纯透明、铺满视口、吃点击的板子（**没有卡片、没有动画**）
+ *
+ * 为什么这里一个视觉图层都没有了：过场里"飞的那个东西"必须是文件夹本体（玻璃 + 三张
+ * 扇形卡 + 名称），而本体只存在于首页那个真的 `<button class="gf-root">` 上。所以飞行
+ * 与消隐都在 `.gf-root` 自己身上做（`glass-folder.css` 的「退场」一节，时间轴在
+ * `HomeCover.tsx`），本文件只保留遮罩 + "其余信息向边缘退开"的规则。
+ *
+ * 为什么遮罩必须吃掉点击：过场进行中父级已经收到了"进分类"的意图，用户这时再点
+ * 别的东西（哪怕点在遮罩外面的视觉区域）只可能造成两条跳转互相打架。
+ * `pointer-events: auto` + 铺满视口 + `inset: 0` 就是最省事的"点击拦网"。
+ */
+
+.ho-shield {
+  /* z-index 70 的依据见 HomeOutro.tsx 文件头。fixed + inset:0 = 视口坐标系。 */
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  /* 过场期间吃掉所有点击（含滚轮穿透不到下面）。 */
+  pointer-events: auto;
+  /**
+   * **不上任何底色**（连一点半透明都不行）：它盖住的正是"文件夹本体正在飞 + 其余信息
+   * 正在向屏幕边缘退开"的整个镜头。一旦上色，这个镜头就被一块板截断.
+   */
+  background: transparent;
+  /* 不接收键盘焦点、不参与无障碍树（装饰性代理层，真正的操作在遮罩下面已经发生） */
+  user-select: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 首页退场（`HomeCover.tsx` 的 `hc-*` 类）—— 本文件的**第二块职责**
+ *
+ * 为什么放在这里：`HomeCover` 没有自己的 CSS 文件，而 `styles.css` / `glass-folder.css`
+ * / `home-stats.css` 都各有主人。这块规则与过场的时间轴是**同一件事的两半**
+ * （文件夹飞中 / 其余信息退场），放在一起才读得通，所以寄放在本文件。
+ * `HomeCover.tsx` 自己 `import './home-outro.css'`，**不依赖**"HomeOutro 先挂载过"
+ * 这种隐式前提。
+ *
+ * 机制：`HomeCover` 根节点在双击那一帧打上 `data-leaving="true"`，本节的规则统一
+ * 按"往哪个方向退 + 淡出"给每个元素定终点，位移量走 `--ho-exit-x / --ho-exit-y`
+ * 两个变量（避免为每个元素写一套 transform）。
+ *
+ * ⚠️ 注意与 `glass-folder.css` 里的 `.gf-root[data-leaving='self']` 区分：
+ * 那一个是**单个文件夹本体**在飞（`self`），本节是**整页其余信息**在退（根节点的
+ * `true`）。两个选择器分别作用在不同元素、不同取值上，不会互相误伤 —— 本节所有
+ * 针对 `.gf-root` 的规则都加了 `:not([data-leaving='self'])`，把正在飞的那个排除掉。
+ *
+ * 为什么用 `translate`（独立属性）而不是 `transform`：
+ *   · 正在飞的那个文件夹用的是 `transform`（translate+scale），若本条也用 transform
+ *     就会把它的飞行位移整块覆盖掉；
+ *   · `HomeStats` 的 `.hs-card` 有入场 `animation`（`hs-card-in`，`fill: both`），
+ *     `transform` 是它关键帧里的属性，同一条声明会和动画打架；
+ *   · `translate` 与 `transform` 是两个独立属性，会叠加而不是互相覆盖，安全。
+ *
+ * 为什么延迟从 60ms 起、按元素错开 0/20/40ms（= 60/80/100）：用户口径是"其他信息
+ * **向屏幕边缘隐退**"，一起动是一刀切，错开 20ms 读起来才是"散开"；60ms 的起步延迟
+ * 让文件夹先起飞一瞬，因果（是谁触发了这场退场）才立得住。分档规则见下面的
+ * `.hc-root[data-leaving='true'] .hc-exit--*` 三条。
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+
+/* 通用退场元素：位移由修饰类给变量，默认不位移（只淡出） */
+.hc-root[data-leaving='true'] .hc-exit {
+  translate: var(--ho-exit-x, 0px) var(--ho-exit-y, 0px);
+  opacity: 0;
+}
+
+/* 退场过渡：位移 260ms（与文件夹起飞同一条缓动），淡出 220ms ease。
+   ⚠️ 排除 `[data-leaving='self']`（正在飞的那个文件夹）：它自己的 `opacity` 是
+   `HomeCover` 的 rAF **每帧**写内联值的，若这里再挂一条 220ms 的 opacity 过渡，
+   每帧都会重开一次补间 → 淡出变成"追不上"的拖尾。它只需要 transform 的过渡，
+   那条在 `glass-folder.css` 的退场一节里。 */
+.hc-root[data-leaving='true'] .hc-exit,
+.hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self']),
+.hc-root[data-leaving='true'] .hs-card {
+  transition:
+    translate 260ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 220ms ease;
+  transition-delay: 60ms, 60ms;
+}
+
+/* ── 修饰类：退场方向与距离 ─────────────────────────────────────────────── */
+
+/* 齿轮（左下）：向左退 32px */
+.hc-exit--left {
+  --ho-exit-x: -32px;
+}
+
+/* 搜索条：向下退 28px */
+.hc-exit--down {
+  --ho-exit-y: 28px;
+}
+
+/* 提示字：向下退 24px（比搜索条少 4px —— 它本来就更靠近底边，等距退会顶到窗口外） */
+.hc-exit--down-soft {
+  --ho-exit-y: 24px;
+}
+
+/**
+ * 错开 20ms 一档（从 60ms 起，共三档 60 / 80 / 100）。
+ *
+ * 分档顺序 = "离文件夹越远越晚走"：文件夹与粒子（60）→ 数据卡与搜索条（80）→
+ * 齿轮与提示字（100）。观感是**一起散开**而不是一刀切 —— 而且最先动的是用户视线
+ * 已经在的那一排，最晚动的是边角件，画面不会"从边缘先烂掉"。
+ *
+ * 为什么这里要重复写带 `[data-leaving]` 前缀的选择器：`.hc-exit--down` 这类修饰类是
+ * 单类（0,1,0），压不过上面那条三段的 `transition-delay`（0,3,0），只有同特异度、
+ * 更靠后才能真正覆盖。
+ */
+.hc-root[data-leaving='true'] .hc-exit--down {
+  transition-delay: 80ms, 80ms;
+}
+
+.hc-root[data-leaving='true'] .hc-exit--left,
+.hc-root[data-leaving='true'] .hc-exit--down-soft {
+  transition-delay: 100ms, 100ms;
+}
+
+/**
+ * 粒子层：只压暗到 0.25，**不位移**。
+ * 它是背景，跟着一起位移会让整个画面像在晃；压暗本身已经完成"退场"的语义，
+ * 而且留 1/4 的星点在淡出阶段垫底，画面不至于在切视图前突然变成一张空纸。
+ */
+.hc-root[data-leaving='true'] .hc-exit--faint {
+  opacity: 0.25;
+}
+
+/**
+ * 数据卡（`HomeStats` 的 `.hs-card`，非本组件所有的节点）：
+ *   · `animation: none` 是必须的 —— 入场 `hs-card-in` 带 `fill-mode: both`，
+ *     结束后会把 `opacity` 钉在关键帧里的 1，普通声明改不动它；
+ *   · 动画来源一撤，声明值（0）生效，`transition` 才会真的播。
+ */
+.hc-root[data-leaving='true'] .hs-card {
+  translate: 48px 0;
+  opacity: 0;
+  animation: none;
+  transition-delay: 80ms, 80ms;
+}
+
+/**
+ * 文件夹排：**左半排向左退、右半排向右退**（各 40px）。
+ *
+ * ⚠️ 全部加了 `:not([data-leaving='self'])`：被双击的那一个是**本体在飞**（transform +
+ * 中心消隐，见 `glass-folder.css` 的「退场」一节），它既不该被平移到边缘、也不该被淡出
+ * —— 它正是这一刻画面中央的主角。这个 `:not` 就是"把主角从群众演员里摘出来"的开关。
+ *
+ * 为什么按 `nth-child(-n+2)` / `nth-child(n+3)` 切半：`GlassFolder` 的 props 里没有
+ * `className` / `style`（签名定死），父级没法给某一张卡单独打标记；而这一排的子节点
+ * **只可能是**这些文件夹卡，顺序与 `folders` 数组一一对应。
+ * 切分与实际的文件夹数（当前 4 张，上限 5 张）：
+ *   · 4 张：第 1、2 张向左，第 3、4 张向右 —— 正好对半，最理想；
+ *   · 5 张：第 1、2 张向左，第 3、4、5 张向右 —— 中间那张（下标 2）归右，可接受
+ *     （它本来就是中位线上的一张，往哪边都不会读错）。
+ * 不为 5 张单独写一套规则：视觉上 2/3 与 2/2 的差别远小于"多一条要同步维护的规则"。
+ */
+.hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self']) {
+  --ho-exit-x: -40px;
+  translate: var(--ho-exit-x) 0;
+  opacity: 0;
+}
+
+.hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self']):nth-child(n + 3) {
+  --ho-exit-x: 40px;
+}
+
+/**
+ * 减少动效：整套退场动画直接关掉。
+ * 正常情况下走不到这里（`App` 在 `prefers-reduced-motion` 下根本不铺过场，点一下
+ * 就切视图、`HomeCover` 当场卸载），但系统设置在交互中途被改掉时，宁可"立刻消失"
+ * 也不要播一段 260ms 的位移。
+ */
+@media (prefers-reduced-motion: reduce) {
+  .hc-root[data-leaving='true'] .hc-exit,
+  .hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self']),
+  .hc-root[data-leaving='true'] .hs-card {
+    transition: none !important;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 文件夹数量 < 4 时的排布（用户 2026-11-09 提出）
+ *
+ * 用户原话：
+ *   「当下方只有 2 到 3 个文件夹的时候，右上角这个信息的位置应该在哪个地方？……
+ *     因为有很多用户可能只用我们的"材质"和"模型"文件夹，另外几个文件夹可能就不存在，
+ *     那就不显示了。所以这个问题是需要考虑到的。」
+ *
+ * 现状为什么不能直接沿用：`hc-folder-row` 是 `justify-between` + `max-w-[820px]`，
+ * 那条 820 是按「4 张卡、间隙 72px」反推出来的。一旦只有 2 张（各 151px），
+ * `justify-between` 会把它们顶到 820 带的**两端**，中间空出 **518px** ——
+ * 读起来不是"两个文件夹"，而是"两个东西各自跑偏了"，而且和上方居中的搜索条
+ * 完全对不齐。
+ *
+ * 所以 <4 张时切成 **居中 + 固定间隙**：整组落在中轴线上，与搜索条同一条竖轴。
+ *   · gap 取 72px —— 正是 1440 窗口下 4 张卡的自然间隙，换成 2/3 张时节奏一致；
+ *   · `max-width` 不影响（2~3 张本来就只有 294~456px），不用改；
+ *   · 4 张及以上**不命中**这组规则，上一版已验收的排布一个像素都不动。
+ * ⚠️ 数据卡的位置也随之解耦，见 `home-stats.css` 末尾（`.hc-root[data-folder-count]`）。
+ * ─────────────────────────────────────────────────────────────────────────── */
+.hc-folder-row[data-count='1'],
+.hc-folder-row[data-count='2'],
+.hc-folder-row[data-count='3'] {
+  justify-content: center;
+  column-gap: 72px;
+}

@@ -21,6 +21,10 @@ import type {
   ThumbStatus
 } from '../shared/types'
 import { baseNameOf, dedupeKeyOf, normalizeCategoryPair, zhimoIdFromSources, zhimoIdOf } from '../shared/naming'
+// SketchUp 插件收件箱（`docs/48 §7` / 勘察方案 A）：任务载荷的类型与契约在 `shared/inbox`
+import type { InboxJob } from '../shared/inbox'
+// 插件的「使用记录」回传（与导出通道同根、不同子目录，见 `shared/inboxUsage`）
+import type { InboxUsageEvent } from '../shared/inboxUsage'
 import { kindFolder, kindsOfFilter, isLegacyCadExt, type KindFilter } from '../shared/classify'
 import { UNCLASSIFIED } from '../shared/taxonomy'
 import { classifyAssetName } from '../shared/classifyAsset'
@@ -32,6 +36,7 @@ import {
   sanitizeFiltersForKind,
   snapshotFilters,
   sortAssets,
+  sortChangePatch,
   type Filters,
   type LibraryView,
   type SortKey
@@ -371,6 +376,328 @@ function ensureSettingsChangedSubscribed(): void {
     // 重读一次 getSettings 只会多一次 IPC，还可能读到更晚的第三次写入 —— 界面跳一下。
     useVault.setState({ settings: next })
   })
+}
+
+// ── SketchUp 插件收件箱（docs/probe/su-export-to-idbox.md · 方案 A）─────────
+//
+// 三条铁律（改这里之前先读）：
+//
+// 1. **create 走既有导入通道** `importPaths([jobDir])` —— 判重 / 队列 UI / 缩略图 /
+//    知末流水线 / AI 分类全部天然复用，一行都不用重写。文件夹导入不处置源目录
+//    （`importer.ts` 只在非目录时 `disposeArchive`），所以 `incoming\<jobId>\` 会原样
+//    留着，等 ack 时被搬到 `done\`。
+// 2. **update 绝不走 `importPaths` 的覆盖档**：那条路会把旧目录整个送进系统回收站，
+//    且只继承 12 个字段 → `renderParams` / `renderShape` / 自定义封面全丢
+//    （勘察 §Q4-3 / §风险 R5，直接违反 `docs/48 §7` 用户口径）。只调
+//    `applyInboxUpdate`（覆盖那一个 `.skp`）→ 再 `rescan()`。
+// 3. **成功和失败都要 ack**：不 ack 任务目录会一直堆在 `incoming\`，
+//    而主进程会每 3 秒重发同一条事件（at-least-once），表现为无限循环。
+
+/** 已消费的 jobId（主进程的派发是 at-least-once：同一 job 可能重复到达） */
+const inboxHandledJobs = new Set<string>()
+/** 正在处理中的 jobId（重复到达时不能并发跑第二遍导入） */
+const inboxInFlightJobs = new Set<string>()
+/** 是否已订阅 `inbox:job`（幂等，与 `conflictUnsubscribers` 同一手法） */
+let inboxJobSubscribed = false
+/**
+ * 「订阅被跳过」的 warn 是否已经打过。
+ *
+ * 独立于 `inboxJobSubscribed`：能力缺失时**不置**订阅标志（下一轮 init 还会再探测一次），
+ * 但 warn 只打一次 —— 否则开发态 StrictMode / 重扫重建会把同一条日志刷好几遍。
+ */
+let inboxSubscribeWarned = false
+
+/**
+ * 记一条「收件箱订阅被跳过」的 warn（**只打一次**）。
+ *
+ * 走 `reportLog`（fire-and-forget，与 `reportAssignTxFailure` 同款）：**不允许静默**。
+ * 能力缺失是"允许发生"的（见 `ensureInboxSubscribed` 头注），但必须能从日志里查到
+ * 「这台机器上收件箱通道没接上」，否则用户的"SketchUp 导出了但 ID BOX 没反应"
+ * 会变成一桩无迹可查的悬案。
+ *
+ * `reportLog` 自己也可能不存在（更老的 preload / 极简测试桩）→ 兜 `console.warn`。
+ */
+function warnInboxSubscribeSkipped(reason: string): void {
+  if (inboxSubscribeWarned) return
+  inboxSubscribeWarned = true
+  const context = { reason, hasBridge: typeof window !== 'undefined' && !!window.modvault }
+  try {
+    if (typeof window.modvault?.reportLog === 'function') {
+      window.modvault.reportLog({ level: 'warn', message: 'inbox:subscribe-skipped', context })
+    } else {
+      console.warn('[inbox] inbox:subscribe-skipped', context)
+    }
+  } catch {
+    /* 日志失败绝不影响 init */
+  }
+}
+
+/**
+ * 订阅收件箱任务（**幂等**：进程内只注册一次）。
+ *
+ * 与 `ensureConflictAskSubscribed` 同一手法：`init()` 在 StrictMode / 重扫重建时可能
+ * 被多次调用，每次 `ipcRenderer.on` 都会让同一条任务被处理多遍。
+ *
+ * ## 为什么这里要做**能力探测**（而不是直接调）
+ *
+ * preload 暴露的 API 是**随版本增长**的：`window.modvault` 上每加一个方法，所有
+ * "只桩了所需方法"的既有测试（本仓 40+ 个 `window.modvault = {...}` 桩）与
+ * **旧版 preload**（用户没重装主程序）都会在拿到新代码的那一刻炸在 `init()` 里 ——
+ * 而 `init()` 一炸，整个界面停在"正在加载…"（0.9.x 的真实故障形态）。
+ *
+ * 所以口径是：**允许能力缺失，但不允许静默** ——
+ * - 缺 `onInboxJob` → 记一条 `inbox:subscribe-skipped` warn，跳过订阅，其余 init 照常；
+ * - 有 → 走真实订阅路径（`typeof !== 'function'` 是**精确**判定，不会把"函数存在"
+ *   也短路掉：`inboxFlow.test.ts` 的桩正是这条路径的守卫）。
+ *
+ * ⚠️ 不把这个函数（或 `init()`）整段包进 try/catch：那会把"真的订阅失败"
+ * （比如 handler 注册过程中抛错）也一起吞掉，症状从"报错"退化成"功能静默不工作"。
+ * 能力缺失是**已知的、可枚举的**情况，只对它做探测。
+ */
+export function ensureInboxSubscribed(): void {
+  if (inboxJobSubscribed) return
+  const bridge = typeof window === 'undefined' ? undefined : window.modvault
+  if (typeof bridge?.onInboxJob !== 'function') {
+    warnInboxSubscribeSkipped('preload 未提供 onInboxJob（旧版 preload 或测试桩只桩了部分方法）')
+    return
+  }
+  inboxJobSubscribed = true
+  bridge.onInboxJob((job) => {
+    void consumeInboxJob(job)
+  })
+}
+
+/**
+ * 给主进程回一个 ack（**永不抛**：ack 失败只是目录晚点搬，不该炸掉调用方）。
+ *
+ * 主进程侧语义：`ok:true` → `done\<jobId>\`；`ok:false` → `failed\<jobId>\` + `error.txt`。
+ */
+async function ackInbox(jobId: string, ok: boolean, reason?: string): Promise<void> {
+  try {
+    await window.modvault.ackInboxJob({ jobId, ok, reason })
+  } catch (err) {
+    console.warn('[inbox] ack 失败（任务目录会留在 incoming，下次启动重扫）', jobId, err)
+  }
+}
+
+/**
+ * 在导入结果里找到刚落库的那个资产。
+ *
+ * ## 为什么要这一步（以及为什么不能省）
+ *
+ * 走 `importPaths([jobDir])` 时，文件夹导入的资产名来自**目录名**，而目录名是
+ * `jobId`（`20261109-184000-ab12`）—— 也就是说入库后资产会叫一串时间戳。
+ * 用户要的名字在 `manifest.name` 里，所以导入完必须**改一次名**（走既有
+ * `renameAsset`，它只改文件夹名 + 末段 relFolder，tags/note/封面全保留）。
+ *
+ * 为什么要轮询：`importPaths` 的 Promise 在主进程返回时就兑现，而资产记录是
+ * 通过 `import:event` 逐条写进 store 的（两条不同的 IPC 通道，顺序不保证）。
+ * 直接读 `get().assets` 有概率还没写进来 → 名字停在时间戳上。
+ *
+ * 窗口取 **10 秒**（250ms × 40），不是 3 秒：`importPaths` 走的是主进程的
+ * `batchChain`（批次串行），用户此刻若正在导入 200 个包，我们这个 job 会排在队尾，
+ * 光等着就可能超过 3 秒。等不到就放弃改名 —— 代价绝不对称：
+ * - 等太久的最坏代价：ack 晚 10 秒（任务目录多留 10 秒在 incoming，主进程的重发
+ *   打在本进程的 in-flight 分支上、什么都不做，无副作用）；
+ * - 等太短的最坏代价：**资产永久叫 `20261109-184000-ab12`**，用户得自己改名。
+ */
+async function waitForInboxAsset(jobId: string): Promise<Asset | null> {
+  const matches = (): Asset | null => {
+    const assets = useVault.getState().assets
+    // `uniqueName()` 撞名时会追加 `-2`，所以两种形态都要认
+    return (
+      assets.find((a) => {
+        const base = a.folder.split(/[\\/]/).pop() ?? ''
+        return base === jobId || base.startsWith(`${jobId}-`)
+      }) ?? null
+    )
+  }
+  const immediate = matches()
+  if (immediate) return immediate
+  for (let i = 0; i < 40; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    const hit = matches()
+    if (hit) return hit
+  }
+  return null
+}
+
+/**
+ * 消费一个收件箱任务（`op: 'create'` / `'update'` 两条链路）。
+ *
+ * 调用顺序（**顺序是契约，别调换**）：
+ *
+ * | 步骤 | create | update |
+ * |---|---|---|
+ * | 1 | `importPaths([job.jobDir])`（既有通道，含判重/队列/缩略图/AI） | `applyInboxUpdate({targetRelFolder, skpSourcePath, jobId})` |
+ * | 2 | 按 jobId 找回刚入库的资产 → `renameAsset(id, manifest.name)` | 成功后 `rescan()`（`files` / `size` 跟磁盘，元数据靠 rescan 的合并白名单保住） |
+ * | 3 | `inboxAck(ok)` | `inboxAck(ok / !ok + reason)` |
+ * | 4 | 一条 notice | 一条 notice（失败文案带可执行动作） |
+ *
+ * 重复到达（同一 jobId 第二次被派发）：**只补一个 ack，不重跑** —— 主进程每 3 秒重发，
+ * 重跑一次 create 会在库里多一份资产。
+ */
+async function consumeInboxJob(job: InboxJob): Promise<void> {
+  const jobId = typeof job?.jobId === 'string' ? job.jobId : ''
+  if (!jobId || !job?.manifest) return
+
+  if (inboxHandledJobs.has(jobId) || inboxInFlightJobs.has(jobId)) {
+    // 已处理过 / 正在处理：补 ack 让主进程停止重发（幂等，主进程侧返回 archivedTo:null）
+    if (!inboxInFlightJobs.has(jobId)) await ackInbox(jobId, true)
+    return
+  }
+  inboxInFlightJobs.add(jobId)
+  const manifest = job.manifest
+  const name = manifest.name || '未命名模型'
+
+  try {
+    if (manifest.op === 'update') {
+      // ── 更新：只覆盖那一个 .skp ─────────────────────────────────
+      const result = await window.modvault.applyInboxUpdate({
+        targetRelFolder: manifest.targetRelFolder ?? '',
+        skpSourcePath: job.skpPath,
+        jobId
+      })
+      if (!result.ok) {
+        await ackInbox(jobId, false, result.reason)
+        enqueueNotice(`SketchUp 更新「${name}」失败：${result.reason}`)
+        return
+      }
+      // 覆盖成功 → 重扫让 files / size 跟上磁盘；分类 / 渲染参数 / 自定义封面
+      // 由 rescan 的合并方向（以本地为底、只覆盖磁盘权威字段）原样保住。
+      await useVault.getState().rescan()
+      await ackInbox(jobId, true)
+      enqueueNotice(
+        `已用 SketchUp 里的最新文件更新「${name}」（覆盖 ${result.targetName}，分类与渲染参数保持不变）`
+      )
+      return
+    }
+
+    // ── 新建：走既有导入通道 ─────────────────────────────────────
+    await useVault.getState().importPaths([job.jobDir])
+    // 入库后的资产名是 jobId（目录名），改回 manifest 里的人类可读名字
+    const created = await waitForInboxAsset(jobId)
+    if (created && created.name !== manifest.name) {
+      try {
+        await useVault.getState().renameAsset(created.id, manifest.name)
+      } catch (err) {
+        // 撞名 / 目录被占用：保持 jobId 名，资产本身已成功入库（不为此判失败）
+        console.warn('[inbox] 资产入库成功但改名失败', { jobId, name: manifest.name, err })
+      }
+    }
+    await ackInbox(jobId, true)
+    enqueueNotice(`已从 SketchUp 收下「${name}」`)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    await ackInbox(jobId, false, `ID BOX 处理任务时出错：${reason}`)
+    enqueueNotice(`SketchUp 导出「${name}」入库失败：${reason}`)
+  } finally {
+    inboxHandledJobs.add(jobId)
+    inboxInFlightJobs.delete(jobId)
+  }
+}
+
+// ── 插件「使用记录」回传（`shared/inboxUsage`）─────────────────────────────
+//
+// 与导出通道（`incoming\`）**同根不同子目录**（`usage\`），物理隔离：那边是"模型文件
+// 要入库"，这边只是"用户又用了一次某个资产"，两者的解析器、重试语义、失败代价都不同，
+// 混在一个目录里迟早出事。
+//
+// 语义要点：
+// 1. **不 ack 就不删文件**（主进程侧实现）→ 这里 `ok:false` 表示"没落进库，请下次再给我"。
+//    所以统计失败绝不会把"用户真的用过"这件事偷偷吞掉。
+// 2. **资产不存在就静默丢弃并 ack 成功**：用户可能在插件里插过一个模型之后把它删了，
+//    这条记录永远配不上号，留在盘上只会无限重试。
+// 3. 统计是**附属行为**：任何异常都不允许冒泡到 init / 界面。
+
+/** 是否已订阅 `inbox:usage`（幂等，与 `inboxJobSubscribed` 同一手法） */
+let inboxUsageSubscribed = false
+/** 「usage 订阅被跳过」的 warn 是否已经打过（只打一次，理由同 `inboxSubscribeWarned`） */
+let inboxUsageWarned = false
+
+/**
+ * 订阅插件的使用记录回传（**幂等**：进程内只注册一次）。
+ *
+ * 为什么与 `ensureInboxSubscribed` 分开而不是合并成一个函数：两者的能力可以独立缺失
+ * （用户可能装了新主程序但用着旧插件，或反过来），合并会让"缺 onInboxUsage"把
+ * 导出通道也一起跳过 —— 那才是真正的功能事故。
+ *
+ * **能力探测而非直接调用**：preload 的方法是随版本增长的，旧 preload 上 `onInboxUsage`
+ * 不存在；直接调会在 `init()` 里抛，界面停在"正在加载…"（0.9.x 的真实故障形态）。
+ */
+export function ensureInboxUsageSubscribed(): void {
+  if (inboxUsageSubscribed) return
+  const bridge = typeof window === 'undefined' ? undefined : window.modvault
+  if (typeof bridge?.onInboxUsage !== 'function') {
+    if (!inboxUsageWarned) {
+      inboxUsageWarned = true
+      const context = {
+        reason: 'preload 未提供 onInboxUsage（旧版 preload 或测试桩只桩了部分方法）',
+        hasBridge: !!bridge
+      }
+      try {
+        if (typeof bridge?.reportLog === 'function') {
+          window.modvault.reportLog({
+            level: 'warn',
+            message: 'inbox:usage-subscribe-skipped',
+            context
+          })
+        } else {
+          console.warn('[inbox] inbox:usage-subscribe-skipped', context)
+        }
+      } catch {
+        /* 日志失败绝不影响 init */
+      }
+    }
+    return
+  }
+  inboxUsageSubscribed = true
+  bridge.onInboxUsage((ev) => {
+    void consumeInboxUsage(ev)
+  })
+}
+
+/**
+ * 消费一条插件使用记录：累加 `useCount` / 更新 `lastUsedAt`，然后回 ack。
+ *
+ * `ok` 的判定只有一种失败：`recordAssetUse` 自己抛了（理论上不会，它内部已兜）。
+ * 这里仍然包一层 —— 主进程那边的代价是"文件留到下次启动重试"，比丢数据便宜。
+ */
+async function consumeInboxUsage(ev: InboxUsageEvent): Promise<void> {
+  let ok = true
+  try {
+    const assetId = ev.record.assetId
+    // 先确认资产还在内存里：`recordAssetUse` 对不存在的 id 也会返回"成功"，
+    // 但那条路径是"配不上号，重试也没用"，语义上与"写库失败"完全不同。
+    const exists = useVault.getState().assets.some((a) => a.id === assetId)
+    if (exists) {
+      // ⚠️ 必须 await 返回值：`recordAssetUse` 内部自己 catch 掉了写库失败
+      // （不能让统计失败打断"打开大图"），所以异常不会冒到这里 ——
+      // 如果只看有没有抛，就永远判成功、ack true、主进程删文件，那次使用被静默吞掉。
+      const persisted = await useVault.getState().recordAssetUse(assetId)
+      if (!persisted) ok = false
+    }
+  } catch (err) {
+    ok = false
+    const reason = err instanceof Error ? err.message : String(err)
+    console.warn('[inbox] 使用记录落库失败（文件保留，下次启动重试）', ev.fileName, reason)
+  }
+  try {
+    await window.modvault.ackInboxUsage({ fileName: ev.fileName, ok })
+  } catch (err) {
+    // ack 通道本身缺失（旧 preload）：文件会留在盘上，下次启动重放。不吵。
+    console.warn('[inbox] 使用记录 ack 失败（文件保留，下次启动重试）', ev.fileName, err)
+  }
+}
+
+/** 仅供单测：复位收件箱订阅守卫 + 去重集合（运行时**不允许**调用） */
+export function resetInboxForTests(): void {
+  inboxJobSubscribed = false
+  inboxSubscribeWarned = false
+  inboxUsageSubscribed = false
+  inboxUsageWarned = false
+  inboxHandledJobs.clear()
+  inboxInFlightJobs.clear()
 }
 
 /**
@@ -1332,6 +1659,14 @@ interface VaultState {
   /** 切换视图；进入回收站时清空选择 / 关闭文件视图（右栏不能停在一个当前视图看不见的资产上） */
   setLibraryView: (view: LibraryView) => void
   init: () => Promise<void>
+  /**
+   * 增量改 `filters`（唯一写点）。
+   *
+   * 两条**自动**副作用（调用方不用自己写）：
+   * - `patch.kind` → 走 `sanitizeFiltersForKind` 清掉新大类不支持的维度；
+   * - `patch.sort` 且**没**同时带 `sortDesc` → 方向回该键的自然方向（`sortChangePatch`）。
+   *   想保留 / 指定方向就显式带上 `sortDesc`（方向按钮走的就是这条路）。
+   */
   setFilter: (patch: Partial<Filters>) => void
   // ── 0.6.0 智能集合（保存的筛选视图） ────────────────────────
   /**
@@ -1508,6 +1843,27 @@ interface VaultState {
   /** 打开 Quick Look（不在索引里的 id 静默忽略：空格可能命中刚被 rescan 丢弃的陈旧 DOM 节点） */
   openQuickLook: (id: string) => void
   closeQuickLook: () => void
+  /**
+   * 记一次「使用」（`useCount += 1` + `lastUsedAt = now`），供排序键
+   * 「最常使用 / 最近使用」使用。
+   *
+   * **只由"用户主动打开查看"的三个入口调用**：`openQuickLook` / `openFolderView` /
+   * `openHdrPreview`。不要在选中（`select` / `toggleSelect` / `selectRange`）、hover、
+   * `applyFilters`、`rescan` 里调用 —— 口径的完整理由写在 `shared/types.ts` 的
+   * `useCount` 注释里（那是单一出处，这里不复制）。
+   *
+   * 三条纪律（实现见 action 本体）：
+   * ① 索引里没有这个 id 就什么都不做（不能凭空造一条记录）；
+   * ② 内存先更新（排序立刻生效），持久化只写这两个字段且**失败不影响主流程**；
+   * ③ 同一 id 在 {@link ASSET_USE_DEBOUNCE_MS} 内的重复调用只记一次。
+   *
+   * @returns 持久化是否成功。**调用方一律可以忽略**（界面上的打点都是
+   * `void recordAssetUse(id)`）—— 唯一关心它的是插件回传通道
+   * （`consumeInboxUsage`）：那边要把"没写进库"翻译成 ack 失败，让主进程
+   * 保留文件下次重试。否则一次 IndexedDB 抖动就会静默吃掉用户的一次真实使用。
+   * 被防抖拦掉时返回 `true`（"这段查看已经记过了"，不该触发重试）。
+   */
+  recordAssetUse: (id: string) => Promise<boolean>
   // ── P2 未分类整理流水线（键盘驱动的串行整理）──────────────────
   /**
    * 整理浮层的**模式**（`null` = 未开启）。
@@ -1941,7 +2297,19 @@ async function patchAssets(ids: string[], patch: MarkPatch): Promise<boolean> {
     await db.assets.bulkPut(updated)
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
-    useVault.setState({ notice: `保存标记失败：${reason}（原标记已保留）` })
+    // 原始异常**只进日志**：`reason` 可能是 `QuotaExceededError: …` / `UnknownError: …`
+    // 这类英文异常原文，直接糊到 toast 上用户既看不懂、又会以为软件崩了（A 级文案泄漏）。
+    // 界面只说"发生了什么 + 我的标记还在不在"；技术原文留给 `reportLog` 对账。
+    try {
+      window.modvault?.reportLog?.({
+        level: 'error',
+        message: 'asset:mark-save-failed',
+        context: { reason, count: updated.length }
+      })
+    } catch {
+      /* 日志失败绝不影响提示与返回值 */
+    }
+    useVault.setState({ notice: '存不下这次标记（可能是磁盘满了），原标记已保留' })
     return false
   }
 
@@ -2776,6 +3144,71 @@ async function rescueDamagedIndex(assets: Asset[]): Promise<void> {
   }
 }
 
+// ── 使用统计（2026-10，排序键「最常使用 / 最近使用」的数据来源）──────────────
+//
+// 打点本身是**附属行为**：它绝不能影响"打开一张图"这个主流程（写库失败也不许抛）。
+// 字段与"什么算一次使用"的完整口径写在 `shared/types.ts` 的 `useCount` / `lastUsedAt`
+// 注释里（单一出处），这里只放运行时纪律。
+
+/**
+ * 同一资产两次打点之间的最小间隔（ms）。
+ *
+ * 为什么需要防抖：Quick Look 是"按住空格来回比图"的用法 —— 用户在两三张之间反复按
+ * 空格（`openQuickLook` 每次都是独立一次打开），不防抖的话 10 秒的挑选能把计数刷上
+ * 几十次，"最常使用"会变成"今天来回看的那张"，长期偏好完全被一次会话淹没。
+ *
+ * 为什么取 2000：一次真实的"我要用这个"起码要看满 2 秒（打开 → 看 → 关）。
+ * 小于 2 秒的重复打开属于"同一段查看"而不是"第二次使用"。
+ */
+export const ASSET_USE_DEBOUNCE_MS = 2000
+
+/**
+ * 每个资产最近一次打点的时间（模块级，**不持久化、不做清理**）。
+ *
+ * 不持久化的理由：防抖只需要覆盖"当前会话里连续的几次按键"，跨启动的重复不算刷计数；
+ * 落库反而会多写一个字段、多一次写盘。不做清理的理由：key 的数量上限就是库内资产数
+ * （几千条字符串 → 几十 KB），加 LRU 只是给自己制造一个可能悄悄失效的机制。
+ */
+const lastUseRecordedAt = new Map<string, number>()
+
+/**
+ * 判断这次打点要不要真的记（并顺手更新时间戳）。
+ *
+ * 副作用写在函数里是刻意的：**"判断"与"占用时间片"必须是同一步**，否则两个连续的
+ * 调用会在同一个 tick 里都读到旧时间戳、都判成"可以记"。
+ */
+function shouldRecordAssetUse(id: string, now: number): boolean {
+  const last = lastUseRecordedAt.get(id)
+  if (last !== undefined && now - last < ASSET_USE_DEBOUNCE_MS) return false
+  lastUseRecordedAt.set(id, now)
+  return true
+}
+
+/** 使用统计写库失败是否已经 warn 过（一次会话只打一条，别刷日志） */
+let useStatWriteWarned = false
+
+/**
+ * 记一条「使用统计写库失败」的 warn（**只打一次**）。
+ *
+ * 走 `reportLog`（fire-and-forget，与 `warnInboxSubscribeSkipped` 同款）：写库失败
+ * 不影响用户任何操作，但**必须能从日志里查到**——否则"用了几十次的模型还是排在后面"
+ * 会变成一桩无迹可查的悬案。
+ */
+function warnUseStatWriteFailed(id: string, err: unknown): void {
+  if (useStatWriteWarned) return
+  useStatWriteWarned = true
+  const context = { id, reason: err instanceof Error ? err.message : String(err) }
+  try {
+    if (typeof window !== 'undefined' && typeof window.modvault?.reportLog === 'function') {
+      window.modvault.reportLog({ level: 'warn', message: 'usestat:write-failed', context })
+    } else {
+      console.warn('[usestat] 使用统计写库失败（不影响打开）', context)
+    }
+  } catch {
+    /* 日志失败绝不影响主流程 */
+  }
+}
+
 export const useVault = create<VaultState>((set, get) => ({
   assets: [],
   filters: { ...DEFAULT_FILTERS },
@@ -2903,6 +3336,15 @@ export const useVault = create<VaultState>((set, get) => ({
     // docs/27 T-06：重复询问的订阅（**幂等**，模块级只注册一次；重复订阅会让一次询问被处理多次）
     ensureConflictAskSubscribed()
 
+    // SketchUp 插件收件箱（`docs/48 §7`）：主进程发现完整任务后推过来，这里消费。
+    // 幂等订阅；`create` 走 `importPaths`、`update` 走 `applyInboxUpdate` + `rescan`，
+    // 两条链路都必定 ack（不 ack 的话主进程会每 3 秒重发同一条任务）。
+    ensureInboxSubscribed()
+
+    // 插件的「使用记录」回传（与导出通道同一条根、不同子目录）。幂等订阅；
+    // 能力缺失时安静跳过（旧 preload），绝不影响 init 的其余部分。
+    ensureInboxUsageSubscribed()
+
     window.modvault.onImportEvent((ev) => {
       // 终态（done / error / skipped）记下**绝对时间戳**：ImportQueue 的自动消失倒计时以它为起点，
       // 悬停暂停 / 恢复、重建 timer 都不会重新计时（见 logic/importText.ts）。
@@ -2964,7 +3406,27 @@ export const useVault = create<VaultState>((set, get) => ({
         // 本批落库数：给批次汇总的"本批 N 个素材"用（消费型，见 `reportReviewSummary`）。
         // ⚠️ 只累加、**绝不在这里发任何汇总** —— 那就是"拖 50 个包弹 50 次"。
         importedInBatchCount += 1
-        void db.assets.put(ev.asset)
+        /**
+         * 落盘 IndexedDB（`db.assets.put`）是**异步且曾经是 fire-and-forget**。
+         *
+         * 2026-11-09 用户 P0「拖进去不在了，我找不到它」复盘时逐条排除了这条路
+         * （证据：磁盘有 `D5A/…/休闲椅.d5a`、Dexie 里有 `kind='d5a'` 且 `deletedAt` 为空）
+         * —— 它的真实原因是 UI 没有入口（见 `logic/homeKinds.ts` 头注）。但这条 `put`
+         * 一旦失败（配额 / 事务中止 / DB 被别处锁住），旧写法是**彻底静默**：
+         * 内存里 `upsert` 仍然生效 → 本次会话看得见、重启就消失，用户只会说"它不见了"。
+         * 既然本批口径是「失败必须让用户看见，不许静默」，这里补一条可见反馈
+         * （notice + 结构化错误日志），成功路径一行不变。
+         */
+        void db.assets
+          .put(ev.asset)
+          .catch((err: unknown) => {
+            // 走 `console.error`：`main.tsx` 装的转发钩子会把它落进主进程日志
+            // （`[renderer] [ERROR] …`），比只在 DevTools 里可见强。
+            console.error('[db] 资产写库失败', ev.asset?.id, err)
+            set({
+              notice: `「${ev.asset!.name}」写入索引失败，重启后可能看不到它（可试一次「刷新」重建索引）`
+            })
+          })
         set((s) => ({ assets: upsert(s.assets, ev.asset!) }))
         // 导入完成后才渲球图（**不阻塞导入进度条**）：入队即返回，后台串行消费
         enqueueBallThumb(ev.asset)
@@ -2982,7 +3444,18 @@ export const useVault = create<VaultState>((set, get) => ({
 
   setFilter: (patch) =>
     set((s) => {
-      const merged: Filters = { ...s.filters, ...patch }
+      // 换排序键 → 方向回该键的自然方向（2026-11「正序 / 倒序」）。
+      //
+      // **落在这里而不是各调用点**：设置 `sort` 的入口不止 popover 点击（还有键盘回车、
+      // 将来的批量恢复），一处漏写就是"从按大小倒序切到按名称，名称也跟着反向"。
+      // 规则本体是纯函数 `sortChangePatch`（有单测），这里只做接线：
+      // - 补丁里显式带了 `sortDesc`（方向按钮 / 显式恢复）→ 用户意图优先，不覆盖；
+      // - 键没变（重复点同一项）→ `sortChangePatch` 只回 `{ sort }`，方向原地保留。
+      const withSort: Partial<Filters> =
+        patch.sort !== undefined && patch.sortDesc === undefined
+          ? { ...patch, ...sortChangePatch(s.filters.sort, patch.sort) }
+          : patch
+      const merged: Filters = { ...s.filters, ...withSort }
       // 切大类时才归一化（`sanitizeFiltersForKind`）：新视图不支持的维度 / 新视图没有的
       // 分辨率档必须清掉，否则入口消失了条件还在生效 → 网格空着且用户找不到原因。
       // 只在 `patch.kind` 存在时跑：改其它维度不必每次重建对象（memo 引用稳定）。
@@ -4218,6 +4691,8 @@ export const useVault = create<VaultState>((set, get) => ({
   openFolderView(id) {
     // 只有索引里真实存在的资产才允许进入（双击可能命中刚被 rescan 丢弃的陈旧 DOM 节点）
     if (!get().assets.some((a) => a.id === id)) return
+    // 使用统计：双击进文件视图 = 用户主动打开查看 → 记一次（口径见 shared/types.ts）
+    void get().recordAssetUse(id)
     set({ folderViewAssetId: id })
   },
   closeFolderView: () => set({ folderViewAssetId: null }),
@@ -4227,6 +4702,8 @@ export const useVault = create<VaultState>((set, get) => ({
     // "预览打不开"的窗比什么都不发生更糟。
     const asset = get().assets.find((a) => a.id === id)
     if (!asset || asset.kind !== 'hdri') return
+    // 使用统计：HDRI 双击进预览弹窗同样是"主动打开查看"（判据通过之后才记）
+    void get().recordAssetUse(id)
     set({ hdrPreviewAssetId: id })
   },
   closeHdrPreview: () => set({ hdrPreviewAssetId: null }),
@@ -4235,10 +4712,80 @@ export const useVault = create<VaultState>((set, get) => ({
     // 只对索引里真实存在的资产生效：空格可能命中刚被 rescan 丢弃的陈旧 DOM 节点
     // （与 openHdrPreview / openFolderView 同一守卫），不在索引里就静默忽略。
     if (!get().assets.some((a) => a.id === id)) return
+    // 使用统计：空格快览 = 用户主动打开查看 → 记一次（连按空格由 action 内部 2s 防抖兜住）
+    void get().recordAssetUse(id)
     set({ quickLookAssetId: id })
   },
   // 关闭只撤浮层，**不动选中**（用户口径：退回网格时选中态要留着，第二次 Esc 才清）
   closeQuickLook: () => set({ quickLookAssetId: null }),
+
+  /**
+   * 记一次「使用」。三个入口调用它：`openQuickLook` / `openFolderView` / `openHdrPreview`。
+   *
+   * 字段语义与"什么算一次使用"的口径写在 `shared/types.ts` 的 `useCount` 注释里。
+   *
+   * ## 为什么持久化用 `update` 而不是 `put`
+   *
+   * `put(id, 整条记录)` 是**整条覆盖**：内存快照 `current` 是调用瞬间拍的，而写库是
+   * 异步的 —— 两者之间缩略图队列、封面抓取、分类回填都可能刚刚改完同一条记录的
+   * 其他字段（`thumbPath` / `thumbStatus` / `cover` / `category1`…）。用 `put` 写回去
+   * 等于把那些并发写入**打回旧值**（用户看到卡片突然没图）。`update` 只 MERGE 这两个
+   * 字段，其他字段由 Dexie 在事务里按当前值保留。
+   *
+   * ## 为什么内存先更新
+   *
+   * 排序键（「最常使用 / 最近使用」）吃的是内存 `assets[]`，写库是后置的持久化。
+   * 先 `set()` 才能让用户下一次排序立刻看到变化；反过来做的话，写库往返期间
+   * 排序还是旧值，用户会以为点了没反应。
+   *
+   * ## 失败绝不影响主流程
+   *
+   * 打点是附属行为：写库失败（磁盘满 / IndexedDB 被清 / 库被占用）时用户仍然应该
+   * 正常打开这张图。所以 `.catch()` 里只 warn 一次，绝不 `throw`、绝不清状态。
+   */
+  recordAssetUse(id) {
+    // ① 索引里没有这个 id 就什么都不做：气泡/空格可能带着刚被 rescan 丢弃的陈旧 id，
+    //    不能凭空造一条只有计数的幽灵记录。
+    //    返回 true：这种记录本就不该重试（配不上号，重试一万次还是配不上）。
+    const current = get().assets.find((a) => a.id === id)
+    if (!current) return Promise.resolve(true)
+
+    // ② 防抖：同一资产 2 秒内的重复打开属于"同一段查看"，不是第二次使用
+    const now = Date.now()
+    if (!shouldRecordAssetUse(id, now)) return Promise.resolve(true)
+
+    const useCount = (current.useCount ?? 0) + 1
+    const lastUsedAt = now
+
+    // ③ 内存先更新（按 id 就地替换，其余字段原样保留 → 其他并发内存改动不会被覆盖）
+    set((s) => ({
+      assets: s.assets.map((a) => (a.id === id ? { ...a, useCount, lastUsedAt } : a))
+    }))
+
+    // ④ 持久化只写这两个字段（**不要换成 `put`**，理由见本 action 头注）
+    //
+    // try/catch 是必须的：Dexie 在几种情况下是**同步抛**（IndexedDB 缺失 → MissingAPIError、
+    // 库已 close → InvalidStateError），`void promise.catch()` 拦不住同步 throw。
+    // 同步 throw 冒泡出去会让 `openQuickLook` / `openFolderView` 直接失败 ——
+    // 用户按空格看一张图，结果因为写统计失败什么都没发生，这是不能接受的主流程故障。
+    //
+    // 返回值 = 持久化结果。**只有插件回传通道会 await 它**（见接口注释）：
+    // 界面上的打点一律 `void recordAssetUse(id)`，不阻塞任何交互。
+    try {
+      return db.assets
+        .update(id, { useCount, lastUsedAt })
+        .then(
+          () => true,
+          (err: unknown) => {
+            warnUseStatWriteFailed(id, err)
+            return false
+          }
+        )
+    } catch (err) {
+      warnUseStatWriteFailed(id, err)
+      return Promise.resolve(false)
+    }
+  },
 
   // ── P2 未分类整理流水线 ─────────────────────────────────────
 
@@ -4603,7 +5150,9 @@ export const useVault = create<VaultState>((set, get) => ({
           importedAt: local.importedAt
           // 其余（id / source / tags / note / favorite / rating / colorTag /
           // styles / renderParams / renderShape / mojibake / deletedAt / trashRel /
-          // aliasOverride）由 `...local` 原样带过来。
+          // aliasOverride / useCount / lastUsedAt）由 `...local` 原样带过来。
+          // ↑ 使用统计（useCount / lastUsedAt）**必须**走这条路：磁盘上没有对应物，
+          //   重扫把它清零等于用户点一次「刷新」就抹掉自己攒了几个月使用习惯。
         })
       } else {
         merged.push(s)
@@ -5666,7 +6215,7 @@ export const useVault = create<VaultState>((set, get) => ({
       targets.push({ id: asset.id, zhimoId })
     }
     if (targets.length === 0) {
-      set({ notice: '没有需要从知末补封面的资产（已有 cover 文件的一律不重抓）' })
+      set({ notice: '没有需要补封面的资产（已有封面的一律不重抓）' })
       return idle
     }
 
@@ -5780,10 +6329,11 @@ export const useVault = create<VaultState>((set, get) => ({
       /* 日志失败绝不影响结果 */
     }
 
-    // 跳过明细分票展示（0.8.3）：「已有 cover 文件」单列 —— 用户按外部教程把
-    // cover 图放回盘上后，看到这句就知道"软件认到了"，而不是按钮坏了。
+    // 跳过明细分票展示（0.8.3）：「已有封面」单列 —— 用户按外部教程把封面图放回盘上后，
+    // 看到这句就知道"软件认到了"，而不是按钮坏了。
+    // ⚠️ 文案里只说「封面」，不写 `cover` / `.cover.png` 这类内部/文件名说法（A13 收口）。
     const skipNotes: string[] = []
-    if (skippedCoverFile > 0) skipNotes.push(`跳过 ${skippedCoverFile}（已有 cover 文件）`)
+    if (skippedCoverFile > 0) skipNotes.push(`跳过 ${skippedCoverFile} 个（已有封面）`)
     if (skippedManual > 0) skipNotes.push(`跳过 ${skippedManual}（手动封面）`)
     const skippedNote = skipNotes.length > 0 ? ` · ${skipNotes.join('，')}` : ''
     set({

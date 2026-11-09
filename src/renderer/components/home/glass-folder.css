@@ -1,0 +1,706 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * ID BOX · 首页封面页「磨砂玻璃文件夹」（Glass Folder）
+ *
+ * ── 几何来源（唯一权威，勿"优化"）─────────────────────────────────────────────
+ * 参考件：E:/workbuddy/2026-08-04-22-21-44/glass-folder-cards-clone.html
+ *         （21st.dev @kedhareswer · glass-folder-cards 的活 DOM 实测复刻）
+ *
+ * 外形**不是**圆角矩形 + 耳朵，而是一条一体成形的 SVG path：背板与翻盖的上沿
+ * 都是「左低右高」的 S 形斜切，这才是"文件夹形状"的来源。
+ *
+ *   BACK_PATH  viewBox 0 0 340 272
+ *     M0 56 A22 22 0 0 1 22 34 L146 34 C170 34 172 0 198 0 L318 0
+ *     A22 22 0 0 1 340 22 L340 250 A22 22 0 0 1 318 272 L22 272
+ *     A22 22 0 0 1 0 250 Z
+ *   FRONT_PATH viewBox 0 0 340 198
+ *     M0 22 A22 22 0 0 1 22 0 L118 0 C144 0 146 32 172 32 L318 32
+ *     A22 22 0 0 1 340 54 L340 176 A22 22 0 0 1 318 198 L22 198
+ *     A22 22 0 0 1 0 176 Z
+ *
+ * 两条 path 的字符串常量放在 GlassFolder.tsx，**只**写进
+ * `element.style.clipPath = "path(...)"`（设计稿要求无描边，`<svg><path>` 描边
+ * 已整体删除，见下方「无描边」一节）。
+ * 层级：.gf-tilt（指针倾斜）→ shadow / back / files / front。
+ * back 与 front **各自**带 clip-path，没有独立的描边 SVG。
+ *
+ * ── 无描边（用户：「文件夹不需要描边，你看一下参考」）────────────────────────
+ * 参考件本来就没有 stroke，形状全靠 clip-path + 玻璃 tint 的明暗差。
+ * ⚠️ 外轮廓阴影**不能**用 box-shadow：它会被同一元素的 `clip-path` 一起裁掉，
+ *   等于没写。唯一正确写法是 `filter: drop-shadow()`（filter 在裁剪之后生效，
+ *   阴影沿裁剪后的形状走），见 `.gf-back`。**不要改回 box-shadow**。
+ *
+ * ── 尺寸：一个旋钮控整组（--gf-scale）────────────────────────────────────────
+ * 几何永远按 340×272 写死，整组用 `.gf-stage { transform: scale(var(--gf-scale)) }`
+ * 等比缩到窗口里（参考件的 .gf-stage 本来就是 transform-origin:0 0 + scale）。
+ * `.gf-root { --gf-scale: … }` 是唯一旋钮；宽高由它派生：
+ *     width  = 340px * --gf-scale
+ *     height = 272px * --gf-scale        （名称区在文件夹**内部**，不再额外留高）
+ * 数值见文件末尾的媒体查询阶梯（1080 窗口 ≈ 104px，1440 窗口 ≈ 151px）。
+ *
+ * ⚠️ 为什么不写 `--gf-scale: calc(宽度 / 340px)`：
+ *    「长度 / 长度」是 CSS Values 4 的分型除法，Chromium 到 130（= Electron 33）
+ *    仍不支持，声明会被整条丢弃，`transform: scale(...)` 静默失效 → 340px 的
+ *    原尺寸硬塞进缩小的盒子里，比改之前更糟。因此这里用媒体查询阶梯给
+ *    **无单位数字**，`width: calc(340px * var(--gf-scale))` 反由它派生，
+ *    两者永远同源、不可能对不上。
+ *
+ * ── 配色：走软件 token（浅 / 深两套），不照抄参考件的硬编码色 ─────────────────
+ * 见下方 `:root, [data-theme='light']` 与 `[data-theme='dark']` 两块。
+ *
+ * ── ⛔ 全局禁令的**单点例外**（重要，改之前先读完）─────────────────────────────
+ * `src/renderer/styles.css` 头部（第 9 行）写的是「全局禁用橙色/棕色高亮、
+ * 紫色系、玻璃拟态 backdrop-blur、渐变」。本文件是**唯一**获准的例外：
+ *   · 理由：这个组件是用户亲自点名的 glass-folder 复刻（"我会给你一个原封不动的
+ *     参考，你直接做进去"），玻璃质感必须靠 backdrop-filter + 半透明渐变才成立；
+ *   · 禁令针对的是全站装饰性渐变，不针对这个被指定复刻的组件；
+ *   · 例外范围仅限本文件 —— **除本文件外任何地方不许新增 backdrop-filter / 渐变**；
+ *   · 代价控制在预算内：深色下 backdrop-filter 用 blur(18px)（参考 22px），
+ *     因为首页 5 个文件夹并排压在 WebGL 粒子之上。
+ *
+ * ── 历史坑：已不适用 ─────────────────────────────────────────────────────────
+ * 上一版（240×224 圆角矩形 + 86×32 标签齿）栽在「齿与翻盖各自 rotate(-1.5deg)
+ * + transform-origin: 50% 100%」——两者尺寸不同 → 原点不同 → 旋转后被拉成两块
+ * 白胶囊。新版外形由 clip-path 一体成形，**没有齿、没有第二块矩形**，
+ * 那条坑自然消失；对应地，`.gf-tab` / `.gf-flap` / `.gf-flap-group` /
+ * `.gf-flap-inner` 这几个类名一律删除，不要再"补回来"。
+ *
+ * ── 三态（hover / open 照参考件实测值；**静止态是唯一偏离参考的数值**）─────────
+ *   静止：hinge   0deg / lift -44px / spread  4px / fan 0.8deg / stack 12px
+ *   hover：hinge -11deg / lift -60px / spread 10px / fan 1.8deg / stack 10px
+ *   open： hinge -24deg / lift -96px / spread 40px / fan 5deg   / stack 30px
+ * 为什么静止不是参考的 `lift: 42px`：参考件把卡片全塞进口袋（展示用），
+ * 那样首页 5 个入口在静止态就是 5 张白纸。这里上移到 -44px，探出 22px。
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* ── 配色 token（前缀 gf- 保证不与全局 token 相撞）──────────────────────────── */
+:root,
+[data-theme='light'] {
+  --gf-back-fill: rgba(255, 255, 255, 0.55);
+  /* front 的实心底色只作为「无 backdrop-filter」时的兜底，见 @supports 那块 */
+  --gf-front-fill: rgba(255, 255, 255, 0.97);
+  /* ★ 外轮廓阴影：**唯一正确写法就是 filter**（box-shadow 会被 clip-path 裁掉），
+     不要改回去。浅色下白色文件夹压在浅页面上会糊成一片，靠这层把轮廓"托"出来。
+     drop-shadow 没有 spread 参数，所以第二层用更小的 blur 近似原来的 -12px 扩散。 */
+  --gf-edge-shadow: drop-shadow(0 1px 1px rgba(15, 23, 42, 0.07))
+    drop-shadow(0 8px 16px rgba(15, 23, 42, 0.14));
+  /* 背板顶部的一层薄高光（压在缩略图之上，让玻璃有厚度） */
+  --gf-back-sheen: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.3) 0%,
+    rgba(255, 255, 255, 0) 26%
+  );
+  --gf-front-tint: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.34) 0%,
+    rgba(255, 255, 255, 0.72) 42%,
+    rgba(255, 255, 255, 0.97) 100%
+  );
+  --gf-spec: rgba(255, 255, 255, 0.5);
+  --gf-sheet-fill: #ffffff;
+  --gf-sheet-line: rgba(15, 23, 42, 0.1);
+  --gf-sheet-shadow: 0 10px 26px -8px rgba(15, 23, 42, 0.22);
+  --gf-thumb-bg: #e4eaf2;
+  --gf-shadow: rgba(16, 18, 24, 0.28);
+}
+
+[data-theme='dark'] {
+  --gf-back-fill: rgba(255, 255, 255, 0.055);
+  --gf-front-fill: rgba(255, 255, 255, 0.1);
+  /* 深色下 0.14 白的前翻盖压在近黑页面上本来就有明暗差，投影只需压住"飘"的感觉 */
+  --gf-edge-shadow: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4))
+    drop-shadow(0 10px 20px rgba(0, 0, 0, 0.55));
+  --gf-back-sheen: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.16) 0%,
+    rgba(255, 255, 255, 0) 28%
+  );
+  --gf-front-tint: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.1) 0%,
+    rgba(255, 255, 255, 0.16) 42%,
+    rgba(255, 255, 255, 0.22) 100%
+  );
+  --gf-spec: rgba(255, 255, 255, 0.16);
+  --gf-sheet-fill: #26262b;
+  --gf-sheet-line: rgba(255, 255, 255, 0.08);
+  --gf-sheet-shadow: 0 12px 28px -8px rgba(0, 0, 0, 0.62);
+  --gf-thumb-bg: #2c2c32;
+  --gf-shadow: rgba(0, 0, 0, 0.6);
+}
+
+/* ── 根节点：本身就是 <button>（键盘可达）────────────────────────────────────
+   内部全是绝对定位的 340×272 几何，被 flex 压扁会互相穿模 → `flex: none`。
+   标签/卡片在 hover·open 时会跑到盒子外（lift 为负）→ `overflow: visible`。 */
+.gf-root {
+  /* 三态与缓动：全部挂在这里，子元素只读不写 */
+  --gf-px: 0;
+  --gf-py: 0;
+  --gf-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --gf-spring: cubic-bezier(0.34, 1.36, 0.5, 1);
+  --gf-hinge: 0deg;
+  /* ★ 静止态就上移：参考件的 42px 是「全部塞进口袋」，那是展示用；
+     首页分类入口必须不 hover 就看出里面有东西（探出量见文件末尾注释） */
+  --gf-lift: -44px;
+  --gf-spread: 4px;
+  --gf-fan: 0.8deg;
+  --gf-stack: 12px;
+  /* 入场整体延迟（按行内 index 由组件内联，避免 5 个同时炸开） */
+  --gf-enter-delay: 0ms;
+  /* ★ 唯一的尺寸旋钮：几何按 340×272 写死，整组等比缩放（阶梯见文件末尾）
+     0.307 = 上一版 0.465 × 0.66（用户「整体缩小至少 1/3」） */
+  --gf-scale: 0.307;
+
+  position: relative;
+  display: block;
+  flex: none;
+  width: calc(340px * var(--gf-scale));
+  /* 名称 + 数量在文件夹**内部**左下角，所以高度就是 stage 高度，不再 +40px */
+  height: calc(272px * var(--gf-scale));
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
+  -webkit-appearance: none;
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: visible;
+  /* .gf-spec 的 mix-blend-mode 只跟文件夹自己的层次混，不跟页面粒子混 */
+  isolation: isolate;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.gf-root:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 6px;
+  border-radius: 22px;
+}
+
+/* ── 舞台：缩放层（几何永远是 340×272）─────────────────────────────────────── */
+.gf-stage {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 340px;
+  height: 272px;
+  transform: scale(var(--gf-scale));
+  transform-origin: 0 0;
+}
+
+/* ── 倾斜容器：指针跟随（--gf-px / --gf-py 由组件的 rAF 节流写入）────────────── */
+.gf-tilt {
+  position: absolute;
+  inset: 0;
+  transform: perspective(1400px) rotateX(calc(var(--gf-py) * -3deg))
+    rotateY(calc(var(--gf-px) * 4deg));
+  transition: transform 0.9s var(--gf-ease);
+}
+
+/* ── 地面投影 ─────────────────────────────────────────────────────────────── */
+.gf-shadow {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: -6px;
+  height: 60px;
+  border-radius: 40px;
+  background: var(--gf-shadow);
+  filter: blur(22px);
+  transform: translateX(calc(var(--gf-px) * -8px));
+  transition:
+    transform 0.9s var(--gf-ease),
+    opacity 0.9s var(--gf-ease);
+  transition-delay: var(--gf-enter-delay, 0ms);
+}
+
+/* ── 背板：clip-path 一体成形（路径由 GlassFolder.tsx 内联写入）────────────── */
+.gf-back {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: var(--gf-back-fill);
+  /* ★ 外轮廓阴影**只能**用 filter：背板轮廓 == 整个文件夹的外轮廓，投影只落在
+     轮廓之外，所以这一层就足以让文件夹从页面上"脱开"一档（浅色必需，深色也受益）。
+     ⛔ 不要"优化"成 box-shadow —— box-shadow 会被同一元素的 clip-path 一起裁掉，
+     filter 才是裁剪之后生效的，这是 clip-path 元素加外阴影的唯一正确写法。 */
+  filter: var(--gf-edge-shadow);
+  transition:
+    translate 1s var(--gf-ease),
+    opacity 0.9s var(--gf-ease);
+  transition-delay: var(--gf-enter-delay, 0ms);
+}
+
+/* 背板上的真实缩略图（thumbs[0]）：参考件这层是 canvas 艺术图，我们换真图。
+   364×296 + left/top -12 = 盖满 340×272 再外扩，`scale(1.02)` 留出视差余量。
+   未 onLoad 前是模糊 + 半透，[data-ready] 后归位（参考件同款过渡）。 */
+.gf-art {
+  position: absolute;
+  left: -12px;
+  top: -12px;
+  width: 364px;
+  height: 296px;
+  max-width: none;
+  object-fit: cover;
+  pointer-events: none;
+  transform: translate(calc(var(--gf-px) * -7px), calc(var(--gf-py) * -6px)) scale(1.02);
+  transform-origin: 50% 50%;
+  transition:
+    transform 1.1s var(--gf-ease),
+    opacity 1.2s var(--gf-ease),
+    filter 1.2s var(--gf-ease);
+  opacity: 0;
+  filter: blur(14px) saturate(0.6);
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+.gf-art[data-ready='true'] {
+  opacity: 1;
+  filter: none;
+}
+
+/* 背板顶部薄高光：压在缩略图之上，玻璃才有厚度（否则读成"贴了张照片"） */
+.gf-back-sheen {
+  position: absolute;
+  inset: 0;
+  background: var(--gf-back-sheen);
+  pointer-events: none;
+}
+
+/* ── 卡片层：三张缩略图卡（插在夹里，不含任何交互 —— 点击由根 button 接管）───
+   `inset(…10px…)`：无论叠多高，卡片底边都不许从口袋里漏出来。 */
+.gf-files {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  clip-path: inset(-400px -400px 10px -400px);
+}
+
+/* 单张卡：几何照抄参考件（272×184 @ 34,96，圆角 16，绕底边旋转） */
+.gf-sheet {
+  position: absolute;
+  left: 34px;
+  top: 96px;
+  width: 272px;
+  height: 184px;
+  box-sizing: border-box;
+  border-radius: 16px;
+  overflow: hidden;
+  pointer-events: auto;
+  background: var(--gf-sheet-fill);
+  box-shadow:
+    inset 0 0 0 1px var(--gf-sheet-line),
+    var(--gf-sheet-shadow);
+  /* 绕底边旋转 = "插在夹里"而不是"飘在上面"，别改成 50% 50% */
+  transform-origin: 50% 100%;
+  transform: translate(
+      calc(var(--gf-jx) + var(--gf-slot) * var(--gf-spread)),
+      calc(var(--gf-lift) + var(--gf-depth) * var(--gf-stack) * -1)
+    )
+    rotate(calc(var(--gf-jr) + var(--gf-slot) * var(--gf-fan)));
+  transition:
+    transform 0.75s var(--gf-spring) calc(var(--gf-depth) * 40ms),
+    box-shadow 0.4s var(--gf-ease),
+    translate 0.9s var(--gf-ease),
+    opacity 0.9s var(--gf-ease);
+}
+
+.gf-sheet-img {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--gf-thumb-bg);
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* 缺图 / 加载失败 / count === 0 的纯色槽：绝不留浏览器的破图框 */
+.gf-sheet-ph {
+  position: absolute;
+  inset: 0;
+  background: var(--gf-thumb-bg);
+}
+
+/* ── 前翻盖（磨砂玻璃）────────────────────────────────────────────────────── */
+.gf-front {
+  position: absolute;
+  left: 0;
+  top: 74px;
+  width: 340px;
+  height: 198px;
+  z-index: 10;
+  /* ⛔ 全局禁令的单点例外，理由见文件头 */
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  backdrop-filter: blur(14px) saturate(1.3);
+  transform-origin: 50% 100%;
+  /* 翻盖绕底边向内翻（hinge 为负 = 上沿后仰） */
+  transform: perspective(760px) rotateX(var(--gf-hinge));
+  transition:
+    transform 0.8s var(--gf-spring),
+    translate 1s var(--gf-ease),
+    opacity 1s var(--gf-ease);
+}
+
+[data-theme='dark'] .gf-front {
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  backdrop-filter: blur(18px) saturate(1.4);
+}
+
+/* 没有 backdrop-filter 时的兜底：用实心色，宁可少一层玻璃也不留透明窟窿 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .gf-front {
+    background: var(--gf-front-fill);
+  }
+}
+
+.gf-tint {
+  position: absolute;
+  inset: 0;
+  background: var(--gf-front-tint);
+}
+
+/* 高光：跟着指针轻微移动（soft-light 只提亮、不改色相） */
+.gf-spec {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    260px 200px at calc(50% + var(--gf-px) * 46%) calc(30% + var(--gf-py) * 40%),
+    var(--gf-spec),
+    rgba(255, 255, 255, 0) 70%
+  );
+  mix-blend-mode: soft-light;
+  opacity: 0.9;
+  transition: background-position 0.6s var(--gf-ease);
+  pointer-events: none;
+}
+
+[data-theme='dark'] .gf-spec {
+  mix-blend-mode: screen;
+  opacity: 1;
+}
+
+/* ── 三态变量 ──────────────────────────────────────────────────────────────────
+ *   静止：hinge   0deg / lift -44px / spread  4px / fan 0.8deg / stack 12px
+ *   hover：hinge -11deg / lift -60px / spread 10px / fan 1.8deg / stack 10px
+ *   open： hinge -24deg / lift -96px / spread 40px / fan 5deg   / stack 30px
+ * open 保留参考件原值（-96 / 40 / 5 / 30），点击后的运动幅度不变。
+ * 静止 -44px：卡片 top 96 → 顶边落在 y=52，翻盖顶在 y=74 → **探出 22px**。 */
+.gf-root:hover,
+.gf-root:focus-visible {
+  --gf-hinge: -11deg;
+  --gf-lift: -60px;
+  --gf-spread: 10px;
+  --gf-fan: 1.8deg;
+  --gf-stack: 10px;
+}
+
+/* open 必须在 hover 之后：点击的 180ms 里指针通常还在组件上 */
+.gf-root[data-open='true'] {
+  --gf-hinge: -24deg;
+  --gf-lift: -96px;
+  --gf-spread: 40px;
+  --gf-fan: 5deg;
+  --gf-stack: 30px;
+}
+
+/* ── 名称区：压在文件夹**内部**左下角，不进 stage ─────────────────────────────
+   参考件就是「名称在左、数量下一行」压在玻璃前翻盖上（"My Files / 3 items"）。
+   做法要点：
+   1. 位置用 `--gf-scale` 换算（left / right / bottom 都乘），这样 5 个不同尺寸的
+      文件夹，标签相对文件夹的**内边距永远一致**（26px / 34px @ 340×272 坐标系）。
+   2. 字号**不乘** --gf-scale：整组已缩到 0.307 倍，12px 再乘就是 4px，读不清。
+   3. z-index 20 > .gf-front 的 10：标签画在磨砂玻璃之上。
+   4. 文字颜色**固定为深色**，不跟随主题 —— 见下方 `.gf-name` 的注释。
+      这里曾经写着「深色下 --text-primary 是浅色字，压在深色玻璃上没问题」，
+      但卡片在深色主题下依然是浅色磨砂，那句话是错的前提（已修）。 */
+.gf-label {
+  position: absolute;
+  left: calc(26px * var(--gf-scale));
+  right: calc(26px * var(--gf-scale));
+  bottom: calc(34px * var(--gf-scale));
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: calc(3px * var(--gf-scale) + 1px);
+  pointer-events: none;
+  text-align: left;
+  /* 入场时标签不许先于文件夹出现：延迟到 back/sheets 之后、front 落定前后淡入
+     （0.22s + 行内 index 错峰；具体由下面「入场」那块的 not([data-entered]) 归零） */
+  transition: opacity 0.32s var(--gf-ease) calc(var(--gf-enter-delay, 0ms) + 0.22s);
+}
+
+.gf-name {
+  min-width: 0;
+  max-width: 100%;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+  /**
+   * ⚠️ 这里**不能**用 `var(--text-primary)`（2026-11-09 修正）。
+   *
+   * 曾经的写法是 `color: var(--text-primary)`，依据上面那条「深色下它是浅色字、
+   * 压在深色玻璃上没问题」——**那个前提是错的**：这张卡片在两种主题下都是
+   * **浅色磨砂玻璃**（`--gf-front-tint` 是白色渐变，下面还压着探出来的缩略图，
+   * 真实素材封面多为浅色室内照）。于是深色主题下变成「浅字压浅卡」，
+   * 首页最关键的四个入口标题几乎读不出来（深色实机截图里肉眼可见）。
+   *
+   * 判据：**文字色跟卡片底色走，不跟主题走**。卡片恒为浅色 ⇒ 字恒为深色。
+   * 用固定值而不是主题 token，是因为这里要的就是"不随主题变"。
+   */
+  color: rgba(20, 20, 22, 0.94);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gf-count {
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.3;
+  /* 同上：次级信息仍然要读得出来。原来用 `--text-muted`，浅色主题下尚可，
+     深色主题下（#98989E）压在浅卡上对比度不足，实测"63 个素材"几乎消失。 */
+  color: rgba(20, 20, 22, 0.62);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 小窗字号回退：<1100 时 --gf-scale 只有 0.307，前翻盖渲染高 60.8px，
+   12/10 的文字块（≈29.9px）要占到 49%，读起来"字偏大、底下偏满"。
+   1080 是主用窗口，所以这一档收到 11 / 9.5（占比降到 ≈41%）。
+   ⚠️ 只改字号，不改 left/right/bottom：内边距仍跟 --gf-scale 走。 */
+@media (max-width: 1099px) {
+  .gf-name {
+    font-size: 11px;
+  }
+
+  .gf-count {
+    font-size: 9.5px;
+  }
+}
+
+/* ── 入场：文件夹自己组装起来 ────────────────────────────────────────────────
+   未入场：back 上移 22px + 透明；sheet 下移 -120px + 透明；front 下移 46px + 透明；
+   shadow 透明。入场后按 depth*40ms 逐张级联（见下面的 transition-delay 覆盖）。 */
+.gf-root:not([data-entered='true']) .gf-back {
+  translate: 0 22px;
+  opacity: 0;
+}
+
+.gf-root:not([data-entered='true']) .gf-sheet {
+  translate: 0 -120px;
+  opacity: 0;
+}
+
+.gf-root:not([data-entered='true']) .gf-front {
+  translate: 0 46px;
+  opacity: 0;
+}
+
+.gf-root:not([data-entered='true']) .gf-shadow {
+  opacity: 0;
+}
+
+/* 标签：入场前透明（否则文字会先浮在还没组装起来的文件夹位置上） */
+.gf-root:not([data-entered='true']) .gf-label {
+  opacity: 0;
+}
+
+/* 入场后：卡片按 depth 级联（transform 0.75s 的 delay 也是它，hover 时同样级联） */
+.gf-root[data-entered='true'] .gf-sheet {
+  transition-delay:
+    calc(var(--gf-depth) * 40ms),
+    0s,
+    calc(var(--gf-enter-delay, 0ms) + 0.18s + var(--gf-depth) * 90ms),
+    calc(var(--gf-enter-delay, 0ms) + 0.18s + var(--gf-depth) * 90ms);
+}
+
+.gf-root[data-entered='true'] .gf-front {
+  transition-delay:
+    0s,
+    calc(var(--gf-enter-delay, 0ms) + 0.42s),
+    calc(var(--gf-enter-delay, 0ms) + 0.42s);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 退场（双击进入分类）的规则**统一在文件末尾**那一节（搜「退场（双击进入分类）」）。
+ *
+ * 消隐的时钟**只有一处**：`@keyframes gf-folder-dissolve`（600ms 延迟、280ms 时长、
+ * `both` 填充）。`HomeCover` 只负责算几何（dx/dy/scale）与"何时切视图"，
+ * **不再逐帧写任何内联变量** —— 曾经那版 rAF 推 `--gf-hole` 的做法已随"挖洞"方案
+ * 一起删除（用户否掉了挖洞，见末节注释）。
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * 起飞时先让地面投影退掉。
+ *
+ * 两个理由：① 一个物体被推到镜头近处，"脚下那块地面上的影子"本来就该消失（它不再是
+ * 放在地上的东西）；② 消隐时整棵子树会被 `filter: blur` 糊开，一块**已经很淡**的
+ * 地面投影跟着糊会变成一团散不掉的灰雾，先让它退干净更稳。
+ *
+ * 140ms 延迟：先让它跟着飞一小段（读起来是"影子留在原地、东西被抓起来"），
+ * 再淡掉。140 + 220 = 360ms，正好在起飞段内结束。
+ */
+.gf-root[data-leaving='self'] .gf-shadow {
+  opacity: 0;
+  transition: opacity 220ms ease 140ms;
+}
+
+/* ── 降级：prefers-reduced-motion ───────────────────────────────────────────
+   全部过渡/动画归零（组件侧点击也直接跳转，不等待翻开动画）。 */
+@media (prefers-reduced-motion: reduce) {
+  .gf-root *,
+  .gf-root *::before,
+  .gf-root *::after {
+    transition-duration: 0s !important;
+    transition-delay: 0s !important;
+    animation: none !important;
+  }
+
+  .gf-tilt {
+    transform: none;
+  }
+
+  /* 过场本身在 `App` 层就被短路了（不铺遮罩、直接切视图），这里只是"设置中途被改"
+     的兜底：不许留一个半透明 / 半糊的文件夹在场上。
+     注意上面的 `.gf-root *` 只覆盖**后代**，根节点自己的 transition（飞行）与
+     animation（消隐）都要靠这条压住。 */
+  .gf-root[data-leaving='self'] {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+/* ── 尺寸阶梯（唯一的 --gf-scale 旋钮）─────────────────────────────────────
+   用户要求「整体缩小至少 1/3」→ 每一档取上一版数值 × 0.66（不重新推导，
+   这样各断点的相对节奏与上一版完全一致，只是整组变成 2/3）。
+   窗口宽 → scale → 文件夹渲染宽（340 * scale）：
+     默认(<1100) 0.307 → 104px      ≥1100 0.330 → 112px
+     ≥1200 0.349 → 119px            ≥1300 0.388 → 132px
+     ≥1400 0.427 → 145px            ≥1440 0.443 → 151px（本仓设计稿基准窗）
+     ≥1520 0.474 → 161px（上限）
+   用阶梯而不是 calc() 的分型除法：见文件头「为什么不写 calc(长度/长度)」。 */
+@media (min-width: 1100px) {
+  .gf-root {
+    --gf-scale: 0.33; /* 112px */
+  }
+}
+
+@media (min-width: 1200px) {
+  .gf-root {
+    --gf-scale: 0.349; /* 119px */
+  }
+}
+
+@media (min-width: 1300px) {
+  .gf-root {
+    --gf-scale: 0.388; /* 132px */
+  }
+}
+
+@media (min-width: 1400px) {
+  .gf-root {
+    --gf-scale: 0.427; /* 145px */
+  }
+}
+
+@media (min-width: 1440px) {
+  .gf-root {
+    --gf-scale: 0.443; /* 151px —— 1440 是本仓设计稿基准窗，单独钉一档 */
+  }
+}
+
+@media (min-width: 1520px) {
+  .gf-root {
+    --gf-scale: 0.474; /* 161px（上限） */
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ── 退场（双击进入分类）：**文件夹本体**飞到屏幕正中，再从中心挖洞化开 ────────
+ *
+ * 用户第三轮口径（逐字）：
+ *   「第一，文件夹移动，而不是我们的缩略图移动。第二，移动到比如模型的这个文件夹时，
+ *     它应该是中心消隐的，而不是瞬间不见的。」
+ *
+ * 所以退场**不是**在遮罩层里重建一份替身（那样飞的永远是"一张图"），而是让 DOM 里
+ * 真实的这个 `.gf-root` 自己平移 + 放大 —— 玻璃本体、三张扇形卡片、名字/数量一个都
+ * 不缺，视觉天然正确，也不存在"两层不完全一致"的错位风险。
+ *
+ * 两段动画（时间轴主人是 `HomeCover.tsx`，本文件只描述几何与终点）：
+ *   A. 0–360ms   飞到正中：`transform: translate(dx, dy) scale(1.5)`，缓动 --gf-ease
+ *                （`cubic-bezier(.2,.8,.2,1)`，快起慢收 = 推到位就停稳）。
+ *                dx/dy/scale 由 `HomeCover` 算好后内联成 --gf-exit-x / -y / -s。
+ *   B. 600–880ms 消隐：**高斯模糊晕开** —— `filter: blur(0 → 14px)` 同时
+ *                `opacity: 1 → 0`，见 `@keyframes gf-folder-dissolve`。
+ *   （360–600ms 是用户明确要的"停留一小段时间"，这 240ms 里本规则不做任何事。）
+ *
+ * ── 消隐为什么是 blur 而不是"挖洞"（2026-11-09 用户第二次否掉后定稿）───────────
+ * 第一版用 `mask-image: radial-gradient(...)` 从中心挖一个圆洞、半径由 rAF 逐帧推。
+ * 用户看真机时一眼否掉：「我要的是**高斯模糊的消影**哦，你给我的是中间一个圆圈，
+ * 然后把它挖掉，肯定是不对的」。截图为证：洞长到一半时，文件夹只剩上沿一圈残边，
+ * 读起来像"被橡皮擦从中间擦掉"，而不像"化开"。
+ *
+ * 根因是**语义错位**：用户说的"中心消隐"指的是"它走到画面中心、在那里消失"，
+ * 不是"从几何中心向外挖掉"。挖洞会把一块玻璃切成一个环，材质感、光泽、扇形卡的
+ * 边缘全部变成硬切边 —— 越是"干净的几何形状"，越像 bug。
+ *
+ * `filter: blur()` 则是在**光学层**把物体化开：先散焦、再淡出，边缘自然羽化，
+ * 与"玻璃被推出焦点"这个物理直觉一致。代价是 blur 会让元素成为新的 backdrop root
+ * （`.gf-tint` 的 backdrop-filter 在消隐期间失效）—— 那时它已经糊了，看不出来。
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+.gf-root[data-leaving='self'] {
+  /* 压过同排其他文件夹（它们这时正在向两侧退开），也压过数据卡(z-10)/齿轮(z-20)。
+     40 的依据：首页这些浮层的 z 值见 `HomeCover.tsx` 的注释，过场遮罩是 70，
+     本节点只要在同页元素之上、遮罩之下即可。 */
+  z-index: 40;
+  transform-origin: 50% 50%;
+  /* A 段：飞到正中。translate 在前、scale 在后 —— 位移量就是屏幕 px 的中心差，不参与缩放 */
+  transform: translate(var(--gf-exit-x, 0px), var(--gf-exit-y, 0px)) scale(var(--gf-exit-s, 1));
+  /* ⚠️ 360ms 与 `HomeCover.tsx` 的 EXIT_FLY_MS 是一对，改一处必须改另一处 */
+  transition: transform 360ms var(--gf-ease);
+  /* B 段：600ms 起 280ms 晕开。`both` 保证 0–600ms 这段按 0% 帧算（blur 0 / opacity 1），
+     也就是"飞与停"的全程都不会被动过一个像素。 */
+  animation: gf-folder-dissolve 280ms ease-in 600ms both;
+  /* 退场期间不再接受指针（避免双击两下把过场叠两次）。
+     真正的点击拦截在上层遮罩（z-70），这条只是就地兜一道。 */
+  pointer-events: none;
+  /* 只提 transform / filter：both 都会被合成层吃掉，不加会掉帧 */
+  will-change: transform, filter, opacity;
+}
+
+/**
+ * 高斯模糊的消影：**散焦 + 淡出**，两者同一时长，读感是一次"化开"而不是两次动作。
+ *
+ * why 280ms：360 飞 + 240 停 = 600，600 + 280 = **880**，与 `App.tsx` 的
+ * `HOME_OUTRO_SWITCH_MS` / `HomeOutro` 的 `HOME_OUTRO_TOTAL_MS` 是同一个数。
+ *
+ * why `blur(14px)`：文件夹在 1080 窗口下约 156×126（1.5 倍后）。14px 已经远超
+ * "还能认出形状"的阈值，但又没大到让边缘撑出画面 —— 再大会看到一圈发白的扩散雾。
+ *
+ * why `ease-in`：模糊是**先慢后快**才像"被推离焦平面"（前面几乎不变，后半段迅速化掉）。
+ * 用 `ease-out` 会前 30% 就糊成一片、后面拖着不动，像卡住。
+ *
+ * 为什么同时降 opacity 而不是只靠 blur：纯 blur 到最大时物体仍在，只是糊 —— 会留下
+ * 一团灰雾，然后在切视图那一帧"突然没了"，正好是用户反复否掉的"瞬间不见"。
+ * 两者同步结束（都在 100%），画面在 880ms 那一刻干净落地。
+ */
+@keyframes gf-folder-dissolve {
+  from {
+    filter: blur(0);
+    opacity: 1;
+  }
+
+  to {
+    filter: blur(14px);
+    opacity: 0;
+  }
+}
+

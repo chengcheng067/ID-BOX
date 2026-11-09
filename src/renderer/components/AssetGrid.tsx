@@ -51,9 +51,12 @@ import { EmptyAreaContextMenu } from './EmptyAreaContextMenu'
 import { MENU_TARGET_SELECTOR } from '../logic/contextMenu'
 import { PurgeConfirmDialog } from './PurgeConfirmDialog'
 import {
+  D5A_MARK_FOLD_PATH,
+  D5A_MARK_PATH,
   IconBox,
   IconCad,
   IconCheck,
+  IconD5a,
   IconEmptyFilter,
   IconEmptyLibrary,
   IconFile,
@@ -68,6 +71,11 @@ import {
 import { COLOR_TAG_LABEL } from '../../shared/types'
 import type { Asset, AssetKind, GridDensity } from '../../shared/types'
 import type { CSSProperties, DragEvent, MouseEvent, RefObject, SVGProps } from 'react'
+// 网格入场：卡片从两侧边缘向内滑入（docs/48 §4）。触发面是「网格出现」这一个统一信号
+// （挂载 / 切视图 / 从文件夹返回 / `enterFromHome`），见下方「入场」两个 effect。
+import './grid-enter.css'
+// D5A 封面占位（紫色，全项目唯一例外）：色值与「为何用属性选择器而不是 dark:」都写在该文件头。
+import './d5a-card.css'
 
 /**
  * 密度三档 → 网格 `minmax` 下限（反馈 6b，docs/15 §6b：大 240 / 中 184 / 小 132）。
@@ -110,6 +118,46 @@ const FOLDER_EXIT_MS = 260
 /** `prefers-reduced-motion: reduce` 下的统一时长（进入 + 退出都是纯 opacity）。
  * 必须**小于** `FOLDER_EXIT_MS`：减少动效的用户不该比普通用户等更久。 */
 const FOLDER_REDUCED_MS = 190
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 网格入场：卡片从两侧边缘向内滑入（docs/48 §4，用户逐字「直接让所有的卡片从边缘向内划入」）
+ *
+ * 用户口径的**作用范围是所有"进入网格"的场景**，不只是「首页 → 库」这一路：
+ *   ① 从文件的文件夹视图返回（2026-11-09 投诉的那条）；
+ *   ② 侧栏切大类 / 切回收站；③ 分类跳转；④ 搜索；
+ *   ⑤ 首页过场（`enterFromHome`，本条沿用旧实现）。
+ * 具体 CSS 在 `grid-enter.css`；本文件只负责"什么时候播一次"+"逐卡参数"+"结束时清干净"。
+ *
+ * 旧实现的触发条件**只有一个** `enterFromHome`（首页过场专用），所以 ①②③④ 四路
+ * 完全没有入场。现在统一成一个「网格出现」信号，见下方 refs 区的注释。
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** 起始水平偏移（px）：左半边卡片从 -64 滑入，右半边从 +64 滑入 */
+const ENTER_EDGE_PX = 64
+/** 逐张错峰步长（ms） */
+const ENTER_STAGGER_STEP_MS = 18
+/** 错峰最多排到第 N 张（再往后统一用它，避免大面积延迟让人干等） */
+const ENTER_STAGGER_MAX_INDEX = 20
+/** 单张卡片的入场时长（ms），与 `grid-enter.css` 的 animation-duration 逐字对齐 */
+const ENTER_DURATION_MS = 480
+/**
+ * 入场收尾富余量（ms）：最后一档错峰结束后再多钉一会儿，确保 `animation` 真的跑完
+ * 才摘标记（`animation-fill-mode: both` 期间 transform 被动画霸占）。
+ */
+const ENTER_CLEANUP_SLACK_MS = 60
+/**
+ * 「入场请求」的有效期（ms）。
+ *
+ * 为什么需要它：请求发出时网格不一定**可播**（空集合没有卡片 / 列表视图没有宿主 /
+ * 重复视图的宿主不是同一个节点 / 用户此刻在列表视图）。这些情况都不该"过几秒突然补播"，
+ * 所以要有一个过期时间；正常路径（挂载、切视图、从文件夹返回）都在同一帧内就绪。
+ */
+const ENTER_REQUEST_TTL_MS = 1200
+/** 入场专用的属性名（宿主是网格里卡片的直接父容器，见下方 effect） */
+const ENTER_ATTR = 'data-enter'
+/** 逐张注入的内联自定义属性名 */
+const ENTER_VAR_X = '--edge-x'
+const ENTER_VAR_I = '--enter-i'
 
 /**
  * 框选起手阈值（px）：位移小于它视为"点击空白"，不进入框选态。
@@ -222,6 +270,9 @@ const KIND_ICON: Record<AssetKind, typeof IconBox> = {
   hdri: IconHdr,
   material: IconMaterial,
   cad: IconCad,
+  // D5A：六边形整包标记（V1.0）。正式封面走 `Cover` 里的紫色品牌占位，
+  // 这个图标只服务列表视图 / 详情面板 / 文件视图这些**非封面位**。
+  d5a: IconD5a,
   other: IconOther
 }
 
@@ -401,6 +452,63 @@ function Cover({ asset, name }: { asset: Asset; name: string }) {
       </div>
     )
   }
+  // ── D5A 整包资产：**紫色品牌占位**（V1.0，docs/48 §1/§5 + 用户实拍图）──────
+  //
+  // 为什么不是灰色类型图标：`.d5a` 永远不会有缩略图（数据层给的是
+  // `coverSource='placeholder'` + `thumbStatus='none'` + `ensureThumb(coverAbs=null)`），
+  // 也就是说这张卡**永远是占位**。占位不是"图没加载出来"的临时态，而是它的正式外观
+  // → 用 D5 的品牌紫当底，一眼能和模型/贴图/HDRI/CAD 区分开。
+  //
+  // 三条硬约束（改动前必读）：
+  // ① 底色与字色一律走 `.d5a-cover`（`d5a-card.css` 里两条按 `[data-theme]` 分的规则），
+  //    JSX 里**不写 hex、也不写 bg-d5 + dark: 变体** —— 本项目的主题是属性切换，
+  //    `dark:` 会跟系统而不是跟应用（理由见该 CSS 文件头）；
+  // ② 只放「标记 + D5A 大字」，**不放任何说明性小字**：`#9977F9` 底上小字必然低于
+  //    4.5:1（该色对任何浅底的对比度上限 3.30:1）。资产名在卡片下方标题行，这里不重复；
+  // ③ 内容全部画在**一张 100×100 的 SVG** 里（与 `.skp` / `.max` / `.dwg` 文件卡同一手法）：
+  //    字号写 SVG user unit 就不必按密度档算 px，小/中/大三档等比缩放、永不溢出，
+  //    占位内容也就不会把 4:3 封面框撑变形。
+  if (asset.kind === 'd5a') {
+    return (
+      <div className="d5a-cover flex h-full w-full items-center justify-center">
+        <svg viewBox="0 0 100 100" className="h-full w-full" aria-hidden="true" focusable="false">
+          {/* 标记：把 24 网格的六边形整体放大 1.55 倍后居中在 y=32 处（描边 2.25 随缩放等比，
+              等价于把 IconD5a 渲染成大号 —— 与通用占位里 `scale-[2.2]` 同一口径）。
+              几何用 `icons.tsx` 导出的常量，不在这里抄第二份路径。 */}
+          <g
+            transform="translate(50 32) scale(1.55) translate(-12 -12)"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.25"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d={D5A_MARK_PATH} />
+            <path d={D5A_MARK_FOLD_PATH} />
+          </g>
+          {/* 主体：D5A 三个字母（粗体大字）。字号按 SVG user unit 给：
+              viewBox 100 在最小密度档（封面约 132×99，等比缩到 99px）下 fontSize 30 ⇒
+              全大写 cap 高 ≈ 30 × 0.79（本仓库实测的大写 cap 比）× 0.99 ≈ **23px**，
+              高于 WCAG 大字档的**粗体**门槛 18.66px（14pt），也接近常规门槛 24px。
+              三档密度下同比例放大，不需要按 px 重算，也就不会撑破 4:3 框。
+              不加 textLength：三字符自然排布约 60 单位，左右留白充足，压字形反而失真
+              （`.max` 那张卡需要 textLength 是因为小写字形宽 + 字号被放大到 52）。 */}
+          <text
+            x="50"
+            y="74"
+            textAnchor="middle"
+            dominantBaseline="central"
+            fontSize="30"
+            fontWeight="800"
+            letterSpacing="0.5"
+            fill="currentColor"
+          >
+            D5A
+          </text>
+        </svg>
+      </div>
+    )
+  }
   const Icon = KIND_ICON[asset.kind]
   return (
     <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-canvas text-muted/60">
@@ -411,6 +519,75 @@ function Cover({ asset, name }: { asset: Asset; name: string }) {
     </div>
   )
 }
+
+/**
+ * 列表视图（表格）行首缩略图 —— 40×30（4:3，与卡片封面框同比例）。
+ *
+ * 用户 2026-11-09 原话：「idbox 本体表格显示的前方也需要加上缩略图的缩小版」。
+ *
+ * ## 三条硬约束（改之前先读）
+ *
+ * ① **不新解码、不新增接口**：数据源与卡片封面**完全同源** ——
+ *    `thumbStatus === 'ready' && thumbPath` → `thumbVaultUrl(thumbPath)`（同一份缓存图，
+ *    也同一套 `vault://thumb/` 协议）。没有缩略图的资产（`.d5a` 恒无、未生成、生成失败）
+ *    一律降级为 `KIND_ICON[kind]`，与卡片"无封面"时同一套图标 ——
+ *    **绝不留白、绝不显示 broken image**（`onError` 也走同一条降级）。
+ * ② **不撑行高**：外框固定 `h-[30px] w-[40px]`，所在单元格 `py-0`，比同行文字
+ *    （`text-sm` 20px 行盒 + `py-2` 16px ≈ 36px）矮 ⇒ 表格行高与 `LIST_ROW_H` 的
+ *    实测口径都不变，虚拟滚动的偏移不会累积错位。
+ * ③ **只用 token、不用 `dark:`**：本项目的主题是 `[data-theme]` 属性切换，
+ *    `dark:` 变体跟的是**操作系统**（`tailwind.config.js` 没有 `darkMode:'class'`），
+ *    在深色应用 + 浅色系统下会串色。所以这里只有 `bg-canvas` / `border-line` / `text-muted`。
+ *
+ * ## 为什么必须是**模块级组件**（不能写成 renderRow 里的内联函数）
+ *
+ * 内联定义每次渲染都是新的组件类型 → React 把整行卸载重建：滚动时等于反复
+ * `setState` + 重新发起图片请求（本仓库对列表视图的硬要求是"滚动不反复 setState"）。
+ * 挂在模块级之后，行的 `key`（asset.id）稳定，滚动窗口回收行时只卸载/挂载真实行。
+ *
+ * ## 为什么 `.d5a` 不用紫色品牌占位
+ *
+ * 卡片封面那套紫底（`.d5a-cover`）在 `d5a-card.css` 里有明文边界：
+ * 「使用范围：仅 D5A 卡片封面占位。新增第二处使用前须重新回签」。
+ * 而 `KIND_ICON.d5a = IconD5a` 的注释写的正是"只服务列表视图 / 详情面板 / 文件视图
+ * 这些**非封面位**" —— 列表行首就是这个位置，所以这里走图标，不扩散紫底。
+ * 深色主题下 `text-muted` 是提亮后的中性灰，16px 六边形仍然清晰。
+ */
+function ListThumb({ asset }: { asset: Asset }) {
+  /**
+   * 记录**哪一个 `src`** 加载失败（与卡片 `Cover` 同一手法，不是布尔值）：
+   * `src` 一变（换封面 / 补齐队列重生成了新文件）比较自然为假 → 自动重试，
+   * 不需要额外 effect，也不会在首帧闪一下图标。
+   */
+  const [brokenSrc, setBrokenSrc] = useState<string | null>(null)
+  const url =
+    asset.thumbStatus === 'ready' && asset.thumbPath ? thumbVaultUrl(asset.thumbPath) : null
+  const Icon = KIND_ICON[asset.kind]
+  return (
+    <span className="flex h-[30px] w-[40px] shrink-0 items-center justify-center overflow-hidden rounded-[4px] border border-line/60 bg-canvas">
+      {url !== null && brokenSrc !== url ? (
+        <img
+          src={url}
+          // 纯装饰：资产名就在右边一格，重复念一遍只会让读屏更吵
+          alt=""
+          /**
+           * `draggable={false}` 是**行为守卫**，不是洁癖：`<img>` 默认可拖，
+           * 从图上升手会起一个"拖图片"的原生 drag（dataTransfer 里是图片 URL），
+           * 而本行的契约是**拖整张行**（`dragProps` 挂在这一行的 `<tr>` 上）。
+           * 关掉图片自拖，dragstart 才会从行上发起。
+           */
+          draggable={false}
+          decoding="async"
+          className="h-full w-full object-contain"
+          onError={() => setBrokenSrc(url)}
+        />
+      ) : (
+        <Icon width={16} height={16} className="text-muted" />
+      )}
+    </span>
+  )
+}
+
 
 /**
  * 卡片右上角标记：收藏星 + 「疑似乱码」。
@@ -788,6 +965,38 @@ function FileCover({ asset, row }: { asset: Asset; row: FileRow }) {
       </div>
     )
   }
+  // ── .d5a 专属封面（V1.0 新增大类，与上面 .skp / .max / .dwg 同族）──────────
+  // 口径：品牌紫淡 tint 底板 + 居中大号 "D5A"（浅色 #F7F4FF/#9977F9 = 3.04:1、
+  // 深色 #2A2340/#B9A6FF = 7.05:1，都是大字档达标；色值见 styles.css 的 `--d5-brand*`）。
+  //
+  // 为什么文件视图也要一块：`.d5a` 是**整包**，它的资产文件夹里就这一个文件 ——
+  // 用户双击进来看到的整屏（网格视图）里，这张卡就是"这个包"本身。留灰色文件图标
+  // 会让它看起来像个未识别文件（而这恰恰是用户最容易困惑的形态）。
+  //
+  // ⚠️ 判定用**扩展名**而不是 `row.kind`：`logic/fileView.ts` 把 `.d5a` 归到 `other` 组
+  // （它不是模型 / 图纸 / 图片），本处只换封面外观，不动分组与排序口径 —— 改分组要连带
+  // 影响文件视图的组标题与排序键，属另一件事（docs/46 T03 未要求）。
+  const rowExt = row.ext.toLowerCase()
+  if (rowExt === 'd5a') {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-d5-tint text-d5">
+        <svg viewBox="0 0 100 100" className="h-full w-full" aria-hidden="true" focusable="false">
+          <text
+            x="50"
+            y="50"
+            textAnchor="middle"
+            dominantBaseline="central"
+            fontSize="38"
+            fontWeight="700"
+            letterSpacing="-0.02em"
+            fill="currentColor"
+          >
+            D5A
+          </text>
+        </svg>
+      </div>
+    )
+  }
   const src = fileThumbUrl(asset, row)
   if (src && !broken) {
     return (
@@ -1033,9 +1242,12 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
     onDragStart: (e: DragEvent) => {
       // 同网格：同步读预热缓存，未命中传 null（主进程回退缩略图，绝不因没预热拖不动）
       const cardPng = cachedDragCard(fileCardKey(row))
-      beginSystemDrag(e, row.name, row.absPath, asset.thumbPath ?? null, (path, thumb) =>
+      beginSystemDrag(e, row.name, row.absPath, asset.thumbPath ?? null, (path, thumb) => {
         window.modvault.startDrag(path, thumb, cardPng)
-      )
+        // 拖出到建模软件 = **真的用了它**（`useCount` / `lastUsedAt`，口径见 `types.ts`）。
+        // 只在 `startDrag` 真正被调用的分支里打点：拖拽被守卫拦掉时这里根本不会执行。
+        useVault.getState().recordAssetUse(asset.id)
+      })
     }
   })
 
@@ -1085,7 +1297,10 @@ function FolderFileList({ asset, view }: { asset: Asset; view: 'grid' | 'list' }
         <span className="w-24 shrink-0 text-right font-medium">大小</span>
       </div>
       {rows.map((row, i) => {
-        const Icon = FILE_ROW_ICON[row.kind]
+        // `.d5a` 在列表视图用 D5A 六边形标记（与卡片封面同一语义）。
+        // `fileRowKindOf` 把它归到 `other`，直接取 `FILE_ROW_ICON` 会得到通用文件图标 ——
+        // 这里只换图标，不动 `row.kind` / 类型文案 / 分组（理由同 `FileCover` 那段）。
+        const Icon = row.ext.toLowerCase() === 'd5a' ? IconD5a : FILE_ROW_ICON[row.kind]
         return (
           <div
             key={row.rel}
@@ -1221,7 +1436,19 @@ function dragCardThumbUrl(a: Asset): string | null {
  */
 const FILE_DRAG_CARD_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
-export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
+export function AssetGrid({
+  view,
+  enterFromHome
+}: {
+  view: 'grid' | 'list'
+  /**
+   * 从首页封面页转场进入网格时为 true（App 在切视图那一帧置 true，约 1100ms 后置 false）。
+   *
+   * 现在它只是「网格出现」入场的**其中一个上升沿**：挂载 / 切视图 / 从文件夹返回都不需要它。
+   * 保留这条是为了兜住"网格先挂载、过场随后才开始"的将来改动，以及 App 侧现存的调用口径。
+   */
+  enterFromHome?: boolean
+}) {
   const assets = useVisibleAssets()
   const allAssets = useVault((s) => s.assets)
   /**
@@ -1308,6 +1535,100 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
   const gridRef = useRef<HTMLDivElement>(null)
   /** 列表视图的滚动容器（列表与网格是两套 padding / 两套行高，各自一个 ref） */
   const listRef = useRef<HTMLDivElement>(null)
+  /**
+   * 网格视图里**卡片的直接父容器**（CSS Grid 那一层，`grid-enter.css` 的 `> *` 宿主）。
+   *
+   * ⚠️ 不能复用 `gridRef`：`gridRef` 是**滚动容器**（`overflow-auto`），它的 children 是
+   * 「上垫片 div / 网格 div / 下垫片 div / 框选矩形 div」，拿 `children` 当卡片用会全错。
+   * 也不能多加一层 gap 容器，否则 `children` 拿到的不是卡片。见下面的 `enterCardsRef` 挂载点。
+   */
+  const enterCardsRef = useRef<HTMLDivElement>(null)
+  /* ── 「网格出现」入场：统一信号（docs/48 §4） ────────────────────────────────
+   *
+   * 旧实现的触发条件**只有一个** `enterFromHome`，于是「从文件的文件夹视图返回」
+   * （`folderViewAssetId` 从 id 变 null）这一路根本没有入场 —— 用户 2026-11-09 投诉的
+   * 「返回上一步时过渡相当不自然，像卡顿了一样」就是它：退场只让文件列表淡出，
+   * 底下的网格**静止**停在最终位置，浮层化开那一刻等于硬切。
+   *
+   * 现在把它收成一个序号：任何"资产列表从不可见变为可见"都只做一件事 ——
+   * `requestGridEnter()` 把 `enterSeq` +1；真正的播放在下面的 apply effect 里。
+   * 挂载 / 视图身份变化 / 从文件夹返回 / `enterFromHome` 上升沿，四条都汇到这一个口。
+   *
+   * 为什么"请求"和"播放"要分成两个 effect：请求那一帧网格**还没量到尺寸**
+   * （`useScrollViewport` 的 layout effect 在下面才跑），此时列数按 1 算，
+   * 逐卡的"哪半边"和行内错峰会全错 —— 这正是旧实现"先按最终位置画一帧"的根因。
+   * 分成两步后，apply 只要过一次"就绪闸门"，而那次就绪重渲染由 layout effect 触发、
+   * 在 paint **之前**完成，所以多等这一下不会多画任何一帧。
+   * ──────────────────────────────────────────────────────────────────────────── */
+  /** 入场请求序号（0 = 从未请求）；每出现一次"网格出现"就 +1 */
+  const [enterSeq, setEnterSeq] = useState(0)
+  /** 请求发出的时刻（`Date.now()`）：迟迟等不到可播条件就作废，绝不"晚点补播" */
+  const enterReqAtRef = useRef(0)
+  /** 已经播过的请求序号：同一个请求只播一次（滚动 / 选区 / 缩略图到位引起的重渲染都不重播） */
+  const playedSeqRef = useRef(0)
+  /** 上一次的"视图身份"（null = 还没记录 → 当前这次 commit 就是挂载） */
+  const prevEnterNavKeyRef = useRef<string | null>(null)
+  /** 上一次网格是否露在中栏（只认 false → true；null = 还没记录） */
+  const prevRevealedRef = useRef<boolean | null>(null)
+  /** 上一次 `enterFromHome`（只认 false → true；App 1100ms 后置 false 不该重播） */
+  const prevFromHomeRef = useRef(enterFromHome === true)
+  /** 正在跑的收尾（摘标记 + 清内联变量）；新请求 / 卸载时先执行一遍 */
+  const enterClearRef = useRef<(() => void) | null>(null)
+  /** 入场收尾定时器（0 = 空闲） */
+  const enterTimerRef = useRef(0)
+  /**
+   * 「视图身份」= 用户现在看的是**哪一批资产**（导航维度）。
+   *
+   * ⚠️ 刻意只放导航维度：回收站 / 大类 / 一二级分类 / 收藏 / 是否在搜索态。
+   * **不放** `sort`、`gridDensity`，也不放体积 / 分辨率 / 色标 / 风格这类维度筛选 ——
+   * 那些属于"同一视图内改条件"，重播入场就是抽卡抖动。
+   * 搜索只认"空 ↔ 非空"一次跳变（`q0` / `q1`）：逐字输入不重播，
+   * 否则每敲一个字整屏卡片就从边缘再滑一次。宁可少播，也不要乱播。
+   */
+  const enterNavKey = [
+    libraryView,
+    filters.kind,
+    filters.category1 ?? '',
+    filters.category2 ?? '',
+    filters.favoriteOnly ? 'fav' : '',
+    (filters.query ?? '').trim() === '' ? 'q0' : 'q1'
+  ].join('\u0000')
+  /** 网格是否真的露在中栏（false = 被文件视图盖着；退场动画期间已经算 true） */
+  const gridRevealed = folderViewAssetId === null
+  /**
+   * 请求一次"网格出现"入场。
+   * `prefers-reduced-motion: reduce` 命中时**连请求都不发**（CSS 侧还有一层纯 opacity 兜底，
+   * 见 `grid-enter.css`；那是给"动画跑到一半系统偏好被改"留的第二道）。
+   */
+  const requestGridEnter = (): void => {
+    if (reducedMotion) return
+    enterReqAtRef.current = Date.now()
+    setEnterSeq((n) => n + 1)
+  }
+  /**
+   * 触发面（合成一个 effect，避免四处 setState 互相打架）：
+   *   ① 挂载 —— 首页 → 库（`isHome` 分支会把整个中栏连带 AssetGrid 卸载重建）、启动后第一次进库；
+   *   ② 视图身份变化 —— 侧栏切大类 / 切回收站、分类跳转、进入·退出搜索、收藏；
+   *   ③ 从文件视图返回 —— `folderViewAssetId` 由 id 变 null；
+   *   ④ `enterFromHome` 上升沿 —— 首页过场（沿用旧口径；若将来 App 改成"网格先挂载再切视图"，
+   *      这条仍能补上入场）。
+   *
+   * ②要求"网格正露着"才播：被文件视图盖住时播了也看不见，还会白跑一次强制布局。
+   */
+  useLayoutEffect(() => {
+    const prevKey = prevEnterNavKeyRef.current
+    prevEnterNavKeyRef.current = enterNavKey
+    const prevRevealed = prevRevealedRef.current
+    prevRevealedRef.current = gridRevealed
+    const fromHomeNow = enterFromHome === true
+    const fromHomeRise = fromHomeNow && !prevFromHomeRef.current
+    prevFromHomeRef.current = fromHomeNow
+
+    const mounted = prevKey === null
+    const navSwitch = prevKey !== null && prevKey !== enterNavKey && gridRevealed
+    const backFromFolder = prevRevealed === false && gridRevealed
+    if (mounted || navSwitch || backFromFolder || fromHomeRise) requestGridEnter()
+  }, [enterNavKey, gridRevealed, enterFromHome]) // eslint-disable-line react-hooks/exhaustive-deps
   /**
    * 进出「资产的文件视图」时保留滚动位置（2026-10-21 用户反馈：返回后总是跳回顶部）。
    *
@@ -1606,6 +1927,107 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
       }),
     [gridRows, gridViewport.scrollTop, gridViewport.viewportH]
   )
+  /**
+   * 入场 apply：把「有一次入场请求」变成真的动画（唯一的播放点）。
+   *
+   * 为什么是 `useLayoutEffect` 而不是 `useEffect`：passive effect 在浏览器 paint **之后**
+   * 才跑 → 网格会先按最终位置画出**一帧**、再跳回边缘开始滑入，那一帧闪痕肉眼可见。
+   * layout effect 在 paint 之前同步执行，标记与内联变量随同一帧提交，首帧就已经在起点。
+   *
+   * 为什么不用 cleanup 收尾：本 effect 的依赖包含 `viewportW/H / assets.length`（滚动、
+   * 缩略图到位、窗口缩放都会让它重跑），用 cleanup 摘标记会把正在跑的动画掐断。
+   * 所以收尾只走定时器（`enterTimerRef`），并用 `playedSeqRef` 保证"一个请求只播一次"。
+   *
+   * 纪律：
+   * - 就绪闸门：必须等网格量到尺寸（`viewportW/H > 0`）。否则列数按 1 算 →
+   *   每张卡都被判成"左半边"、错峰也只排到首屏那几张，其余卡片只有淡入没有位移；
+   * - 读 `offsetLeft` / `clientWidth` 是**一次**强制布局，只发生在真正开播那一帧，
+   *   不进 rAF 循环、不挂滚动监听；
+   * - 结束后（480 + 20×18 + 60 = 900ms）**摘掉** `data-enter` 与两个内联变量：
+   *   `animation-fill-mode: both` 会把卡片钉在 `transform: translateX(0) scale(1)`，
+   *   而动画来源的优先级高于普通声明 → 不摘的话 `.card-hover:hover` 的 `translateY(-2px)`
+   *   上浮会被这份"收尾 transform"整块盖掉。规则一消失，transform 自动回到卡片自己的规则；
+   * - 全程**只动 transform / opacity**，不碰 `pointer-events` → 动画期间卡片照样能点、能双击。
+   */
+  useLayoutEffect(() => {
+    if (enterSeq === 0) return
+    // 这个请求已经播过：滚动 / 选中 / 缩略图到位引起的重渲染都会再进这里
+    if (playedSeqRef.current === enterSeq) return
+    // 请求过期 → 作废。典型的"永远等不到可播条件"：空集合（没有卡片）、列表视图、
+    // 重复视图（那套 DOM 的宿主不是 `enterCardsRef`）。宁可少播，也不要过几秒突然补一次。
+    if (Date.now() - enterReqAtRef.current > ENTER_REQUEST_TTL_MS) {
+      playedSeqRef.current = enterSeq
+      return
+    }
+    // 系统「减少动效」：直接不播（CSS 侧还有一层纯 opacity 兜底，这里是第二道）
+    if (reducedMotion) {
+      playedSeqRef.current = enterSeq
+      return
+    }
+    // 宿主只在「网格 + 非重复视图」里存在；其它视图先挂起，多数会在 TTL 内被丢弃
+    if (view !== 'grid' || dupOnly) return
+    // 就绪闸门（见上方说明）：量到尺寸的那次 setState 由 `useScrollViewport` 的
+    // layout effect 触发，在 paint 之前同步重渲染 → 等它一次不会多画任何一帧。
+    if (gridViewport.viewportW <= 0 || gridViewport.viewportH <= 0) return
+    const root = enterCardsRef.current
+    if (!root) return
+    const cards = Array.from(root.children) as HTMLElement[]
+    if (cards.length === 0) return
+
+    playedSeqRef.current = enterSeq
+    // 上一个请求的标记先摘干净（快速连续切视图时不叠两层动画）
+    if (enterTimerRef.current) {
+      window.clearTimeout(enterTimerRef.current)
+      enterTimerRef.current = 0
+    }
+    enterClearRef.current?.()
+    enterClearRef.current = null
+
+    /**
+     * 网格中心线。⚠️ 坐标系必须和 `el.offsetLeft` 一致：卡片的 `offsetParent` 是
+     * **滚动容器**（`relative`），不是这张静态的网格容器，所以中心线也要算到同一个原点
+     * （`root.offsetLeft + clientWidth/2`）。直接拿 `clientWidth/2` 会把分界线整体左移一个
+     * 容器内边距（px-5 = 20px），中间那一列会被判到错的一侧。
+     */
+    const mid = root.offsetLeft + root.clientWidth / 2
+    cards.forEach((el, i) => {
+      const centerX = el.offsetLeft + el.offsetWidth / 2
+      el.style.setProperty(ENTER_VAR_X, centerX < mid ? `-${ENTER_EDGE_PX}px` : `${ENTER_EDGE_PX}px`)
+      el.style.setProperty(ENTER_VAR_I, String(Math.min(i, ENTER_STAGGER_MAX_INDEX)))
+    })
+    root.setAttribute(ENTER_ATTR, 'true')
+    /** 收尾：摘标记 + 清内联变量（可重入：定时器、下一个请求、卸载三处都会调） */
+    const clearEnter = (): void => {
+      root.removeAttribute(ENTER_ATTR)
+      for (const el of cards) {
+        el.style.removeProperty(ENTER_VAR_X)
+        el.style.removeProperty(ENTER_VAR_I)
+      }
+    }
+    enterClearRef.current = clearEnter
+    enterTimerRef.current = window.setTimeout(() => {
+      enterTimerRef.current = 0
+      if (enterClearRef.current === clearEnter) enterClearRef.current = null
+      clearEnter()
+    }, ENTER_DURATION_MS + ENTER_STAGGER_MAX_INDEX * ENTER_STAGGER_STEP_MS + ENTER_CLEANUP_SLACK_MS)
+  }, [enterSeq, view, dupOnly, gridViewport.viewportW, gridViewport.viewportH, assets.length, reducedMotion])
+
+  // 卸载：清掉入场定时器并摘干净标记（避免在已卸载的 DOM 上留属性）
+  useEffect(
+    () => () => {
+      if (enterTimerRef.current) window.clearTimeout(enterTimerRef.current)
+      enterTimerRef.current = 0
+      const clear = enterClearRef.current
+      enterClearRef.current = null
+      clear?.()
+      // `React.StrictMode`（dev）会把挂载后的 effect 立刻清一次再重跑：把"已播序号"
+      // 复位，重挂载时同一个请求还能再播一遍 —— 否则 dev 下首屏永远没有入场
+      // （生产构建不做这次模拟卸载，这一行不会有任何影响）。
+      playedSeqRef.current = 0
+    },
+    []
+  )
+
   /**
    * 列表行高：`LIST_ROW_H`(44) 只是 Bootstrap 初值 —— 表格行的真实高度由内容决定
    * （`text-sm` 的 20px 行盒 + `py-2` 的 16px + 折叠边框 ≈ 37，且随 DPI 取整浮动）。
@@ -2037,9 +2459,11 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
         // 拖拽卡片位图（v0.5.4）：hover 时已预热 → 这里**同步**读缓存；
         // 未命中就传 null，main 回退到缩略图图标 —— 绝不能因为没预热而拖不动。
         const cardPng = cachedDragCard(a.id)
-        beginSystemDrag(e, a.name, abs, a.thumbPath ?? null, (path, thumb) =>
+        beginSystemDrag(e, a.name, abs, a.thumbPath ?? null, (path, thumb) => {
           window.modvault.startDrag(path, thumb, cardPng)
-        )
+          // 卡片拖出到建模软件 = 一次真实使用（口径见 `types.ts` 的 `useCount`）
+          useVault.getState().recordAssetUse(a.id)
+        })
       }
     }
   }
@@ -2269,6 +2693,14 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
             )}
           </span>
         </td>
+        {/*
+          行首缩略图（2026-11-09 用户反馈）：40×30、`py-0`。
+          `align-middle` 让图在行内垂直居中；`py-0` 是关键 —— 带 `py-2` 的话
+          30px + 16px = 46px 会把行撑高，`LIST_ROW_H` 的偏移就会累积错位（见 ListThumb 头注）。
+        */}
+        <td className="w-[48px] px-1 py-0 align-middle">
+          <ListThumb asset={a} />
+        </td>
         <td className="max-w-[320px] truncate px-3 py-2 font-medium" title={displayOf(a)}>
           <span className="flex min-w-0 items-center gap-1.5">
             <span className="min-w-0 flex-1 truncate">{displayOf(a)}</span>
@@ -2336,6 +2768,9 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
               {/* 行首：多选复选框 + 归类抓手列（2026-10）。宽度与行内单元格一致（w-14），
                   复选框显隐不引起列宽跳动 */}
               <th className="w-14 px-2 py-2" aria-label="选择 / 拖动归类" />
+              {/* 行首缩略图列（2026-11-09）：只要一个空表头 + 无障碍名，不排文字 ——
+                  这是纯视觉列，加了「缩略图」三个字反而把它挤成 80px 宽、把「名称」压窄。 */}
+              <th className="w-[48px] px-1 py-2" aria-label="缩略图" />
               <th className="px-3 py-2 font-medium">名称</th>
               {/* 2026-10-21 走查修正：这一列显示的是 `KIND_LABEL`（贴图 / 材质预设 / 模型），
                   是**类型**不是分类；真正的分类在下一列「一级 / 二级」。原表头写「分类」会让人
@@ -2356,7 +2791,7 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
                   // 每组一个小节：标题行（可整组选中）+ 组内资产行。多个 tbody 合法。
                   <Fragment key={g.key}>
                     <tr className="border-b border-line/60 bg-elevated/40">
-                      <td colSpan={6} className="px-3 py-1.5">
+                      <td colSpan={7} className="px-3 py-1.5">
                         <DupGroupHeader
                           group={g}
                           onSelect={() => selectMany(g.assets.map((x) => x.id))}
@@ -2372,13 +2807,13 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
                   <>
                     {listWin.offsetY > 0 && (
                       <tr aria-hidden style={{ height: listWin.offsetY }}>
-                        <td colSpan={6} />
+                        <td colSpan={7} />
                       </tr>
                     )}
                     {listSlice.map(renderRow)}
                     {listBottomPad > 0 && (
                       <tr aria-hidden style={{ height: listBottomPad }}>
-                        <td colSpan={6} />
+                        <td colSpan={7} />
                       </tr>
                     )}
                   </>
@@ -2665,6 +3100,9 @@ export function AssetGrid({ view }: { view: 'grid' | 'list' }) {
         <>
           {gridWin.offsetY > 0 && <div aria-hidden style={{ height: gridWin.offsetY }} />}
           <div
+            // 卡片的**直接父容器**（`gridSlice.map(renderCard)` → 每张卡是这里的一级子元素）。
+            // 网格入场的 `data-enter` 就钉在这一层，`grid-enter.css` 用 `> *` 命中卡片。
+            ref={enterCardsRef}
             className={gridCols}
             style={
               renderedRowHeights.length > 0

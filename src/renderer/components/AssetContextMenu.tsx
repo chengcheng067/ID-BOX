@@ -44,6 +44,15 @@ export function AssetContextMenu({
   const setNotice = useVault((s) => s.setNotice)
   const openFolderView = useVault((s) => s.openFolderView)
   const openHdrPreview = useVault((s) => s.openHdrPreview)
+  /**
+   * 「重命名…」= 复用**既有**批量改名链路（`openRenameDialog` → `<RenameDialog>` →
+   * `applyRenames` → 主进程 `renameAsset`）。
+   *
+   * 三处已有入口用的都是它：网格卡的 `F2` / 底部操作条「重命名…」/ 详情面板的
+   * 内联改名（那条走 `renameAsset` 单条）。菜单里**不新写一套**，所以「只改文件夹名、
+   * 不改包里的文件」「冲突行禁用」「失败汇总 notice」这些既有语义原样继承。
+   */
+  const openRenameDialog = useVault((s) => s.openRenameDialog)
   // 删除撤销期（设置·数据与备份，三档 0 / 3000 / 5000）：提示文案必须跟着设置走，
   // 不能写死「5 秒内可撤销」——否则用户把撤销期设成 3 秒 / 不等待时提示会自相矛盾。
   const undoGraceMs = useVault((s) => s.settings?.undoGraceMs ?? DEFAULT_UNDO_GRACE_MS)
@@ -122,6 +131,9 @@ export function AssetContextMenu({
     onPreviewHdr: () => {
       if (single) openHdrPreview(single.id)
     },
+    // 多选也照开：`RenameDialog` 是批量弹窗（模板 + 预览 + 冲突禁用），
+    // 与网格底部操作条的「重命名…」是同一条链路。
+    onRename: () => openRenameDialog(ids),
     onReveal: () => {
       void window.modvault.reveal(revealTarget)
     },

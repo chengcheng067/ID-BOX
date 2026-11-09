@@ -282,8 +282,11 @@ describe('store.setFavorite / setRating / setColorTag —— 批量标记', () =
     await useVault.getState().setFavorite([a.id], true)
 
     expect(useVault.getState().assets[0]!.favorite).toBe(false)
-    expect(useVault.getState().notice).toContain('保存标记失败')
-    expect(useVault.getState().notice).toContain('quota exceeded')
+    // A 级文案收口：toast 只说人话，**不许**把 `QuotaExceededError …` 这类英文异常原文
+    // 糊到用户脸上（原文仍然进 reportLog，见 `patchAssets` 的日志调用）
+    expect(useVault.getState().notice).toContain('存不下这次标记')
+    expect(useVault.getState().notice).toContain('原标记已保留')
+    expect(useVault.getState().notice).not.toContain('quota exceeded')
   })
 
   it('多选批量：selectedIds 全量传入（3 项）', async () => {

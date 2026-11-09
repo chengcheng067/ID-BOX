@@ -478,14 +478,17 @@ describe('importText：skipped 的配色 / 倒计时 / 终态（ImportStatus 加
       })
     ).toBe('已覆盖（原目录已不存在，按新素材落盘）')
 
-    // ② 旧版本没能进回收站（被 DCC 占用）→ 用户必须知道"其实没进回收站"
+    // ② 旧版本没能进回收站（被 DCC 占用）→ 用户必须知道"其实没进回收站"，
+    //    且文案里不许出现内部后缀名（A14 收口：`.idbox-old-*` 只留在磁盘与注释里）
+    const stashMessage =
+      '已覆盖；旧版本没能移进回收站，已改名成「原名.旧版本」留在同一个文件夹里，确认没用可以自己删'
     expect(
       importItemDetail({
         status: 'done',
-        message: '已覆盖；旧版本未能移入回收站，已暂存为 .idbox-old-*',
+        message: stashMessage,
         conflict: { reason: 'same-name', resolution: 'overwrite', existingName: '卧室双人床' }
       })
-    ).toBe('已覆盖；旧版本未能移入回收站，已暂存为 .idbox-old-*')
+    ).toBe(stashMessage)
 
     // 正常覆盖（无 message）仍走 §6.1 的文案
     expect(
@@ -885,7 +888,8 @@ describe('store 接线（docs/27 T-06）', () => {
         existingName: '现代壁灯',
         degraded: true
       },
-      message: '已覆盖；旧版本未能移入回收站，已暂存为 .idbox-old-*'
+      message:
+        '已覆盖；旧版本没能移进回收站，已改名成「原名.旧版本」留在同一个文件夹里，确认没用可以自己删'
     })
 
     batchDoneHandler!()
@@ -1086,7 +1090,16 @@ describe('源码守卫：组件接线', () => {
     expect(s).toContain('ensureConflictAskSubscribed()')
     expect(s).toContain('if (conflictUnsubscribers.length > 0) return')
     // ⚠️ 写入路径一行都不许改（覆盖 = 同一个 id 的 put，天然是替换同一行）
-    expect(s).toContain('void db.assets.put(ev.asset)')
+    // 2026-11-09 v1.0.1 修订：原来是 `void db.assets.put(ev.asset)` 的**裸 fire-and-forget**，
+    // 写库失败时彻底静默（症状：本次会话看得见、重启后消失——正是用户报的"拖进去不在了"的
+    // 另一条可能路径）。现在写成 `db.assets.put(ev.asset).catch(...)`（跨行链式），
+    // 失败会 console.error + 一条可见 notice。
+    // 因此断言从"钉字面量"改为守**更强的两条性质**（允许换行与缩进，不锁排版）：
+    //   ① 覆盖语义不变：仍然是 `db.assets` 上的 `put(ev.asset)`；
+    //   ② 失败必须可见：紧跟 `.catch(`（不许再退回静默的 `void` 裸调用）。
+    expect(s).toMatch(/db\.assets\s*\.put\(ev\.asset\)/)
+    expect(s).not.toContain('void db.assets.put(ev.asset)')
+    expect(s).toMatch(/\.put\(ev\.asset\)\s*\.catch\(/)
   })
 
   /**

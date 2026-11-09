@@ -118,6 +118,11 @@ export const SettingsSchema = z.object({
   showColorTags: z.boolean().optional().catch(true),
   showDuplicates: z.boolean().optional().catch(true),
   /**
+   * 首页右上数据卡开关（默认 true）。同上的降级策略：缺键 / 脏值都按「显示」，
+   * 只让这一项回落，不拖垮整份 settings.json。
+   */
+  showHomeStats: z.boolean().optional().catch(true),
+  /**
    * 知末封面抓取总开关（docs/24 §3.5，默认 **true**）。
    *
    * `.catch(true)`：**单项降级** —— 脏值（`'yes'` / `1` / `null`）只让这一项回落默认，
@@ -203,6 +208,16 @@ export const SettingsSchema = z.object({
    * 才开，缺键 / 脏值一律关。
    */
   pluginIndexEnabled: z.boolean().optional().catch(false),
+  /**
+   * 「插件写盘需要你主动开启」这条引导**是否已露过一次脸**（V1.0 D-2，docs/46 §1.7）。
+   *
+   * `.optional().catch(false)`：同样**单项降级** —— 脏值（`'true'` / `0` / `null`）只让这一项
+   * 回落 `false`，不拖垮整份 settings.json。
+   * ⚠️ 回落方向与上面 `pluginIndexEnabled` **故意相反**：这里到 `false` = 引导还要再显示一次。
+   * 宁可多提示一次，也不要因为一个脏值把引导永久吞掉（用户就永远不知道插件为什么是空的）。
+   * 与写盘开关是两个独立字段，**互不反写**。
+   */
+  pluginIndexGuideShown: z.boolean().optional().catch(false),
   /** @deprecated 旧档迁移用 */
   trashArchiveAfterImport: z.boolean().optional()
 })
@@ -481,6 +496,8 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   merged.showFavorites = merged.showFavorites === false ? false : true
   merged.showColorTags = merged.showColorTags === false ? false : true
   merged.showDuplicates = merged.showDuplicates === false ? false : true
+  // 首页数据卡：同样只有严格 false 才关闭
+  merged.showHomeStats = merged.showHomeStats === false ? false : true
   // 知末封面（docs/24 §3.5）：只认严格 false（'false' / 0 之类脏值一律按开；缺键 = 默认开）
   merged.zhimoCover = merged.zhimoCover === false ? false : true
   // ⚠️ 子开关**独立归一化**：即使 zhimoCover === false 也原样保留它的值。
@@ -512,6 +529,11 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   // 同方向。这个值会落进 `manifest.pluginIndexEnabled`，插件靠它区分「未开导出」(IDBOX-101)，
   // 所以归一化必须收口成布尔、不能留 undefined。
   merged.pluginIndexEnabled = merged.pluginIndexEnabled === true
+  // D-2 引导「已展示」(docs/46 §1.7)：只认严格 true 才算"看过了"；缺键 / 'true' / 0 / null
+  // 一律回落到 false = 下次还显示。**方向与上面一条相反是刻意的**：写盘开关回落成"关"是安全的，
+  // 引导回落成"已看过"则会让用户永远看不到提示、也就永远不知道插件为什么是空面板。
+  // 这两项各自独立、互不反写（不自动勾选写盘、也不因勾选而反写本项）。
+  merged.pluginIndexGuideShown = merged.pluginIndexGuideShown === true
   delete merged.trashArchiveAfterImport
   return merged
 }

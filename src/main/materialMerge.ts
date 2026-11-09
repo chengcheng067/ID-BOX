@@ -332,7 +332,9 @@ async function readManifest(file: string): Promise<Manifest> {
   const text = await fs.readFile(file, 'utf-8')
   const data = JSON.parse(text) as Manifest
   if (!data || data.version !== 1 || !Array.isArray(data.items)) {
-    throw new Error('manifest 格式不可识别')
+    // 文案收口（A16）：这句会冒到设置页卡片上（"回滚失败：…"），"manifest" 是内部
+    // 概念 —— 用户只知道"合并记录"。同时给出**可执行动作**（重新发起合并）。
+    throw new Error('合并记录文件读不出来，请重新发起合并')
   }
   return data
 }

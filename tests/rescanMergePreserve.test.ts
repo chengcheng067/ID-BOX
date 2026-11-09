@@ -68,6 +68,9 @@ const DISK_AUTHORITATIVE = [
  * - `renderParams / renderShape`：材质球调参，**主进程 rescan 根本不产出这两个字段**
  *   （本次事故的核心）；
  * - `mojibake`：乱码标记是**解压时**嗅探出来的，rescan 不采集 → 只能保留；
+ * - `useCount / lastUsedAt`：使用统计（用户行为），磁盘上根本没有对应物 ——
+ *   重扫若是把它们清零，用户点了「刷新」就等于把自己攒了几个月的使用习惯抹掉，
+ *   「最常使用 / 最近使用」排序瞬间全平；
  * - `deletedAt / trashRel`：软删状态，重扫无权替用户还原/删除；
  * - `importedAt`：导入时间，磁盘上没有可比对的值；
  * - `updatedAt`：重扫不是用户编辑，改它会把「最近修改」排序整库顶到当下。
@@ -79,6 +82,9 @@ const LOCAL_PRESERVED = [
   'styles',
   'renderParams',
   'renderShape',
+  // 使用统计（2026-10）：主进程 rescan 不产出这两个字段，重扫无权清零用户的使用习惯
+  'useCount',
+  'lastUsedAt',
   'deletedAt',
   'trashRel',
   'aliasOverride',
@@ -155,6 +161,7 @@ const { useVault } = await import('../src/renderer/store')
 const FOLDER = 'E:\\Lib\\模型\\家具\\沙发\\北欧布艺沙发'
 const LOCAL_UPDATED_AT = 1_650_000_000_000
 const SCAN_UPDATED_AT = 1_700_000_999_000
+const LOCAL_LAST_USED_AT = 1_690_000_000_000
 
 /** 本地记录：每个本地保留字段都有"可辨识"的值，任何被磁盘值覆盖都会被抓到 */
 function localAsset(): Asset {
@@ -180,6 +187,9 @@ function localAsset(): Asset {
     materialMeta: undefined, // 磁盘有值 → 用磁盘
     renderParams: { roughness: 1.4, bump: 0.7, uv: 3.1, light: 1, metal: 0, alpha: 1 },
     renderShape: 'plane',
+    // 使用统计：攒了 12 次的使用习惯，重扫绝不许清零（磁盘上没有这个信息）
+    useCount: 12,
+    lastUsedAt: LOCAL_LAST_USED_AT,
     deletedAt: undefined,
     trashRel: undefined,
     aliasOverride: '我的别名',
@@ -220,6 +230,9 @@ function scannedAsset(over: Partial<Asset> = {}): Asset {
     category2: '水磨石',
     styles: [],
     materialMeta: { name: '木纹', tags: ['wood'] },
+    // 极端值：证明重扫绝不把使用统计清零（主进程真实产出里这两个字段根本不存在）
+    useCount: 0,
+    lastUsedAt: 0,
     deletedAt: 999, // 极端值：证明重扫绝不把"删除态"从磁盘带进来
     trashRel: '.trash/scanned-uuid',
     tags: [],
@@ -270,10 +283,10 @@ describe('Asset 字段归类表 —— 完整性', () => {
     const overlap = disk.filter((k) => (local as string[]).includes(k))
     expect(overlap).toEqual([])
     // 覆盖：编译期已经保证（UnclassifiedKey 必须是 never），这里钉住总数防手滑删行
-    // 34 = 33（docs/35 之前）+ classifyReview（docs/35 R-13，只加一个嵌套字段而不是 4 个平铺）
-    expect(disk.length + local.length).toBe(34)
+    // 36 = 34（docs/35 R-13）+ useCount + lastUsedAt（2026-10 使用统计，两个平铺字段）
+    expect(disk.length + local.length).toBe(36)
     expect(disk.length).toBe(17)
-    expect(local.length).toBe(17)
+    expect(local.length).toBe(19)
   })
 })
 
@@ -307,6 +320,9 @@ describe('store.rescan —— 以 local 为底，逐字段验证', () => {
     expect(merged.styles).toEqual(['现代', '侘寂'])
     // 重扫不是用户编辑 → 「最近修改」时间戳不动
     expect(merged.updatedAt).toBe(LOCAL_UPDATED_AT)
+    // 使用统计是纯用户行为数据（磁盘上没有对应物）：重扫既不累加也不清零
+    expect(merged.useCount).toBe(12)
+    expect(merged.lastUsedAt).toBe(LOCAL_LAST_USED_AT)
     // 软删状态绝不从磁盘带进来（否则一次重扫等于替用户删库）
     expect(merged.deletedAt).toBeUndefined()
     expect(merged.trashRel).toBeUndefined()

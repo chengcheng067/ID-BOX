@@ -245,8 +245,11 @@ describe('T-04 ③ 覆盖：同路径替换 + 元数据继承 + 旧目录进回�
     // 必须显式告诉用户，不能静默
     const done = h.events.filter((e) => e.status === 'done')
     expect(done).toHaveLength(1)
-    expect(done[0]!.message).toContain('未能移入回收站')
-    expect(done[0]!.message).toContain('.idbox-old-')
+    expect(done[0]!.message).toContain('没能移进回收站')
+    expect(done[0]!.message).toContain('旧版本')
+    // A14 文案收口：内部目录名**不许**冒到用户可见的 message 上（磁盘上仍是 .idbox-old-，
+    // 见上一段的 leftovers 断言 —— 那才是"文件还在"的证据，这里是"用户看不懂的话别出现"）
+    expect(done[0]!.message).not.toContain('.idbox-old-')
     // 结构化标记：旧版**没进**回收站，渲染层绝不能对用户说"旧版在回收站"
     expect(done[0]!.conflict?.degraded).toBe(true)
   })

@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import type { AssetFile } from '../shared/types'
 import { IGNORED_NAMES, isJunkFileName, kindOfExt } from '../shared/classify'
+import { INBOX_MANIFEST_FILE, INBOX_MANIFEST_MAX_BYTES, isInboxManifestJson } from '../shared/inbox'
 
 /** 库内暂存目录名（与库根同盘，保证 moveDir 是同盘 rename O(1)） */
 export const STAGING_DIR = '.staging'
@@ -168,4 +169,49 @@ export function safeJoin(root: string, rel: string): string {
     throw new Error('路径越界：不在库目录内')
   }
   return abs
+}
+
+/**
+ * 从（staging 里的）内容根删掉 **ID BOX 收件箱的协议文件** `manifest.json`。
+ *
+ * ## 为什么需要它
+ *
+ * SketchUp 插件「导出至 ID BOX」把 `<baseName>.skp` / `<baseName>.cover.png` /
+ * `manifest.json` 一起写在 `%APPDATA%\idbox_export\incoming\<jobId>\` 里，而 `create`
+ * 通道是**文件夹导入** —— 那个 `manifest.json` 会被 `fs.cp` 一起拷进用户的素材库，
+ * 表现为"点开一个模型文件夹，里面躺着一个 manifest.json"。内部协议文件跑进用户库里
+ * 既不专业，也让人以为软件在乱写东西。
+ *
+ * ## 为什么删在 staging（`importer.ts` 的 `fs.cp` 之后）而不是落盘之后
+ *
+ * staging 是**唯一**的删除时机能同时让三件事一起对：
+ * ① 文件不落进用户的库（磁盘干净）；
+ * ② `walkFiles` 建的 `files[]` 里没有它（详情页文件列表干净）；
+ * ③ `size` / `primaryKind` / `classifyAssetName` 的输入不含它（分类与体积不受影响）。
+ * 落到目标目录再删就只能补 ①，②③ 已经算错了（还要再算一遍）。
+ *
+ * ## 判据（保守，不按文件名一刀切）
+ *
+ * 只在**文件名恰为 `manifest.json` 且内容通过 `isInboxManifestJson`** 时才删：
+ * 用户自己的素材包里带的 `manifest.json`（PBR 材质包 / 导出器工程描述）必须原样保留，
+ * 删了是不可逆的数据事故。判据实现只有一份（`shared/inbox.ts`）。
+ *
+ * 幂等、**永不抛**（读不到 / 不是文件 / 不匹配都返回 false）。
+ *
+ * @param dir 内容根（staging 下钻后的那一层）
+ * @returns true = 确实删掉了一个本产品写的协议文件
+ */
+export async function dropInboxProtocolManifest(dir: string): Promise<boolean> {
+  const abs = path.join(dir, INBOX_MANIFEST_FILE)
+  try {
+    const st = await fs.stat(abs)
+    if (!st.isFile() || st.size <= 0 || st.size > INBOX_MANIFEST_MAX_BYTES) return false
+    const text = await fs.readFile(abs, 'utf-8')
+    if (!isInboxManifestJson(text)) return false
+    await fs.rm(abs, { force: true })
+    return true
+  } catch {
+    // 没有该文件（绝大多数导入）/ 读不了 / 删不掉：一律当"没这回事"，绝不影响导入
+    return false
+  }
 }
