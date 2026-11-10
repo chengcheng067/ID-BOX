@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVault, type ZhimoReclassSummary } from '../store'
 import { DISPOSAL_LABEL, SEVEN_ZIP_DOWNLOAD_URL } from '../../shared/types'
-import type { AiClassifySettings, AliasRecord, ArchiveDisposal, MotionQuality } from '../../shared/types'
+import type { AliasRecord, ArchiveDisposal, MotionQuality } from '../../shared/types'
 import { MOTION_PROFILES, MOTION_QUALITY_ORDER } from '../../shared/motionQuality'
 import { aliasKeyOf } from '../../shared/aliasRules'
 import { formatBytes } from '../../shared/format'
@@ -1215,23 +1215,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     useState<ZhimoCoverBackfillSummary | null>(null)
   // 本轮是否被用户主动取消（store 的 cancelRequested 结束时会复位，读不到历史）
   const [zhimoBackfillCancelled, setZhimoBackfillCancelled] = useState(false)
-  // AI 辅助分类（docs/15 §7）：表单先本地编辑，失焦/切换时落库（避免每敲一个字符写一次 settings.json）
-  const aiSettings: AiClassifySettings = settings?.aiClassify ?? {
-    enabled: false,
-    baseUrl: '',
-    apiKey: '',
-    model: ''
-  }
-  const [aiForm, setAiForm] = useState<AiClassifySettings>(aiSettings)
-  /**
-   * AI 卡是否展开（默认收起，见 tab 里那段注释）。
-   *
-   * 只影响呈现，不参与落库：折叠时四个字段的值原样留在 `aiForm` 里，
-   * 展开后立刻可见（不会因为折叠被清空）。
-   */
-  const [aiOpen, setAiOpen] = useState(false)
-  const [aiTesting, setAiTesting] = useState(false)
-  const [aiTest, setAiTest] = useState<{ ok: boolean; message: string } | null>(null)
   /**
    * 「导出 SketchUp 插件包（.rbz）」的结果（docs/39 §4.3 形态①，用户 2026-11-04 拍板）。
    *
@@ -1243,11 +1226,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     { kind: 'ok'; path: string; bytes: number } | { kind: 'error'; message: string } | null
   >(null)
   const [rbzExporting, setRbzExporting] = useState(false)
-
-  // 外部设置变化（另一个窗口/入口改了配置）→ 表单跟随（按字段比较，避免对象身份抖动）
-  useEffect(() => {
-    setAiForm(aiSettings)
-  }, [aiSettings.enabled, aiSettings.baseUrl, aiSettings.apiKey, aiSettings.model])
 
   useEffect(() => {
     void window.modvault.sevenZipPath().then(setSevenZip)
@@ -1596,33 +1574,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
   /** 当前勾选的类别数（0 → 执行按钮禁用） */
   const pickedCount = (pickMissing ? 1 : 0) + (pickNotIndexed ? 1 : 0) + (pickMismatch ? 1 : 0)
-
-  /** AI 表单落库：`patch` 与本地值合并后整体保存（main 侧还会做一次逐字段归一化） */
-  const commitAi = (patch: Partial<AiClassifySettings>) => {
-    const next: AiClassifySettings = { ...aiForm, ...patch }
-    setAiForm(next)
-    void saveSettings({ aiClassify: next })
-  }
-
-  /**
-   * 「测试连接」：只发一条最小请求（不分类、不注入词表），
-   * 失败原因（401 / 404 / 模型名错 / 超时）原样展示，方便用户自查。
-   */
-  const testAi = async () => {
-    setAiTesting(true)
-    setAiTest(null)
-    try {
-      const r = await window.modvault.aiClassifyTest(aiForm)
-      setAiTest(r)
-    } catch (err) {
-      setAiTest({
-        ok: false,
-        message: `测试失败：${err instanceof Error ? err.message : String(err)}`
-      })
-    } finally {
-      setAiTesting(false)
-    }
-  }
 
   // ── 各 tab 内容（v0.8.1 重排：卡片 + 行的统一语言） ─────────────
 
@@ -2277,112 +2228,6 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         {/* @guard:zhimo-reclass-end */}
       </SettingsCard>
 
-      {/* AI 辅助分类（可选）：词表优先 + 模型兜底，不内置任何模型。
-          默认关闭；未填写 = 零网络请求。表单失焦落库（不逐字符写 settings.json）。
-
-          v0.8.1 尺寸收敛（用户裁定 A1）：**默认折叠**成一行 —— 90% 的用户永远不填这四项，
-          展开的 172px 表单会把它上面的两张卡顶出视口。折叠态仍必须能看出开关状态：
-          摘要第一句就是「已开启 · 模型 xxx」/「未开启」，状态不藏。
-          展开按钮是原生 `<button>` + `aria-expanded` + `aria-controls`，Enter / Space 可用。 */}
-      <SettingsCard
-        title="AI 辅助分类（可选）"
-        note={
-          aiOpen
-            ? '兼容 OpenAI 格式的 /chat/completions 接口（OpenAI、DeepSeek、通义、Ollama 等）。密钥仅保存在本机 settings.json；识别不了或请求失败时保持「未分类」，不会打断导入，也不会覆盖已分类的资产。'
-            : undefined
-        }
-      >
-        <SettingsRow
-          title="模型兜底"
-          desc={
-            aiForm.enabled
-              ? `已开启${aiForm.model.trim() ? ` · 模型 ${aiForm.model.trim()}` : ' · 尚未填写模型名'}；仅当词表无法判断时才调用`
-              : '未开启；仅当词表无法判断时才调用，只发送资产名，不发送文件内容'
-          }
-          actions={
-            <>
-              <button
-                type="button"
-                className="btn !py-1 text-xs"
-                aria-expanded={aiOpen}
-                aria-controls="ai-classify-fields"
-                onClick={() => setAiOpen((v) => !v)}
-                title={aiOpen ? '收起接口设置' : '展开填写接口地址 / 密钥 / 模型名'}
-              >
-                {aiOpen ? '收起' : '展开填接口信息'}
-              </button>
-              <Toggle checked={aiForm.enabled} onChange={(v) => commitAi({ enabled: v })} />
-            </>
-          }
-        />
-        {aiOpen && (
-          <div id="ai-classify-fields" className="border-t border-soft-line py-2.5">
-            <div className="grid grid-cols-[64px_1fr] items-center gap-x-2 gap-y-2">
-              <label className="text-[11px] text-secondary" htmlFor="ai-base-url">
-                接口地址
-              </label>
-              <input
-                id="ai-base-url"
-                className="input !py-1 text-xs"
-                value={aiForm.baseUrl}
-                placeholder="https://api.example.com/v1"
-                spellCheck={false}
-                onChange={(e) => setAiForm({ ...aiForm, baseUrl: e.target.value })}
-                onBlur={() => commitAi({})}
-              />
-
-              <label className="text-[11px] text-secondary" htmlFor="ai-api-key">
-                密钥
-              </label>
-              <input
-                id="ai-api-key"
-                className="input !py-1 text-xs"
-                type="password"
-                value={aiForm.apiKey}
-                placeholder="sk-…（本地服务可留空）"
-                spellCheck={false}
-                autoComplete="off"
-                onChange={(e) => setAiForm({ ...aiForm, apiKey: e.target.value })}
-                onBlur={() => commitAi({})}
-              />
-
-              <label className="text-[11px] text-secondary" htmlFor="ai-model">
-                模型名
-              </label>
-              <input
-                id="ai-model"
-                className="input !py-1 text-xs"
-                value={aiForm.model}
-                placeholder="gpt-4o-mini / qwen2.5:7b"
-                spellCheck={false}
-                onChange={(e) => setAiForm({ ...aiForm, model: e.target.value })}
-                onBlur={() => commitAi({})}
-              />
-            </div>
-            <div className="mt-2.5 flex items-center gap-2">
-              <button
-                className="btn !py-1 text-xs"
-                disabled={aiTesting || !aiForm.baseUrl.trim() || !aiForm.model.trim()}
-                onClick={() => void testAi()}
-                title="发一条最小请求，验证地址 / 密钥 / 模型名是否可用"
-              >
-                <IconRefresh />
-                {aiTesting ? '测试中…' : '测试连接'}
-              </button>
-              {aiTest && (
-                <span
-                  className={`max-w-[320px] truncate text-[11px] ${
-                    aiTest.ok ? 'text-success' : 'text-danger'
-                  }`}
-                  title={aiTest.message}
-                >
-                  {aiTest.message}
-                </span>
-              )}
-            </div>
-          </div>
-        )}
-      </SettingsCard>
     </div>
   )
 

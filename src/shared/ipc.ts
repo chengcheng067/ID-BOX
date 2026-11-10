@@ -163,12 +163,10 @@ export const IPC = {
    * 会返回错误串（不是"打开浏览器"的语义）。只接受 http/https，其余返回 false。
    */
   openExternal: 'shell:openExternal',
-  // ── 2026-10-19 AI 辅助分类（docs/15 §7，词表优先 + 模型兜底） ──────────
-  /** 请求一批资产名的分类结论（main 侧发 HTTP，渲染层有 CORS/CSP 限制） */
-  aiClassify: 'ai:classify',
-  /** 「测试连接」：发一条最小请求，回报成功 / 失败原因 */
-  aiClassifyTest: 'ai:test',
-  /** 主进程 → 渲染进程：一个导入批次已结束（Payload = ImportBatchDoneEvent） */
+  /**
+   * 主进程 → 渲染进程：一个导入批次已结束（Payload = ImportBatchDoneEvent）。
+   * 知末封面流水线 / 三源交叉验证 / 插件索引快照共用这条通道，**不是 AI 专属**。
+   */
   importBatchDone: 'import:batchDone',
   // ── 2026-10 诊断日志（崩溃取证 + 用户自助导出） ──────────────────
   /** 日志目录 / 文件数 / 总大小（设置页展示，invoke） */

@@ -48,7 +48,6 @@ const modvault = {
   ensureThumb: vi.fn(),
   deleteThumb: vi.fn(),
   // 导入后置任务（`setTimeout(0)` 里 fire-and-forget）可能碰到的通道，一律给空实现
-  aiClassify: vi.fn(),
   reportPluginSnapshot: vi.fn(),
   fetchZhimoMeta: vi.fn(),
   fetchZhimoCover: vi.fn(),
@@ -146,7 +145,6 @@ beforeEach(() => {
   modvault.ensureThumb.mockResolvedValue(null)
   modvault.deleteThumb.mockResolvedValue(0)
   modvault.reportPluginSnapshot.mockResolvedValue(true)
-  modvault.aiClassify.mockResolvedValue({ items: [], failedNames: [], error: null })
 
   ensureInboxSubscribed()
 })

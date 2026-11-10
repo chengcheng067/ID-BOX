@@ -6,7 +6,6 @@ import { app } from 'electron'
 import {
   DEFAULT_SETTINGS,
   LEGACY_DISPOSAL_ALIASES,
-  type AiClassifySettings,
   type ArchiveDisposal,
   type Settings,
   type ThemeMode,
@@ -33,22 +32,6 @@ const CANDIDATE_ROOTS = ['E:\\', 'D:\\', 'C:\\']
 const DisposalSchema = z
   .enum(['recycle', 'delete', 'keep', 'trash'])
   .transform((v): ArchiveDisposal => (v === 'trash' ? 'recycle' : v))
-
-/**
- * AI 辅助分类子对象（docs/15 §7）。**逐字段 `.catch` + 整个对象 `.catch`**：
- * - 字段级：`enabled: "yes"` 这类脏值只让该字段回落默认，其余字段（尤其 apiKey）不丢；
- * - 对象级：`aiClassify: "garbage"` 这类整块脏值也不让 `safeParse` 整体失败
- *   （否则 loadSettings 会丢掉 libraryDir 等全部配置 —— 本项目在 `gridDensity` 上踩过这个坑）。
- */
-const AiClassifySchema = z
-  .object({
-    enabled: z.boolean().optional().catch(false),
-    baseUrl: z.string().optional().catch(''),
-    apiKey: z.string().optional().catch(''),
-    model: z.string().optional().catch('')
-  })
-  .catch({ enabled: false, baseUrl: '', apiKey: '', model: '' })
-  .optional()
 
 /** 导出仅供测试：验证单项降级语义（脏值不拖垮整份设置）。 */
 export const SettingsSchema = z.object({
@@ -151,8 +134,6 @@ export const SettingsSchema = z.object({
    * 方向与 `zhimoCover` 一致：默认开，只有严格 `false` 才关。
    */
   autoCheckUpdate: z.boolean().optional().catch(true),
-  /** AI 辅助分类（默认关闭；逐字段降级，见 AiClassifySchema 注释） */
-  aiClassify: AiClassifySchema,
   /**
    * 别名映射表（0.6.0）。单项脏值只丢该项，整表坏掉就回落空数组
    * （空数组 = 显示名走 `displayName()` 的老规则，绝不因为别名表坏掉而没名字）。
@@ -401,8 +382,6 @@ export function migrateSettings(raw: RawSettings): Settings {
     // 删除撤销期三档：旧档缺键（undefined）/ 脏值都在这里收口成 5000；
     // `0`（不等待）必须原样保留 —— 它是合法档位，不能被"falsy 兜底"吃掉。
     undoGraceMs: normalizeUndoGraceMs(raw.undoGraceMs),
-    // zod 侧字段都是 optional（脏值逐字段降级），这里收口成完整对象，旧档缺键 → 默认关闭
-    aiClassify: normalizeAiClassify(raw.aiClassify),
     // 0.6.0：别名表 / 智能集合 / 重命名模板 —— 旧档缺键 → 空数组 / 保守模板
     aliases: Array.isArray(raw.aliases) ? raw.aliases : [],
     savedViews: Array.isArray(raw.savedViews) ? raw.savedViews : [],
@@ -427,25 +406,6 @@ export function migrateSettings(raw: RawSettings): Settings {
  */
 export function normalizeTrashRetention(v: unknown): TrashRetention {
   return v === '5d' || v === '10d' || v === '30d' || v === 'recycle' ? v : '30d'
-}
-
-/**
- * AI 辅助分类设置的**唯一归一化入口**（读档、写档、IPC 测试连接三处共用）。
- *
- * 四条规则：`enabled` 只认严格 true（"yes"/1 都不算，避免误开导致静默发网络请求）；
- * 三个字符串字段非字符串一律归 '' 并去首尾空白；**绝不抛错**（设置页任何脏输入都不能阻断保存）。
- */
-export function normalizeAiClassify(
-  raw: Partial<AiClassifySettings> | null | undefined
-): AiClassifySettings {
-  const src: Partial<AiClassifySettings> =
-    raw !== null && typeof raw === 'object' ? raw : {}
-  return {
-    enabled: src.enabled === true,
-    baseUrl: typeof src.baseUrl === 'string' ? src.baseUrl.trim() : '',
-    apiKey: typeof src.apiKey === 'string' ? src.apiKey.trim() : '',
-    model: typeof src.model === 'string' ? src.model.trim() : ''
-  }
 }
 
 /** 写档前归一化：补齐默认值、丢弃未知键、确保数值为正 */
@@ -516,8 +476,6 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   } else {
     merged.extractConcurrency = Math.min(8, Math.max(1, Math.round(cc)))
   }
-  // AI 辅助分类（docs/15 §7）：旧档无此键 → 全默认（关闭）；脏子对象逐字段降级不丢整份设置
-  merged.aiClassify = normalizeAiClassify(merged.aiClassify)
   // 诊断日志详细级别：只认严格 true（"true"、1 之类脏值一律关闭，避免无意刷盘）
   merged.verboseLogging = merged.verboseLogging === true
   // 自定义分类词表（2026-10）：单条新增也可能带脏值，写档前再统一清洗一遍

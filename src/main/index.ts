@@ -6,8 +6,6 @@ import { IPC } from '../shared/ipc'
 import { resolveExternalUrl, truncateUrlForLog } from '../shared/urlPolicy'
 import {
   DEFAULT_SETTINGS,
-  type AiClassifyPayload,
-  type AiClassifySettings,
   type AssignCategoryPayload,
   type AssignCategoryResult,
   type Asset,
@@ -33,7 +31,7 @@ import {
   TRASH_RETENTION_DAYS,
   type UpdateInfo
 } from '../shared/types'
-import { loadSettings, normalizeAiClassify, normalizeSettings, saveSettings } from './settings'
+import { loadSettings, normalizeSettings, saveSettings } from './settings'
 import {
   exportLogsTo,
   flushLogsSync,
@@ -49,11 +47,6 @@ import {
   setVerboseLogging
 } from './logger'
 import { applyLibraryChoice, broadcastSettingsToWindows } from './settingsBroadcast'
-import {
-  AI_CLASSIFY_MAX_NAMES,
-  aiClassifyDetailed,
-  testAiConnection
-} from './aiClassify'
 import { findSevenZip, thumbsDir } from './paths'
 import { guardDragIconPath } from './dragIconGuard'
 import { guardOpenPaths, guardTrashPaths } from './ipcGuard'
@@ -554,10 +547,11 @@ async function runImport(paths: string[], ctx?: ImportConflictContext): Promise<
       shouldStop: () => importCancelGen !== myGen,
       emit: emitImportEvent
     })
-    // ── AI 辅助分类触发点（docs/15 §7）────────────────────────────────
-    // 批次结束后**通知渲染层**去后台补分类：这里只 `send`（fire-and-forget），
-    // **不 await 任何网络请求**——导入耗时与是否配置 AI 完全无关。
-    // 覆盖两条导入入口：UI 的 import:paths 与监控目录（watcher 直接调 runImport）。
+    // ── 导入批次结束通知（import:batchDone，共享通道）──────────────────────
+    // 批次结束后**通知渲染层**驱动各类后台后置任务（知末封面流水线 / 三源交叉验证 /
+    // 插件索引快照等）：这里只 `send`（fire-and-forget），**不 await 任何网络请求**，
+    // 导入耗时与后置任务无关。覆盖两条导入入口：UI 的 import:paths 与监控目录
+    // （watcher 直接调 runImport）。
     try {
       win?.webContents.send(IPC.importBatchDone, { count: assets.length })
     } catch {
@@ -1109,11 +1103,7 @@ function bootstrap(): void {
       archiveDisposal: settings.archiveDisposal,
       sevenZipPath: settings.sevenZipPath,
       thumbMaxPx: settings.thumbMaxPx,
-      extractConcurrency: settings.extractConcurrency,
-      aiClassifyEnabled: settings.aiClassify.enabled,
-      aiClassifyBaseUrl: settings.aiClassify.baseUrl,
-      aiClassifyModel: settings.aiClassify.model
-      // ⚠️ 故意不记 apiKey：脱敏逻辑兜底，这里连键都不放
+      extractConcurrency: settings.extractConcurrency
     })
 
     app.on('activate', () => {
@@ -1202,14 +1192,9 @@ ipcMain.handle(IPC.getSettings, () => settings)
 
 ipcMain.handle(IPC.setSettings, async (_e, patch: Partial<Settings>) => {
   const safePatch: Partial<Settings> = patch ?? {}
-  // `aiClassify` 是**嵌套对象**：浅合并会让只改 `enabled` 的 patch 把 baseUrl/apiKey 抹掉，
-  // 所以这里单独深合并一层，再交给 normalizeSettings 逐字段降级/裁剪。
   settings = normalizeSettings({
     ...settings,
-    ...safePatch,
-    aiClassify: safePatch.aiClassify
-      ? { ...settings.aiClassify, ...safePatch.aiClassify }
-      : settings.aiClassify
+    ...safePatch
   })
   await saveSettings(settings)
   // 「记录详细日志」开关立即生效（无需重启）
@@ -2561,40 +2546,3 @@ ipcMain.handle(IPC.logExport, async (): Promise<LogExportResult> => {
   }
 })
 
-// ── 2026-10-19 AI 辅助分类（docs/15 §7）─────────────────────────────
-//
-// 为什么在主进程发请求：渲染进程受 CORS / CSP 限制，用户自接的服务通常不带
-// `Access-Control-Allow-Origin`。这里只做两条通道：批量分类 + 测试连接。
-//
-// handler 侧三道闸门（渲染层不可信）：
-// ① `names` 必须是字符串数组、逐项去空白、截断到 `AI_CLASSIFY_MAX_NAMES`；
-// ② **未启用或 baseUrl 为空 → 直接返回空结果，不发任何网络请求**；
-// ③ 密钥只从**主进程 settings** 读取（不接受渲染层传入的 apiKey，避免 XSS 后外带）。
-
-ipcMain.handle(IPC.aiClassify, async (_e, payload: AiClassifyPayload | undefined) => {
-  const rawNames = Array.isArray(payload?.names) ? payload.names : []
-  const names = rawNames
-    .filter((n): n is string => typeof n === 'string' && n.trim().length > 0)
-    .slice(0, AI_CLASSIFY_MAX_NAMES)
-  if (names.length === 0) {
-    return { items: [], failedNames: [], error: null }
-  }
-  if (!settings.aiClassify.enabled || !settings.aiClassify.baseUrl.trim()) {
-    return { items: names.map(() => null), failedNames: [], error: null }
-  }
-  return aiClassifyDetailed({ names, settings: settings.aiClassify })
-})
-
-ipcMain.handle(
-  IPC.aiClassifyTest,
-  (_e, raw: Partial<AiClassifySettings> | undefined) => {
-    // 只取四个已知字段；缺省回落到已保存值（允许「先测通再保存」）
-    const merged = normalizeAiClassify({
-      enabled: raw?.enabled ?? settings.aiClassify.enabled,
-      baseUrl: raw?.baseUrl ?? settings.aiClassify.baseUrl,
-      apiKey: raw?.apiKey ?? settings.aiClassify.apiKey,
-      model: raw?.model ?? settings.aiClassify.model
-    })
-    return testAiConnection(merged)
-  }
-)

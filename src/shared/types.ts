@@ -218,62 +218,12 @@ export type CoverSource =
  */
 export type ImportStatus = 'extracting' | 'organizing' | 'done' | 'error' | 'skipped' | 'cancelled'
 
-// ── 2026-10-19 用户自接模型 API 辅助分类（docs/15 §7） ────────────────────
-//
-// 口径（用户拍板）：**词表优先 + 模型兜底，不内置任何模型**。
-// 用户自己填接口地址 / 密钥 / 模型名，默认关闭 → 安装包体积零增长。
-// 只在 `autoClassify()` 完全命中不了（落 `未分类/未分类`）时才调用，且**绝不覆盖**已有分类。
-
 /**
- * AI 辅助分类设置（OpenAI 兼容的 `/chat/completions` 接口）。
+ * 主进程 → 渲染进程：一个导入批次已结束（**不阻塞导入**）。
  *
- * 默认值 = 全部关闭 + 空串：**未配置时不会发出任何网络请求**。
- * 开启前设置页会明确告知「会把资产名发送到你配置的服务」。
+ * 这是「知末封面流水线 / 三源交叉验证 / 插件索引快照」共用的通道，不是任何单一功能的专属回调；
+ * 渲染层据此在后台驱动各类后置任务，绝不能因为某一条后置任务下线就删掉它。
  */
-export interface AiClassifySettings {
-  /** 总开关，默认 false */
-  enabled: boolean
-  /** 接口地址，形如 `https://api.xxx.com/v1`（末尾可带 `/chat/completions`），默认 '' */
-  baseUrl: string
-  /** API Key（Bearer），默认 ''（本地服务如 Ollama 可留空） */
-  apiKey: string
-  /** 模型名，如 `gpt-4o-mini` / `qwen2.5:7b`，默认 '' */
-  model: string
-}
-
-/** `ai:classify` 入参：一批待分类的资产名（渲染层按 20 个一批调用） */
-export interface AiClassifyPayload {
-  names: string[]
-}
-
-/** 模型给出的单条分类结论（已通过词表校验） */
-export interface AiClassifyItem {
-  name: string
-  category1: string
-  category2: string
-}
-
-/**
- * `ai:classify` 返回值。
- *
- * `items` 与入参 `names` **等长同序**（缺失 / 校验不过 / 模型输出 null → 该位为 null）。
- * `failedNames` 只装「请求整体失败」的名字（网络 / HTTP / 解析 / 超时），
- * 渲染层据此把「未识别」与「失败」分开计数（notice 文案：成功 X / 未识别 Y / 失败 Z）。
- */
-export interface AiClassifyBatchResult {
-  items: Array<AiClassifyItem | null>
-  failedNames: string[]
-  /** 最近一次失败原因（仅日志 / 测试连接展示，**不弹错误对话框**） */
-  error: string | null
-}
-
-/** `ai:test` 返回值：「测试连接」按钮的即时反馈 */
-export interface AiClassifyTestResult {
-  ok: boolean
-  message: string
-}
-
-/** 主进程 → 渲染进程：一个导入批次已结束（渲染层据此后台补分类，**不阻塞导入**） */
 export interface ImportBatchDoneEvent {
   /** 本批次成功返回的资产数 */
   count: number
@@ -772,11 +722,6 @@ export interface Settings {
    */
   verboseLogging: boolean
   /**
-   * 用户自接模型 API 辅助分类（docs/15 §7，默认关闭）。
-   * **不内置模型**：用户自己填地址/密钥/模型名，未配置时代码路径完全不发请求。
-   */
-  aiClassify: AiClassifySettings
-  /**
    * 导入后自动从知末抓模型封面（总开关，默认 true）。
    *
    * 失败**全程静默**（不弹错、不 notice、不阻塞导入）；只对 `kind === 'model'` 生效。
@@ -907,13 +852,6 @@ export const DEFAULT_SETTINGS: Settings = {
   showHomeStats: true,
   // 诊断日志：默认只记 info 及以上（debug 需用户显式开启，见设置·数据与备份）
   verboseLogging: false,
-  // AI 辅助分类默认关闭：未配置 = 零网络请求（词表命不中时保持「未分类」，与旧行为一致）
-  aiClassify: {
-    enabled: false,
-    baseUrl: '',
-    apiKey: '',
-    model: ''
-  },
   // 知末封面（docs/24）：两项默认都开 = 装上就有效果；失败静默，不影响导入
   zhimoCover: true,
   // 子开关默认开 = 用无水印小图替换包内预览图（只约束自动任务，手动永远替换）

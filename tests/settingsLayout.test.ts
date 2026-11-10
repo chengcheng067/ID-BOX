@@ -354,8 +354,8 @@ describe('逐屏要点：危险区 / 徽标 / 状态位', () => {
 
   it('「检查」并入「存量重排」卡（同一心智单元，不再单开一张卡）', () => {
     const cls = sliceBetween(code, 'const classifyTab = (', 'const libraryTab = (')
-    // 只有三张卡：导入时 / 存量重排 / AI
-    expect((cls.match(/<SettingsCard/g) ?? []).length).toBe(3)
+    // 只有两张卡：导入时 / 存量重排（第三张卡已于 2026-11-11 随下线功能移除）
+    expect((cls.match(/<SettingsCard/g) ?? []).length).toBe(2)
     expect(cls).not.toContain('title="检查"')
     const card = sliceBetween(cls, 'title="存量重排"', '<SettingsCard')
     expect(card).toContain('库一致性检查')
@@ -371,22 +371,6 @@ describe('逐屏要点：危险区 / 徽标 / 状态位', () => {
     const rows = sliceBetween(cls, 'title="重跑自动分类"', '<SettingsCard')
     expect(rows).not.toContain('可撤销备份')
     expect(rows).not.toContain('whitespace-nowrap text-[11px] text-muted')
-  })
-
-  it('AI 辅助分类默认折叠，可键盘展开，且折叠态看得出开关是开还是关', () => {
-    // 默认收起（false），展开态只影响呈现、不清空已填字段
-    expect(code).toMatch(/const \[aiOpen, setAiOpen\] = useState\(false\)/)
-    // 原生 button + aria-expanded / aria-controls：Enter / Space 可用
-    expect(code).toContain('aria-expanded={aiOpen}')
-    expect(code).toContain('aria-controls="ai-classify-fields"')
-    expect(code).toMatch(/<button[\s\S]{0,200}type="button"[\s\S]{0,200}aria-expanded=\{aiOpen\}/)
-    // 折叠时字段整块不渲染（省高度），展开才出现
-    expect(code).toContain('{aiOpen && (')
-    expect(code).toContain('id="ai-classify-fields"')
-    // 状态不藏：摘要第一句就是「已开启 · 模型 xxx」/「未开启」
-    expect(code).toContain('已开启')
-    expect(code).toContain('未开启')
-    expect(code).toMatch(/已开启\$\{aiForm\.model\.trim\(\)/)
   })
 
   it('数据与备份：撤销期与保留期都收在行右侧的分段控件里（不再竖排占三行）', () => {

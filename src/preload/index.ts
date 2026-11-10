@@ -2,10 +2,6 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { IPC } from '../shared/ipc'
 import type { ProbedImageSize } from '../shared/imageSize'
 import type {
-  AiClassifyBatchResult,
-  AiClassifyPayload,
-  AiClassifySettings,
-  AiClassifyTestResult,
   AssignCategoryPayload,
   AssignCategoryResult,
   Asset,
@@ -427,20 +423,9 @@ const api = {
   openExternal: (url: string): Promise<boolean> =>
     ipcRenderer.invoke(IPC.openExternal, url),
 
-  // ── 2026-10-19 AI 辅助分类（docs/15 §7，词表优先 + 模型兜底） ────────
   /**
-   * 请求一批资产名的分类结论（每次建议 ≤20 个名字）。
-   * **请求由主进程发出**（渲染进程受 CORS / CSP 限制）；密钥只存在主进程 settings，
-   * 这里不传、也拿不到。
-   * 返回 `items` 与 `names` 等长同序，`null` = 未识别 / 该批失败。
-   */
-  aiClassify: (payload: AiClassifyPayload): Promise<AiClassifyBatchResult> =>
-    ipcRenderer.invoke(IPC.aiClassify, payload),
-  /** 「测试连接」：发一条最小请求，回报成功 / 失败原因（允许未启用时测试） */
-  aiClassifyTest: (settings: AiClassifySettings): Promise<AiClassifyTestResult> =>
-    ipcRenderer.invoke(IPC.aiClassifyTest, settings),
-  /**
-   * 订阅「一个导入批次已结束」。渲染层据此**后台**补分类（fire-and-forget，不阻塞导入）。
+   * 订阅「一个导入批次已结束」（共享通道：知末封面流水线 / 三源交叉验证 /
+   * 插件索引快照等后置任务都挂在这里）。fire-and-forget，不阻塞导入。
    * 覆盖 UI 导入与监控目录两条入口。返回退订函数。
    */
   onImportBatchDone: (cb: (ev: ImportBatchDoneEvent) => void): (() => void) => {
