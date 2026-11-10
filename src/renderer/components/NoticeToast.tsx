@@ -1,55 +1,80 @@
 import { useEffect, useState } from 'react'
 import { useVault } from '../store'
 import { graceSecondsLeft } from '../logic/deleteFlow'
+import { resolveUndoTarget, shouldRenderBubble } from '../logic/noticeLifecycle'
+import { IconClose } from '../icons'
 
 /**
- * 底部合并 toast（UI 设计规范 v0.2 §3.5，高 44 通栏）—— **文档流里的真实布局行，不是浮层**。
+ * **屏幕居中的临时气泡**（2026-11-10 用户逐条确认的口径）。
  *
- * 2026-10 用户裁定：原来这条是 `position: fixed` 的浮层（`fixed inset-x-0 bottom-0 z-40`），
- * 会盖住它下面的任何东西 —— 左下侧栏的「设置」行、右侧详情面板的底部操作行（红色「删除」钮）
- * 都被压住/看起来被裁切。现在它是 `App` 根 flex column 的第三行：
- * `Toolbar` → 三列区 → 本行。所以它不再遮挡任何东西，代价是窗口可用高度少 44px。
- * ⚠️ 只在**有内容时**才占高度（`return null` 时这一行不存在，网格/详情面板拿回全部高度），
- * 这与浮层「显示时才出现」的语义一致，但现在是挤压布局而不是覆盖。`shrink-0` 保证三列区
- * 内容再长也不会把这条压扁（三列区是 `min-h-0 flex-1`，高度富余归它）。
+ * 用户原话：
+ * > 「排查一下底部的这一类弹窗提示，全部把它编到中间来做临时弹窗气泡。」
+ * > 「2026-11-10 晚逐条弹窗确认：**三类内容全部搬到屏幕居中气泡**（不是只搬纯文字提示）。
+ * >   底部通栏整条取消。」
  *
- * 原 `NoticeToast`（左下浮窗轻提示）与 `UndoToast`（居中撤销条）**合并为本组件**：
- * - 左：绿圆勾图标 + 结果文字（如「导入完成 3 个资产 · 已自动剔除 2 个杂质文件」）；
- * - 右：撤销条——删除（「删除「资产名」」）或拖拽归类（「已归类 N 个到「一级 / 二级」」），
- *   蓝底「撤销 Ns」倒计时按钮，归零自动收尾。**不新造 toast**：反馈 6d 明确要求
- *   「复用删除那套撤销机制」，所以归类撤销就长在同一条通栏里，只是文案与回调不同。
+ * ## 形态变化
+ * 旧实现是 `App` 根 flex column 的**第三行真实布局行**（`h-11 shrink-0 border-t bg-toast`），
+ * 有内容时吃掉 44px 窗口高度、且没有任何关闭出口。现在整条取消，三类内容
+ * （`notice` 轻提示 / `grace` 删除撤销 / `assignGrace` 归类撤销）全部装进一个
+ * `fixed` + `top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2` 的居中气泡：
+ * - 容器 `pointer-events-none`（不挡网格/详情面板的点击），气泡本体 `pointer-events-auto`；
+ * - 撤销按钮与 ✕ 都在气泡本体内，天然可点；
+ * - 全走既有 token（不自行取色）：`bg-card` / `border-panel-line` / `shadow-modal` /
+ *   `rounded-modal` / `bg-success` / `text-danger` / `bg-accent` / `bg-accent-tint`；
+ * - 宽度上限 `w-[min(420px,calc(100vw_-_48px))]`（与 `ImportQueue` 同一档，窄窗口留 24px 边距）。
  *
- * ⚠️ 删除撤销条的倒计时长度来自 `pendingDelete.graceMs`（设置·数据与备份「删除撤销期」，
- * 三档 0 / 3000 / 5000）。`graceMs === 0`（不等待）时 store 的 `confirmDelete()` **不会**
- * 进入 `grace` 阶段，因此本组件天然渲染不出撤销条 —— 这里不需要为 0 加任何特判：
- * `grace` 变量只在 `stage === 'grace'` 时非 null（见下方 `const grace = ...`）。
- * 归类撤销（`pendingAssign`）是**另一条链路**（`logic/dragAssign.ts`），固定 5 秒，不受该设置影响。
+ * `fixed` 元素不参与 flex 布局 → App 根不再有这一行，三列区自然拿回原来的 44px。
+ * 所以 `ImportQueue.tsx` 原来「44px 底栏 + 12px 间隙 = 56px」的锚点假设失效，
+ * 已同步重算为 `bottom-3`（只留 12px）。
  *
- * 选型说明：两者互斥出现频率低、且都属「底部条状反馈」，合并后视觉只有一个落点，
- * 不再互相遮挡（原左下轻提示会被居中撤销条盖住）。轻提示 4.5 秒自动消失；
- * 撤销倒计时基于 `pending.startedAt` 绝对时间计算，不怕定时器漂移。
+ * ## 层级
+ * `z-48` = `logic/zStack.ts` 的 `Z_NOTICE_BUBBLE`：**高于舞台球 45、低于最底层弹窗 50**。
+ * ⚠️ Tailwind 扫描式生成，类名必须写字面量 `z-48`（不能拼模板串），且 `48` 已同步登记进
+ * `tailwind.config.js` 的 `theme.extend.zIndex`。
+ *
+ * ## 「从底层规避提示不消失」——本组件**不再持有任何 notice 消失计时器**
+ * 旧代码 `:46-50` 在组件里起了一个 4.5 秒的 `setTimeout`，回调把 `setNotice` 置回
+ * `null`，再配一个 cleanup 里的 `clearTimeout` —— 这就是 bug 的根因：组件一旦在计时器触发前
+ * 卸载（`<React.StrictMode>` 双挂载、ErrorBoundary
+ * 「重新加载窗口」重建整棵树），计时器被清掉、再没人重新排期 → `notice` 永久残留。
+ *
+ * 现在到期清理归 **store 状态层**（`logic/noticeLifecycle.ts` 的模块作用域 `NoticeRuntime`）：
+ * 每条 notice 带绝对 `expiresAt` + 来源 `id`，超时回调按 id 校验再清；组件卸载/重挂/重载
+ * 都不影响状态层计时器。本组件退化成**纯渲染**（state → UI），只保留两个撤销倒计时
+ * （它们不是 notice 的消失计时器，语义必须保持不变）。
+ *
+ * ✕ 走新增的 `dismissNotice()` action，给用户一个手动关闭出口。
+ *
+ * ## 内容口径（与旧通栏逐字一致）
+ * - 左/上：绿圆勾 + 结果文字；
+ * - 右/下：撤销条——删除（「删除「资产名」」）或拖拽归类（「已归类 N 个到「一级 / 二级」」），
+ *   蓝底「撤销 Ns」倒计时按钮，归零自动收尾。**不新造 toast**。
+ * - 两个撤销条同时存在时**删除优先**：删除是「文件将消失」的不可逆动作，注意力先给它
+ *   （判据已抽成纯函数 `resolveUndoTarget`，可在无 jsdom 的 node 环境单测）。
+ * - `graceMs === 0`（设置里选「不等待」）时 store 直接 `commitDelete()`，永不进入
+ *   `grace` 阶段 → 天然渲染不出撤销条，这里不需要任何特判。
+ *
+ * ⚠️ ✕ **只在 `notice` 在场时**出现：删除/归类撤销条是「有倒计时终态」的状态机，点 ✕
+ * 关闭它既不能当撤销（会误保留文件）也不能当收尾（会提前删文件），语义上不成立。
+ * 这类气泡靠倒计时归零自动收尾，撤销按钮本身就是出口。
  */
 export function NoticeToast() {
   const notice = useVault((s) => s.notice)
-  const setNotice = useVault((s) => s.setNotice)
+  const dismissNotice = useVault((s) => s.dismissNotice)
   const pending = useVault((s) => s.pendingDelete)
   const undoDelete = useVault((s) => s.undoDelete)
   const commitDelete = useVault((s) => s.commitDelete)
-  // 拖拽归类撤销（反馈 6d）：与删除撤销共用同一条底部通栏、同一套倒计时/按钮样式
   const pendingAssign = useVault((s) => s.pendingAssign)
   const undoAssign = useVault((s) => s.undoAssign)
   const commitAssign = useVault((s) => s.commitAssign)
   const [secondsLeft, setSecondsLeft] = useState(0)
   const [assignSecondsLeft, setAssignSecondsLeft] = useState(0)
 
-  // 轻提示 4.5 秒自动消失；可被下一条覆盖
-  useEffect(() => {
-    if (!notice) return
-    const timer = window.setTimeout(() => setNotice(null), 4500)
-    return () => window.clearTimeout(timer)
-  }, [notice, setNotice])
+  // ⚠️ 这里**故意没有** notice 的消失计时器（旧版是组件里的 4.5 秒 `setTimeout`）。
+  // 消失计时器已整体搬到 store 状态层（见 `logic/noticeLifecycle.ts`）。组件卸载不再
+  // 影响它，从底层杜绝「提示不消失」。以下两个 effect 只是撤销条的倒计时，不是它。
 
-  // 撤销倒计时（grace 阶段）：归零自动 commitDelete
+  // 撤销倒计时（grace 阶段）：归零自动 commitDelete —— 语义与旧通栏完全相同。
   useEffect(() => {
     if (!pending || pending.stage !== 'grace') return
     const tick = () => {
@@ -62,7 +87,7 @@ export function NoticeToast() {
     return () => window.clearInterval(timer)
   }, [pending?.stage, pending?.startedAt, pending?.graceMs, commitDelete])
 
-  // 归类撤销倒计时：归零只清状态（归类已落盘，到期 = 放弃撤销），不做任何回滚
+  // 归类撤销倒计时：归零只清状态（归类已落盘，到期 = 放弃撤销），不做任何回滚。
   useEffect(() => {
     if (!pendingAssign) return
     const tick = () => {
@@ -75,10 +100,16 @@ export function NoticeToast() {
     return () => window.clearInterval(timer)
   }, [pendingAssign?.startedAt, pendingAssign?.graceMs, commitAssign])
 
-  const grace = pending && pending.stage === 'grace' ? pending : null
-  // 两个撤销条同时存在时**删除优先**：删除是「文件将消失」的不可逆动作，注意力先给它
-  const assignGrace = grace ? null : pendingAssign
-  if (!notice && !grace && !assignGrace) return null
+  const hasNotice = Boolean(notice)
+  const hasDeleteGrace = pending !== null && pending.stage === 'grace'
+  const hasAssignGrace = pendingAssign !== null
+
+  // 纯函数判据：三类内容任一在即渲染；两个撤销条同时存在时删除优先。
+  if (!shouldRenderBubble(hasNotice, hasDeleteGrace, hasAssignGrace)) return null
+  const undoTarget = resolveUndoTarget(hasDeleteGrace, hasAssignGrace)
+
+  const grace = undoTarget === 'delete' ? pending : null
+  const assignGrace = undoTarget === 'assign' ? pendingAssign : null
 
   const count = grace ? grace.ids.length : 0
   const name = grace
@@ -87,67 +118,68 @@ export function NoticeToast() {
       : `${count} 个资产`
     : ''
 
-  // B6#22（形态类按画布）：画布 `2:168` 底是 #F8FAFC（canvas 灰）不是白卡，
-  // 描边 #E8EDF2（= --border-panel）；深 `2:446` #161618 + #2A2A2D。
-  // 通栏直角条形态本就与画布一致（画布 cornerRadius 0），只补底色与描边档。
-  // B5 口径「按画布实测值」延伸到本条：pad20 / gap10（原 px-4 gap-3）。
-  //
-  // ⚠️ 2026-10 用户拍板：本条**不再是浮层**。原来是 `fixed inset-x-0 bottom-0 z-40`，
-  // 它盖在它下面的任何东西之上 —— 左栏底部的「设置」行、右栏底部操作行都被压住
-  // （用户截图里右栏最后一行残缺、红色「删」按钮被切就是这条造成的）。
-  // 现在它是 `App` 根 flex column 里的**真实布局行**：Toolbar → 三列区 → 本行。
-  // `shrink-0` 保证这一行不被三列区挤扁；组件返回 null 时不占任何高度（见上）。
-  // 视觉 token 一个不动：h-11 / border-t border-panel-line / bg-toast / px-5 / gap-2.5。
+  // 有 notice 时，下方撤销区补一条分隔线；只有撤销条时不加，避免气泡里出现孤零零的横线。
+  const rowClass = hasNotice
+    ? 'flex items-center justify-between gap-2.5 border-t border-panel-line pt-2.5'
+    : 'flex items-center justify-between gap-2.5'
+
   return (
-    <div className="flex h-11 shrink-0 items-center gap-2.5 border-t border-panel-line bg-toast px-5">
-      {/* 左：绿圆勾 + 结果文字（§3.5） */}
-      {notice && (
-        <span className="flex min-w-0 items-center gap-2 text-[12px] text-secondary">
-          <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-success text-white">
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M20 6L9 17l-5-5" />
-            </svg>
-          </span>
-          <span className="truncate" title={notice}>
-            {notice}
-          </span>
-        </span>
-      )}
+    <div className="pointer-events-none fixed left-1/2 top-1/2 z-48 -translate-x-1/2 -translate-y-1/2">
+      <div className="pointer-events-auto flex w-[min(420px,calc(100vw_-_48px))] flex-col gap-2.5 rounded-modal border border-panel-line bg-card px-4 py-3.5 shadow-modal">
+        {/* 上：绿圆勾 + 结果文字 + 手动关闭 ✕（走状态层 dismissNotice，按 id 校验） */}
+        {hasNotice && (
+          <div className="flex items-start gap-2.5">
+            <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-success text-white">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 6L9 17l-5-5" />
+              </svg>
+            </span>
+            <span className="min-w-0 flex-1 break-words text-[13px] leading-5 text-secondary">
+              {notice}
+            </span>
+            <button
+              type="button"
+              className="-mr-1 -mt-0.5 shrink-0 rounded-md p-1 text-muted transition-colors hover:bg-elevated hover:text-primary"
+              onClick={dismissNotice}
+              title="关闭提示"
+              aria-label="关闭提示"
+            >
+              <IconClose width={14} height={14} />
+            </button>
+          </div>
+        )}
 
-      <div className="flex-1" />
+        {/* 下：删除撤销条（删除优先） */}
+        {grace && (
+          <div className={rowClass}>
+            <span className="min-w-0 flex-1 truncate text-[12px] text-danger" title={`删除「${name}」`}>
+              删除「{name}」
+            </span>
+            <UndoPill
+              label={`撤销 ${secondsLeft}s`}
+              title="撤销本次删除（宽限期内文件仍在原位）"
+              onClick={undoDelete}
+            />
+          </div>
+        )}
 
-      {/* 右：撤销条（§3.5）——删除优先；删除不在场时显示归类撤销。
-          只在 `stage === 'grace'` 时渲染：设置里选「不等待」（graceMs=0）时 store
-          直接 commitDelete，永远到不了 grace → 这里不会出现倒计时条。 */}
-      {grace && (
-        <span className="flex shrink-0 items-center gap-2.5">
-          <span className="max-w-[280px] truncate text-[12px] text-danger" title={`删除「${name}」`}>
-            删除「{name}」
-          </span>
-          <UndoPill
-            label={`撤销 ${secondsLeft}s`}
-            title="撤销本次删除（宽限期内文件仍在原位）"
-            onClick={undoDelete}
-          />
-        </span>
-      )}
-
-      {/* 归类撤销（反馈 6d）：归类已落盘，点「撤销」= 按原分类把目录再搬回去 */}
-      {assignGrace && (
-        <span className="flex shrink-0 items-center gap-2.5">
-          <span
-            className="max-w-[280px] truncate text-[12px] text-secondary"
-            title={`已归类 ${assignGrace.moved} 个到「${assignGrace.label}」`}
-          >
-            已归类 {assignGrace.moved} 个到「{assignGrace.label}」
-          </span>
-          <UndoPill
-            label={`撤销 ${assignSecondsLeft}s`}
-            title="撤销本次归类（按原分类搬回去；目标重名会自动加序号）"
-            onClick={() => void undoAssign()}
-          />
-        </span>
-      )}
+        {/* 下：归类撤销条（反馈 6d）：点「撤销」= 按原分类把目录再搬回去 */}
+        {assignGrace && (
+          <div className={rowClass}>
+            <span
+              className="min-w-0 flex-1 truncate text-[12px] text-secondary"
+              title={`已归类 ${assignGrace.moved} 个到「${assignGrace.label}」`}
+            >
+              已归类 {assignGrace.moved} 个到「{assignGrace.label}」
+            </span>
+            <UndoPill
+              label={`撤销 ${assignSecondsLeft}s`}
+              title="撤销本次归类（按原分类搬回去；目标重名会自动加序号）"
+              onClick={() => void undoAssign()}
+            />
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -156,14 +188,14 @@ export function NoticeToast() {
  * 撤销按钮胶囊（删除 / 归类共用同一套画布样式）。
  *
  * B6#24（形态类按画布）：画布撤销区是「tint 胶囊包实心钮」两层——
- * 外层 `2:174` r8 pad10 h28 gap8 fill #E1EFFF（浅）/ `2:452` r7 #1E2A38（深）；
- * 内层 `2:176` r6 pad8 h20 fill #007AFF 白字 / `2:454` r5 #0A84FF。
- * 原实现是单个实心蓝胶囊（缺外层 tint），已补两层。**不新造颜色**，全部走既有 token。
+ * 外层 r8 pad10 h28 gap8 `bg-accent-tint` / 内层 r6 pad8 h20 `bg-accent` 白字。
+ * **不新造颜色**，全部走既有 token。搬到居中气泡后形态一个字未改。
  */
 function UndoPill({ label, title, onClick }: { label: string; title: string; onClick: () => void }) {
   return (
-    <span className="inline-flex h-7 items-center gap-2 rounded-toast-undo bg-accent-tint px-2.5">
+    <span className="inline-flex h-7 shrink-0 items-center gap-2 rounded-toast-undo bg-accent-tint px-2.5">
       <button
+        type="button"
         className="inline-flex h-5 items-center rounded-toast-undo-inner bg-accent px-2 text-[11px] font-semibold text-white transition"
         onClick={onClick}
         title={title}

@@ -56,6 +56,16 @@ import { toDeleteTargets, type DeleteTarget } from './logic/deleteFlow'
 // `graceMs` 已是 `pendingDelete` 的字段，所以这里只负责**取值**，纯函数的默认参数
 // （`DELETE_GRACE_MS`）保持不动，避免既有 import 炸掉。
 import { normalizeUndoGraceMs } from '../shared/undoGrace'
+// notice 生命周期（2026-11-10「从底层规避提示不消失」）：到期清理归状态层，
+// 逐字不动 ~90 处业务文案写入点，靠订阅把它们收口到同一个 runtime。
+import {
+  NOTICE_SHOW_MS,
+  createNoticeRuntime,
+  splitNotice,
+  toNoticeState,
+  type NoticeMeta,
+  type NoticeState
+} from './logic/noticeLifecycle'
 import {
   countCustomUsage,
   sanitizeCustomTerm
@@ -701,44 +711,22 @@ export function resetInboxForTests(): void {
 }
 
 /**
- * 底部 toast 的展示时长，与 `NoticeToast.tsx` 的 `setTimeout(..., 4500)` 一致。
- * 只有"需要排队"时才会用到这个值（见 `enqueueNotice`）。
- */
-const NOTICE_SHOW_MS = 4500
-
-/** 待展示的 toast 文案（顺序即发生顺序） */
-const noticeQueue: string[] = []
-let noticeTimer: ReturnType<typeof setTimeout> | null = null
-
-/**
- * 把一条 toast 排进队列并立刻尝试展示（同一批次可能同时有"跳过"和"覆盖"两条汇总）。
+ * 把一条提示排进队列并立刻尝试展示（同一批次可能同时有"跳过"和"覆盖"两条汇总）。
  *
  * 为什么要队列：`notice` 是单字段，直接连写两次 `set({ notice })` 在同一个 tick 里
  * 只有最后一条能看见 —— 两条汇总互不吞并必须靠**依次展示**（每条 4.5s）。
- * `NoticeToast` 的自动消失逻辑不受影响（它只看当前 `notice`）。
  *
- * 自愈：若排期期间「正在展示的那条」已被清空（用户关掉 / 4.5s 到 / 别处 setNotice），
- * 就立即续上下一条，不会白等 4.5 秒。
+ * 2026-11-10「从底层规避提示不消失」：队列、计时器、到期清理**全部搬到状态层**
+ * `noticeRuntime`（见本文件 `create` 之后的「notice 到期清理」段）。这里只保留一个
+ * 薄薄的入口，不再有第二套 `noticeTimer` / `drainNoticeQueue`：
+ * - 旧 `drainNoticeQueue()` 在队列空时直接 `return`，**从不清最后一条 notice**；
+ *   超时回调也只 `noticeTimer = null; drainNoticeQueue()`，与视图组件那套 timer
+ *   互不感知 —— 这正是「已移入「最近删除」不消失」的另一半根因。
+ * - 现在 `noticeRuntime.enqueue()` 用绝对到期时间 + 来源 id 统一排期，最后一条
+ *   到点同样会清空，且在组件卸载 / 重挂后依然生效。
  */
 function enqueueNotice(text: string): void {
-  noticeQueue.push(text)
-  drainNoticeQueue()
-}
-
-function drainNoticeQueue(): void {
-  if (noticeTimer !== null) {
-    // 正在展示中：等它到点（下面是续排逻辑）
-    if (useVault.getState().notice !== null) return
-    clearTimeout(noticeTimer)
-    noticeTimer = null
-  }
-  const next = noticeQueue.shift()
-  if (next === undefined) return
-  useVault.setState({ notice: next })
-  noticeTimer = setTimeout(() => {
-    noticeTimer = null
-    drainNoticeQueue()
-  }, NOTICE_SHOW_MS)
+  noticeRuntime.enqueue(text)
 }
 
 /**
@@ -1073,31 +1061,7 @@ let assetIndexById = new Map<string, Asset>()
 export const AUTO_MIGRATE_LIMIT = 50
 
 /**
- * AI 辅助分类（docs/15 §7）：每次 IPC 请求携带的名字数。
- * 与 main 侧 `AI_CLASSIFY_BATCH_SIZE` 同值——一批 = 一次 HTTP 请求，便于逐批落库。
- */
-export const AI_CLASSIFY_BATCH_SIZE = 20
-
-/** AI 补分类结果（notice 文案三个数字） */
-export interface AiClassifySummary {
-  /** 成功归类（真实移动了目录）的资产数 */
-  ok: number
-  /** 模型明确判断不了（返回 null / 校验不过）的资产数 */
-  unknown: number
-  /** 请求整体失败（网络 / HTTP / 解析 / 超时）+ 移动失败的资产数 */
-  failed: number
-}
-
-const EMPTY_AI_SUMMARY: AiClassifySummary = { ok: 0, unknown: 0, failed: 0 }
-
-/**
- * 并发保护：同一时刻只允许一个补分类流程在跑。
- * 用模块级布尔而不是 state，是为了在 `set()` 之前就能拦住重入（state 读取有微任务间隙）。
- */
-let aiClassifyRunning = false
-
-/**
- * 知末封面（docs/24 §3.6，T-04）—— 模块级状态，理由同 `aiClassifyRunning`：
+ * 知末封面（docs/24 §3.6，T-04）—— 模块级状态：
  * 必须在 `set()` 之前就能拦住重入（state 读取有微任务间隙）。
  *
  * `zhimoCoverRunning`：同一时刻只允许一个抓取流程（自动 / 手动都算）；
@@ -1314,8 +1278,8 @@ export interface RunZhimoCategoryReclassOptions {
 }
 
 /**
- * 并发保护：站方分类重排同一时刻只允许一个在跑（理由同 `aiClassifyRunning`：
- * 必须在 `set()` 之前就能拦住重入）。
+ * 并发保护：站方分类重排同一时刻只允许一个在跑
+ * （模块级布尔，必须在 `set()` 之前就能拦住重入）。
  */
 let zhimoReclassRunning = false
 
@@ -1335,7 +1299,8 @@ export interface ReclassUndoSummary {
 export const RECLASS_BACKUP_KEEP = 3
 
 /**
- * 并发保护：重跑分类 / 撤销重跑同一时刻只允许一个在跑（模块级布尔，理由同 `aiClassifyRunning`）。
+ * 并发保护：重跑分类 / 撤销重跑同一时刻只允许一个在跑
+ * （模块级布尔，必须在 `set()` 之前就能拦住重入）。
  */
 let reclassifyRunning = false
 
@@ -1577,6 +1542,14 @@ interface VaultState {
   pendingAssign: PendingAssign | null
   /** 全局轻提示（assignCategory 的 renamed/failed 反馈、迁移结果等）；null = 无 */
   notice: string | null
+  /**
+   * notice 的**到期元数据**（来源 id + 绝对到期时间），由状态层计时器统一维护。
+   *
+   * 2026-11-10：把「到期清理」责任从 `NoticeToast` 的 `useEffect` 搬到 store 状态层，
+   * 组件退化为纯渲染。视图**不读**这个字段 —— 它只是让状态层能按 id 校验旧 timer、
+   * 并在组件卸载 / StrictMode 重挂 / ErrorBoundary 重载后仍然把 notice 清掉。
+   */
+  noticeMeta: NoticeMeta | null
   /** 遗留布局（relFolder 段数 ≠ 4）资产数；> AUTO_MIGRATE_LIMIT 时只在设置页手动迁移 */
   legacyLayoutCount: number
   /** 可用的「重扫前索引备份」条数（>0 时设置页「恢复上次重扫前索引」按钮可用） */
@@ -1587,8 +1560,6 @@ interface VaultState {
   materialMergeSources: MergeMaterialSource[]
   /** 合并进行中：迁移期间禁用「重新扫描」与重复点击 */
   materialMergeBusy: boolean
-  /** AI 补分类进行中（后台任务，仅用于防重入 / 将来 UI 显示进度） */
-  aiClassifyBusy: boolean
   /**
    * 手动抓取中的**资产 id**（null = 没有手动任务在跑）。
    *
@@ -1957,7 +1928,18 @@ interface VaultState {
    * 失败条目**保持原记录**（磁盘没动，索引也不能动）。
    */
   applyRenames: (rows: RenameRequestRow[]) => Promise<RenameSummary>
+  /**
+   * 存量提示入口（组件里 ~30 处调用）。2026-11-10 起统一汇入状态层 `noticeRuntime`：
+   * `null` = 关闭当前提示，非 null = 显示一条（换新 id + 新 4.5s 到期时间）。
+   */
   setNotice: (n: string | null) => void
+  /**
+   * 统一提示入口（新代码推荐）。与 `setNotice` / `enqueueNotice` / 约 90 处裸
+   * `set({ notice })` 一起收敛到**同一个**状态层运行时，见 `logic/noticeLifecycle.ts`。
+   */
+  showNotice: (text: string) => void
+  /** 手动关闭当前提示（居中气泡的 ✕）；按 id 校验，绝不误清后来的新提示。 */
+  dismissNotice: () => void
   // ── 资产操作 ────────────────────────────────────────────────
   renameAsset: (id: string, newName: string) => Promise<void>
   /**
@@ -2090,17 +2072,6 @@ interface VaultState {
     parent: string | null,
     name: string
   ) => Promise<{ ok: boolean; used: number }>
-  /**
-   * AI 辅助分类（docs/15 §7，可选功能，默认关闭）。
-   *
-   * 只处理 `未分类/未分类` 的资产：按名字分批（20 个/批）→ 主进程发请求 →
-   * **校验通过的结论**逐组调用既有 `assignCategory`（真实移动目录 + 更新 DB，
-   * 不复制移动逻辑）→ 完成后汇总一条 notice。
-   *
-   * 四条纪律：① 绝不覆盖已有分类；② 任何失败静默降级（不弹错误框）；
-   * ③ 正在跑时不重复启动；④ 未启用 / 未配置 → 立即返回，**零网络请求**。
-   */
-  runAiClassify: () => Promise<AiClassifySummary>
   /**
    * 「重跑自动分类」（v1.0.13）——把历史遗留的 `未分类/未分类` 资产按**当前**词表重判一次。
    *
@@ -3221,12 +3192,12 @@ export const useVault = create<VaultState>((set, get) => ({
   pendingDelete: null,
   pendingAssign: null,
   notice: null,
+  noticeMeta: null,
   legacyLayoutCount: 0,
   rescanBackupCount: 0,
   materialMergeCount: 0,
   materialMergeSources: [],
   materialMergeBusy: false,
-  aiClassifyBusy: false,
   zhimoCoverBusyId: null,
   reclassifyBusy: false,
   reclassifyBackupCount: 0,
@@ -3314,12 +3285,11 @@ export const useVault = create<VaultState>((set, get) => ({
       void handleMergeProbe(info)
     })
 
-    // AI 辅助分类（docs/15 §7）：导入批次结束后**后台**补分类。
-    // 事件由 main 在 `importPaths` 返回后 fire-and-forget 发出（UI 导入与监控目录导入都覆盖）。
+    // 导入批次结束（`import:batchDone` 共享通道）：事件由 main 在 `importPaths` 返回后
+    // fire-and-forget 发出（UI 导入与监控目录导入都覆盖），渲染层据此驱动各类后台后置任务。
     window.modvault.onImportBatchDone(() => {
-      scheduleAiClassify()
       // 知末后置流水线：**先按站方分类重排、跑完再抓封面**（串行，不并行打同一个站）。
-      // 同 `scheduleAiClassify`：`setTimeout(0)`，绝不 await 网络请求。
+      // 后置任务走 `setTimeout(0)`，绝不 await 网络请求。
       scheduleZhimoPipeline()
       // docs/27 §3.1：批次结束后把「已跳过 N 个」/「已覆盖 N 个」各汇总成一条 toast。
       // 两条**互不吞并**（用 `enqueueNotice` 依次展示）：先跳过、后覆盖，顺序即发生顺序。
@@ -3651,11 +3621,8 @@ export const useVault = create<VaultState>((set, get) => ({
     // 快照排除软删资产（D17）；`index` 为空数组 = 不判重 = 0.6.9 的旧行为。
     const ctx = { index: buildDedupeSnapshot(get().assets) }
     await window.modvault.importPaths(paths, ctx)
-    // 导入批次结束 → 后台补分类（docs/15 §7）。
-    // ⚠️ `scheduleAiClassify` 只是 `setTimeout(..., 0)`，**没有 await 任何网络请求**：
-    // 导入动作的耗时不因配置了 AI 而增加一个毫秒（main 侧也会推 import:batchDone，双保险）。
-    scheduleAiClassify()
-    // 同上：知末这边是**一条链**（先站方分类重排 → 再抓封面），不是两个并行任务。
+    // 知末这边是**一条链**（先站方分类重排 → 再抓封面），不是两个并行任务；
+    // 用 `setTimeout(0)` 把后置任务推出导入调用栈，绝不 await 网络请求。
     // 链式的原因：两者打同一个站；重排只取详情页（便宜）且必须先跑完，封面才开工。
     scheduleZhimoPipeline()
   },
@@ -4977,7 +4944,19 @@ export const useVault = create<VaultState>((set, get) => ({
     return { renamed: updated.length, failed, skipped, rolledBack: res.rolledBack, reason: firstReason }
   },
 
-  setNotice: (n) => set({ notice: n }),
+  setNotice: (n) => {
+    // 不再把消失计时器留给视图：直接交给状态层运行时（换新 id + 绝对到期时间）。
+    if (n === null) noticeRuntime.dismiss()
+    else noticeRuntime.show(n)
+  },
+  showNotice: (text) => noticeRuntime.show(text),
+  dismissNotice: () => {
+    // 先用纯函数把 store 的「文案 + 元数据」还原成结构化 state 做一道空值守卫；
+    // 真正的 id 校验 / 计时器清理 / 队列续排全在 runtime 里（组件不持有任何计时器）。
+    const snap = toNoticeState(get().notice, get().noticeMeta)
+    if (snap === null) return
+    noticeRuntime.dismiss()
+  },
 
   async renameAsset(id, newName) {
     const asset = get().assets.find((a) => a.id === id)
@@ -5712,108 +5691,6 @@ export const useVault = create<VaultState>((set, get) => ({
   },
 
   /**
-   * AI 辅助分类（docs/15 §7）——**词表优先、模型兜底**。
-   *
-   * 执行顺序（不可调换）：
-   * ① 只取 `未分类/未分类` 的资产（**绝不覆盖已有分类**，这也是唯一合法输入域）；
-   * ② 每次最多 20 个名字调 `ai:classify`（main 侧发 HTTP；串行，不并发打用户的服务）；
-   * ③ 按结论的「一级/二级」**分组**，每组调一次既有 `assignCategory`
-   *    （真实移动目录 + 缩略图重生 + 写 Dexie —— 不复制任何移动逻辑）；
-   * ④ 完成后只发**一条** notice：`成功 X / 未识别 Y / 失败 Z`。
-   *
-   * 失败语义：网络 / 解析 / 超时失败的名字计入「失败」，模型明确不判的计入「未识别」，
-   * 两者都保持未分类 —— **不弹错误对话框**（后台任务，打扰用户没有收益）。
-   */
-  async runAiClassify() {
-    if (aiClassifyRunning) return EMPTY_AI_SUMMARY
-    const cfg = get().settings?.aiClassify
-    // 未启用 / 未配置 → 零网络请求（与「默认关闭」拍板一致）
-    if (!cfg || !cfg.enabled || !cfg.baseUrl.trim() || !cfg.model.trim()) {
-      return EMPTY_AI_SUMMARY
-    }
-
-    const pending = get().assets.filter((a) => {
-      const cur = categoriesOf(a)
-      return cur.category1 === UNCLASSIFIED && cur.category2 === UNCLASSIFIED
-    })
-    if (pending.length === 0) return EMPTY_AI_SUMMARY
-
-    aiClassifyRunning = true
-    set({ aiClassifyBusy: true })
-    let ok = 0
-    let unknown = 0
-    let failed = 0
-    try {
-      for (let offset = 0; offset < pending.length; offset += AI_CLASSIFY_BATCH_SIZE) {
-        const batch = pending.slice(offset, offset + AI_CLASSIFY_BATCH_SIZE)
-        // 空名字不发请求（也不占对齐位），直接计入「未识别」
-        const sendable: Asset[] = []
-        const names: string[] = []
-        for (const asset of batch) {
-          if (typeof asset.name === 'string' && asset.name.trim()) {
-            sendable.push(asset)
-            names.push(asset.name)
-          } else {
-            unknown += 1
-          }
-        }
-        if (names.length === 0) continue
-
-        // 这一批请求失败（网络/超时/IPC 异常）→ 全部计入「失败」，继续下一批
-        const res = await window.modvault.aiClassify({ names }).catch(() => null)
-        if (!res) {
-          failed += names.length
-          continue
-        }
-        const failedSet = new Set(res.failedNames)
-
-        // 同批内按分类对分组：一次 assignCategory 只接受一个分类对，分组能少发大量 IPC
-        const groups = new Map<
-          string,
-          { category1: string; category2: string; ids: string[] }
-        >()
-        res.items.forEach((item, i) => {
-          const asset = sendable[i]
-          if (!asset) return
-          if (!item) {
-            const name = names[i] ?? ''
-            if (failedSet.has(name)) failed += 1
-            else unknown += 1
-            return
-          }
-          const key = `${item.category1}\u0000${item.category2}`
-          const group = groups.get(key) ?? {
-            category1: item.category1,
-            category2: item.category2,
-            ids: []
-          }
-          group.ids.push(asset.id)
-          groups.set(key, group)
-        })
-
-        for (const group of groups.values()) {
-          // 复用既有指派链路：真实移动 + 缩略图重生 + DB 更新（含 notice）
-          const summary = await get().assignCategory(group.ids, group.category1, group.category2)
-          ok += summary.moved
-          failed += summary.failed
-        }
-      }
-    } catch {
-      // 后台任务兜底：任何未预期异常都静默降级，不冒泡到 UI
-      failed += 1
-    } finally {
-      aiClassifyRunning = false
-      set({ aiClassifyBusy: false })
-    }
-
-    const summary: AiClassifySummary = { ok, unknown, failed }
-    if (ok + unknown + failed > 0) {
-      set({ notice: `AI 归类完成：成功 ${ok} / 未识别 ${unknown} / 失败 ${failed}` })
-    }
-    return summary
-  },
-
-  /**
    * 重跑自动分类（v1.0.13）——把历史 `未分类/未分类` 资产按**当前**词表重判一次。
    *
    * 为什么要这个入口：分类只在导入那一刻跑。v1.0.11（`ID_<数字>` 尾巴剥离）与
@@ -5878,7 +5755,7 @@ export const useVault = create<VaultState>((set, get) => ({
           })
         )
 
-        // ③ 按分类对分组：一次 assignCategory 只接受一个分类对（同 AI 补分类的口径）
+        // ③ 按分类对分组：一次 assignCategory 只接受一个分类对
         const groups = new Map<
           string,
           { category1: string; category2: string; ids: string[] }
@@ -6529,6 +6406,66 @@ export const useVault = create<VaultState>((set, get) => ({
   }
 }))
 
+// ─────────────────────────────────────────────────────────────────────────────
+// notice 到期清理（2026-11-10 用户：「从底层规避这个 bug」）────────────────────
+//
+// 结构性缺陷 recap：全应用对 `notice` 只有 1 个订阅者（旧 NoticeToast）、只有 1 个
+// 清理动作（组件里那个 4.5 秒 `setTimeout`，回调把 `setNotice` 置回 `null`）。组件一旦在 timer 触发
+// 前卸载（StrictMode 双挂载 / ErrorBoundary 重载重建整棵树），cleanup 把 timer 清掉、
+// 再没人重新排期 → `notice` 永久残留，而通栏没有关闭按钮。
+//
+// 修法（**不是补一个 timer，而是换责任层**）：
+// ① 到期清理搬到这里的**模块作用域单例** `noticeRuntime`。它不属于任何 React 组件，
+//    组件卸载 / 重挂 / 重载都不会调用它的 cleanup，计时器必定触发。
+// ② 每条 notice 带绝对 `expiresAt` + 单调 `id`；timer 回调按 id 校验再清，
+//    旧 timer 不会误清后来写入的新提示。
+// ③ 所有写入收敛：`setNotice` / `showNotice` / `dismissNotice` / `enqueueNotice`
+//    直接调 runtime；约 90 处裸 `set({ notice })` / `useVault.setState({ notice })`
+//    由下面的**订阅**调 `absorb()` 汇到同一个 runtime（业务文案一处都不用改）。
+// ④ 队列最后一条到点也会清空；`dismissNotice()` 给气泡一个手动关闭出口。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 状态层 → store 的唯一出口：结构化 notice 拆回「文案 + 元数据」两个字段。 */
+function emitNoticeState(next: NoticeState): void {
+  const { text, meta } = splitNotice(next)
+  useVault.setState({ notice: text, noticeMeta: meta })
+}
+
+/**
+ * 唯一的 notice 生命周期运行时（模块作用域单例）。
+ *
+ * 时钟 / 计时器用全局 `Date.now` / `setTimeout` / `clearTimeout`（不写 `window.*`，
+ * 因为 store 会被 `environment:'node'` 的 vitest 直接 import）。句柄用 `unknown`
+ * 由 `createNoticeRuntime` 透传，避开浏览器 number 与 Node Timeout 的类型分歧。
+ */
+const noticeRuntime = createNoticeRuntime({
+  now: () => Date.now(),
+  schedule: (cb, ms) => setTimeout(cb, ms),
+  cancel: (handle) => clearTimeout(handle as number),
+  emit: emitNoticeState,
+  durationMs: NOTICE_SHOW_MS
+})
+
+/**
+ * 订阅收口：捕获所有**没走 action 的裸写**（`set({ notice })` /
+ * `useVault.setState({ notice })` / `set((s) => ({ ..., notice }))` / 条件 spread
+ * `...(p.notice ? { notice } : {})` —— 全仓约 90 处，含用户报的那条
+ * `commitDelete()` 软删成功分支 `store.ts` 里的 `notice: '已移入「最近删除」…'`）。
+ *
+ * 防回环：`emitNoticeState()` 也会触发本订阅，但那时 `notice` 文案没变（内部 emit
+ * 只更新 `noticeMeta`），守卫直接 return；`absorb()` 里还有第二道「文案与当前一致
+ * 就跳过」的保险。所以一次写入最多产生一次 `showInternal`，不会递归。
+ */
+useVault.subscribe((state, prev) => {
+  if (state.notice === prev.notice) return
+  noticeRuntime.absorb(state.notice)
+})
+
+/** 仅供单测：复位运行时 + 计时器 + 队列（运行时**不允许**调用）。 */
+export function resetNoticeForTests(): void {
+  noticeRuntime.reset()
+}
+
 /**
  * 整理浮层的待办集（派生数据，**不是 store 状态**）。两个 hook 共用这一份。
  *
@@ -6681,27 +6618,10 @@ export function countLegacyLayout(assets: Asset[]): number {
 }
 
 /**
- * 把 AI 补分类**推到当前调用栈之外**执行（docs/15 §7「不阻塞导入」）。
- *
- * 为什么必须是 `setTimeout(0)` 而不是直接 `void runAiClassify()`：
- * 直接调用会同步执行到第一个 `await` 之前的全部代码（筛选资产 + 组装批次），
- * 虽然只有毫秒级，但它坐在**导入的 Promise 链**里；`setTimeout` 让它彻底离开
- * 导入调用栈——导入流程的耗时应与「是否配置 AI」严格无关（可被单测/走查验证）。
- *
- * 双触发（store.importPaths 收尾 + main 的 import:batchDone）都走这里，
- * 由 `aiClassifyRunning` 与「无未分类资产」早退保证不会重复劳动。
- */
-function scheduleAiClassify(): void {
-  setTimeout(() => {
-    void useVault.getState().runAiClassify()
-  }, 0)
-}
-
-/**
  * 把知末封面抓取**推到当前调用栈之外**执行（docs/24 §3.6）。
  *
- * 与 `scheduleAiClassify` 同一理由与同一写法：抓取是**后置任务**，
- * 不能坐在导入的 Promise 链里（导入耗时必须与"是否开封面抓取"严格无关）。
+ * 抓取是**后置任务**，不能坐在导入的 Promise 链里（导入耗时必须与
+ * "是否开封面抓取"严格无关），所以用 `setTimeout(0)` 把它推出导入调用栈。
  *
  * ⚠️ 导入结束的两个触发点（`store.importPaths` 收尾 + main 的 `import:batchDone`）
  * **不再**直接调本函数 —— 它们走 `scheduleZhimoPipeline()`（先站方分类重排、再抓封面，

@@ -2266,7 +2266,11 @@ export default function App() {
           <TriageOverlayLazy />
         </Suspense>
       )}
-      {/* 规范 §3.5：底部合并 toast（左=轻提示 / 右=删除撤销条），替代原 NoticeToast+UndoToast 两个浮窗 */}
+      {/* 2026-11-10：底部 44px 通栏**整条取消**。三类内容（notice / 删除撤销 / 归类撤销）
+          全部搬进屏幕居中的临时气泡（NoticeToast 内部已是 `fixed` + 居中 + z-48）。
+          它现在是 out-of-flow 的浮层，**不再是根 flex column 的第三行布局行** ——
+          三列区自然拿回原来被通栏吃掉的 44px；`ImportQueue` 的 bottom 假设已同步重算。
+          notice 的消失计时器也已从组件搬到 store 状态层（见 logic/noticeLifecycle.ts）。 */}
       <NoticeToast />
 
       {/* 首页 → 分类库的过场遮罩（最后渲染 = 文档最末 = 叠在所有兄弟之上，z-index 70）。

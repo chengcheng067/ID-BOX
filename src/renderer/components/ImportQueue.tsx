@@ -15,9 +15,12 @@ import { IconAlert, IconCheck, IconClose, IconDownload } from '../icons'
  * 位置/朝向的三条硬约束（改之前先读）：
  * - 水平：`left-1/2 -translate-x-1/2`。宽度不能用 `w-72`（288px）——居中后既窄又悬空，
  *   改 `w-[min(420px,calc(100vw_-_48px))]`（窄窗口时留 24px 边距，不会贴到窗口边上）。
- * - 垂直：保持 `bottom-14`（= 44px 底栏 NoticeToast + 12px 间隙）。**刻意不做动态 bottom**：
- *   底栏出现/消失时若跟着改 bottom，整个队列会上下抖一下；多出的 12px 空隙无害。
- * - 堆叠：`flex-col-reverse`。容器底边锚定在 `bottom-14`，反向列让**第 0 条钉在底部**，
+ * - 垂直：`bottom-3`（12px 距窗口底边）。2026-11-10 前的旧锚点是 56px =
+ *   44px 底部通栏 NoticeToast + 12px 间隙 —— 现在底部通栏**整条取消**，三类提示全部
+ *   搬进屏幕居中气泡（`NoticeToast` 已是 `fixed` 居中浮层），那 44px 的假设不再存在。
+ *   按「底栏已不存在」重算：56 − 44 = 12px → `bottom-3`。**刻意不做动态 bottom**：
+ *   底栏时代若跟着显隐改 bottom，整个队列会上下抖一下；现在锚点彻底固定，更没有理由动态改。
+ * - 堆叠：`flex-col-reverse`。容器底边锚定在 `bottom-3`，反向列让**第 0 条钉在底部**，
  *   新条目从下往上长 → 已在场的卡片 y 坐标不变；正序列则每次增删都整摞上跳一个卡高。
  *   ⚠️ 真正的卡片栈在**内层** wrapper 上，内外两层都要 `flex-col-reverse`，只改外层不会有效果
  *   （外层只有一个子节点）。
@@ -109,11 +112,11 @@ export function ImportQueue() {
   }
 
   return (
-    <div className="pointer-events-none fixed bottom-14 left-1/2 z-30 flex w-[min(420px,calc(100vw_-_48px))] -translate-x-1/2 flex-col-reverse gap-2">
+    <div className="pointer-events-none fixed bottom-3 left-1/2 z-30 flex w-[min(420px,calc(100vw_-_48px))] -translate-x-1/2 flex-col-reverse gap-2">
       {/* 悬停判定放在**内层**（有指针事件的容器）上：
           外层是 pointer-events-none（不挡网格点击），内层只在有卡片时才存在；
           鼠标在卡片之间移动不会触发 enter/leave，倒计时不会来回重置。
-          卡片栈方向在这里定义（`flex-col-reverse`）：底边锚定 → 第 0 条固定在底部，
+          卡片栈方向在这里定义（`flex-col-reverse`）：底边锚定 `bottom-3` → 第 0 条固定在底部，
           新条目向上长，已在场的卡片不会跟着跳。 */}
       <div
         className="pointer-events-auto flex flex-col-reverse gap-2"
@@ -125,7 +128,7 @@ export function ImportQueue() {
          * 1) `slice(-6)` 取**最新** 6 条。旧写法 `slice(0, 6)` 取的是最老的 6 条 ——
          *    一次拖 10 个包时最后 4 个的进度根本看不见（可见性 bug）。
          * 2) `.reverse()` 让 DOM[0] = 最新一条。内层是 `flex-col-reverse`，DOM[0] 落在**底部**
-         *    （最靠近 `bottom-14` 锚点）→「最新在底部，旧的往上顶」，与改动前右下角那版
+         *    （最靠近 `bottom-3` 锚点）→「最新在底部，旧的往上顶」，与改动前右下角那版
          *    的观感一致，只是锚点从右边搬到了中间。**两个都要有**：只 `slice(-6)` 不
          *    `reverse` 就变成"最新在顶部"，方向反了。
          * 3) 契约：`store` 里的 `imports` 顺序 = 首次出现顺序（稳定，不随状态变化重排）；
@@ -189,7 +192,7 @@ export function ImportQueue() {
         {/*
          * 「全部取消」条（2026-10 导入取消）—— 必须是内层 flex-col-reverse 容器的
          * **最后一个** child：`column-reverse` 下 DOM[0] 贴底，放最前面会渲染到卡片栈
-         * **下方**（贴着 `bottom-14` 锚点），看起来像"最新一条"。放最后 = 视觉顶部。
+         * **下方**（贴着 `bottom-3` 锚点），看起来像"最新一条"。放最后 = 视觉顶部。
          *
          * 不加二次确认：取消是无损操作（不回滚、不删文件，只停未开始的条目），
          * 弹窗只会让用户多点一次。也不弹 notice：队列本身就是反馈，再叠一条 toast 是噪音。
