@@ -1922,16 +1922,27 @@ export default function App() {
                               ⚠️ 本组件**不硬编码档位** —— 2026-11-09 用户要求「D5A 属于模型格式，
                               格式里要能选到」，只在 `MODEL_FORMAT_OPTIONS` 加一项即可，
                               弹层/摘要/空态文字全部自动跟随。 */}
+                          {/* 模型格式：与分辨率面板同构（单选、点完即收起、active 高亮同色）。
+                              选项表在 `shared/modelFormat`（全部 / SU / 3DMAX / **D5A**），
+                              与卡片徽标文案同源。
+                              ⚠️ 本组件**不硬编码档位** —— 2026-11-09 用户要求「D5A 属于模型格式，
+                              格式里要能选到」，只在 `MODEL_FORMAT_OPTIONS` 加一项即可，
+                              弹层/摘要/空态文字全部自动跟随。
+                              2026-11-13 用户拍板「d5a 字体要是紫色」⇒ 只有 **D5A 这一行**走紫，
+                              其余行照旧。走 `text-d5a`（小字档 token 类名），不写死 hex；
+                              active 行的底仍是 accent-tint（紫 on accent-tint 实测 4.92:1，达标）。
+                              ⛔ 禁止 `dark:` 变体（主题走 data-theme，见 styles.css 文件头回签段）。 */}
                           {extraPanel === 'format' &&
                             MODEL_FORMAT_OPTIONS.map((opt) => {
                               const active = filters.modelFormat === opt.value
+                              const purpleText = opt.value === 'd5a'
                               return (
                                 <button
                                   key={opt.label}
                                   className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
                                     active
-                                      ? 'bg-accent-tint font-medium text-accent-text'
-                                      : 'text-secondary hover:bg-elevated/60'
+                                      ? `bg-accent-tint font-medium ${purpleText ? 'text-d5a' : 'text-accent-text'}`
+                                      : `${purpleText ? 'text-d5a' : 'text-secondary'} hover:bg-elevated/60`
                                   }`}
                                   aria-pressed={active}
                                   onClick={() => {
@@ -2267,9 +2278,9 @@ export default function App() {
         </Suspense>
       )}
       {/* 2026-11-10：底部 44px 通栏**整条取消**。三类内容（notice / 删除撤销 / 归类撤销）
-          全部搬进屏幕居中的临时气泡（NoticeToast 内部已是 `fixed` + 居中 + z-48）。
+          全部搬进底部居中的临时气泡（NoticeToast 内部已是 `fixed bottom-4 left-1/2` + z-48）。
           它现在是 out-of-flow 的浮层，**不再是根 flex column 的第三行布局行** ——
-          三列区自然拿回原来被通栏吃掉的 44px；`ImportQueue` 的 bottom 假设已同步重算。
+          三列区自然拿回原来被通栏吃掉的 44px；`ImportQueue` 的 bottom 已同步让位上移（`bottom-16`，最下一条留给气泡）。
           notice 的消失计时器也已从组件搬到 store 状态层（见 logic/noticeLifecycle.ts）。 */}
       <NoticeToast />
 

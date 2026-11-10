@@ -150,15 +150,74 @@ describe('格式徽标 · 文案表与源码守卫', () => {
     // 占位图标（无封面兜底要能区分 3DMAX）
     expect(grid).toContain('function Icon3dsMax')
     expect(grid).toContain('is3dsMaxAsset')
-    // 卡片格式徽标：kind=model 时按格式出 badge-su / badge-max
+    // 卡片格式徽标：模型域按格式出 badge-su / badge-max / badge-d5a
     expect(grid).toContain('badge-su')
     expect(grid).toContain('badge-max')
+    expect(grid).toContain('badge-d5a')
     expect(grid).toContain('MODEL_FORMAT_BADGE_LABEL')
     // 文件视图 .max 强化封面（与 .skp 的大 SU 同族）
     expect(grid).toContain("row.ext.toLowerCase() === 'max'")
     // 占位图标用 3ds Max 青蓝的深一档 #2A7A99（色值写死在图标里，与 IconSketchUp 同做法）
     expect(grid).toContain('#2A7A99')
   })
+
+  /**
+   * 2026-11-13 用户拍板（三条本体口径之一）：「D5a 这个只是一个格式，它和 Su 3DS 是同级的，
+   * 前面没有模型的角标做丢了要补，d5a 字体要是紫色」。
+   *
+   * 卡片左上角是两个角标：**kind 角标 + 格式角标**。之前格式角标的条件是裸
+   * `a.kind === 'model'`，把 `d5a` 挡在外面 ⇒ D5A 卡只有一个 kind 角标（显示「D5A」），
+   * 读起来像"大类叫 D5A"而不是"模型的一种格式"。现在两处都按**模型域**走：
+   *   kind 角标 = `KIND_LABEL.model`（「模型」）；格式角标 = `D5A`（走 `.badge-d5a`）。
+   * ⚠️ 同一文件里其它 `kind === 'model'`（`:420`/`:439`/`:860`/`:915`）判的是**真实文件**
+   *    （封面/文件视图分支），语义不同，不该被改成 `isModelKind` —— 这条守卫同时钉住这一点。
+   */
+  it('卡片角标：模型域走 isModelKind ⇒ D5A 卡同时有「模型」kind 角标和 D5A 格式角标', () => {
+    const raw = read('src/renderer/components/AssetGrid.tsx')
+    const grid = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+      .replace(/\{\/\*[\s\S]*?\*\/\}/g, '')
+    // 角标区必须走模型域判定（不是裸 kind）
+    expect(grid).toContain('isModelKind(a.kind)')
+    // kind 角标文案按模型域显示「模型」，不能显示 D5A
+    expect(grid).toContain('isModelKind(a.kind) ? KIND_LABEL.model : KIND_LABEL[a.kind]')
+    // 格式角标三分支（skp→badge-su / max→badge-max / d5a→badge-d5a）
+    expect(grid).toContain("fmt === 'skp' ? 'badge-su' : fmt === 'max' ? 'badge-max' : 'badge-d5a'")
+    // D5A 的 title 不能写成"3ds Max 模型"
+    expect(grid).toContain("'D5 Render 资产包'")
+    // import 必须真的带上 isModelKind（否则 typecheck 红）
+    expect(raw).toContain(
+      "import { getModelFormat, isModelKind, MODEL_FORMAT_BADGE_LABEL } from '../../shared/modelFormat'"
+    )
+    // 封面/文件视图那几处判的是真实文件扩展名，仍按裸 kind（本次不许被改）
+    expect(grid.match(/row\.kind === 'model'/g)?.length).toBe(2)
+    expect(grid).toContain("asset.kind === 'model' && isSketchUpAsset(asset)")
+    expect(grid).toContain("asset.kind === 'model' && !isSketchUpAsset(asset) && is3dsMaxAsset(asset)")
+  })
+
+  it('格式面板：只有 D5A 那一行的文字走紫（小字档 token 类名，不写死 hex）', () => {
+    const app = read('src/renderer/App.tsx')
+    const panel = app.slice(app.indexOf("extraPanel === 'format' &&"), app.indexOf("extraPanel === 'resolution' &&"))
+    expect(panel).toContain("opt.value === 'd5a'")
+    expect(panel).toContain('text-d5a')
+    expect(panel).toContain('text-accent-text')
+    // ⛔ 主题走 data-theme，禁止 dark: 变体（会跟操作系统串色）
+    expect(panel).not.toMatch(/dark:/)
+    // ⛔ 不得写死紫色 hex（口径见 tests/d5a.test.ts 的 token 计数与红线原文）
+    expect(panel).not.toMatch(/#[0-9a-fA-F]{3,8}/)
+    const css = read('src/renderer/styles.css')
+    // 小字档 token 双主题成对（与 --brand-su-* / --brand-max-* 同一族）
+    expect(css.match(/--brand-d5a-bg:/g)?.length).toBe(2)
+    expect(css.match(/--brand-d5a-text:/g)?.length).toBe(2)
+    expect(css).toContain('.badge-d5a')
+    const tailwind = read('tailwind.config.js')
+    expect(tailwind).toContain("--brand-d5a-bg")
+    expect(tailwind).toContain("--brand-d5a-text")
+    expect(tailwind).toContain("'d5a-tint'")
+    expect(tailwind).toContain('d5a: token')
+  })
+
 
   it('2026-10-29 改口守卫：源码里不再出现旧的三字母缩写，也不会残留红棕色值', () => {
     const grid = read('src/renderer/components/AssetGrid.tsx')

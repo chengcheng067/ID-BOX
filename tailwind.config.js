@@ -76,6 +76,15 @@ export default {
         'cad-tint': token('--brand-cad-bg'),
         cad: token('--brand-cad-text'),
         /**
+         * D5A 小字档（2026-11-13 用户拍板后新增）：卡片格式角标 `.badge-d5a` 与中栏「模型格式」
+         * 面板的 D5A 行文字。与 `su` / `max` / `cad` 同族（tint 作底 + 品牌色作字），
+         * 但**刻意不复用 `d5` / `d5-tint`** —— 那一套是「D5A 卡片封面占位」的大字档
+         * （浅紫在 11–12px 小字上只有 3.04–3.30:1，达不到 AA 正文）。
+         * 口径与实测对比度见 styles.css 文件头的回签段（2026-11-13）。
+         */
+        'd5a-tint': token('--brand-d5a-bg'),
+        d5a: token('--brand-d5a-text'),
+        /**
          * D5 Render 资产包占位色（V1.0，docs/48 §1 / docs/46 §1.5.2 M07）：
          * - `d5`：「D5a」大字 / 文字色（浅 #9977F9 / 深 #B9A6FF）；
          * - `d5-tint`：卡片封面占位底板（浅 #F7F4FF / 深 #2A2340）。

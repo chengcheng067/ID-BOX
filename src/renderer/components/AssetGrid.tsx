@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useVault, useVisibleAssets, noteVisibleAssets } from '../store'
 import { KIND_LABEL } from '../../shared/classify'
-import { getModelFormat, MODEL_FORMAT_BADGE_LABEL } from '../../shared/modelFormat'
+import { getModelFormat, isModelKind, MODEL_FORMAT_BADGE_LABEL } from '../../shared/modelFormat'
 import { formatBytes, formatDate, thumbVaultUrl, vaultUrl } from '../../shared/format'
 import {
   EMPTY_ALIASES,
@@ -2900,28 +2900,40 @@ export function AssetGrid({
           {/* §3.3 类型徽标：贴图/材质预设 = accent-tint 底蓝字，模型等 = 中性灰 tint（.badge 默认）
               2026-10-21 走查：单图「数据通道图」（法线 / AO / 粗糙度 / 位移）的封面**本来就该是原图**
               ——它没有 albedo 可上球。为了让这类卡片读起来是「这是一张法线图」而不是「球没渲出来」，
-              在类型徽标旁再挂一个通道徽标（中性灰，不抢强调色）。 */}
+              在类型徽标旁再挂一个通道徽标（中性灰，不抢强调色）。
+              2026-11-13 用户拍板（D5A 只是**一种格式**，与 SU / max 同级）：kind 角标按**模型域**
+              显示「模型」，`D5A` 归到右边的格式角标。所以这里用 `isModelKind` 而不是裸 kind。 */}
           <div className="absolute left-2 top-2 flex items-center gap-1">
             <span
               className={`badge ${
                 a.kind === 'texture' || a.kind === 'material' ? 'badge-accent' : ''
               }`}
             >
-              {KIND_LABEL[a.kind]}
+              {isModelKind(a.kind) ? KIND_LABEL.model : KIND_LABEL[a.kind]}
             </span>
-            {/* 模型格式徽标（2026-10「3DMAX 支持」，文案 `skp→SU` / `max→max`）：
-                kind=model 且能从文件列表判出格式时显示 —— SU 走 SketchUp 红系
-                （.badge-su），max 走 3ds Max 青蓝系（.badge-max）。
+            {/* 模型格式徽标（2026-10「3DMAX 支持」，文案 `skp→SU` / `max→max` / `d5a→D5A`）：
+                **模型域**（`isModelKind` = model + d5a）且能从文件列表判出格式时显示 —— SU 走 SketchUp 红系
+                （.badge-su），max 走 3ds Max 青蓝系（.badge-max），D5A 走品牌紫（.badge-d5a）。
                 2026-10-29 用户改口：字样由旧的三字母缩写改为「max」，色由红棕改青蓝。
-                判定走 shared/modelFormat 纯函数（skp > max），其余模型格式（fbx 等）不显示。 */}
-            {a.kind === 'model' &&
+                2026-11-13 用户改口：D5A 与 SU / max 是**同级格式** ⇒ 判据必须是 `isModelKind`（不是裸
+                `kind === 'model'`，否则 D5A 卡永远没有格式角标），紫色只在这一处角标 + 格式面板。
+                判定走 shared/modelFormat 纯函数（skp > max > d5a），其余模型格式（fbx 等）不显示。 */}
+            {isModelKind(a.kind) &&
               (() => {
                 const fmt = getModelFormat(a.files)
                 if (!fmt) return null
                 return (
                   <span
-                    className={`badge ${fmt === 'skp' ? 'badge-su' : 'badge-max'}`}
-                    title={fmt === 'skp' ? 'SketchUp 模型' : '3ds Max 模型'}
+                    className={`badge ${
+                      fmt === 'skp' ? 'badge-su' : fmt === 'max' ? 'badge-max' : 'badge-d5a'
+                    }`}
+                    title={
+                      fmt === 'skp'
+                        ? 'SketchUp 模型'
+                        : fmt === 'max'
+                          ? '3ds Max 模型'
+                          : 'D5 Render 资产包'
+                    }
                   >
                     {MODEL_FORMAT_BADGE_LABEL[fmt]}
                   </span>

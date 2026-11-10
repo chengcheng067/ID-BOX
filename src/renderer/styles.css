@@ -16,6 +16,19 @@
  *    ⛔ 不得扩散到：CTA / 选中态 / chip / 强调色 / 顶栏 / Quick Look / 侧栏 /
  *       kind 角标 / 插件面板（panel.html 是另一套 token，不引入紫色）/ 任何非 D5A 占位处。
  *    ⛔ 本例外不是「通用紫色许可」：**新增第二处使用前须重新回签**。
+ *    ── 回签 · 2026-11-13（用户拍板，第 2、3 处使用点）──
+ *    上面 :10–:18 的原文逐字保留（它是红线原文，不是被推翻的旧口径）。本次新增两处使用点：
+ *      ② 卡片上的**模型格式角标**（`.badge-d5a`，即「模型 | D5A」里的那个 D5A 角标）；
+ *      ③ 中栏「模型格式」筛选面板里的 **D5A 这一行的文字**。
+ *    用户原话口径：「D5a 这个只是一个格式，它和 Su / 3DMAX 是同级的……d5a 字体要是紫色」。
+ *    ⚠️ 上面「不得扩散到 kind 角标」仍然成立 —— 紫色只用在**格式角标**（D5A 是格式），
+ *       kind 角标照旧走中性灰；D5A 卡的 kind 角标按模型域显示「模型」。
+ *    ⚠️ 原主紫 `#9977f9` 对任何浅底最高只有 **3.30:1**（见下面浅色档注释），小字（11–12px）
+ *       必然低于 AA 的 4.5:1，所以这两处**不能沿用 `--d5-brand`**，另立小字档 token：
+ *       `--brand-d5a-bg` / `--brand-d5a-text`（与 `--brand-su-*` / `--brand-max-*` 同族同手法）。
+ *       浅 `#6b4fd0`：on tint 底 5.29:1、on 白卡 5.75:1、on accent-tint 选中行 4.92:1 ——
+ *       三个落点全部 ≥ 4.5:1（实测）。深沿用 `#b9a6ff`：on tint 底 7.05、on accent-tint 6.90。
+ *       ⛔ 换名而非加第二对 `--d5-brand`，是为了保住 `tests/d5a.test.ts` 对「仅新增一对」的计数。
  * ────────────────────────────────────────────────────────────────────────── */
 :root,
 [data-theme='light'] {
@@ -67,6 +80,17 @@
   --brand-max-text: #16708f;
   --brand-cad-bg: #fde7ef;
   --brand-cad-text: #c00d43;
+
+  /* D5A 的**小字档**（2026-11-13 回签：卡片格式角标 `.badge-d5a` + 中栏格式面板的 D5A 行）。
+     为什么不复用上面那对 `--d5-brand`：主紫 #9977f9 对任何浅底最多 3.30:1，排 11–12px 小字
+     必然低于 WCAG AA 的 4.5:1 —— 那一套只够「大字档」。这里另立一档，与 --brand-su-* /
+     --brand-max-* / --brand-cad-* 同族同手法（tint 作底 + 压暗字），实测：
+       #6b4fd0 on #f7f4ff = 5.29:1（角标底）
+       #6b4fd0 on #ffffff = 5.75:1（面板是白卡）
+       #6b4fd0 on #e1efff = 4.92:1（面板 active 行走 accent-tint 时）
+     ⛔ 名字不能写成 `--d5-brand` 的第二对：tests/d5a.test.ts:598 钉住"仅新增一对"的计数。 */
+  --brand-d5a-bg: #f7f4ff;
+  --brand-d5a-text: #6b4fd0;
 
   /* D5A 品牌色（V1.0，浅色档）——**全项目唯一的紫色例外**，见文件头 :9 之后的例外段。
      色值来源：用户 2026-11-09 从 D5 资产卡实拍图逐像素取样后拍板（docs/48 §1，U-5 已结案），
@@ -160,6 +184,13 @@
      ⛔ 使用范围同浅色档：仅 D5A 卡片封面占位，新增第二处须重新回签。 */
   --d5-brand: #b9a6ff;
   --d5-brand-tint: #2a2340;
+
+  /* D5A 小字档（深色）——与浅色档成对，缺一不可（同一对 token 名）。
+     深色主色本身已经够小字（实测：on 底 `#2a2340` 7.05:1、on 白卡位 `#161618` 8.57:1、
+     on 面板 `#242428` 7.34:1、on accent-tint `#1e2a38` 6.90:1），所以深档字色沿用
+     `#b9a6ff`，底沿用「比卡片紫一档」的暗紫；只有浅色档必须换深压紫。 */
+  --brand-d5a-bg: #2a2340;
+  --brand-d5a-text: #b9a6ff;
 
   --shadow-modal: 0 16px 48px rgba(0, 0, 0, 0.5);
   /* 卡片不加投影，靠 #111113 → #161618 → #1C1C1E → #242428 明度分层（§1） */
@@ -363,6 +394,14 @@
   .badge-max {
     background: var(--brand-max-bg);
     color: var(--brand-max-text);
+  }
+  /* D5A 格式角标（2026-11-13 用户拍板：「d5a 字体要是紫色」，且 D5A 与 SU / max **同级**）。
+     同一手法：tint 底 + 品牌紫字，走 `--brand-d5a-*` 小字档（不是 `--d5-brand` —— 那对
+     在浅底上只有 3.04–3.30:1，排 11px 小字不达 AA；本角标实测 5.29:1）。
+     ⚠️ 紫色仍只允许这一个角标 + 格式面板 D5A 行（回签见文件头 :19 之后），kind 角标照旧中性灰。 */
+  .badge-d5a {
+    background: var(--brand-d5a-bg);
+    color: var(--brand-d5a-text);
   }
   .btn {
     @apply inline-flex items-center gap-1.5 rounded-btn border border-line bg-card px-3 py-1.5 text-sm font-medium text-primary transition active:scale-[.98];
