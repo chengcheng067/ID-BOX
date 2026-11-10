@@ -14,6 +14,10 @@
       （2026-11-09 用户要求，面板里唯一允许的持久化；**绝不写盘文件**，也绝不写 ID BOX 数据）。
     - 搜索与筛选纯前端：只在内存里过滤 Ruby 推下来的记录。
     - 只读：面板从不调用任何写文件的 Ruby 回调（Ruby 侧也没有这样的回调）。
+    - 单一主题（2026-11-10 用户拍板 D01，防回潮）：本插件只提供浅色，**禁止**新增
+      按系统深色偏好的媒体查询覆盖、主题属性、主题切换或任何主题持久化；
+      系统为深色时本页仍按浅色渲染。若将来要支持深色，须先经用户重新拍板并
+      单独立卡，不得直接加深色媒体查询覆盖（见 `:root` 注释的同款声明）。
 
   与 Ruby 的契约（add_action_callback，只增不删）：
     sketchup.ready()                → 面板就绪，请求数据
@@ -22,12 +26,21 @@
     sketchup.applyMaterial(id)      → 双击材质：建材质 + 设当前材质（**不贴面**，V1.0）
     sketchup.setPanelSize(flag)     → 折叠 / 展开窗口（flag = true 折叠），调 dialog.set_size
     sketchup.closePanel()           → 关闭面板，调 dialog.close
+      （页面侧暂无入口，Ruby 侧能力保留：自绘「关闭」按钮已按 2026-11-09 B′ 删除，
+        原 JS 桥 window.sketchup.closePanel() 及其死函数已按 2026-11-10 D09 清掉；
+        菜单 / 工具栏关闭走 Ruby 的 close，A8「回调契约只增不删」故 Ruby 注册保留。
+        勿据「页面没有入口」删此注册或本行契约。）
   Ruby 侧调用（execute_script）：
     window.IDBOX.render(payload)    → 渲染整份数据（payload 只增字段：thumbsRoot、materialKinds）
     window.IDBOX.setStatus(obj)     → 底部状态行 { message, level }
 
   必须保留的 11 个 DOM id：
     banner clear count empty fresh list notes q refresh status ver
+  假控件去留（2026-11-10 用户拍板，docs/51 §8.0）：
+    - D02：左栏底部整块 CTA（按钮形态 + 加号图标 + 说明文字 + title）已整块删除；
+      不留静态灰字提示、不改成真按钮，面板侧零新接口。别再加回来。
+    - D03：版本行里的齿轮图标已删，只留纯文字版本号 + 一行静态说明；
+      整行无 cursor:pointer / accent 底 / 按钮语义 / 悬浮提示，也不做「关于 / 诊断」浮层。
   本版新增（不计入 11 个）：win-fold（折叠）。自绘的「关闭」按钮已被用户拍板删除
   （2026-11-09 B′：它与系统标题栏的 × 完全重复，留着就是"两排按钮打架"）——别再加回来。
 
@@ -48,10 +61,13 @@
   renderNotes 也会把「缩略图根未下发」明写出来，不再是一片图标让人猜。
 -->
 <style>
-  /* ══ 语义覆盖集 S（34 变量）· 浅色档 ══════════════════════════════════════
+  /* ══ 语义覆盖集 S（34 变量）· 唯一变量源（本插件只提供浅色）══════════════════
      A 底色/描边 12 · B 文字四档 4 · C 强调/tint 6 · D 状态色 5
      E 品牌格式徽标 6（取代退役的 --tag-*）· F 阴影 3
-     S5：--bg-active-nav 原生只在深色存在，浅色侧补别名（值 = --accent-tint）
+     S5：--bg-active-nav 是与 --accent-tint 同值的别名（选中态导航底色）。
+     本 :root 是**唯一变量源**；不存在深色覆盖集。若将来要支持深色，须先经用户
+     重新拍板并单独立卡，禁止新增深色媒体查询覆盖、主题属性、主题切换或任何
+     主题持久化（2026-11-10 用户拍板 D01 / D12；同款声明见文件头硬约束清单）。
   ═════════════════════════════════════════════════════════════════════════ */
   :root {
     /* A · 底色 / 描边（12） */
@@ -59,7 +75,7 @@
     --bg-sidebar: #f1f5f9;
     --bg-elevated: #e2e8f0;
     --surface-card: #ffffff;
-    --bg-active-nav: #e1efff;            /* S5 别名（原生只在深色定义） */
+    --bg-active-nav: #e1efff;            /* S5 别名（与 --accent-tint 同值） */
     --panel-bg: #ffffff;
     --border: #e2e8f0;
     --border-panel: #e8edf2;
@@ -112,13 +128,12 @@
     --fs-caption: 11px;
     --fs-micro: 10px;
 
-    /* 圆角 / 间距（浅色档，portable-spec §3.2） */
+    /* 圆角 / 间距（唯一档，portable-spec §3.2；本插件只提供浅色，见文件头 D01） */
     --radius-card: 16px;
     --radius-nav: 9px;
     --radius-chip: 6px;
     --radius-badge: 4px;
     --radius-search: 10px;
-    --radius-cta: 10px;
     --radius-logo: 6px;
     --radius-seg: 6px;
     --radius-seg-group: 10px;
@@ -132,70 +147,6 @@
 
     /* 系统字体栈（不引字体文件） */
     --font-ui: -apple-system,"PingFang SC","Microsoft YaHei UI","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
-  }
-
-  /* ══ 深色档：S 集 34 变量必须成对且逐变量 ≠ 浅色值（S3）═══════════════════ */
-  @media (prefers-color-scheme: dark) {
-    :root {
-      /* A（12） */
-      --bg-canvas: #111113;
-      --bg-sidebar: #161618;
-      --bg-elevated: #242428;
-      --surface-card: #1c1c1e;
-      --bg-active-nav: #1e2a38;
-      --panel-bg: #161618;
-      --border: #2a2a2d;
-      --border-panel: #2a2a2d;
-      --border-soft: #2a2a2d;
-      --pill-bg: #1c1c1e;
-      --toast-bg: #161618;
-      --bg-floatbar: #242428;
-
-      /* B（4） */
-      --text-primary: #f2f2f4;
-      --text-secondary: #98989e;
-      --text-tertiary: #98989e;
-      --text-muted: #636368;
-
-      /* C（6） */
-      --accent: #0a84ff;
-      --accent-text: #6db2ff;
-      --accent-tint: #1e2a38;
-      --tint-neutral: #242428;
-      --tint-neutral-text: #98989e;
-      --seg-active: #2c2c2e;
-
-      /* D（5） */
-      --danger: #ff6961;
-      --danger-tint: #2a1517;
-      --success: #7a9268;
-      --preview: #b18cff;
-      --preview-tint: #2b2140;
-
-      /* E（6） */
-      --brand-su-bg: #3a2224;
-      --brand-su-text: #f08c8c;
-      --brand-max-bg: #16303a;
-      --brand-max-text: #6cc4e0;
-      --brand-cad-bg: #3a1622;
-      --brand-cad-text: #ff5b8c;
-
-      /* F（3）· 深色必须 none */
-      --shadow-card: none;
-      --shadow-card-hover: none;
-      --shadow-card-active: none;
-
-      /* 圆角 / 间距（深色档整体比浅色小一档；logo / seg / gap-card 两主题同值） */
-      --radius-card: 10px;
-      --radius-nav: 7px;
-      --radius-chip: 5px;
-      --radius-search: 8px;
-      --radius-cta: 8px;
-      --radius-seg-group: 8px;
-      --radius-pill-header: 7px;
-      --radius-toast-undo-inner: 5px;
-      --radius-cover: 8px;
-    }
   }
 
   * { box-sizing: border-box; }
@@ -362,14 +313,12 @@
   .tree-item:hover { background: var(--bg-elevated); }
   .tree-item.is-active { background: var(--bg-active-nav); color: var(--accent-text); }
   .side-foot { flex: 0 0 auto; border-top: 1px solid var(--border); padding: 10px 12px; }
-  .cta {
-    display: flex; align-items: center; gap: 6px; width: 100%; height: 32px; padding: 0 10px;
-    border: none; border-radius: var(--radius-cta); background: var(--accent-tint);
-    color: var(--accent-text); font-size: var(--fs-card-name); font-weight: 600; font-family: inherit;
-  }
   .side-meta { margin-top: 8px; font-size: var(--fs-micro); color: var(--text-muted); }
   .side-meta .lib-path { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .side-settings { margin-top: 6px; display: flex; align-items: center; gap: 6px; font-size: var(--fs-caption); color: var(--text-tertiary); }
+  /* 版本行 + 设置指路：纯静态文字（2026-11-10 D03）。无 cursor:pointer、无 accent 底、
+     无按钮语义、无 title 悬浮提示 —— 整行不做任何「看起来能点」的外观，也不做只读浮层。 */
+  .side-settings { margin-top: 6px; display: block; font-size: var(--fs-caption); color: var(--text-tertiary); }
+  .side-settings-hint { margin-top: 2px; display: block; font-size: var(--fs-micro); color: var(--text-muted); }
 
   /* ── ③ 筛选 chips ── */
   .main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
@@ -427,12 +376,6 @@
   .card-body { padding: 8px 10px 10px; min-width: 0; }
   .card-name { font-size: var(--fs-card-name); font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .card-meta { margin-top: 3px; font-size: var(--fs-caption); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-  @media (prefers-color-scheme: dark) {
-    .card { border-color: var(--border); box-shadow: none; }
-    .card:not(.is-selected):hover { background-color: var(--bg-elevated); box-shadow: none; transform: translateY(-2px); }
-    .card.is-selected { box-shadow: none; }
-  }
 
   /* ── ⑤ 空态两态（图形与 DOM 各自不同） ── */
   /* 默认可见；隐藏只靠 .hidden（JS 置 className = 'empty' / 'empty hidden'，与原实现一致） */
@@ -524,10 +467,6 @@
   <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
     <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
   </symbol>
-  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="12" cy="12" r="3"/>
-    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l-.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/>
-  </symbol>
   <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
     <path d="M20 6L9 17l-5-5"/>
   </symbol>
@@ -552,10 +491,6 @@
   </symbol>
   <symbol id="i-empty-filter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
     <path d="M21 4H3l7 8.5V19l4 2v-8.5L21 4z"/>
-  </symbol>
-  <!-- 补支：CTA 加号（portable-spec §5.2 补充支，path 逐字取 icons.tsx IconPlus） -->
-  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M12 5v14M5 12h14"/>
   </symbol>
 </svg>
 
@@ -631,15 +566,10 @@
         <nav id="side-tree" class="nav-tree"></nav>
       </div>
       <div class="side-foot">
-        <div class="cta" title="面板只读：导入请在 ID BOX 主程序内完成">
-          <svg class="icon icon-10" aria-hidden="true"><use href="#i-plus" id="cta-plus"></use></svg>+ 在 ID BOX 里导入
-        </div>
         <div class="side-meta">
           <span class="lib-path" id="lib-path">—</span>
-          <span class="side-settings">
-            <svg class="icon icon-10" aria-hidden="true"><use href="#i-settings"></use></span>
-            <span id="side-version"></span>
-          </span>
+          <span class="side-settings"><span id="side-version"></span></span>
+          <span class="side-settings-hint">设置请在 ID BOX 主程序</span>
         </div>
       </div>
     </aside>
@@ -1110,7 +1040,7 @@
   function cardFor(record) {
     var reason = blockReason(record);
     var kind = textOf(record.kind) || 'other';
-    var card = make('div', 'card' + (reason ? ' card-disabled' : '') + (state.selectedId === textOf(record.id) ? ' is-selected' : ''));
+    var card = make('div', 'card' + (reason ? ' is-disabled' : '') + (state.selectedId === textOf(record.id) ? ' is-selected' : ''));
     card.setAttribute('data-id', textOf(record.id));
     /* 提示语按动作分：模型 = 单击插入；材质/贴图 = 双击建材质（不贴面） */
     var hint = isMaterialRecord(record)
@@ -1320,12 +1250,19 @@
        · 材质分组 = texture + material，由 groupOf 把两类都归到 'material' 天然合并计数。
      返回 [{ name, count }]，count 降序、「未分类」恒最后。
 
-     ⚠️ **本面板只做到一级分类，这是有意的取舍、不是漏做**（2026-11-09 team-lead 拍板）：
-        面板是"浏览 + 插入"的高频窄场景，960px 窗口里左栏只有 216px，再挂本体那样的
-        二级树（以及材质组的「贴图/材质」单类 chip）会把侧栏挤爆、把用户要看的卡片压没。
-        用户说的「和本体一样」= **一级的展开逻辑一致**（全部不显示 / 点大类才展开 / 计数按
-        该大类范围 / 材质两类合并）。二级留到确有需要时单独立卡，届时要同时补上
-        activeCategory2 的筛选维度与空态文案，不要只加 DOM。
+     三级分类（2026-11-10 用户要求「1 级 / 2 级菜单的触发改成和 ID BOX 主软件一样」）：
+       · 与 Sidebar.tsx:928-1133 同构：点大类展开一级树，点一级 = 筛到该一级并展开其二级树，
+         点二级 = 再筛到 category2，再点取消二级且一级保持不变；分类导航只在左栏。
+       · 渐进披露（D05 定稿 B）：只为有 ≥1 个真实二级值的一级渲染展开箭头与二级行；
+         '未分类' 哨兵不算真实值，二级层不得生成「未分类」节点（isUnclassified() 剔除）。
+       · 计数范围 = 当前大类 / 当前一级，且必须走 scopedRecords()（显示范围白名单），不跨类、不跨层。
+       · state.activeCategory2 与 state.expandedL1 只由 commit() 写入（T02 落地）。
+       · 一级层「未分类」= 空值或 '未分类' 哨兵，走 isUnclassified()，节点保留且可点。
+       · 二级值已实测充足（可见作用域 103 条 / 真实二级 85 条 / 38 个不同值 / 19 个一级中
+         10 个 ≥2、5 个 ==1、4 个 ==0），本树不是空壳。
+       ⚠️ 旧结论「只做到一级分类，这是有意的取舍、不是漏做」（2026-11-09 team-lead 拍板）
+          已于 2026-11-10 **废止**：勿再据此删二级树；实现由 T02 / T03 串行落地，本轮 T01
+          只更正注释、不动分类逻辑。
 
      「未分类」节点**保留且可点**（2026-11-09 team-lead 拍板）：本体也是这样，
        点它筛出 category1 为空的那批（`matches()` 里对 UNCLASSIFIED_LABEL 走特判）。 */
@@ -1533,19 +1470,6 @@
       return;
     }
     window.sketchup.setPanelSize(collapsed ? true : false);
-  }
-
-  /* JS → Ruby 的关闭桥。
-     ⚠️ 自绘「关闭」按钮已按用户拍板（2026-11-09 B′）删除，本函数**故意保留**：
-       · Ruby 侧 `closePanel` 回调（panel_dialog.rb 的 bind_window_callbacks）仍在，
-         菜单 / 工具栏关闭走的是同一条 Ruby 路径，删这个桥会让将来任何页面侧入口断掉；
-       · 现在页面里没有调用点（唯一的调用者就是被删的那个按钮），属**有意保留的接口**。 */
-  function closePanel() {
-    if (!hasSketchupCallback('closePanel')) {
-      setStatus({ message: '面板未连接到 SketchUp（回调不可用），请重开面板。', level: 'error' });
-      return;
-    }
-    window.sketchup.closePanel();
   }
 
   function applyQuery(value) {

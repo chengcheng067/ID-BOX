@@ -319,7 +319,9 @@ module IDBoxPanel
       false
     end
 
-    # 自绘「关闭」按钮 → 与菜单/工具栏的关闭同一条路径（close 里含 stop_polling）
+    # 菜单 / 工具栏的关闭 → 与「自绘关闭按钮」（已按 2026-11-09 B′ 删除）原本共用同一条路径
+    # （close 里含 stop_polling）。2026-11-10 D09：页面侧暂无入口，Ruby 侧能力保留 ——
+    # 页面里已无 closePanel 调用点，但菜单 / 工具栏关闭仍走这里，不要因为「页面没调用」删本方法。
     def on_close_panel
       close
     end
@@ -327,12 +329,13 @@ module IDBoxPanel
     # V1.0 的窗口级回调（只增不删，A8）：名字必须与 panel.html 的调用逐字一致。
     # 为什么不放进 PanelCallback：那边的 CALLBACK_NAMES 是 A8 定稿的三件套，
     # 本卡不改它（三件套的注释与顺序都是验收对象），窗口控件与材质是新增的一组。
+    # closePanel 一条：页面侧暂无入口（JS 死函数已清），Ruby 侧注册按 A8「回调契约只增不删」保留。
     def bind_window_callbacks
       return false if @dialog.nil?
       @dialog.add_action_callback('setPanelSize') do |_context, collapsed|
         on_set_panel_size(collapsed)
       end
-      @dialog.add_action_callback('closePanel') { |_context| on_close_panel }
+      @dialog.add_action_callback('closePanel') { |_context| on_close_panel }  # 页面侧暂无入口，Ruby 侧能力保留（D09 / A8）
       @dialog.add_action_callback('applyMaterial') { |_context, record_id| on_apply_material(record_id) }
       true
     rescue StandardError => error
