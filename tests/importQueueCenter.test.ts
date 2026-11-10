@@ -13,7 +13,7 @@
  *    新条目向上长，已在场的卡片 y 不变。**内外两层都要**：外层只有一个子节点，
  *    只改外层等于没改（真正的卡片栈在内层 wrapper 上）。
  * ③ 必须原样保留：`pointer-events-none`（外层，不挡网格点击）+ `pointer-events-auto`（内层）
- *    的两层结构、`bottom-14`（避让 44px 底栏 + 12px 间隙）、`slice(-6).reverse()`
+ *    的两层结构、底部锚点（2026-11-13 起为 `bottom-16`，让位给贴底的气泡；更早是 bottom-14）、`slice(-6).reverse()`
  *    （最新 6 条、最新在底部）、`onMouseEnter/onMouseLeave` 悬停暂停、无条目 `return null`。
  * ④ 位置不许用行内 style 动态算：底栏出现/消失时改 bottom 会让整摞上下抖。
  */
@@ -119,9 +119,9 @@ describe('刻意保留的两层指针结构（外层不挡网格点击）', () =
   })
 })
 
-describe('避让底部提示条：bottom-14 原样保留', () => {
-  it('仍是 bottom-14（44px 底栏 + 12px 间隙）', () => {
-    expect(anchorClassName()).toContain('bottom-14')
+describe('底部空间分配：队列让位给气泡，锚定 bottom-16', () => {
+  it('队列在 bottom-16（2026-11-13 拍板：气泡贴底 bottom-4，队列上移让位）', () => {
+    expect(anchorClassName()).toContain('bottom-16')
   })
 
   it('没有改成动态 bottom / 计算值（会在底栏出现消失时抖动）', () => {

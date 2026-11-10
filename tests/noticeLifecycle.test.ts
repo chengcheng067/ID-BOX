@@ -188,7 +188,8 @@ describe('noticeLifecycle · 纯函数', () => {
     expect(a).toEqual({ text: '已移入「最近删除」（左侧栏可还原）', id: 3, expiresAt: 10_000 + NOTICE_SHOW_MS })
     expect(makeNotice('x', 1, Number.NaN, -5).expiresAt).toBe(0)
     expect(makeNotice('x', 1, 100, Number.NaN).expiresAt).toBe(100 + NOTICE_SHOW_MS)
-    expect(NOTICE_SHOW_MS).toBe(4500)
+    // 2026-11-13 用户拍板：时长统一 3 秒（「它也就 3 秒钟就消失啊」）
+    expect(NOTICE_SHOW_MS).toBe(3000)
   })
 
   it('shouldClearOnTimeout 必须「id 对得上 + 确实到期」才允许清', () => {
@@ -437,11 +438,13 @@ describe('noticeLifecycle · 接线守卫', () => {
     // 气泡 ✕ 走状态层 dismissNotice
     expect(code).toContain('dismissNotice')
     expect(code).toContain('onClick={dismissNotice}')
-    // 屏幕居中 + 容器不挡点击 + 气泡本体可点
-    expect(code).toContain('top-1/2')
+    // 2026-11-13 拍板：气泡**贴底居中**（不再屏幕正中央）。保留断言、只改期望值。
+    // 旧正中央的两个分量必须彻底消失，否则气泡会回到 top-1/2。
+    expect(code).not.toContain('top-1/2')
+    expect(code).not.toContain('-translate-y-1/2')
+    expect(code).toContain('bottom-4')
     expect(code).toContain('left-1/2')
     expect(code).toContain('-translate-x-1/2')
-    expect(code).toContain('-translate-y-1/2')
     expect(code).toContain('pointer-events-none')
     expect(code).toContain('pointer-events-auto')
     // 底部通栏整条取消
@@ -496,11 +499,12 @@ describe('noticeLifecycle · 接线守卫', () => {
     expect(toast).not.toContain('`z-${')
   })
 
-  it('验收⑤：ImportQueue 的 bottom 已按「底栏不存在」重算为 bottom-3', () => {
+  it('验收⑤（2026-11-13 改）：气泡贴底 bottom-4，ImportQueue 让位上移 bottom-16', () => {
     const src = readSrc('src/renderer/components/ImportQueue.tsx')
-    expect(src).toContain('fixed bottom-3 left-1/2')
+    expect(src).toContain('fixed bottom-16 left-1/2')
     expect(src).not.toContain('fixed bottom-14')
-    expect(src).toContain('底栏已不存在')
+    expect(src).not.toContain('fixed bottom-3 left-1/2')
+    expect(src).toContain('让位')
     // 绝对时间戳自动消失机制不许被动过
     expect(src).toContain('dismissRemainingMs(it.status, it.settledAt, now)')
     expect(src).toContain('flex-col-reverse')

@@ -5,18 +5,20 @@ import { resolveUndoTarget, shouldRenderBubble } from '../logic/noticeLifecycle'
 import { IconClose } from '../icons'
 
 /**
- * **屏幕居中的临时气泡**（2026-11-10 用户逐条确认的口径）。
+ * **屏幕底部居中的临时气泡**（2026-11-13 用户改口后的口径）。
  *
- * 用户原话：
- * > 「排查一下底部的这一类弹窗提示，全部把它编到中间来做临时弹窗气泡。」
- * > 「2026-11-10 晚逐条弹窗确认：**三类内容全部搬到屏幕居中气泡**（不是只搬纯文字提示）。
+ * 用户原话（按时间先后，两代口径都要留档）：
+ * > 2026-11-10：「排查一下底部的这一类弹窗提示，全部把它编到中间来做临时弹窗气泡。」
+ * > 「2026-11-10 晚逐条弹窗确认：三类内容全部搬到屏幕居中气泡（不是只搬纯文字提示）。
  * >   底部通栏整条取消。」
+ * > 2026-11-13：「弹窗气泡往屏幕下方移啊，你现在给我做在正中央的。」→ 弹窗拍板：
+ * >   **底部居中贴底（约 16px），导入队列上移让位**；✕ 保留作兜底；时长统一 3 秒。
  *
  * ## 形态变化
  * 旧实现是 `App` 根 flex column 的**第三行真实布局行**（`h-11 shrink-0 border-t bg-toast`），
  * 有内容时吃掉 44px 窗口高度、且没有任何关闭出口。现在整条取消，三类内容
  * （`notice` 轻提示 / `grace` 删除撤销 / `assignGrace` 归类撤销）全部装进一个
- * `fixed` + `top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2` 的居中气泡：
+ * `fixed` + `bottom-4 left-1/2 -translate-x-1/2` 的**底部居中**气泡（最下一条给气泡）：
  * - 容器 `pointer-events-none`（不挡网格/详情面板的点击），气泡本体 `pointer-events-auto`；
  * - 撤销按钮与 ✕ 都在气泡本体内，天然可点；
  * - 全走既有 token（不自行取色）：`bg-card` / `border-panel-line` / `shadow-modal` /
@@ -24,8 +26,13 @@ import { IconClose } from '../icons'
  * - 宽度上限 `w-[min(420px,calc(100vw_-_48px))]`（与 `ImportQueue` 同一档，窄窗口留 24px 边距）。
  *
  * `fixed` 元素不参与 flex 布局 → App 根不再有这一行，三列区自然拿回原来的 44px。
- * 所以 `ImportQueue.tsx` 原来「44px 底栏 + 12px 间隙 = 56px」的锚点假设失效，
- * 已同步重算为 `bottom-3`（只留 12px）。
+ *
+ * ## 底部空间分配（2026-11-13 拍板）
+ * 气泡拿最下一条 = `bottom-4`（16px）。`ImportQueue` 原来占的 `bottom-3` 让位上移到
+ * `bottom-16`（64px）：气泡本体高约 44px（单行 13px 文字 + py-3.5），16 + 44 = 60，
+ * 队列底边落在 64px → 两者**最少的可视间隙约 4px**；气泡若带撤销条会更高（约 76px），
+ * 那种情况下队列会与之贴得很近甚至叠，但因为两者都只在各自有内容时渲染，实际同屏概率低。
+ * ⚠️ 不许把气泡改成动态 bottom（会与队列互相抖）。锚点各自固定：气泡 `bottom-4`、队列 `bottom-16`。
  *
  * ## 层级
  * `z-48` = `logic/zStack.ts` 的 `Z_NOTICE_BUBBLE`：**高于舞台球 45、低于最底层弹窗 50**。
@@ -124,7 +131,7 @@ export function NoticeToast() {
     : 'flex items-center justify-between gap-2.5'
 
   return (
-    <div className="pointer-events-none fixed left-1/2 top-1/2 z-48 -translate-x-1/2 -translate-y-1/2">
+    <div className="pointer-events-none fixed bottom-4 left-1/2 z-48 -translate-x-1/2">
       <div className="pointer-events-auto flex w-[min(420px,calc(100vw_-_48px))] flex-col gap-2.5 rounded-modal border border-panel-line bg-card px-4 py-3.5 shadow-modal">
         {/* 上：绿圆勾 + 结果文字 + 手动关闭 ✕（走状态层 dismissNotice，按 id 校验） */}
         {hasNotice && (

@@ -214,7 +214,7 @@ let pipelineInFlight = 0
  * ## 为什么走 `enqueueNotice` 而不是新造 modal
  *
  * ① 模态阻断：用户批量导入 50 个包后可能立刻去干别的，一个必须点掉的 modal 是打扰；
- * ② `enqueueNotice` 已经解决了"多条批次汇总互不吞并"（队列 + 逐条 4.5s），
+ * ② `enqueueNotice` 已经解决了"多条批次汇总互不吞并"（队列 + 逐条 NOTICE_SHOW_MS，2026-11-13 起 3s），
  *    另起一个弹窗等于把并发展示问题重写一遍；
  * ③ 已有 Esc 层级栈（Quick Look / 整理浮层 / 分类弹窗）再加一层要重排优先级。
  *
@@ -305,7 +305,7 @@ function armConflictAskWatchdog(requestId: string): void {
  *   原文件保留在原位」等汇总也走这条队列，裸写会把正在展示的那条顶掉。
  *   实际到达顺序由主进程钉死：`send(importConflictExpired)` 在 `resolve(null)` **之前**，
  *   所以渲染层先收到作废事件 → 「超时」提示立即展示；随后该条被 skip、`batchDone` 到达
- *   → 批次汇总入队，4.5s 后才轮到。两条都会出现（顺序不人为调整：宁可保证"一定说出口"）。
+ *   → 批次汇总入队，NOTICE_SHOW_MS（3s）后才轮到。两条都会出现（顺序不人为调整：宁可保证"一定说出口"）。
  */
 function clearExpiredAsk(requestId: string): void {
   const current = useVault.getState().conflictAsk
@@ -714,7 +714,7 @@ export function resetInboxForTests(): void {
  * 把一条提示排进队列并立刻尝试展示（同一批次可能同时有"跳过"和"覆盖"两条汇总）。
  *
  * 为什么要队列：`notice` 是单字段，直接连写两次 `set({ notice })` 在同一个 tick 里
- * 只有最后一条能看见 —— 两条汇总互不吞并必须靠**依次展示**（每条 4.5s）。
+ * 只有最后一条能看见 —— 两条汇总互不吞并必须靠**依次展示**（每条 NOTICE_SHOW_MS）。
  *
  * 2026-11-10「从底层规避提示不消失」：队列、计时器、到期清理**全部搬到状态层**
  * `noticeRuntime`（见本文件 `create` 之后的「notice 到期清理」段）。这里只保留一个
@@ -1930,7 +1930,7 @@ interface VaultState {
   applyRenames: (rows: RenameRequestRow[]) => Promise<RenameSummary>
   /**
    * 存量提示入口（组件里 ~30 处调用）。2026-11-10 起统一汇入状态层 `noticeRuntime`：
-   * `null` = 关闭当前提示，非 null = 显示一条（换新 id + 新 4.5s 到期时间）。
+   * `null` = 关闭当前提示，非 null = 显示一条（换新 id + 新到期时间（NOTICE_SHOW_MS））。
    */
   setNotice: (n: string | null) => void
   /**
@@ -1938,7 +1938,7 @@ interface VaultState {
    * `set({ notice })` 一起收敛到**同一个**状态层运行时，见 `logic/noticeLifecycle.ts`。
    */
   showNotice: (text: string) => void
-  /** 手动关闭当前提示（居中气泡的 ✕）；按 id 校验，绝不误清后来的新提示。 */
+  /** 手动关闭当前提示（底部气泡的 ✕）；按 id 校验，绝不误清后来的新提示。 */
   dismissNotice: () => void
   // ── 资产操作 ────────────────────────────────────────────────
   renameAsset: (id: string, newName: string) => Promise<void>

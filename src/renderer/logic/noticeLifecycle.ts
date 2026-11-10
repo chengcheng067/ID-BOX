@@ -18,7 +18,7 @@
  *    共用同一份状态与同一个计时器。`notice` 的 ~90 处裸写（`set({ notice })` /
  *    `useVault.setState({ notice })` / `set((s) => ({ ..., notice }))`）由 `store.ts`
  *    的订阅调用 `absorb()` 汇到同一个 runtime，无需逐处改业务文案。
- * 4. **队列语义保留**：`enqueue()` 依次展示、互不吞并，每条独立 4.5s；**最后一条到点也会
+ * 4. **队列语义保留**：`enqueue()` 依次展示、互不吞并，每条独立 `NOTICE_SHOW_MS`（2026-11-13 起 3s）；**最后一条到点也会
  *    清空**（旧 `drainNoticeQueue()` 在 `shift()` 返回 undefined 时直接 return、从不清
  *    最后一条 —— 那是「两套消失机制互不感知」的另一半根因，本模块一并修掉）。
  *
@@ -28,8 +28,15 @@
  * `tests/noticeLifecycle.test.ts` 覆盖 6 条验收判据（含组件卸载后状态层仍会清理）。
  */
 
-/** 一条 notice 的展示时长（毫秒）。与旧 `NoticeToast` 的 4500 完全一致，不改节奏。 */
-export const NOTICE_SHOW_MS = 4500
+/**
+ * 一条 notice 的展示时长（毫秒）—— **全应用唯一时长口径**。
+ * 2026-11-13 用户拍板统一改成 3000（原话：「它也就 3 秒钟就消失啊」）。
+ * 改这一处即全应用生效：所有裸写 `set({ notice })` 都经 `useVault.subscribe` 的
+ * `absorb()` 汇入同一个 runtime，用的就是这个常量。
+ * ⚠️ 撤销条（删除 / 归类）走各自的 `graceMs`（3000 / 5000ms），与 notice 时长无关，
+ *    不受本常量影响 —— 不要误以为改这里会缩短撤销宽限期。
+ */
+export const NOTICE_SHOW_MS = 3000
 
 /**
  * notice 的到期元数据（存进 store 的 `noticeMeta`）。

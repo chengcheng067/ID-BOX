@@ -15,12 +15,12 @@ import { IconAlert, IconCheck, IconClose, IconDownload } from '../icons'
  * 位置/朝向的三条硬约束（改之前先读）：
  * - 水平：`left-1/2 -translate-x-1/2`。宽度不能用 `w-72`（288px）——居中后既窄又悬空，
  *   改 `w-[min(420px,calc(100vw_-_48px))]`（窄窗口时留 24px 边距，不会贴到窗口边上）。
- * - 垂直：`bottom-3`（12px 距窗口底边）。2026-11-10 前的旧锚点是 56px =
- *   44px 底部通栏 NoticeToast + 12px 间隙 —— 现在底部通栏**整条取消**，三类提示全部
- *   搬进屏幕居中气泡（`NoticeToast` 已是 `fixed` 居中浮层），那 44px 的假设不再存在。
- *   按「底栏已不存在」重算：56 − 44 = 12px → `bottom-3`。**刻意不做动态 bottom**：
- *   底栏时代若跟着显隐改 bottom，整个队列会上下抖一下；现在锚点彻底固定，更没有理由动态改。
- * - 堆叠：`flex-col-reverse`。容器底边锚定在 `bottom-3`，反向列让**第 0 条钉在底部**，
+ * - 垂直：`bottom-16`（64px 距窗口底边）。演变：2026-11-10 前是 56px（44px 底部通栏 + 12px
+ *   间隙）；通栏取消后重算为 `bottom-3`（12px）；2026-11-13 用户「弹窗气泡往屏幕下方移」→
+ *   拍板「底部居中贴底，队列上移让位」→ 最下一条（`bottom-4`）给 `NoticeToast`，队列让到
+ *   `bottom-16`。气泡本体高约 44px，16 + 44 = 60 → 队列底边 64px，两者最少可视间隙约 4px。
+ *   **刻意不做动态 bottom**：若跟着对方显隐改 bottom，整个队列会上下抖一下；锚点各自固定。
+ * - 堆叠：`flex-col-reverse`。容器底边锚定在 `bottom-16`，反向列让**第 0 条钉在底部**，
  *   新条目从下往上长 → 已在场的卡片 y 坐标不变；正序列则每次增删都整摞上跳一个卡高。
  *   ⚠️ 真正的卡片栈在**内层** wrapper 上，内外两层都要 `flex-col-reverse`，只改外层不会有效果
  *   （外层只有一个子节点）。
@@ -112,7 +112,7 @@ export function ImportQueue() {
   }
 
   return (
-    <div className="pointer-events-none fixed bottom-3 left-1/2 z-30 flex w-[min(420px,calc(100vw_-_48px))] -translate-x-1/2 flex-col-reverse gap-2">
+    <div className="pointer-events-none fixed bottom-16 left-1/2 z-30 flex w-[min(420px,calc(100vw_-_48px))] -translate-x-1/2 flex-col-reverse gap-2">
       {/* 悬停判定放在**内层**（有指针事件的容器）上：
           外层是 pointer-events-none（不挡网格点击），内层只在有卡片时才存在；
           鼠标在卡片之间移动不会触发 enter/leave，倒计时不会来回重置。
