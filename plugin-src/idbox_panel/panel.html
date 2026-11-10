@@ -312,6 +312,10 @@
   .tree-item .nav-count { margin-left: auto; font-size: var(--fs-caption); color: var(--text-muted); font-variant-numeric: tabular-nums; }
   .tree-item:hover { background: var(--bg-elevated); }
   .tree-item.is-active { background: var(--bg-active-nav); color: var(--accent-text); }
+  /* T03 三级树（docs/51 §3.5 渐进披露）：二级行缩进一档，箭头走既有 --text-tertiary，不新造颜色。
+     --fs-caption 是既有字号档（见 :root 字号八级），与主软件 caption 档一致。 */
+  .tree-item-l2 { padding-left: 26px; font-size: var(--fs-caption); }
+  .tree-caret { margin-left: auto; color: var(--text-tertiary); }
   .side-foot { flex: 0 0 auto; border-top: 1px solid var(--border); padding: 10px 12px; }
   .side-meta { margin-top: 8px; font-size: var(--fs-micro); color: var(--text-muted); }
   .side-meta .lib-path { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -624,6 +628,8 @@
     selectedId: '',        /* 单值，不是数组（§5.2 裁定 2） */
     activeKind: '',        /* '' = 全部；展示分组见 KIND_GROUPS */
     activeCategory1: '',
+    activeCategory2: '',   /* 二级分类；'' = 不筛选 */
+    expandedL1: '',        /* 当前展开了哪个一级的二级树；'' = 都不展开 */
     sortKey: 'default',
     thumbsRoot: '',        /* 来自 payload（T04 才落字段），本卡默认空 ⇒ 首屏全 SVG 占位 */
     viewMode: 'grid',
@@ -677,6 +683,13 @@
 
   function textOf(value) {
     return (value === undefined || value === null) ? '' : String(value);
+  }
+
+  /* 「未分类」的统一判据：空串 / null / 字面「未分类」都算未分类。
+     ⚠️ 必须用它判定，不要各写各的 —— 索引里的空分类是字符串 '未分类' 而不是 null。 */
+  function isUnclassified(value) {
+    var text = textOf(value).trim();
+    return text === '' || text === UNCLASSIFIED_LABEL;
   }
 
   function hasSketchupCallback(name) {
@@ -1107,8 +1120,16 @@
     if (state.activeCategory1) {
       var category1 = textOf(record.category1).trim();
       if (state.activeCategory1 === UNCLASSIFIED_LABEL) {
-        if (category1) { return false; }          /* 未分类节点 = category1 为空 */
+        if (!isUnclassified(category1)) { return false; }
       } else if (category1 !== state.activeCategory1) {
+        return false;
+      }
+    }
+    if (state.activeCategory2) {
+      var category2 = textOf(record.category2).trim();
+      if (state.activeCategory2 === UNCLASSIFIED_LABEL) {
+        if (!isUnclassified(category2)) { return false; }
+      } else if (category2 !== state.activeCategory2) {
         return false;
       }
     }
@@ -1187,7 +1208,30 @@
       /* ② 筛选 0：搜索框与已输入词保留，不被全局空态盖掉 */
       empty.className = 'empty';
       empty.appendChild(iconEl('i-empty-filter', 'icon-40'));
-      empty.appendChild(make('div', 'empty-text', '没有匹配「' + state.query.trim() + '」的记录。'));
+
+      /* 空态文案按「为什么空」分支：查询词优先，其次分类筛选。
+         ⚠️ 分类筛选时 query 是空的，直接拼会显示「没有匹配「」」。 */
+      var q = state.query.trim();
+      var hasFilter = !!(state.activeKind || state.activeCategory1 || state.activeCategory2);
+      if (q) {
+        empty.appendChild(make('div', 'empty-lead', '没有匹配「' + q + '」的记录'));
+        empty.appendChild(make('div', 'empty-text', '换个关键词，或点下方「清除筛选」回到全部。'));
+      } else if (hasFilter) {
+        empty.appendChild(make('div', 'empty-lead', '这个筛选下没有素材'));
+        empty.appendChild(make('div', 'empty-text', '换个分类，或点下方「清除筛选」回到全部。'));
+      } else {
+        empty.appendChild(make('div', 'empty-lead', '没有可显示的素材'));
+        empty.appendChild(make('div', 'empty-text', '在 ID BOX 里导入素材后，回到这里点「刷新」。'));
+      }
+
+      /* 出口：只有「有东西可清」时才给按钮（q 或分类筛选）。复用 .chip 既有样式，不新造颜色。
+         出口把搜索词也一并清掉 —— 否则 q 非空时点它只清分类，空态文案不会变，看起来像按钮坏了。 */
+      if (q || hasFilter) {
+        var clearBtn = make('button', 'chip chip-ghost', '清除筛选');
+        clearBtn.type = 'button';
+        clearBtn.setAttribute('data-role', 'empty-clear');
+        empty.appendChild(clearBtn);
+      }
       return;
     }
     empty.className = 'empty hidden';
@@ -1302,6 +1346,39 @@
     return list;
   }
 
+  /* 某个大类 + 某个一级下，真实存在的二级值（含计数）。
+     排序沿用 topCategories 的口径：未分类恒最后、其余按计数降序、同数按名称。
+     ⚠️ 聚合范围必须是当前大类 + 当前一级，不能全库 —— 模型侧和材质侧的二级值不重叠，
+        跨类聚合会造出「点进去 0 条」的假节点。 */
+  function secondCategories(kindKey, category1) {
+    var key = (kindKey === undefined) ? state.activeKind : textOf(kindKey);
+    var l1 = textOf(category1).trim();
+    if (!key || !l1) { return []; }
+
+    var records = groupRecords(key);
+    var counts = {};
+    for (var i = 0; i < records.length; i += 1) {
+      var row = records[i];
+      if (textOf(row.category1).trim() !== l1) { continue; }
+      var raw = textOf(row.category2).trim();
+      /* 关键：哨兵不生成二级节点，否则会多出一个叫「未分类」的假分类 */
+      if (isUnclassified(raw)) { continue; }
+      counts[raw] = (counts[raw] || 0) + 1;
+    }
+
+    var list = [];
+    for (var label in counts) {
+      if (Object.prototype.hasOwnProperty.call(counts, label)) {
+        list.push({ name: label, count: counts[label] });
+      }
+    }
+    list.sort(function (a, b) {
+      if (b.count !== a.count) { return b.count - a.count; }
+      return a.name.localeCompare(b.name);
+    });
+    return list;
+  }
+
   function renderSide() {
     var nav = $('side-nav');
     var tree = $('side-tree');
@@ -1329,12 +1406,38 @@
     if (head) { head.hidden = categories.length === 0; }
     tree.hidden = categories.length === 0;
     for (var j = 0; j < categories.length; j += 1) {
-      var row = make('div', 'tree-item' + (state.activeCategory1 === categories[j].name ? ' is-active' : ''));
-      row.setAttribute('data-category', categories[j].name);
+      var cat = categories[j];
+      var isL1Active = state.activeCategory1 === cat.name;
+      var isOpen = state.expandedL1 === cat.name;
+
+      var row = make('div', 'tree-item' + (isL1Active ? ' is-active' : ''));
+      row.setAttribute('data-category', cat.name);
+      row.setAttribute('data-row-depth', '1');
       row.appendChild(iconEl('i-folder', 'icon-nav'));
-      row.appendChild(make('span', null, categories[j].name));
-      row.appendChild(make('span', 'nav-count', categories[j].count));
+      row.appendChild(make('span', null, cat.name));
+      row.appendChild(make('span', 'nav-count', cat.count));
+
+      /* 只有「有 ≥1 个真实二级值」的一级才画展开箭头（渐进披露） */
+      var children = secondCategories(state.activeKind, cat.name);
+      if (children.length > 0) {
+        var caret = make('span', 'tree-caret', isOpen ? '▾' : '▸');
+        row.appendChild(caret);
+        row.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+      }
       tree.appendChild(row);
+
+      if (isOpen && children.length > 0) {
+        for (var k = 0; k < children.length; k += 1) {
+          var sub = children[k];
+          var subRow = make('div', 'tree-item tree-item-l2' +
+            (state.activeCategory2 === sub.name ? ' is-active' : ''));
+          subRow.setAttribute('data-category2', sub.name);
+          subRow.setAttribute('data-row-depth', '2');
+          subRow.appendChild(make('span', null, sub.name));
+          subRow.appendChild(make('span', 'nav-count', sub.count));
+          tree.appendChild(subRow);
+        }
+      }
     }
 
     var libPath = $('lib-path');
@@ -1366,30 +1469,17 @@
     var countNode = $('count');
     chips.textContent = '';
 
-    var all = make('button', 'chip' + (state.activeKind === '' && state.activeCategory1 === '' ? ' chip-accent' : ' chip-ghost'), '全部');
+    var all = make('button', 'chip' + (state.activeKind === '' && state.activeCategory1 === '' && state.activeCategory2 === '' ? ' chip-accent' : ' chip-ghost'), '清除筛选');
     all.type = 'button';
     all.setAttribute('data-chip', 'reset');
     chips.appendChild(all);
 
-    var typeChip = make('button', 'chip chip-ghost' + (state.activeKind ? ' is-active' : ''));
-    typeChip.type = 'button';
-    typeChip.setAttribute('data-chip', 'type');
-    typeChip.appendChild(document.createTextNode(state.activeKind ? groupLabel(state.activeKind) : '类型'));
-    typeChip.appendChild(make('span', 'caret', '▾'));
-    chips.appendChild(typeChip);
-
-    var catChip = make('button', 'chip chip-ghost' + (state.activeCategory1 ? ' is-active' : ''));
-    catChip.type = 'button';
-    catChip.setAttribute('data-chip', 'category');
-    catChip.appendChild(document.createTextNode(state.activeCategory1 || '分类'));
-    catChip.appendChild(make('span', 'caret', '▾'));
-    chips.appendChild(catChip);
-
+    /* T03 第 7 步（D04）：type / category 两颗假 chip 已删——分类入口在左栏树里，
+       chips 无浮层、靠点击循环切换的降级方案对分类已无意义。这里只剩「清除筛选」+「排序」。 */
     var sortChip = make('button', 'chip chip-ghost' + (state.sortKey !== 'default' ? ' is-active' : ''));
     sortChip.type = 'button';
     sortChip.setAttribute('data-chip', 'sort');
     sortChip.appendChild(document.createTextNode(SORT_LABELS[state.sortKey] || '排序'));
-    sortChip.appendChild(make('span', 'caret', '▾'));
     chips.appendChild(sortChip);
 
     /* 「共 N 项」用 #count（§4.1 必保留 id），挂在 chips 行右侧 */
@@ -1473,11 +1563,12 @@
   }
 
   function applyQuery(value) {
-    state.query = textOf(value);
-    $('clear').className = state.query ? 'clear' : 'clear hidden';
+    var query = textOf(value);
+    /* DOM 部分保留原样：输入框 value 由调用方单独设（input 事件的 target / clear 点击里置空），
+       这里只管「清空按钮」显隐 + 写 state + 按矩阵重绘。 */
+    $('clear').className = query ? 'clear' : 'clear hidden';
     dismissUndoPill();     /* 搜索属于「用户在浏览」⇒ 不用等 5 s 自然收 */
-    renderList();
-    renderCount();
+    commit({ query: query }, 'query');
   }
 
   /* ⑤ 选中：与插入是同一次 click（单值 state.selectedId） */
@@ -1508,10 +1599,8 @@
     renderBanner(data || { ok: false, message: '没有数据' });
     renderNotes(data);
     renderFreshness();
-    renderSide();
-    renderChips();
-    renderList();
-    renderCount();
+    /* 整份数据重绘 = 四区全亮：走 commit(null, 'reset')，不再手抄四件套 */
+    commit(null, 'reset');
   }
 
   window.IDBOX = {
@@ -1575,6 +1664,20 @@
   });
   $('refresh').addEventListener('click', function () { refreshIndex(); });
   $('banner').addEventListener('click', function () { refreshIndex(); });   /* P1-2：可点击提示条 */
+
+  /* T03 第 9 步：空态里的「清除筛选」出口（事件绑在 #empty 上，用 closestWithAttr 找）。
+     ⚠️ commit 只写 state，不负责输入框的 value —— 搜索词必须在这里显式清 DOM，
+     与「清空搜索」按钮（#clear）同款处理，否则输入框里残留旧词而列表已回到全部。 */
+  $('empty').addEventListener('click', function (event) {
+    var btn = closestWithAttr(event.target, 'data-role');
+    if (!btn || btn.getAttribute('data-role') !== 'empty-clear') { return; }
+    $('q').value = '';
+    $('clear').className = 'clear hidden';
+    commit({
+      query: '', activeKind: '', activeCategory1: '', activeCategory2: '',
+      expandedL1: '', sortKey: 'default'
+    }, 'reset');
+  });
 
   /* 自绘窗口控件：只剩「折叠」（2026-11-09 B′：关闭交给系统 × / 菜单，不再有自绘关闭按钮） */
   $('win-fold').addEventListener('click', function () { setCollapsed(!state.collapsed); });
@@ -1666,24 +1769,36 @@
     var key = item.getAttribute('data-kind') || '';
     /* 再点当前大类 ⇒ 收起（回到「全部」）；切到别的大类 ⇒ 旧的一级分类必须清掉，
        否则会出现「材质分组 + 灯具」这种空列表（跨类的 category1 不成立）。 */
-    state.activeKind = (key !== '' && key === state.activeKind) ? '' : key;
-    state.activeCategory1 = '';
-    renderSide();
-    renderChips();
-    renderList();
-    renderCount();
+    commit({
+      activeKind: (key !== '' && key === state.activeKind) ? '' : key,
+      /* 换大类 ⇒ 旧的一级/二级不再属于当前范围；清场点必须三字段一起清 */
+      activeCategory1: '',
+      activeCategory2: '',
+      expandedL1: ''
+    }, 'kind');
   });
 
   $('side-tree').addEventListener('click', function (event) {
+    /* 先看是不是二级（二级行同时带 data-category2） */
+    var sub = closestWithAttr(event.target, 'data-category2');
+    if (sub) {
+      var c2 = sub.getAttribute('data-category2') || '';
+      /* 再点同一条 = 取消二级；一级保持不变 */
+      commit({ activeCategory2: (c2 === state.activeCategory2) ? '' : c2 }, 'category2');
+      return;
+    }
+
     var item = closestWithAttr(event.target, 'data-category');
     if (!item) { return; }
     var name = item.getAttribute('data-category') || '';
-    /* 再点同一个一级分类 ⇒ 取消该分类（留在当前大类里） */
-    state.activeCategory1 = (name === state.activeCategory1) ? '' : name;
-    renderSide();
-    renderChips();
-    renderList();
-    renderCount();
+    var same = (name === state.activeCategory1);
+
+    commit({
+      activeCategory1: same ? '' : name,
+      /* 点一级 = 筛选 + 展开它的二级；再点同一个一级 = 收起并清二级 */
+      expandedL1: same ? '' : name,
+      activeCategory2: ''
+    }, 'category1');
   });
 
   /* chips 无浮层（React 能力），降级为点击循环切换，三态 class 保留 */
@@ -1693,28 +1808,17 @@
     if (!chip) { return; }
     var which = chip.getAttribute('data-chip');
     if (which === 'reset') {
-      state.activeKind = '';
-      state.activeCategory1 = '';
-      state.sortKey = 'default';
-    } else if (which === 'type') {
-      var keys = [];
-      var groups = allowedGroups();
-      for (var i = 0; i < groups.length; i += 1) { keys.push(groups[i].key); }
-      state.activeKind = nextIn(keys, state.activeKind);
-      /* 换大类 ⇒ 旧的一级分类不再属于当前范围（否则会筛出一个空列表） */
-      state.activeCategory1 = '';
-    } else if (which === 'category') {
-      var names = [''];
-      var categories = topCategories();
-      for (var j = 0; j < categories.length; j += 1) { names.push(categories[j].name); }
-      state.activeCategory1 = nextIn(names, state.activeCategory1);
-    } else if (which === 'sort') {
-      state.sortKey = nextIn(SORT_KEYS, state.sortKey);
+      commit({
+        activeKind: '', activeCategory1: '', activeCategory2: '',
+        expandedL1: '', sortKey: 'default'
+      }, 'reset');
+      return;
     }
-    renderSide();
-    renderChips();
-    renderList();
-    renderCount();
+    /* T03 第 7 步（D04）：which === 'type' / 'category' 两个分支已随两颗假 chip 一起删除；
+       chips 只剩「清除筛选」与「排序」。nextIn 仍被 sort 使用，保留。 */
+    if (which === 'sort') {
+      commit({ sortKey: nextIn(SORT_KEYS, state.sortKey) }, 'sort');
+    }
   });
 
   function nextIn(list, current) {
@@ -1722,17 +1826,48 @@
     return list[(index + 1) % list.length];
   }
 
+  /* 重绘矩阵：哪些原因需要重绘哪些区域。true = 重绘。
+     原则：改筛选 → 左栏高亮 + chips + 列表 + 计数都要变；
+           改排序 → 只影响列表顺序，不动左栏和计数；
+           改搜索词 → 只影响列表和计数。 */
+  var REDRAW_MATRIX = {
+    kind:     { side: true,  chips: true,  list: true,  count: true },
+    category1:{ side: true,  chips: true,  list: true,  count: true },
+    category2:{ side: true,  chips: true,  list: true,  count: true },
+    sort:     { side: false, chips: true,  list: true,  count: false },
+    query:    { side: false, chips: false, list: true,  count: true },
+    reset:    { side: true,  chips: true,  list: true,  count: true },
+    density:  { side: false, chips: false, list: true,  count: false },
+    view:     { side: false, chips: false, list: true,  count: false },
+    select:   { side: false, chips: false, list: false, count: false }
+  };
+
+  /* 唯一的 state 写入入口。patch 里放要改的字段，reason 决定重绘范围。 */
+  function commit(patch, reason) {
+    if (patch) {
+      for (var key in patch) {
+        if (Object.prototype.hasOwnProperty.call(patch, key)) {
+          state[key] = patch[key];
+        }
+      }
+    }
+    var plan = REDRAW_MATRIX[reason] || REDRAW_MATRIX.reset;
+    if (plan.side) { renderSide(); }
+    if (plan.chips) { renderChips(); }
+    if (plan.list) { renderList(); }
+    if (plan.count) { renderCount(); }
+  }
+
   /* 分段控件：仅切换网格 / 单列展示（卡片 markup 不变） */
   document.querySelector('.seg').addEventListener('click', function (event) {
     var btn = event.target;
     while (btn && !btn.getAttribute('data-view')) { btn = btn.parentNode; }
     if (!btn) { return; }
-    state.viewMode = btn.getAttribute('data-view');
+    commit({ viewMode: btn.getAttribute('data-view') }, 'view');
     var buttons = document.querySelectorAll('.seg-btn');
     for (var i = 0; i < buttons.length; i += 1) {
       buttons[i].className = 'seg-btn' + (buttons[i].getAttribute('data-view') === state.viewMode ? ' is-active' : '');
     }
-    renderList();
   });
 
   /* ESC：折叠态下先展开（用户下意识按 Esc 想退出窄条）；
@@ -1745,14 +1880,11 @@
       setStatus({ message: '已展开面板（Esc）', level: 'info' });
       return;
     }
-    if (!state.activeKind && !state.activeCategory1 && state.sortKey === 'default') { return; }
-    state.activeKind = '';
-    state.activeCategory1 = '';
-    state.sortKey = 'default';
-    renderSide();
-    renderChips();
-    renderList();
-    renderCount();
+    if (!state.activeKind && !state.activeCategory1 && !state.activeCategory2 && state.sortKey === 'default') { return; }
+    commit({
+      activeKind: '', activeCategory1: '', activeCategory2: '',
+      expandedL1: '', sortKey: 'default'
+    }, 'reset');
     setStatus({ message: '已取消筛选（Esc）', level: 'info' });
   });
 
@@ -1763,9 +1895,9 @@
      （列数由 CSS 变量决定，首帧就是用户上次选的那档，不会先闪一下 3 列） */
   applyDensity(readDensity());
 
-  renderChips();
-  renderSide();
-  renderList();
+  /* 初始化也走 commit：四件套只允许出现在 commit 内部（§2.3 判据 1）。
+     reason = 'reset' ⇒ 四区全亮，与改之前逐区一致。 */
+  commit(null, 'reset');
 
   /* 折叠态图标初值（展开态 = 折叠图标 + 对应的 title / aria-label） */
   applyCollapsedClass(false);
