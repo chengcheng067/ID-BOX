@@ -227,10 +227,19 @@ export const KIND_NAV_ORDER: ReadonlyArray<AssetKind | KindGroup> = [
  * `'cad'` 刻意排在 `'model'` **之后**：同时含 `.skp` 与 `.dwg` 的包应判 `'model'`
  * （模型是主内容、图纸是附件）；只有图纸、没有模型时才落到 `'cad'`。
  *
- * `'d5a'` 排在 `'texture'` 之后、`'other'` 之前：`.d5a` 是**整包存档**，包内条目永远不会
- * 进 `files[]`（不解包），所以正常情况下 `files[]` 里只有它自己 —— 这个位置只是为了
- * 万一将来某条路径把贴图混进了同一个 `files[]`（例如用户手工往资产目录塞了张预览图），
- * 仍然优先认「有具体大类」的 `texture`，而不是把它算成 D5A。
+ * `'d5a'` 仍排在 `'texture'` 之后、`'other'` 之前（**本批刻意不改这个顺序**）。
+ * `.d5a` 是**整包存档**、不解包，正常情况下 `files[]` 里只有它自己；真正「包里多出
+ * 一张 texture」的情形是**用户手工塞的预览图**（`预览.jpg` 之类，不带 `.cover.` 后缀），
+ * 那时优先认「有具体大类」的 `texture` 是既有语义，`tests/d5a.test.ts` 有断言钉住，
+ * 不能靠调优先级顺序去"修"——那会连带改掉真实「模型包 + 贴图」与 PBR 材质包的判定。
+ *
+ * ⚠️ 但**程序生成的附属封面**（`<资产名>.cover.jpg/png`，由「自定义封面」/ 知末抓图 /
+ * HDR 拍照等功能落盘）**不参与大类判定**：`primaryKind()` 在算 `present` 之前就把它剔除
+ * （见 `withoutProgramCovers`）。旧注释把意图写反了——它假设「手工塞预览图」才需要
+ * texture 优先，结果正规「自定义封面」功能往 `files[]` 追加了一条 `kind:'texture'` 的
+ * cover，D5A 资产当场被判成贴图（弹窗大类显示「材质（贴图）」、一级词表全是石材木纹）。
+ * 剔除 cover 后 D5A+cover ⇒ `present={d5a}` ⇒ 正确返回 `d5a`；真实「模型包 + 贴图」
+ * 与 PBR 材质包（`detectMaterialPack`）的既有语义一字不动。
  */
 const KIND_PRIORITY: AssetKind[] = ['model', 'cad', 'material', 'hdri', 'texture', 'd5a', 'other']
 
@@ -355,6 +364,37 @@ export function isCoverAssetImage(name: string): boolean {
   return /\.cover\.(jpe?g|png)$/i.test(name)
 }
 
+/**
+ * 剔除「程序生成的附属封面」后的**判定用文件列表**（`primaryKind` / `pickPrimaryFile` 共用）。
+ *
+ * 背景（2026-11-11 P0 真机缺陷）：`commitCover()` 给资产贴自定义封面时，会把
+ * `<资产名>.cover.png` 作为 `kind:'texture'` 的 `AssetFile` 追加进 `files[]`（**不改
+ * `asset.kind`**）。重扫 `walkFiles` 收齐目录内所有文件后调 `primaryKind()`：D5A 包变成
+ * `present={d5a,texture}`，`KIND_PRIORITY` 里 `texture` 排在 `d5a` 前面 ⇒ 整包被判成贴图，
+ * 「指派分类」弹窗显示「材质（贴图）」+ 石材/砖材/木纹词表；`pickPrimaryFile` 的
+ * `files[0]` 兜底又把 `mainFile` 选成 `.cover.png`（插件 `index.json` 已出现该脏值）。
+ *
+ * 裁定：**附属封面不参与大类与主文件判定**。它只是预览图，不是资产本体；按受控后缀
+ * `isCoverAssetImage`（只认 `\.cover\.(jpe?g|png)$`）剔除，而不是按 `kind==='texture'`
+ * 剔除 —— 真实贴图 / 用户手工塞的预览图（`预览.jpg`）必须继续参与判定，否则「模型包 +
+ * 贴图仍优先 model」「PBR 材质包走 `detectMaterialPack`」等既有语义会被改坏。
+ *
+ * ⚠️ 传的是 `rel` 而不是 `name`：`primaryKind()` 的入参类型只有 `{rel, kind}`，且
+ * `isCoverAssetImage` 的正则锚定结尾，`rel` 以文件名收尾，判定结果与 `name` 一致。
+ *
+ * **边界**：若剔除后为空（目录里只有一张 `.cover.png`、没有任何主文件），返回**原列表**。
+ * 这不是偷懒，是数据安全：此时若用空集，`primaryKind` 会落到 `'other'` —— 下一次
+ * `assignCategory` 用 `kindFolder('other')='其他'` 拼目标目录，会把一条还在库里的资产
+ * 真实搬进 `其他/`（"打飞"）；`pickPrimaryFile` 也会失去 `files[0]` 兜底返回 undefined。
+ * 保留原列表 ⇒ 行为与改动前逐字节一致（`present={texture}` → `texture`、主文件仍是那张封面），
+ * 且这种"只有封面"通常是封面已落盘、主文件还没写完的中间态，绝不能因判据调整被抹掉。
+ * 单一规则放在这里，保证大类判定与主文件判定**不会各自演化出两套封面口径**。
+ */
+function withoutProgramCovers<T extends Pick<AssetFile, 'rel' | 'kind'>>(files: T[]): T[] {
+  const significant = files.filter((f) => !isCoverAssetImage(f.rel))
+  return significant.length > 0 ? significant : files
+}
+
 export function kindOfExt(ext: string): AssetKind {
   return EXT_KIND[ext.toLowerCase().replace(/^\./, '')] ?? 'other'
 }
@@ -385,11 +425,16 @@ export function isLegacyCadExt(ext: string | undefined): boolean {
  * material 扩展名 > hdri > texture > other。
  * 材质包判定插在 model 之后、hdri 之前：样本 B（含 .exr 的 AmbientCG 包）
  * 曾被误判进 HDRI；同前缀 Albedo+Normal+Roughness 齐全即材质包。
+ *
+ * 2026-11-11 P0：`present` 与材质包判定都只用 `withoutProgramCovers(files)` ——
+ * 附属封面不参与大类判定。D5A 包贴一次自定义封面后 `present={d5a}` ⇒ 正确返回 `d5a`；
+ * 真实贴图 / 手工预览图不叫 `.cover.*`，原样参与 ⇒ 既有优先级语义一字不改。
  */
 export function primaryKind(files: Pick<AssetFile, 'rel' | 'kind'>[]): AssetKind {
   if (files.length === 0) return 'other'
-  const present = new Set(files.map((f) => f.kind))
-  if (!present.has('model') && detectMaterialPack(files) !== null) return 'material'
+  const significant = withoutProgramCovers(files)
+  const present = new Set(significant.map((f) => f.kind))
+  if (!present.has('model') && detectMaterialPack(significant) !== null) return 'material'
   for (const k of KIND_PRIORITY) if (present.has(k)) return k
   return 'other'
 }
@@ -472,17 +517,25 @@ export function pickCover(files: AssetFile[], opts?: PickCoverOptions): CoverPic
  * 恰 1 项（就是那个 `.d5a` 自己），三轮都不命中 → 退到 `files[0]`，语义正确。
  * 反过来说，若把 `d5a` 加进 `PRIMARY_MODEL_EXTS`，它就会被当成"模型主文件"，
  * 拖出 / 双击定位那两条链会开始按模型语义处理它 —— 直接违背「可读不可插入」。
+ *
+ * ⚠️ **附属封面先剔除**（2026-11-11 P0）：D5A 资产贴自定义封面后 `files[]` 变成
+ * `{d5a, <名>.cover.png}`，目录遍历常把 `.cover.png` 排在 `.d5a` 前面；旧实现退到
+ * `files[0]` 就把 `mainFile` 选成了封面（插件 `index.json` 里已出现该脏值）。
+ * 剔除 cover 后仍走同一套 `skp > max > … > model > cad > files[0]` 规则：
+ * 模型包优先 `.skp` / `.max`、CAD 优先 `.dwg` 全部不变，D5A 自然落回 `.d5a`。
+ * 只按 `isCoverAssetImage` 受控后缀剔除，真实贴图 / 手工预览图照常参与。
  */
 export function pickPrimaryFile(files: AssetFile[]): AssetFile | undefined {
   if (files.length === 0) return undefined
+  const significant = withoutProgramCovers(files)
   for (const ext of PRIMARY_MODEL_EXTS) {
-    const hit = files.find((f) => f.ext.toLowerCase() === ext)
+    const hit = significant.find((f) => f.ext.toLowerCase() === ext)
     if (hit) return hit
   }
-  const model = files.find((f) => f.kind === 'model')
+  const model = significant.find((f) => f.kind === 'model')
   if (model) return model
-  const cad = files.find((f) => f.kind === 'cad')
-  return cad ?? files[0]
+  const cad = significant.find((f) => f.kind === 'cad')
+  return cad ?? significant[0]
 }
 
 /**
