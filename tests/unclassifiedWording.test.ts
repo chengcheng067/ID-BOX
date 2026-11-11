@@ -5,8 +5,13 @@
  *
  * **语义与判据源**，不是把三个数字强行改成同一个值。三者量的本就不是同一个集合：
  * - ① `countLevel1`：分类树按 `category1` **分组计数**（未分类节点 = 一级未分类，不套筛选）；
- * - ② `isCategoryIncomplete`：中栏头「· 待补 N」，`||`（半归类也算），套当前筛选；
+ * - ② `isCategoryIncomplete`：中栏头「· 待补 N」与首页数据卡「待补分类」，**自 2026-11-11 起只认
+ *   一级是否已指派**（`category1 === 未分类`），套当前筛选；
  * - ③ `isUnclassified`：「全库一对都没定」的唯一判据源，`&&`，不套筛选。
+ *
+ * ② 与 ③ **仍刻意不同、不许合并**：半归类资产（一级已填、二级未分类）在 ② 下不算待补，
+ * 但 ③ 也本来不算 —— 两者的差异自 2026-11-11 起只剩「② 套筛选」这一点，判据本身对半归类
+ * 资产已趋同（③ 仍要求两级都空）。详见 docs/25「未分类三口径」条目末尾的 2026-11-11 变更记录。
  *
  * ## 为什么有「源码守卫」这一段
  *
@@ -24,7 +29,8 @@ import { normalizeCategoryPair } from '../src/shared/naming'
 import {
   categoriesOf,
   countLevel1,
-  isCategoryIncomplete
+  isCategoryIncomplete,
+  level2OptionsFor
 } from '../src/renderer/logic/category'
 import { isUnclassified } from '../src/renderer/logic/triageFlow'
 
@@ -56,14 +62,15 @@ function asset(patch: Partial<Asset> = {}): Asset {
   }
 }
 
-// ── A · 两种判据在「半归类资产」上刻意不同 ───────────────────────────
+// ── A · 两种判据仍刻意不同（② 只认一级；③ 要求两级都空）────────────────
 
 describe('A · isUnclassified（③ 双未分类）vs isCategoryIncomplete（② 待补）', () => {
-  it('★半归类资产（一级已填、二级未分类）：③ false / ② true', () => {
+  it('★半归类资产（一级已填、二级未分类）：③ false / ② false（2026-11-11 起 ② 只认一级）', () => {
     const half = asset({ category1: '椅子', category2: UNCLASSIFIED })
     expect(categoriesOf(half)).toEqual({ category1: '椅子', category2: UNCLASSIFIED })
     expect(isUnclassified(half)).toBe(false)
-    expect(isCategoryIncomplete(half)).toBe(true)
+    // 2026-11-11 用户口径：一级已指派即算已分类，二级未分类不再计入「待补」
+    expect(isCategoryIncomplete(half)).toBe(false)
   })
 
   it('★双未分类（两级都空）：③ true / ② true', () => {
@@ -94,6 +101,20 @@ describe('A · isUnclassified（③ 双未分类）vs isCategoryIncomplete（②
     expect(isCategoryIncomplete(null)).toBe(false)
     expect(isCategoryIncomplete(undefined)).toBe(false)
   })
+
+  it('★HDR 场景：一级已指派、二级无词表可填 → ② false（不算待补）', () => {
+    // 用户口径（2026-11-11）：「HDR 没有 2 级分类，只有 1 级分类。那只要有一级分类的，
+    // 我们都认为它已经给了分类，就不是"待补分类"了。」
+    // 这类频道 `level2OptionsFor` 返回 `null`（`LEVEL2_MAP` 里查不到该一级 → 无二级级联词表，
+    // UI 渲染为「可自由输入」），所以二级为空是常态而不是缺陷：一级已指派即算已分类。
+    const hdr = asset({ kind: 'hdri', category1: '城市HDR' }) // category2 缺省 = 老数据无字段
+    expect(level2OptionsFor('城市HDR', 'hdri')).toBeNull() // 无二级级联词表，这就是理由
+    expect(categoriesOf(hdr)).toEqual({ category1: '城市HDR', category2: UNCLASSIFIED })
+    expect(isCategoryIncomplete(hdr)).toBe(false)
+    // ③ 仍是 `&&`（两级都空才算）：HDR 这条一级已填，按 ③ 也是 false —— 两者在此刻一致。
+    // 判据层面的不同只在「一级未指派、二级有值」那种数据上体现（见 C 段）。
+    expect(isUnclassified(hdr)).toBe(false)
+  })
 })
 
 // ── B · ① countLevel1 仍是「按 category1 分组」 ──────────────────────
@@ -120,7 +141,7 @@ describe('B · countLevel1 保留分组判据：半归类计入其一级节点�
     expect(nodes[nodes.length - 1]?.value).toBe(UNCLASSIFIED)
   })
 
-  it('★同一批数据下 ② 与 ③ 的数量本就不同（不强行统一成同一个值）', () => {
+  it('★同一批数据下 ② 与 ③ 的数量：新口径下相等（都 1），差异曾存在于半归类资产上', () => {
     const list: Asset[] = [
       asset({ category1: '椅子', category2: UNCLASSIFIED }),
       asset({ category1: '椅子', category2: UNCLASSIFIED }),
@@ -128,7 +149,9 @@ describe('B · countLevel1 保留分组判据：半归类计入其一级节点�
       asset({ category1: UNCLASSIFIED, category2: UNCLASSIFIED })
     ]
     expect(list.filter(isUnclassified)).toHaveLength(1) // ③ 只认双未分类
-    expect(list.filter(isCategoryIncomplete)).toHaveLength(3) // ② 半归类也算待补
+    // 2026-11-11 起 ② 只认一级：这批数据里只有最后那条双未分类命中，所以两者相等。
+    // 旧口径（`||`）下这里是 3（两条半归类也算待补）——那个差异现在不存在了。
+    expect(list.filter(isCategoryIncomplete)).toHaveLength(1) // ② 只认一级未指派
   })
 })
 
