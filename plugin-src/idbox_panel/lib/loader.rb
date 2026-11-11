@@ -165,8 +165,8 @@ module IDBoxPanel
         'records' => @records,
         # 2026-11-09 新增（A8「只增不删」允许）：
         #   materialKinds = 允许「双击创建材质」的 kind（texture / material）。
-        #   与 insertableKinds 分开是刻意的：单击插入组件 与 双击建材质 是两个不同动作，
-        #   合成一张表会让面板无法区分「这条能双击」还是「这条只能单击」。
+        #   与 insertableKinds 分开是刻意的：双击插入组件 与 双击建材质 是两个不同动作，
+        #   合成一张表会让面板无法区分「这条双击后建材质」还是「这条双击后插入」。
         'materialKinds' => MATERIAL_KINDS,
         'insertableKinds' => INSERTABLE_KINDS,
         'kindLabels' => KIND_LABELS,
@@ -662,7 +662,7 @@ module IDBoxPanel
           #   · 贴图没挂上 / 没能设为当前材质（上面两个 warn 分支）⇒ 不切，别给用户一个
           #     拿着错误材质的油漆桶；
           #   · 只读态 / 无活动模型根本到不了这里（apply 前面已经 return）；
-          #   · Inserter（单击插入模型）**绝不**切工具 —— 那会把用户正在放组件的手打断。
+          #   · Inserter（双击插入模型）**绝不**切工具 —— 那会把用户正在放组件的手打断。
           switch_to_paint_tool
           result(true, nil, Messages.material_ok(name))
         else

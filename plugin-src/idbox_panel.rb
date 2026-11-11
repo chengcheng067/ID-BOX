@@ -50,6 +50,9 @@ module IDBoxPanel
     #   （逐条见 docs/48 §6 / §7 / §12 与 docs/50 的插件章节），按语义化版本升 minor。
     #   ⚠️ 必须与 lib/core.rb 的 PLUGIN_VERSION 同值（那边也有同样的提示，两处一起改）。
     #   2026-11-10 T01 只补齐这条滞后的变更记录，本轮**不升版本号**（§8 D10 = A）。
+    #   1.3.0 → 1.0.5（2026-11-11 用户拍板）：编号体系与主程序统一，插件包版本直接跟
+    #   `package.json.version` 同号。历史各行保留作变更记录，不回改。
+    #   ⚠️ 必须与 lib/core.rb 的 PLUGIN_VERSION 同值（那边也有同样的提示，两处一起改）。
     #
     # 为什么这里不能直接引用 `IDBoxPanel::PLUGIN_VERSION`（试过，不安全）：
     #   本文件是**扩展入口**，它在 `Registrar.register`（文件末尾）这一行才触发
@@ -57,7 +60,7 @@ module IDBoxPanel
     #   `Sketchup.require` 进来的 —— 也就是说 `apply_metadata` 执行时 PLUGIN_VERSION **还不存在**。
     #   而「根 .rb 只做注册、不得加载额外文件」是硬约束（docs/42 §2 文件 1），
     #   不能为了取一个版本号提前 require core。⇒ 只能保持字面量 + 人工同步。
-    EXT_VERSION = '1.3.0'.freeze
+    EXT_VERSION = '1.0.5'.freeze
     EXT_CREATOR = 'ID BOX'.freeze
     EXT_COPYRIGHT = 'ID BOX'.freeze
     EXT_DESCRIPTION =

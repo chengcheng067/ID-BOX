@@ -7,7 +7,7 @@
 #      与被插入的那个 record 只有「读一个 id」的关系（见 record_insert）。
 #
 # ── 干什么 ────────────────────────────────────────────────────────────────
-# 用户在面板里单击插入一个模型（`loader.rb` 的 `Inserter.insert` 成功返回前）会调
+# 用户在面板里双击插入一个模型（`loader.rb` 的 `Inserter.insert` 成功返回前）会调
 # `UsageLog.record_insert(record)`，本文件往
 #
 #     %APPDATA%\idbox_export\usage\<jobId>.json

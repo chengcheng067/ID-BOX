@@ -449,6 +449,19 @@ failures << '场景 E：胶囊正文「撤销 Ctrl+Z」不得改动' unless pane
 puts "  INSERTABLE_KINDS => #{IDBoxPanel::INSERTABLE_KINDS.inspect}（应为 [\"model\"]）"
 failures << '场景 E：INSERTABLE_KINDS 仍须为 %w[model]' unless IDBoxPanel::INSERTABLE_KINDS == %w[model]
 
+# ⑥b 动作口径（2026-11-11 用户改口径：防误点导致长时间卡顿）——
+#   · 单击一律只做「选中 + 提示」，不得执行动作；动作都在双击（模型插入 / 材质建材质）。
+#   ⚠️ 必须在**监听器函数体内**判，不能全文件判：`insertRecord` 本身是个函数，
+#      它的定义与 `window.sketchup.insertRecord(id)` 调用点都在监听器之外，全文件扫会误判。
+click_body = panel_src[/\$\('list'\)\.addEventListener\('click', function \(event\) \{.*?\n  \}\)/m].to_s
+dbl_body = panel_src[/\$\('list'\)\.addEventListener\('dblclick', function \(event\) \{.*?\n  \}\)/m].to_s
+puts "  #list 单击监听体内含 insertRecord( => #{click_body.include?('insertRecord(')}（应为 false）"
+puts "  #list 双击监听体内含 insertRecord( => #{dbl_body.include?('insertRecord(')}（应为 true）"
+failures << '场景 E：面板的单击分支不得调用 insertRecord（单击只做选中 + 提示，防误点）' if
+  click_body.include?('insertRecord(')
+failures << '场景 E：面板的双击分支必须含 insertRecord 调用（模型的动作在双击）' unless
+  dbl_body.include?('insertRecord(')
+
 # ⑦ P2-1（+ 2026-11-09 续卡）：**用户可见文本里不得出现任何内部字段名**。
 #    口径：先整体剥注释（注释里保留 `manifest.appVersion` 这类来源链说明是有价值的），
 #    再只从**字符串字面量**里数。为什么只数字面量：代码里的 `data.generatedAt` /

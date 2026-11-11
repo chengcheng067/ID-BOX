@@ -60,7 +60,7 @@ module IDBoxPanel
       # refreshIndex：用户手动点「刷新」
       dialog.add_action_callback('refreshIndex') { |_context| panel.on_refresh }
 
-      # insertRecord(id)：点一下即插入（A14：不做二次确认）
+      # insertRecord(id)：双击卡片才插入（单击只做选中 + 提示，2026-11-11 改口径：防误点卡顿；仍不做二次确认）
       dialog.add_action_callback('insertRecord') { |_context, record_id| panel.on_insert(record_id) }
 
       true

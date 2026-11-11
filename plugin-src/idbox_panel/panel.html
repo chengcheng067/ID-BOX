@@ -22,7 +22,7 @@
   与 Ruby 的契约（add_action_callback，只增不删）：
     sketchup.ready()                → 面板就绪，请求数据
     sketchup.refreshIndex()         → 强制重读索引文件（新增调用点：提示条）
-    sketchup.insertRecord(id)       → 插入一条记录（新增调用点：卡片单击）
+    sketchup.insertRecord(id)       → 插入一条记录（新增调用点：卡片双击）
     sketchup.applyMaterial(id)      → 双击材质：建材质 + 设当前材质（**不贴面**，V1.0）
     sketchup.setPanelSize(flag)     → 折叠 / 展开窗口（flag = true 折叠），调 dialog.set_size
     sketchup.closePanel()           → 关闭面板，调 dialog.close
@@ -1055,10 +1055,10 @@
     var kind = textOf(record.kind) || 'other';
     var card = make('div', 'card' + (reason ? ' is-disabled' : '') + (state.selectedId === textOf(record.id) ? ' is-selected' : ''));
     card.setAttribute('data-id', textOf(record.id));
-    /* 提示语按动作分：模型 = 单击插入；材质/贴图 = 双击建材质（不贴面） */
+    /* 提示语按动作分：模型 = 双击插入；材质/贴图 = 双击建材质（不贴面） */
     var hint = isMaterialRecord(record)
       ? '双击：在当前模型里创建材质并设为当前材质（不会自动贴到任何面上）'
-      : '单击插入到当前模型（可 Ctrl+Z 撤销）';
+      : '双击插入到当前模型（可 Ctrl+Z 撤销）';
     card.title = reason ? (reason + '\n' + hint) : hint;
 
     var frame = make('div', 'card-cover-frame');
@@ -1705,6 +1705,7 @@
     return card;
   }
 
+  /* 单击一律只做选中 + 提示，不执行动作（2026-11-11 用户改口径：防误点卡顿）。 */
   $('list').addEventListener('click', function (event) {
     var card = cardFrom(event);
     if (!card) { return; }
@@ -1722,21 +1723,33 @@
     }
     var reason = blockReason(record);
     if (reason) { setStatus({ message: reason, level: 'warn' }); return; }
-    insertRecord(id);
+    setStatus({
+      message: '双击这张' + kindLabelOf(record.kind) + '：插入到当前模型（可 Ctrl+Z 撤销）',
+      level: 'info'
+    });
   });
 
-  /* 双击材质 → 建材质（docs/48 §6）。模型保持「单击即插入」不变（A14 不变量）。 */
+  /* 模型与材质都是双击动作（docs/48 §6）；单击只做选中 + 提示
+     （2026-11-11 用户改口径：防误点卡顿，原 A14「点一下即插入、不做二次确认」改此）。 */
   $('list').addEventListener('dblclick', function (event) {
     var card = cardFrom(event);
     if (!card) { return; }
     var record = findRecord(card.getAttribute('data-id'));
-    if (!record || !isMaterialRecord(record)) { return; }
+    if (!record) { return; }
     var data = state.data || {};
-    if (data.readOnly) {
-      setStatus({ message: 'ID BOX 与插件版本不匹配，建材质已禁用；请把主程序与插件升级到同一版本', level: 'warn' });
+    /* 材质/贴图 → 建材质（不贴面） */
+    if (isMaterialRecord(record)) {
+      if (data.readOnly) {
+        setStatus({ message: 'ID BOX 与插件版本不匹配，建材质已禁用；请把主程序与插件升级到同一版本', level: 'warn' });
+        return;
+      }
+      applyMaterial(textOf(record.id));
       return;
     }
-    applyMaterial(textOf(record.id));
+    /* 可插入 kind → 插入 */
+    var reason = blockReason(record);
+    if (reason) { setStatus({ message: reason, level: 'warn' }); return; }
+    insertRecord(textOf(record.id));
   });
 
   function findRecord(id) {

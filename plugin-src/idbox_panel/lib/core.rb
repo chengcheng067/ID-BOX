@@ -51,8 +51,13 @@ module IDBoxPanel
   #   撤销胶囊三态 / A 级文案收口，见 docs/48 §6、§7、§12 与 docs/50），按语义化版本升 minor。
   #   ⚠️ 必须与 idbox_panel.rb 的 Registrar::EXT_VERSION 同值（那边也有同样的提示）。
   #   2026-11-10 T01 只补这条滞后的变更记录，本轮**不升版本号**（§8 D10 = A）。
-  # 注意：这不是主程序版本（主程序仍是 0.9.3）；面板显示的是主程序 appVersion。
-  PLUGIN_VERSION = '1.3.0'.freeze
+  # 1.3.0 → 1.0.5（2026-11-11 用户拍板）：**编号体系与主程序统一**。插件原本自成序列
+  #   （1.2.x / 1.3.0），与主程序版本号对不上，用户在面板里看到两个不同的数字容易误解；
+  #   本条起插件包版本直接跟主程序同版本号 ⇒ 与 `package.json.version` 一致。
+  #   ⚠️ 历史各行（1.1.0 → 1.3.0）保留作变更记录，不回改；本条起两条编号合并成一条。
+  #   以前那句「这不是主程序版本」不再成立：从 1.0.5 起两者同号（面板左上角仍显示 appVersion）。
+  #   ⚠️ 必须与 idbox_panel.rb 的 Registrar::EXT_VERSION 同值（那边也有同样的提示，两处一起改）。
+  PLUGIN_VERSION = '1.0.5'.freeze
   MANIFEST_FILE = 'manifest.json'.freeze
   INDEX_FILE = 'index.json'.freeze
   # 支持目录名 = 根 .rb 同名（去掉 .rb），docs/39 §4.2 硬要求
@@ -98,7 +103,7 @@ module IDBoxPanel
 
   # 六值（types.ts:19）
   KINDS = %w[model texture hdri material cad other].freeze
-  # 允许「单击插入模型」的 kind：只有 model。
+  # 允许「双击插入模型」的 kind：只有 model（2026-11-11 用户改口径：单击只做选中 + 提示，防误点卡顿）。
   # ⚠️ 材质（texture / material）不走这里：它走**双击建材质**（MATERIAL_KINDS + Materializer），
   #    见 docs/48 §6「材质双击语义」——只建材质并设为当前材质，绝不自动贴面。
   INSERTABLE_KINDS = %w[model].freeze
