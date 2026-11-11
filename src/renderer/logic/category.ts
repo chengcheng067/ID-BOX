@@ -4,6 +4,8 @@
  * 覆盖：三级树的计数与排序（未分类哨兵恒排最后且不隐藏）、重名二级节点识别、
  * 级联选项来源、风格筛选选项、遗留布局迁移的渲染层计划（与 `main/layout.ts`
  * `planLayoutMigration` 同规则镜像——main 侧不可 import，规则必须保持一致）。
+ *
+ * 「待补分类」判据（`isCategoryIncomplete`）自 2026-11-11 起只认一级是否已指派，见该函数 doc。
  */
 import type { Asset, AssetKind, LayoutMove } from '../../shared/types'
 import {
@@ -26,14 +28,22 @@ export function categoriesOf(a: Asset): { category1: string; category2: string }
 }
 
 /**
- * 是否「待补分类」：一级**或**二级仍为未分类（半归类资产也算）。
+ * 是否「待补分类」：**只认一级是否已指派**——`category1` 仍是未分类才算待补。
  *
- * ## 这是中栏头「· 待补 N」的唯一判据源（docs/25「未分类三口径」② 号，已按语义统一）
+ * ## 2026-11-11 用户口径（本次变更）
  *
- * 与 `triageFlow.ts::isUnclassified`（`&&` 双未分类、全库、不套筛选）**刻意不同**：
- * 产品意图是「当前这批里还有多少要补分类」，半归类资产（`'椅子' / '未分类'`）当然要算，
- * 所以 `docs/25:2088-2089` 明确写了「不该改判据，只该改文案」。本函数就是那个不改的判据，
- * 抽成纯函数只为可单测 + 让 `App.tsx` 不再内联写一套。
+ * 一级已指派即视为已分类；HDR / 材质这类**该频道没有二级级联词表**的资产不该被计入待补
+ * （`level2OptionsFor` 返回 `null` 的那些）。用户原话：「比如说 HDR 没有 2 级分类，只有 1 级
+ * 分类。那只要有一级分类的，我们都认为它已经给了分类，就不是"待补分类"了。不然的话，一直
+ * 显示着"待补分类"，我会有一点强迫症」。判据由 `||`（一级或二级）收为只查 `category1`。
+ *
+ * ## 这是中栏头「· 待补 N」与首页数据卡「待补分类」的唯一判据源（docs/25「未分类三口径」② 号）
+ *
+ * ⚠️ 与 `triageFlow.ts::isUnclassified`（`&&` 双未分类、全库、不套筛选）**仍刻意不同**，不许合并、
+ * 不许把它的 `&&` 改成 `||` 或 `===`：后者是整理流水线待办集的唯一判据源，本卡不改它、也不改它的
+ * 测试期望——流水线动作是「指派一对 (一级, 二级)」，一级已填的资产按确认会 `assignCategory` 判
+ * skipped 不动，表现为「按了确认没反应」。两处判据量的是不同的东西：这里回答「这批里还有多少
+ * 分类没给过」，那里回答「还有哪些资产一对都没定、需要流水线去补」。
  *
  * **入参范围由调用方决定**：`App.tsx` 传 `useVisibleAssets()` 的结果（套当前筛选：
  * 搜索词 / 大类 / 分类 / 体积 / 时间 / 分辨率 / 色标…），所以它量的集合与左栏分类树
@@ -45,8 +55,7 @@ export function categoriesOf(a: Asset): { category1: string; category2: string }
  */
 export function isCategoryIncomplete(asset: Asset | null | undefined): boolean {
   if (!asset) return false
-  const c = categoriesOf(asset)
-  return c.category1 === UNCLASSIFIED || c.category2 === UNCLASSIFIED
+  return categoriesOf(asset).category1 === UNCLASSIFIED
 }
 
 /** relFolder 的段数（posix 分隔） */
