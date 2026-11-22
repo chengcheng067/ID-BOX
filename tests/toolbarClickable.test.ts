@@ -61,8 +61,11 @@ describe('搜索面板的「门外点击层」不许盖住顶栏', () => {
 
   it('顶栏高度确实是 56px（h-14），常量不会悄悄失真', () => {
     const src = read(TOOLBAR)
-    // 顶栏根节点：`<header className="topbar app-drag relative z-20 flex h-14 …">`
-    expect(src).toMatch(/<header className="[^"]*\bh-14\b/)
+    // 顶栏根节点：`<header className="topbar app-drag relative z-20 flex h-14 …">`。
+    // 2026-11-22 毛玻璃批次把 header 改成多行 JSX 属性（className 换行 + style），
+    // 正则随之放宽为「<header 之后 120 字符内出现 className 且含 h-14」——
+    // 守卫意图不变：h-14（56px）必须真的还在顶栏根节点上。
+    expect(src).toMatch(/<header[\s\S]{0,120}?className="[^"]*\bh-14\b/)
   })
 
   it('遮罩仍然存在（"点门外关面板"的语义不许被顺手删掉）', () => {

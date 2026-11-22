@@ -128,6 +128,27 @@ import {
   overwriteSummaryText,
   skippedSummaryText
 } from './logic/importText'
+// 一键打包（docs/58 T4）：导出收敛到 toPortableAsset，导入裁决走纯函数状态机。
+import {
+  fromPortableAsset,
+  mergePersonalSettings,
+  toPortableAsset,
+  PACKAGE_KIND_ORDER,
+  type PackageExportProgressEvent,
+  type PackageImportProgressEvent,
+  type PackageInspectResult,
+  type PackageResolution,
+  type PortableAsset
+} from '../shared/packageFormat'
+import {
+  INITIAL_PACKAGE_CONFLICT_STATE,
+  buildPackageConflicts,
+  canApplyPackage,
+  conflictStateReducer,
+  resolutionTable,
+  shouldSkipConfirm,
+  type PackageConflictState
+} from './logic/packageRestore'
 
 export type { Filters, SortKey, KindFilter } from './logic/filters'
 
@@ -385,6 +406,29 @@ function ensureSettingsChangedSubscribed(): void {
     // 直接落 store，**不重读盘**：广播携带的就是主进程写盘后归一化的那一份。
     // 重读一次 getSettings 只会多一次 IPC，还可能读到更晚的第三次写入 —— 界面跳一下。
     useVault.setState({ settings: next })
+  })
+}
+
+/**
+ * 打包进度订阅（docs/58 §2.5）：进程内只挂一次。
+ *
+ * 老单测的 `window.modvault` 是按需拼的局部 mock，未必有这两个方法；这里做存在性
+ * 守卫，缺方法就静默跳过（不影响那些用例的既有行为）。
+ */
+let packageProgressSubscribed = false
+
+export function ensurePackageProgressSubscribed(): void {
+  if (packageProgressSubscribed) return
+  const api = window.modvault
+  if (typeof api.onPackageExportProgress !== 'function' || typeof api.onPackageImportProgress !== 'function') {
+    return
+  }
+  packageProgressSubscribed = true
+  api.onPackageExportProgress((ev: PackageExportProgressEvent) => {
+    useVault.setState({ packageProgress: { done: ev.done, total: ev.total } })
+  })
+  api.onPackageImportProgress((ev: PackageImportProgressEvent) => {
+    useVault.setState({ packageProgress: { done: ev.done, total: ev.total } })
   })
 }
 
@@ -1620,6 +1664,40 @@ interface VaultState {
    * （主进程一次导入只问一次，见 §4.5）。
    */
   conflictAsk: ImportConflictAsk | null
+
+  // ── 一键打包（docs/58 T4）：导出选项 / 导入冲突预览 ───────────────────
+  /** 「一键打包」弹窗是否打开；由设置页「数据」卡的两个入口打开 */
+  packageDialogOpen: boolean
+  /** 导出 / 导入进行中（互斥；同时禁用两个入口按钮） */
+  packageBusy: 'export' | 'import' | null
+  /** 最近一次进度（0..total）；null = 无任务 */
+  packageProgress: { done: number; total: number } | null
+  /** 只读验包结果（含个人设置补丁）；null = 还没验过 / 已收尾 */
+  packageInspect: PackageInspectResult | null
+  /** 选中的包位置（只给 apply IPC 用，界面不展示） */
+  packagePath: string | null
+  /** 冲突比对 + 逐项裁决状态机（唯一状态源，组件只读） */
+  packageConflict: PackageConflictState
+  /** 单行中文错误（坏包 / 导出失败），null = 无错误 */
+  packageError: string | null
+
+  /** 打开打包弹窗（重置上一次的裁决状态） */
+  openPackageDialog: () => void
+  /** 关闭打包弹窗（忙碌中也不许关：避免用户以为取消成功） */
+  closePackageDialog: () => void
+  /** 导出：先选落点，再把当前库快照交给主进程流式写包 */
+  exportPackage: (opts?: { includedKinds?: AssetKind[]; includePersonalSettings?: boolean }) => Promise<void>
+  /** 选包 + 只读验包 + 比对冲突，结果写进 `packageConflict` 预览状态 */
+  pickPackageImport: () => Promise<void>
+  /** 非空库的显式确认「会覆盖已有项」；空库不经过这一步 */
+  confirmPackageImport: () => void
+  /** 逐项三档裁决（skip / overwrite / keep-both） */
+  setPackageResolution: (id: string, resolution: PackageResolution) => void
+  /** 全部冲突按同一档裁决（顶部批次按钮） */
+  setAllPackageResolutions: (resolution: PackageResolution) => void
+  /** 放行导入：apply → 写前备份 → bulkPut → 个人设置合并 → 广播 settings 变更 */
+  applyPackageImport: () => Promise<void>
+
   /**
    * 答复一次重复询问：调 `window.modvault.answerImportConflict` 后**无论如何清空** `conflictAsk`。
    *
@@ -2649,6 +2727,35 @@ async function backupDupCleanup(dropped: Asset[], rewritten: Asset[]): Promise<v
   if (stale.length > 0) await db.backups.bulkDelete(stale.map((b) => b.id))
 }
 
+// ── 一键打包导入：写库前快照（docs/58 §4.1 / §5 restoring）─────────────────
+//
+// 与 `backupRescanPreSnapshot` 同构，**刻意用独立前缀** `package-import-`：
+// - `listRescanBackups()` 只认 `rescan-`，这里不会被「恢复上次重扫前索引」误取；
+// - 写库（bulkPut）**之前**先落盘，备份失败必须让导入停下（宁可不导，也不能无凭证覆盖）。
+
+/** `db.backups` 里「素材包导入前快照」的 id 前缀 */
+export const PACKAGE_IMPORT_BACKUP_PREFIX = 'package-import-'
+
+/** 这类快照保留条数（救急用，不是归档；与重扫快照同口径） */
+export const PACKAGE_IMPORT_BACKUP_KEEP = 3
+
+/** 导入写库前把当前完整记录整份写进 `db.backups`（`package-import-<ts>`） */
+async function backupPackageImport(records: readonly Asset[]): Promise<void> {
+  if (records.length === 0) return
+  const at = Date.now()
+  await db.backups.put({
+    id: `${PACKAGE_IMPORT_BACKUP_PREFIX}${at}`,
+    at,
+    json: JSON.stringify(records)
+  })
+  const all = await db.backups.toArray()
+  const stale = all
+    .filter((b) => typeof b.id === 'string' && b.id.startsWith(PACKAGE_IMPORT_BACKUP_PREFIX))
+    .sort((a, b) => b.at - a.at)
+    .slice(PACKAGE_IMPORT_BACKUP_KEEP)
+  if (stale.length > 0) await db.backups.bulkDelete(stale.map((b) => b.id))
+}
+
 /**
  * init 里的「同 folder 重复索引记录」清理（T-PRUNE 治本档 C 的存量迁移）。
  *
@@ -3214,6 +3321,13 @@ export const useVault = create<VaultState>((set, get) => ({
   dupOnly: false,
   libraryView: 'assets',
   conflictAsk: null,
+  packageDialogOpen: false,
+  packageBusy: null,
+  packageProgress: null,
+  packageInspect: null,
+  packagePath: null,
+  packageConflict: { ...INITIAL_PACKAGE_CONFLICT_STATE },
+  packageError: null,
 
   async init() {
     // 重入闸门（见模块级 `initInFlight` 注释）：正在跑的这一次未结束前，第二次调用直接返回。
@@ -3238,6 +3352,8 @@ export const useVault = create<VaultState>((set, get) => ({
     // 而那种变更主进程已落盘、下一次 init / 重启必然生效（不会出现"永久不一致"）。
     // 幂等由模块级 `settingsChangedSubscribed` 保证（StrictMode 双跑不会重复订阅）。
     ensureSettingsChangedSubscribed()
+    // 一键打包进度（T4）：同上，进程内只挂一次
+    ensurePackageProgressSubscribed()
 
     // ── ① 索引记录卫生：同 folder 重复记录先收掉（T-PRUNE 治本档 C 的存量迁移） ──
     // 必须在救援之前：后面每一步都以"索引记录"为准，12 份必然被删的副本先出局，
@@ -5634,6 +5750,188 @@ export const useVault = create<VaultState>((set, get) => ({
         filters: { ...s.filters, ...reset.filters },
         dupOnly: reset.dupOnly
       }))
+    }
+  },
+
+  // ── 一键打包（docs/58 T4）──────────────────────────────────────────────
+  // 导出：库快照 → 包格式契约 → 主进程流式写包；失败一律不抛到 UI，只写单行中文。
+  openPackageDialog: () =>
+    set({
+      packageDialogOpen: true,
+      packageBusy: null,
+      packageProgress: null,
+      packageInspect: null,
+      packagePath: null,
+      packageError: null,
+      packageConflict: { ...INITIAL_PACKAGE_CONFLICT_STATE }
+    }),
+
+  closePackageDialog: () => {
+    // 忙碌时不许关：否则用户以为取消了，实际主进程还在写盘。
+    if (get().packageBusy !== null) return
+    set({
+      packageDialogOpen: false,
+      packageProgress: null,
+      packageInspect: null,
+      packagePath: null,
+      packageError: null,
+      packageConflict: { ...INITIAL_PACKAGE_CONFLICT_STATE }
+    })
+  },
+
+  async exportPackage(opts) {
+    if (get().packageBusy !== null) return
+    const includedKinds = opts?.includedKinds ?? [...PACKAGE_KIND_ORDER]
+    const includePersonalSettings = opts?.includePersonalSettings === true
+    if (includedKinds.length === 0) {
+      set({ packageError: '请至少选择一个大类再导出' })
+      return
+    }
+    set({ packageBusy: 'export', packageProgress: null, packageError: null })
+    try {
+      const destPath = await window.modvault.packageExportPick()
+      if (!destPath) return
+      const records: PortableAsset[] = get()
+        .assets.filter((a) => !isDeletedAsset(a))
+        .filter((a) => includedKinds.includes(a.kind))
+        .map(toPortableAsset)
+      const result = await window.modvault.packageExport({
+        destPath,
+        records,
+        includedKinds,
+        includePersonalSettings
+      })
+      if (!result.ok) {
+        // F-3：主进程 reason 原样透传（里面已是白话中文 + 真实数字），
+        // 绝不再把任何失败硬说成磁盘问题 —— 那正是 V1.1.0 的假提示根因。
+        if (!result.canceled) set({ packageError: result.error || '导出失败，请重试' })
+        return
+      }
+      get().showNotice(`已导出 ${result.count} 项素材`)
+    } catch {
+      // 只有非 IPC 异常（选盘被中断 / 渲染层自身出错）才用中性文案，不猜具体原因。
+      set({ packageError: '导出失败，请重试' })
+    } finally {
+      set({ packageBusy: null, packageProgress: null })
+    }
+  },
+
+  async pickPackageImport() {
+    if (get().packageBusy !== null) return
+    set({
+      packageBusy: 'import',
+      packageProgress: null,
+      packageInspect: null,
+      packagePath: null,
+      packageError: null,
+      packageConflict: { ...INITIAL_PACKAGE_CONFLICT_STATE, phase: 'inspecting' }
+    })
+    try {
+      const packagePath = await window.modvault.packageImportPick()
+      if (!packagePath) {
+        set({ packageConflict: { ...INITIAL_PACKAGE_CONFLICT_STATE } })
+        return
+      }
+      const inspected = await window.modvault.packageImportInspect(packagePath)
+      if (!inspected.ok) {
+        const message = inspected.reason || '素材包无法打开，请换一个再试'
+        set({
+          packageInspect: inspected,
+          packagePath: null,
+          packageError: message,
+          packageConflict: { ...INITIAL_PACKAGE_CONFLICT_STATE, phase: 'error', error: message }
+        })
+        return
+      }
+      // inspect 只读；比对也只读 IndexedDB，此时磁盘与库都未改动。
+      const localAssets = await db.assets.toArray()
+      const conflicts = buildPackageConflicts(localAssets, inspected.records)
+      set({
+        packageInspect: inspected,
+        packagePath,
+        packageConflict: conflictStateReducer(get().packageConflict, {
+          type: 'inspect',
+          conflicts,
+          total: inspected.records.length,
+          needsConfirm: !shouldSkipConfirm(localAssets)
+        })
+      })
+    } catch {
+      const message = '素材包无法打开，请换一个再试'
+      set({
+        packageError: message,
+        packageConflict: { ...INITIAL_PACKAGE_CONFLICT_STATE, phase: 'error', error: message }
+      })
+    } finally {
+      set({ packageBusy: null })
+    }
+  },
+
+  confirmPackageImport: () =>
+    set((s) => ({ packageConflict: conflictStateReducer(s.packageConflict, { type: 'confirm' }) })),
+
+  setPackageResolution: (id, resolution) =>
+    set((s) => ({
+      packageConflict: conflictStateReducer(s.packageConflict, { type: 'choose', id, resolution })
+    })),
+
+  setAllPackageResolutions: (resolution) =>
+    set((s) => ({
+      packageConflict: conflictStateReducer(s.packageConflict, { type: 'choose-all', resolution })
+    })),
+
+  async applyPackageImport() {
+    const before = get()
+    const { packageConflict, packageInspect, packagePath } = before
+    if (before.packageBusy !== null || !packagePath || !packageInspect?.ok) return
+    // 唯一放行闸门：非空库已确认 + 每条冲突都有裁决。少一条就什么都不做。
+    if (!canApplyPackage(packageConflict)) return
+
+    const resolutions = resolutionTable(packageConflict)
+    set({
+      packageBusy: 'import',
+      packageProgress: null,
+      packageError: null,
+      packageConflict: conflictStateReducer(packageConflict, { type: 'importing' })
+    })
+    try {
+      // ① 主进程按清单白名单提取 + 按裁决还原记录（本进程只读结果，不碰磁盘）。
+      const applied = await window.modvault.packageImportApply({ path: packagePath, resolutions })
+      if (!applied.ok) throw new Error(applied.error)
+
+      // ② 写库**之前**落快照（备份失败即中止，绝不在无凭证时覆盖现有记录）。
+      const existing = await db.assets.toArray()
+      await backupPackageImport(existing)
+
+      // ③ folder 用目标机库根现算；缓存指针清空，由惰性升级链路重建。
+      const libraryDir = before.settings?.libraryDir ?? (await window.modvault.getSettings()).libraryDir
+      const restored = applied.restored.map((record) => fromPortableAsset(record as PortableAsset, libraryDir))
+      if (restored.length > 0) await db.assets.bulkPut(restored)
+
+      // ④ 个人设置补丁合并：只覆盖白名单键，libraryDir 等机器路径逐字保留。
+      //    setSettings 落盘后由主进程广播 settings:changed，其余窗口同步生效。
+      if (applied.personal) {
+        const current = get().settings ?? (await window.modvault.getSettings())
+        const merged = mergePersonalSettings(current, applied.personal)
+        const written = await window.modvault.setSettings(merged)
+        set({ settings: written })
+      }
+
+      // ⑤ 内存索引同步（与磁盘同批记录，避免 UI 还显示旧的覆盖前内容）。
+      const restoredIds = new Set(restored.map((a) => a.id))
+      set((s) => ({
+        assets: [...s.assets.filter((a) => !restoredIds.has(a.id)), ...restored],
+        packageConflict: conflictStateReducer(s.packageConflict, { type: 'done' })
+      }))
+      get().showNotice(`已导入 ${restored.length} 项素材`)
+    } catch {
+      const message = '导入未完成，请稍后重试'
+      set((s) => ({
+        packageError: message,
+        packageConflict: conflictStateReducer(s.packageConflict, { type: 'fail', message })
+      }))
+    } finally {
+      set({ packageBusy: null, packageProgress: null, packageInspect: null, packagePath: null })
     }
   },
 

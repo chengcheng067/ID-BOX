@@ -1,5 +1,17 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import { IPC } from '../shared/ipc'
+import {
+  IPC,
+  type HomeBackgroundSaveInput,
+  type HomeBackgroundSaveResult,
+  type PackageExportInput,
+  type PackageExportProgressEvent,
+  type PackageExportResult,
+  type PackageImportApplyInput,
+  type PackageImportProgressEvent,
+  type PackageImportResult,
+  type PackageInspectResult,
+  type PluginLinkStatus
+} from '../shared/ipc'
 import type { ProbedImageSize } from '../shared/imageSize'
 import type {
   AssignCategoryPayload,
@@ -408,6 +420,21 @@ const api = {
       ipcRenderer.off(IPC.winMaximizedEvent, handler)
     }
   },
+  // ── 首页自定义背景图（docs/55 §2.1.4，Q-5/Q-6） ──────────────────────
+  /**
+   * 保存背景图：本地文件复制 / URL 下载到 `<userData>/home-bg/`。
+   *
+   * **永不 reject**：失败是 `{ ok:false, error }`（中文原因，可直接展示），界面据此
+   * 保留旧图、不写坏 `homeBackground.fileName`。运行期零网络 —— 渲染层只读 `bg://`。
+   */
+  saveHomeBackground: (input: HomeBackgroundSaveInput): Promise<HomeBackgroundSaveResult> =>
+    ipcRenderer.invoke(IPC.homeBackgroundSave, input),
+  /**
+   * 清理一张缓存背景图（替换 / 移除时删旧文件；幂等、永不抛错）。
+   * 入参只接受主进程产出的 `<sha256>.<ext>` 文件名，带路径会被主进程守卫拒绝。
+   */
+  clearHomeBackground: (fileName: string | null): Promise<void> =>
+    ipcRenderer.invoke(IPC.homeBackgroundClear, fileName),
   /** 应用版本号（读 package.json version，主进程 app.getVersion()） */
   getAppVersion: (): Promise<string> => ipcRenderer.invoke(IPC.getAppVersion),
   /**
@@ -498,6 +525,15 @@ const api = {
    */
   exportPluginRbz: (): Promise<PluginRbzExportResult> => ipcRenderer.invoke(IPC.pluginExportRbz),
 
+  /**
+   * 查询 SketchUp 插件联通状态（2026-11-22 用户需求「联通绿点」）。
+   *
+   * 主进程只读本地 `%APPDATA%\idbox\plugin\manifest.json`（零网络），
+   * 返回 `PluginLinkStatus`：`connected:true` 时 SketchUp 卡亮绿点；
+   * 任何失败形态都收敛为 `{ connected: false, generatedAt: null }`，**永不 reject**。
+   */
+  getPluginLinkStatus: (): Promise<PluginLinkStatus> => ipcRenderer.invoke(IPC.pluginLinkStatus),
+
   // ── SketchUp 插件收件箱（docs/probe/su-export-to-idbox.md · 方案 A）──────
   /**
    * 订阅「收件箱来了一个完整任务」。
@@ -561,7 +597,47 @@ const api = {
    * **永不因它抛错而影响主流程**（调用方请自行 `.catch`）：使用统计是附属行为。
    */
   ackInboxUsage: (payload: InboxUsageAckPayload): Promise<InboxUsageAckResult> =>
-    ipcRenderer.invoke(IPC.inboxUsageAck, payload)
+    ipcRenderer.invoke(IPC.inboxUsageAck, payload),
+
+  // ── 一键打包与素材同步（docs/58 §2.5 · T1 骨架；T2/T3 填实主进程侧）──────
+  /** 弹保存对话框定库包落点；返回绝对路径 / null（取消）。 */
+  packageExportPick: (): Promise<string | null> => ipcRenderer.invoke(IPC.packageExportPick),
+  /** 流式写单文件 zip；**永不 reject**，失败在 `error` 字段。 */
+  packageExport: (input: PackageExportInput): Promise<PackageExportResult> =>
+    ipcRenderer.invoke(IPC.packageExport, input),
+  /**
+   * 订阅导出进度（main → renderer）；返回退订函数，组件卸载必须调用。
+   * T1 阶段主进程尚无发送方，订阅本身安全（收不到事件而已）。
+   */
+  onPackageExportProgress: (cb: (ev: PackageExportProgressEvent) => void): (() => void) => {
+    const channel = IPC.packageExportProgress
+    const handler = (_: unknown, ev: PackageExportProgressEvent) => cb(ev)
+    ipcRenderer.on(channel, handler)
+    return () => {
+      ipcRenderer.off(channel, handler)
+    }
+  },
+  /** 请求取消当前导出（send，fire-and-forget；只置代次计数，在写的那一个正常收尾）。 */
+  packageExportCancel: (): void => {
+    ipcRenderer.send(IPC.packageExportCancel)
+  },
+  /** 弹打开对话框选库包；返回绝对路径 / null（取消）。 */
+  packageImportPick: (): Promise<string | null> => ipcRenderer.invoke(IPC.packageImportPick),
+  /** **只读**验包（不改库、不落盘）；坏包原因在 `reason` 字段。 */
+  packageImportInspect: (packagePath: string): Promise<PackageInspectResult> =>
+    ipcRenderer.invoke(IPC.packageImportInspect, packagePath),
+  /** 白名单提取 + 还原（记录级冲突由 resolutions 裁决）；**永不 reject**。 */
+  packageImportApply: (input: PackageImportApplyInput): Promise<PackageImportResult> =>
+    ipcRenderer.invoke(IPC.packageImportApply, input),
+  /** 订阅导入进度（main → renderer）；返回退订函数。 */
+  onPackageImportProgress: (cb: (ev: PackageImportProgressEvent) => void): (() => void) => {
+    const channel = IPC.packageImportProgress
+    const handler = (_: unknown, ev: PackageImportProgressEvent) => cb(ev)
+    ipcRenderer.on(channel, handler)
+    return () => {
+      ipcRenderer.off(channel, handler)
+    }
+  }
 }
 
 contextBridge.exposeInMainWorld('modvault', api)

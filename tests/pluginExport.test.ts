@@ -217,7 +217,9 @@ describe('插件快照字段形状（docs/39 §3.2）', () => {
       'files',
       'thumbRel',
       'suMajor',
-      'updatedAt'
+      'updatedAt',
+      // T5（docs/55 §1.2）：13 个旧字段逐字保留、相对顺序不变，仅尾部追加一个可选字段
+      'displayMetric'
     ])
     expect(record.id).toBe('a1b2c3d4-0001')
     expect(record.name).toBe('测试模型-中文名字')
@@ -941,5 +943,50 @@ describe('分层与接线守卫', () => {
     expect(ipc).toContain("pluginSnapshot: 'plugin:snapshot'")
     const snapshot = readFileSync(new URL('../src/shared/pluginSnapshot.ts', import.meta.url), 'utf-8')
     expect(snapshot).not.toContain('../renderer')
+  })
+})
+
+// ── T5 · displayMetric 只增不删（docs/55 §1.2 / §4-T5 / §5-R-12）────────────
+describe('插件快照 displayMetric（A 级只增）', () => {
+  it('apiVersion 仍是 "1"，信封与旧字段语义不变', () => {
+    expect(PLUGIN_API_VERSION).toBe('1')
+    const envelope = buildPluginEnvelope(buildPluginRecords([sampleAsset()]), {
+      generatedAt: '2026-11-04T10:00:00.000Z',
+      libraryRoot: LIB
+    })
+    expect(envelope.apiVersion).toBe('1')
+    expect(Object.keys(envelope)).toEqual(['apiVersion', 'generatedAt', 'libraryRoot', 'count', 'records'])
+    // 逐条字段依旧没有 generatedAt；新字段也进不了信封层
+    expect(envelope.records[0]).not.toHaveProperty('generatedAt')
+    expect(envelope.records[0]).toHaveProperty('displayMetric')
+  })
+
+  it('buildPluginRecord 填 displayMetric：主文件体积走 formatBytes，旧 13 字段一个不删', () => {
+    const r = buildPluginRecord(sampleAsset({ files: [file('m.skp', 'skp', 'model')] }))
+    // 样本主文件 size = 512 → formatBytes(512) = '512 B'（R-12：仅主文件，非 Asset.size=1536）
+    expect(r.displayMetric).toBe('512 B')
+    expect(r.mainFile).toBe('m.skp')
+    // 旧字段逐项仍在且语义不变（键序断言见上方 happy path 用例）
+    expect(r.id).toBe('a1b2c3d4-0001')
+    expect(r.files).toEqual([{ rel: 'm.skp', ext: 'skp' }])
+    expect(Object.keys(r.files[0])).toEqual(['rel', 'ext']) // 两键纪律不动
+    expect(r.thumbRel).toBe('a1b2c3.jpg')
+    expect(r.suMajor).toBe(2024)
+    expect(r.updatedAt).toBe('2026-11-04T10:00:00.000Z')
+    // 用户 2026-11-20 最终口径：贴图也按主文件大小，不再显分辨率（Q-16 作废）
+    const tex = buildPluginRecord(sampleAsset({
+      kind: 'texture',
+      files: [file('main.png', 'png', 'texture')]
+    }))
+    expect(tex.displayMetric).toBe('512 B')
+  })
+
+  it('非法 / 缺字段的主文件 → displayMetric 为 null，不出现 NaN / undefined / -', () => {
+    const noSize = buildPluginRecord(sampleAsset({ files: [{ ...file('m.skp', 'skp', 'model'), size: 0 }] }))
+    expect(noSize.displayMetric).toBe(null)
+    expect(buildPluginRecord(sampleAsset({ files: [] })).displayMetric).toBe(null)
+    expect(buildPluginRecord(sampleAsset({ files: null as never })).displayMetric).toBe(null)
+    // 快照字段恒存在（可选是对旧快照而言），值为 null 时插件只显示分类路径
+    expect(Object.prototype.hasOwnProperty.call(noSize, 'displayMetric')).toBe(true)
   })
 })

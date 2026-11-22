@@ -327,13 +327,14 @@ describe('接线守卫：打包能装上还差这几处', () => {
     expect(main.indexOf('请先在设置里开启')).toBeLessThan(main.indexOf('await buildRbz('))
   })
 
-  it('设置页那一行是按钮（不是 CheckRow）——复选框数量守卫不变', () => {
+  it('导出入口是按钮（不是 CheckRow）——2026-11-22 搬进「同步插件」tab 的 SketchUp 卡，守卫跟随', () => {
     const ui = read('src/renderer/components/SettingsDialog.tsx')
-    expect(ui).toContain('导出 SketchUp 插件包（.rbz）')
-    expect(ui).toContain('在 SketchUp 里用「扩展 → 安装扩展」选中该文件；装完重启 SketchUp 生效')
+    // 数据 tab 的旧行已按用户口径删除（入口搬到同步插件 tab，功能不重复提供）
+    expect(ui).not.toContain('title="导出 SketchUp 插件包（.rbz）"')
+    expect(ui).not.toContain('在 SketchUp 里用「扩展 → 安装扩展」选中该文件；装完重启 SketchUp 生效')
+    // 新入口仍是按钮动作（void exportRbz()），且不借 CheckRow 的自绘开关承载
     expect(ui).toContain('void exportRbz()')
-    // 导出按钮旁边不许出现 role="checkbox" 那套自绘开关（它是动作，不是状态）
-    const row = ui.slice(ui.indexOf('title="导出 SketchUp 插件包（.rbz）"'))
-    expect(row.slice(0, 900)).not.toContain('<CheckRow')
+    const entry = ui.slice(ui.indexOf('onClick={() => void exportRbz()}'))
+    expect(entry.slice(0, 900)).not.toContain('<CheckRow')
   })
 })

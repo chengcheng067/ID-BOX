@@ -5,7 +5,12 @@ import path from 'node:path'
 import { app } from 'electron'
 import {
   DEFAULT_SETTINGS,
+  HOME_PARTICLE_DENSITY_RANGE,
+  HOME_PARTICLE_SIZE_RANGE,
+  HOME_WAVE_LENGTH_RANGE,
+  HOME_WAVE_SPEED_RANGE,
   LEGACY_DISPOSAL_ALIASES,
+  clampHomeTideNumber,
   type ArchiveDisposal,
   type Settings,
   type ThemeMode,
@@ -15,6 +20,7 @@ import { DEFAULT_LIBRARY_DIR } from './paths'
 import { freeBytesOf } from './disk'
 import { DEFAULT_UNDO_GRACE_MS, normalizeUndoGraceMs } from '../shared/undoGrace'
 import { normalizeCustomTaxonomy } from '../shared/customTaxonomy'
+import { HEX_PATTERN, clampDimAlpha, clampWaveHeight, validHexOrNull } from '../shared/homeTide'
 
 /** 首次运行选盘时的最低可用空间门槛（U3） */
 export const MIN_FREE_BYTES_FOR_LIBRARY = 20 * 1024 * 1024 * 1024
@@ -32,6 +38,34 @@ const CANDIDATE_ROOTS = ['E:\\', 'D:\\', 'C:\\']
 const DisposalSchema = z
   .enum(['recycle', 'delete', 'keep', 'trash'])
   .transform((v): ArchiveDisposal => (v === 'trash' ? 'recycle' : v))
+
+/**
+ * 首页海浪配色叶子（docs/55 §1.1）：非法 hex / 脏值 → `null`（= 走原 palette 兜底）。
+ *
+ * 正则直接复用 `shared/homeTide` 的 `HEX_PATTERN`，与渲染层共用同一份校验口径，
+ * 避免两处正则漂移。`.nullable().optional().catch(null)` = 每个叶子单独降级。
+ */
+const WaveColorLeafSchema = z.string().regex(HEX_PATTERN).nullable().optional().catch(null)
+
+/** 单主题海浪配色；整块脏掉也只回落这一块，不拖垮整份 settings.json。 */
+const ThemeWaveColorsSchema = z
+  .object({ waterColor: WaveColorLeafSchema, crestColor: WaveColorLeafSchema })
+  .optional()
+  .catch({ waterColor: null, crestColor: null })
+
+/** 全默认海浪配色（`null` = 未自定义，旧档缺键落到这个形状 = 今天的行为）。 */
+const DEFAULT_WAVE_COLORS = {
+  light: { waterColor: null, crestColor: null },
+  dark: { waterColor: null, crestColor: null }
+}
+
+/** 全默认首页背景（`source='none'` → 不渲染图片层与压暗层）。 */
+const DEFAULT_HOME_BACKGROUND = {
+  source: 'none' as const,
+  fileName: null,
+  sourceUrl: null,
+  dimAlpha: 0.35
+}
 
 /** 导出仅供测试：验证单项降级语义（脏值不拖垮整份设置）。 */
 export const SettingsSchema = z.object({
@@ -199,6 +233,61 @@ export const SettingsSchema = z.object({
    * 与写盘开关是两个独立字段，**互不反写**。
    */
   pluginIndexGuideShown: z.boolean().optional().catch(false),
+  // ── V1.0 首页自定义与引导（docs/55 §1.1）：每项叶子单项降级 ──────────────
+  /**
+   * 首页海浪配色。对象层 + 每片颜色叶子都带 `.catch`：
+   * 非法 hex（`'#ggg'` / `'red'` / 数字）只让那片叶子回落 `null`，
+   * 整块写坏（写成字符串 / 数组）才整块回落全 null —— **绝不拖垮整份 settings.json**
+   * （否则 `libraryDir` 一起丢、库会"消失"）。
+   */
+  homeWaveColors: z
+    .object({ light: ThemeWaveColorsSchema, dark: ThemeWaveColorsSchema })
+    .optional()
+    .catch(DEFAULT_WAVE_COLORS),
+  /**
+   * 首页海浪高度。这里只校验"是个数字"；
+   * 越界值（`'large'` 被 catch 成 0.65，`99` / `-3` 这类类型正确但越界的）由
+   * `normalizeSettings` / `migrateSettings` 里的 `clampWaveHeight()` 收口到 `[0.2, 1.5]`。
+   */
+  homeWaveHeight: z.number().optional().catch(0.65),
+  /**
+   * 海浪速度（2026-11-22 设置重排）。这里只校验"是个数字"；越界值由
+   * `normalizeSettings` / `migrateSettings` 的 `clampHomeTideNumber(…, HOME_WAVE_SPEED_RANGE)`
+   * 收口到 `[0.2, 4]`，脏类型回落 1.6（= 改动前 BASE_SPEED 定稿值）。
+   */
+  homeWaveSpeed: z.number().optional().catch(HOME_WAVE_SPEED_RANGE.default),
+  /** 海浪波长（2026-11-22 设置重排）：同上，收口到 `[0.4, 3]`，脏类型回落 1.1。 */
+  homeWaveLength: z.number().optional().catch(HOME_WAVE_LENGTH_RANGE.default),
+  /** 粒子大小（2026-11-22 设置重排）：同上，收口到 `[1, 4]`，脏类型回落 2。 */
+  homeParticleSize: z.number().optional().catch(HOME_PARTICLE_SIZE_RANGE.default),
+  /** 粒子密度（2026-11-22 设置重排）：同上，收口到 `[0.3, 2]`，脏类型回落 1.5。 */
+  homeParticleDensity: z.number().optional().catch(HOME_PARTICLE_DENSITY_RANGE.default),
+  /**
+   * 指针交互总闸（2026-11-22 设置重排，默认 **true** = 改动前行为）。
+   * `.catch(true)` 单项降级；normalize / migrate 再收口「只认严格 false」。
+   */
+  homeWaveInteractive: z.boolean().optional().catch(true),
+  /** 点击涟漪开关（2026-11-22 设置重排，默认 **true** = 改动前行为）。同上。 */
+  homeWaveClickRipples: z.boolean().optional().catch(true),
+  /**
+   * 首页自定义背景图。`source` 用 enum 单项 catch；`fileName`/`sourceUrl` 叶子各自降级；
+   * `dimAlpha` 越界由 `clampDimAlpha()` 收口到 `[0, 0.85]`。
+   */
+  homeBackground: z
+    .object({
+      source: z.enum(['none', 'local', 'url']).catch('none'),
+      fileName: z.string().nullable().optional().catch(null),
+      sourceUrl: z.string().nullable().optional().catch(null),
+      dimAlpha: z.number().catch(0.35)
+    })
+    .optional()
+    .catch(DEFAULT_HOME_BACKGROUND),
+  /** 首页引导首启是否已展示：脏值回落 `false` = 再显示一次（宁可多提示）。 */
+  homeGuideFirstRunShown: z.boolean().optional().catch(false),
+  /** 上次展示引导的版本号：脏值回落 `null`。 */
+  homeGuideLastVersion: z.string().nullable().optional().catch(null),
+  /** 首页引导是否被永久关闭：脏值回落 `false`。 */
+  homeGuideDisabled: z.boolean().optional().catch(false),
   /** @deprecated 旧档迁移用 */
   trashArchiveAfterImport: z.boolean().optional()
 })
@@ -365,6 +454,52 @@ export async function migrateLegacySettingsFile(userDataDir: string): Promise<Se
 }
 
 /**
+ * 首页海浪配色的**唯一归一化入口**（读档 / 写档共用）。
+ *
+ * 每片颜色单独过 `validHexOrNull`：非法 hex 只丢那一片（→ null = 走原 palette），
+ * 绝不因为一片脏色就把整个 `homeWaveColors`（更别说整份 settings.json）打回默认。
+ */
+function normalizeHomeWaveColors(value: unknown): Settings['homeWaveColors'] {
+  const obj = (value && typeof value === 'object' ? value : {}) as {
+    light?: { waterColor?: unknown; crestColor?: unknown }
+    dark?: { waterColor?: unknown; crestColor?: unknown }
+  }
+  return {
+    light: {
+      waterColor: validHexOrNull(obj.light?.waterColor),
+      crestColor: validHexOrNull(obj.light?.crestColor)
+    },
+    dark: {
+      waterColor: validHexOrNull(obj.dark?.waterColor),
+      crestColor: validHexOrNull(obj.dark?.crestColor)
+    }
+  }
+}
+
+/**
+ * 首页背景图的**唯一归一化入口**（读档 / 写档共用）。
+ * `source` 只认三个合法枚举值；两个字符串叶子脏了各自回落 null；`dimAlpha` 由
+ * `clampDimAlpha` 收口到 `[0, 0.85]`。整块非法时回到 `source='none'` = 不渲染。
+ */
+function normalizeHomeBackground(value: unknown): Settings['homeBackground'] {
+  const obj = (value && typeof value === 'object' ? value : {}) as {
+    source?: unknown
+    fileName?: unknown
+    sourceUrl?: unknown
+    dimAlpha?: unknown
+  }
+  return {
+    source:
+      obj.source === 'none' || obj.source === 'local' || obj.source === 'url'
+        ? obj.source
+        : 'none',
+    fileName: typeof obj.fileName === 'string' ? obj.fileName : null,
+    sourceUrl: typeof obj.sourceUrl === 'string' ? obj.sourceUrl : null,
+    dimAlpha: clampDimAlpha(obj.dimAlpha)
+  }
+}
+
+/**
  * 旧档迁移（P0-5）：`trashArchiveAfterImport:true → 'recycle'`、`:false → 'keep'`；
  * 迁移后删掉 deprecated 键，写档不再带它。
  */
@@ -394,7 +529,25 @@ export function migrateSettings(raw: RawSettings): Settings {
     // 左右侧边栏折叠（0.8.3）：旧档缺键 → 展开；只认严格 true（zod 侧脏值已 catch 成 false，
     // 这里再收口一次保证返回的 Settings 是完整布尔对象）
     sidebarLeftCollapsed: raw.sidebarLeftCollapsed === true,
-    sidebarRightCollapsed: raw.sidebarRightCollapsed === true
+    sidebarRightCollapsed: raw.sidebarRightCollapsed === true,
+    // V1.0 首页自定义（docs/55 §1.1）：旧档缺键 → 全 null / 0.65 / none → 行为与今天逐字一致。
+    // ⚠️ `.optional()` 对缺键产出 undefined，直接展开会覆盖 DEFAULT_SETTINGS 的默认值，
+    //    所以这六项必须在这里逐个收口（与 undoGraceMs / customTaxonomy 同一纪律）。
+    homeWaveColors: normalizeHomeWaveColors(raw.homeWaveColors),
+    homeWaveHeight: clampWaveHeight(raw.homeWaveHeight),
+    // 海浪参数六项（2026-11-22 设置重排）：旧档缺键 → 引擎定稿默认值，默认画面逐帧一致。
+    // 数值项 clamp 收口；两个布尔项「只认严格 false 才关」（与改动前"永远开"一致）。
+    homeWaveSpeed: clampHomeTideNumber(raw.homeWaveSpeed, HOME_WAVE_SPEED_RANGE),
+    homeWaveLength: clampHomeTideNumber(raw.homeWaveLength, HOME_WAVE_LENGTH_RANGE),
+    homeParticleSize: clampHomeTideNumber(raw.homeParticleSize, HOME_PARTICLE_SIZE_RANGE),
+    homeParticleDensity: clampHomeTideNumber(raw.homeParticleDensity, HOME_PARTICLE_DENSITY_RANGE),
+    homeWaveInteractive: raw.homeWaveInteractive !== false,
+    homeWaveClickRipples: raw.homeWaveClickRipples !== false,
+    homeBackground: normalizeHomeBackground(raw.homeBackground),
+    homeGuideFirstRunShown: raw.homeGuideFirstRunShown === true,
+    homeGuideLastVersion:
+      typeof raw.homeGuideLastVersion === 'string' ? raw.homeGuideLastVersion : null,
+    homeGuideDisabled: raw.homeGuideDisabled === true
   }
   delete next.trashArchiveAfterImport
   return next
@@ -492,6 +645,22 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   // 引导回落成"已看过"则会让用户永远看不到提示、也就永远不知道插件为什么是空面板。
   // 这两项各自独立、互不反写（不自动勾选写盘、也不因勾选而反写本项）。
   merged.pluginIndexGuideShown = merged.pluginIndexGuideShown === true
+  // V1.0 首页自定义（docs/55 §1.1）：写档前再收口一次。脏值只回落该项，
+  // 绝不拖垮整份 settings.json（与 pluginIndexGuideShown 等同一项纪律）。
+  merged.homeWaveColors = normalizeHomeWaveColors(merged.homeWaveColors)
+  merged.homeWaveHeight = clampWaveHeight(merged.homeWaveHeight)
+  // 海浪参数六项（2026-11-22 设置重排）：写档前再收口一次（与读档同一口径）
+  merged.homeWaveSpeed = clampHomeTideNumber(merged.homeWaveSpeed, HOME_WAVE_SPEED_RANGE)
+  merged.homeWaveLength = clampHomeTideNumber(merged.homeWaveLength, HOME_WAVE_LENGTH_RANGE)
+  merged.homeParticleSize = clampHomeTideNumber(merged.homeParticleSize, HOME_PARTICLE_SIZE_RANGE)
+  merged.homeParticleDensity = clampHomeTideNumber(merged.homeParticleDensity, HOME_PARTICLE_DENSITY_RANGE)
+  merged.homeWaveInteractive = merged.homeWaveInteractive !== false
+  merged.homeWaveClickRipples = merged.homeWaveClickRipples !== false
+  merged.homeBackground = normalizeHomeBackground(merged.homeBackground)
+  merged.homeGuideFirstRunShown = merged.homeGuideFirstRunShown === true
+  merged.homeGuideLastVersion =
+    typeof merged.homeGuideLastVersion === 'string' ? merged.homeGuideLastVersion : null
+  merged.homeGuideDisabled = merged.homeGuideDisabled === true
   delete merged.trashArchiveAfterImport
   return merged
 }

@@ -10,8 +10,8 @@
  * ② **视觉语言**：自绘标记必须复用既有 token（`border-accent` / `bg-accent` / `border-line`），
  *    不许写死色值、不许再挂 `accent-color`（那是滑块 `.slider-accent` 专用的）；
  * ③ **可访问性 + 语义不变**：`role="checkbox"` + `aria-checked` + 可聚焦；
- *    5 个调用点的 setter 必须原样存在（`setPicked` / `setForceAck` / 三个 apply 勾选），
- *    换控件不许顺手改业务逻辑。
+ *    8 个调用点的 setter 必须原样存在（`setPicked` / `setForceAck` / 三个 apply 勾选 /
+ *    插件开关 / 指针交互 / 点击涟漪），换控件不许顺手改业务逻辑。
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -91,11 +91,12 @@ describe('自绘复选框必须复用既有视觉语言', () => {
     expect(code).not.toContain('accent-color')
   })
 
-  it('6 个调用点全部用自绘 CheckRow（换一半 = 用户还会看到系统控件）', () => {
-    // 原 5 个（别名建议 + forceAck + 三个 apply 勾选）+ 新增第 6 个 = 设置页的
-    // SketchUp 插件开关（`pluginIndexEnabled`）。新控件必须走同一个 CheckRow，
-    // 不许为了省事在设置页写原生 checkbox。
-    expect(code.match(/<CheckRow/g)?.length).toBe(6)
+  it('8 个调用点全部用自绘 CheckRow（换一半 = 用户还会看到系统控件）', () => {
+    // 原 5 个（别名建议 + forceAck + 三个 apply 勾选）+ 第 6 个 SketchUp 插件开关
+    // （`pluginIndexEnabled`）+ 2026-11-22 海浪参数重排新增的第 7/8 个：
+    // 「指针交互」（`homeWaveInteractive`）与「点击涟漪」（`homeWaveClickRipples`）。
+    // 新控件必须走同一个 CheckRow，不许为了省事在设置页写原生 checkbox。
+    expect(code.match(/<CheckRow/g)?.length).toBe(8)
     expect(code).not.toMatch(/<label\b[\s\S]{0,120}type="checkbox"/)
   })
 

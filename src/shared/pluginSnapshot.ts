@@ -16,6 +16,7 @@
  * - 路径统一 posix `/`，时间一律 ISO8601 UTC（沿用 `logger.ts:199` / `kindMigrate.ts:248`）。
  */
 import { pickPrimaryFile } from './classify'
+import { formatBytes } from './format'
 import { UNCLASSIFIED } from './taxonomy'
 import type { Asset, AssetFile, AssetKind } from './types'
 
@@ -129,6 +130,17 @@ export interface PluginSnapshotRecord {
    * 逐条改用 P1 可增字段 `updatedAt`（只增不删）。非数字 → null。
    */
   updatedAt: string | null
+  /**
+   * 卡片副标题的显示指标（A 级只增，字段名保持不变）。
+   *
+   * 用户 2026-11-20 最终口径：**所有 kind 统一显示主文件大小** —— 恒等于
+   * `formatBytes(primary.size)`（仅主文件，不是 `Asset.size` 整目录总量，R-12）。
+   * 该口径覆盖了早先「材质显分辨率、模型显体积」的双指标方案
+   * （Q-16 作废；Q-17 的「仅主文件」口径推广到所有 kind）。
+   *
+   * 声明为可选是为了兼容旧快照：字段缺失 / 非法值 ⇒ 插件只显示分类路径（Q-19）。
+   */
+  displayMetric?: string | null
 }
 
 /** `index.json` 信封（顶层是对象，不是数组） */
@@ -239,6 +251,34 @@ export function toPluginFileEntry(file: Pick<AssetFile, 'rel' | 'ext'>): PluginF
 }
 
 /**
+ * 派生卡片副标题的显示指标：恒等于「主文件大小」。
+ *
+ * 用户 2026-11-20 最终口径：**所有 kind 统一**取 `primary.size` 经 `formatBytes()`，
+ * 不再区分「材质显分辨率、模型显体积」。此前 Q-16 的 `w×h` 分支作废；
+ * Q-17 的「仅主文件」口径推广到全部 kind。
+ *
+ * R-12（docs/55 §5）：**只算主文件**，不是 `Asset.size`（整目录总量）——
+ * 用户明知会低估多文件资产仍坚持这一口径，不要"修正"回整目录。
+ *
+ * `primary` 缺失 / `size` 非数 / 0 / 负数 / Infinity / NaN → null（Q-19），
+ * 插件侧据此只显示分类路径，不出现 `NaN` / `undefined` / `-`。
+ *
+ * 纯函数：只读入参、零 IO；`primary` 由调用方 `pickPrimaryFile(safeFiles)` 提供，
+ * 源字段 `AssetFile.size` 已在导入时逐文件 stat 存在，不需要额外 `fs.stat`。
+ * 签名**不接收 kind**：结果必须与资产大类无关。
+ */
+export function deriveDisplayMetric(
+  primary: AssetFile | undefined
+): string | null {
+  if (!primary) return null
+  const size = primary.size
+  // 仅主文件体积（R-12）——调用前 guard，formatBytes 的 '-' 兜底永不进快照
+  return typeof size === 'number' && Number.isFinite(size) && size > 0
+    ? formatBytes(size)
+    : null
+}
+
+/**
  * 生成一条记录。
  *
  * ⚠️ 本函数**不做软删判定**（软删记录由调用方过滤，见 `buildPluginRecords`）：
@@ -269,7 +309,9 @@ export function buildPluginRecord(asset: Asset): PluginSnapshotRecord {
     updatedAt:
       typeof asset.updatedAt === 'number' && Number.isFinite(asset.updatedAt)
         ? new Date(asset.updatedAt).toISOString()
-        : null
+        : null,
+    // A 级只增：新指标派生自同一份 primary，不额外读盘（用户 2026-11-20 最终口径）
+    displayMetric: deriveDisplayMetric(primary)
   }
 }
 

@@ -636,6 +636,71 @@ export interface CustomTaxonomy {
   level2: Record<string, string[]>
 }
 
+/** 首页海浪配色（单主题）。两个字段都可为 `null` = 未自定义，渲染层回落原 palette。 */
+export interface ThemeWaveColors {
+  waterColor: string | null
+  crestColor: string | null
+}
+
+// ── 2026-11-22 海浪参数设置重排（用户原话：「海浪颜色以及海浪大小在设置里的层级
+//    看上去非常糟糕和混乱……重新整理一下设置」；层级参照 TuneShape 调参面板截图）──
+//
+// 四个数值参数（速度 / 波长 / 粒子大小 / 粒子密度）的**滑块规格单一真源**：
+// 设置页滑块 min/max/step、settings.ts 的 clamp、HomeParticles 的回落默认值
+// 全部只从这四个常量取 —— 抄一份就会漂移（HEX_PATTERN 迁入 shared 的同一教训）。
+//
+// **默认值 = 改动前 HomeParticles.tsx 的引擎定稿值**（BASE_SPEED 1.6 / BASE_WAVELENGTH
+// 1.1 / particleSize 2 / density 1.5）：旧档缺键回落默认 → 默认画面与改动前逐帧一致。
+
+/** 单个海浪引擎参数的滑块规格（min/max/step/默认值成组，UI 与 clamp 共用） */
+export interface HomeTideRange {
+  min: number
+  max: number
+  /** 滑块步长 */
+  step: number
+  /** 默认值 = 引擎定稿值（缺键 / 脏值回落到这里，保证默认画面不变） */
+  default: number
+}
+
+/** 海浪速度：相位推进倍率（`elapsed += Δms/1000 × speed`），定稿 1.6 */
+export const HOME_WAVE_SPEED_RANGE: HomeTideRange = { min: 0.2, max: 4, step: 0.05, default: 1.6 }
+/**
+ * 波长：波场空间频率的分母（`u = x/λ, v = z/λ`），越大浪越宽越缓，定稿 1.1。
+ * 波场本身是固定多正弦叠加（引擎没有独立"频率"旋钮），λ 是唯一的波长口径。
+ */
+export const HOME_WAVE_LENGTH_RANGE: HomeTideRange = { min: 0.4, max: 3, step: 0.05, default: 1.1 }
+/** 粒子直径乘数（顶点着色器 footprint 的主项），定稿 2（§1.5 ÷1.5 对齐观感） */
+export const HOME_PARTICLE_SIZE_RANGE: HomeTideRange = { min: 1, max: 4, step: 0.1, default: 2 }
+/**
+ * 粒子密度乘数（网格 420×300×√density），定稿 1.5。
+ * 区间 [0.3, 2] 与引擎 `planPoints` 的夹取范围一致；渲染层还会再乘动效档位系数。
+ */
+export const HOME_PARTICLE_DENSITY_RANGE: HomeTideRange = { min: 0.3, max: 2, step: 0.05, default: 1.5 }
+
+/**
+ * 海浪数值参数的统一 clamp（settings 读档 / 写档 / UI 写入三处共用）。
+ *
+ * 非 number / NaN / Infinity 一律回落 `range.default`（**不是**夹到边界 ——
+ * 与 `shared/homeTide.ts#clampWaveHeight` 同一口径：脏值没有方向，按默认走
+ * 才不会把用户配置带跑偏）；类型正确但越界的值夹回区间。
+ */
+export function clampHomeTideNumber(value: unknown, range: HomeTideRange): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return range.default
+  return Math.min(range.max, Math.max(range.min, value))
+}
+
+/** 首页自定义背景图的来源：`none` = 不渲染图片层与压暗层（旧档 / 默认行为）。 */
+export type HomeBackgroundSource = 'none' | 'local' | 'url'
+
+/** 首页自定义背景图设置。 */
+export interface HomeBackgroundSettings {
+  source: HomeBackgroundSource
+  fileName: string | null
+  sourceUrl: string | null
+  /** 压暗层透明度，clamp 到 `[0, 0.85]` */
+  dimAlpha: number
+}
+
 export interface Settings {
   /** 库根目录 */
   libraryDir: string
@@ -816,6 +881,59 @@ export interface Settings {
    * 且单项降级不拖垮整份 settings.json。
    */
   pluginIndexGuideShown: boolean
+  // ── V1.0 首页自定义与引导（docs/55 §1.1）───────────────────────────────
+  /**
+   * 首页海浪两套主题的自定义配色。
+   *
+   * 四片颜色叶子都为 `null` = 未自定义 → 渲染层回落 `LIGHT_PALETTE` / `DARK_PALETTE`。
+   * 旧档缺键 → 全 null → 行为与今天逐字一致（零迁移）。
+   */
+  homeWaveColors: { light: ThemeWaveColors; dark: ThemeWaveColors }
+  /** 首页海浪高度，clamp 到 `[0.2, 1.5]`，默认 0.65（`HomeParticles.tsx` 定稿值）。 */
+  homeWaveHeight: number
+  /**
+   * 首页海浪速度倍率（2026-11-22 设置重排），clamp `HOME_WAVE_SPEED_RANGE`。
+   * 默认 1.6 = 改动前 `BASE_SPEED` 定稿值 → 旧档缺键默认画面逐帧一致。
+   */
+  homeWaveSpeed: number
+  /**
+   * 首页海浪波长乘数（2026-11-22 设置重排），clamp `HOME_WAVE_LENGTH_RANGE`。
+   * 默认 1.1 = 改动前 `BASE_WAVELENGTH` 定稿值。
+   */
+  homeWaveLength: number
+  /**
+   * 首页粒子直径乘数（2026-11-22 设置重排），clamp `HOME_PARTICLE_SIZE_RANGE`。
+   * 默认 2 = 改动前 palette 定稿值（§1.5）。
+   */
+  homeParticleSize: number
+  /**
+   * 首页粒子密度乘数（2026-11-22 设置重排），clamp `HOME_PARTICLE_DENSITY_RANGE`。
+   * 默认 1.5 = 改动前 palette 定稿值；渲染层仍会乘动效档位系数（smooth 0.45 / ultra 1.15）。
+   */
+  homeParticleDensity: number
+  /**
+   * 首页指针交互总闸（涌浪 + 视差，2026-11-22 设置重排）。默认 **true** = 改动前行为
+   * （两套 palette 的 interactive 均为 true）。归一化方向：只认严格 `false` 才关
+   * （缺键 / 脏值一律开 —— 与改动前"永远开"一致）。
+   */
+  homeWaveInteractive: boolean
+  /**
+   * 首页点击涟漪开关（2026-11-22 设置重排）。默认 **true** = 改动前行为。
+   * 归一化方向同上：只认严格 `false` 才关。引擎侧 `ripple()` 还会再看
+   * `interactive` 总闸 —— 两开关独立，关总闸涟漪自然失效。
+   */
+  homeWaveClickRipples: boolean
+  /**
+   * 首页自定义背景图。`source === 'none'` 时不渲染图片层与压暗层 → 首页与今天一致。
+   * 本地文件 / URL 两种来源只落数据，本层不改渲染。
+   */
+  homeBackground: HomeBackgroundSettings
+  /** SVG 引导是否首启已展示过（默认 false = 再显示一次，宁可多提示）。 */
+  homeGuideFirstRunShown: boolean
+  /** 上次展示引导时记录的版本号；`null` = 从未展示。 */
+  homeGuideLastVersion: string | null
+  /** 用户是否永久关闭了首页引导（默认 false）。 */
+  homeGuideDisabled: boolean
   /** @deprecated 仅用于读取旧 settings.json，读到后映射为 archiveDisposal */
   trashArchiveAfterImport?: boolean
 }
@@ -873,7 +991,24 @@ export const DEFAULT_SETTINGS: Settings = {
   pluginIndexEnabled: false,
   // D-2 引导**默认未展示**（V1.0，docs/46 §1.7）：装上先让用户看到一次"插件为什么要你手动勾"，
   // 点掉或勾开写盘后置 true。与上面一项互相独立，绝不联动改值。
-  pluginIndexGuideShown: false
+  pluginIndexGuideShown: false,
+  // V1.0 首页自定义与引导（docs/55 §1.1）：全默认 = 今天的行为，旧档零迁移
+  homeWaveColors: {
+    light: { waterColor: null, crestColor: null },
+    dark: { waterColor: null, crestColor: null }
+  },
+  homeWaveHeight: 0.65,
+  // 2026-11-22 海浪参数重排：默认 = 改动前引擎定稿值（默认画面逐帧一致，旧档零迁移）
+  homeWaveSpeed: HOME_WAVE_SPEED_RANGE.default,
+  homeWaveLength: HOME_WAVE_LENGTH_RANGE.default,
+  homeParticleSize: HOME_PARTICLE_SIZE_RANGE.default,
+  homeParticleDensity: HOME_PARTICLE_DENSITY_RANGE.default,
+  homeWaveInteractive: true,
+  homeWaveClickRipples: true,
+  homeBackground: { source: 'none', fileName: null, sourceUrl: null, dimAlpha: 0.35 },
+  homeGuideFirstRunShown: false,
+  homeGuideLastVersion: null,
+  homeGuideDisabled: false
 }
 
 // ── T06 分类体系 IPC 载荷（shared 定义，main 与 preload 共用，避免 preload 反向 import main） ──

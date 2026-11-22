@@ -1,7 +1,34 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type SVGProps
+} from 'react'
 import { useVault, type ZhimoReclassSummary } from '../store'
-import { DISPOSAL_LABEL, SEVEN_ZIP_DOWNLOAD_URL } from '../../shared/types'
-import type { AliasRecord, ArchiveDisposal, MotionQuality } from '../../shared/types'
+import {
+  DEFAULT_SETTINGS,
+  DISPOSAL_LABEL,
+  SEVEN_ZIP_DOWNLOAD_URL,
+  HOME_PARTICLE_DENSITY_RANGE,
+  HOME_PARTICLE_SIZE_RANGE,
+  HOME_WAVE_LENGTH_RANGE,
+  HOME_WAVE_SPEED_RANGE,
+  clampHomeTideNumber
+} from '../../shared/types'
+import type {
+  AliasRecord,
+  ArchiveDisposal,
+  HomeTideRange,
+  MotionQuality,
+  Settings,
+  ThemeWaveColors
+} from '../../shared/types'
+import { clampWaveHeight, validHexOrNull } from '../../shared/homeTide'
+import type { HomeBackgroundSaveInput, PluginLinkStatus } from '../../shared/ipc'
+import type { PluginInstallStatus } from '../../shared/pluginInstall'
 import { MOTION_PROFILES, MOTION_QUALITY_ORDER } from '../../shared/motionQuality'
 import { aliasKeyOf } from '../../shared/aliasRules'
 import { formatBytes } from '../../shared/format'
@@ -43,7 +70,14 @@ import {
 import { Modal } from './Modal'
 import { useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
-import { IconCheck, IconClose, IconDownload, IconRefresh } from '../icons'
+import {
+  Icon3dsMax,
+  IconCheck,
+  IconClose,
+  IconRefresh,
+  IconRhino,
+  IconSketchUp
+} from '../icons'
 import { isUnclassified } from '../logic/triageFlow'
 // 品牌资源（2026-10 用户要求「图标 logo 换一下」「关于页做上打赏和反馈」）：
 // 三张图都由 `scripts/build-app-icon.cjs` 从 `resources/brand/` 的原图生成，
@@ -74,7 +108,7 @@ import brandMark from '../assets/brand/mark.png'
  *
  * ⚠️ 本轮只搬 JSX 与文案：所有 handler / state / IPC 调用 / 字段名一字未改。
  */
-type SettingsTab = 'appearance' | 'import' | 'classify' | 'library' | 'alias' | 'data' | 'about'
+type SettingsTab = 'appearance' | 'import' | 'classify' | 'library' | 'alias' | 'data' | 'about' | 'syncPlugins'
 
 const TABS: { key: SettingsTab; label: string }[] = [
   { key: 'appearance', label: '外观' },
@@ -84,7 +118,8 @@ const TABS: { key: SettingsTab; label: string }[] = [
   { key: 'library', label: '库' },
   { key: 'alias', label: '别名' },
   { key: 'data', label: '数据与备份' },
-  { key: 'about', label: '关于' }
+  { key: 'about', label: '关于' },
+  { key: 'syncPlugins', label: '同步插件' }
 ]
 
 /**
@@ -97,6 +132,8 @@ const TAB_GROUPS: { label: string; keys: SettingsTab[] }[] = [
   { label: '偏好', keys: ['appearance'] },
   { label: '素材', keys: ['import', 'classify', 'library', 'alias'] },
   { label: '数据', keys: ['data'] },
+  // T3（docs/55 §2.2.1）：插件同步入口与业务数据分开，独立成「扩展」组。
+  { label: '扩展', keys: ['syncPlugins'] },
   { label: '其他', keys: ['about'] }
 ]
 
@@ -108,7 +145,80 @@ const TAB_SUB: Record<SettingsTab, string> = {
   library: '库目录、索引维护、结构迁移',
   alias: '把口语 / 英文词映射到分类',
   data: '删除、缓存、日志与迁移',
-  about: '版本、更新与反馈'
+  about: '版本、更新与反馈',
+  syncPlugins: 'Rhino、SketchUp、3ds Max 插件同步入口'
+}
+
+/**
+ * 同步插件卡的数据形状（2026-11-23 用户拍板：**删掉写死的版本号**）。
+ *
+ * 三个版本号全是过期或编造的（SketchUp 那个早于插件真身 1.1.0；Rhino / 3DS MAX 的
+ * 是凭空写的占位）。现在标题旁的小字只用主进程扫回来的
+ * `install.shippedVersion`（= 本体自带的插件版本），卡片常量里不再存版本。
+ */
+type SyncPluginCard = {
+  name: string
+  supportText: string
+  icon: ComponentType<SVGProps<SVGSVGElement>>
+  disabled: boolean
+}
+
+/**
+ * 同步插件卡（2026-11-22 用户拍板：三张卡；2026-11-23 追加真机安装态）。
+ *
+ * 规划里只有 **SketchUp / Rhino / 3ds Max** 三个目标软件，其余四张
+ * （Cinema 4D / ARCHICAD / Revit / SketchUp LiveSync）连同图标一并移除。
+ *
+ * - **SketchUp** 是唯一有插件版本的目标：右侧控件按真机扫描四态分支
+ *   （安装 / 已安装 / 更新到 X / 已安装），动作都走既有 `.rbz` 导出链路；
+ * - **Rhino / 3DS MAX** 暂无插件：灰卡 +「待开发」，点击无动作（Q-8 口径延续）。
+ */
+const SYNC_PLUGIN_CARDS: SyncPluginCard[] = [
+  {
+    name: 'SketchUp',
+    supportText: '支持 SketchUp 各版本（以官方说明为准）',
+    icon: IconSketchUp,
+    disabled: false
+  },
+  {
+    name: 'Rhino',
+    supportText: '支持 Rhino 各版本（以官方说明为准）',
+    icon: IconRhino,
+    disabled: true
+  },
+  {
+    name: '3DS MAX',
+    supportText: '支持 3DS MAX 各版本（以官方说明为准）',
+    icon: Icon3dsMax,
+    disabled: true
+  }
+]
+
+/**
+ * SketchUp 卡第二行摘要（2026-11-23 用户拍板：**逐台列版本**，不再糊成"n 个已装 vX"）。
+ *
+ * - 没装 / 旧主进程没有 `install` → null（调用方回退卡片自带的 supportText）；
+ * - 1 台 → `SketchUp 2025 已装 v1.1.0`；解析不出版本 → `SketchUp 2025 已装`；
+ * - 2 台 → `SketchUp 2025 v1.1.0 · SketchUp 2024 v1.0.5`（**真实差异必须看得见**：
+ *   旧的那台被最高版本糊掉，用户就不知道哪台需要更新）；
+ * - 3 台及以上 → 前两台同上 + `· 等 {n} 个`（n = 总台数）。
+ *
+ * 顺序沿用 `install.hits`（已按版本降序、null 垫底），这里不重排。
+ * 单行展示（调用点 `truncate`），不出现内部词。
+ */
+function sketchupInstallText(install: PluginInstallStatus | undefined): string | null {
+  if (!install || install.state === 'missing') return null
+  const hits = install.hits
+  if (hits.length === 0) return null
+  if (hits.length === 1) {
+    const only = hits[0]
+    return only.version ? `${only.sketchup} 已装 v${only.version}` : `${only.sketchup} 已装`
+  }
+  const head = hits
+    .slice(0, 2)
+    .map((hit) => (hit.version ? `${hit.sketchup} v${hit.version}` : `${hit.sketchup} 已装`))
+    .join(' · ')
+  return hits.length > 2 ? `${head} · 等 ${hits.length} 个` : head
 }
 
 /**
@@ -129,6 +239,29 @@ const GITHUB_ISSUES_URL = 'https://github.com/chengcheng067/ID-BOX/issues'
  * 这里只共享**样式**，每个调用点自己 map、自己写 onClick。
  */
 const SEG_GROUP_CLASS = 'inline-flex items-center gap-0.5 rounded-[9px] bg-pill p-0.5'
+
+/**
+ * 海浪配色预设两档（2026-11-22 重排）。**自绘浮层**的选项单一来源 ——
+ * 原生 `<select>` 是本项目红线（用户拍板「不要系统的默认的东西出现」；
+ * 历史上 sortMenu / CategoryPicker / checkbox 三轮都是原生控件改自绘的返工）。
+ */
+const WAVE_PRESET_OPTIONS: ReadonlyArray<{ value: 'default' | 'custom'; label: string }> = [
+  { value: 'default', label: '跟随主题默认' },
+  { value: 'custom', label: '自定义' }
+]
+
+/**
+ * 首页海浪色板的**显示兜底**（= `HomeParticles.tsx` 两套 palette 的水体 / 浪峰色）。
+ * 只用于 `<input type="color">` 必须有一个合法六位值；用户未自定义时显示它，
+ * 但**不写进 settings**（写 null = 走主题默认）。色值不含 D5A 紫（styles.css 唯一例外）。
+ */
+const WAVE_FALLBACK_HEX: Record<
+  'light' | 'dark',
+  Record<'waterColor' | 'crestColor', string>
+> = {
+  light: { waterColor: '#007ad6', crestColor: '#d9a863' },
+  dark: { waterColor: '#0091ff', crestColor: '#efdabd' }
+}
 
 /** 单个分段项的样式（选中 = 白/深色浮起底 + accent 文字 + 轻投影） */
 const segItemClass = (active: boolean): string =>
@@ -276,6 +409,109 @@ function CheckRow({
   )
 }
 
+/** 可写盘的五个海浪数值参数（2026-11-22 设置重排的滑块全集）。 */
+type WaveNumberField =
+  | 'homeWaveHeight'
+  | 'homeWaveSpeed'
+  | 'homeWaveLength'
+  | 'homeParticleSize'
+  | 'homeParticleDensity'
+
+/**
+ * 海浪参数滑块行（2026-11-22 重排，照截图样式）：label + range + 数值回显（×.##）
+ * + 「×」重置按钮回默认值。默认值时按钮**隐形占位**（`invisible` 不参与交互但保住
+ * 对齐）；range 规格只从 shared 的 `HomeTideRange` 常量取，不在此处手抄数字。
+ */
+function WaveSliderRow({
+  label,
+  ariaLabel,
+  range,
+  value,
+  onChange,
+  onReset
+}: {
+  label: string
+  ariaLabel: string
+  range: HomeTideRange
+  value: number
+  onChange: (v: number) => void
+  onReset: () => void
+}) {
+  // 2026-11-23 用户反馈「滑块巨卡、不跟手」：原实现把 input 的每一次 onChange（即
+  // 每个 input 事件）都直接 saveSettings → 写盘 → 广播 → 首页粒子引擎销毁重建，
+  // 拖动时每秒触发几十次重建，等于把首页当压力测试跑。现在改成：**拖动只更新本地
+  // 显示值（跟手），pointerup / keyup / blur（松手）才提交** —— 一次拖动只触发
+  // 一次设置写入与引擎重建。外部 value 变化（如重置）通过 effect 回显到本地。
+  const [local, setLocal] = useState(value)
+  useEffect(() => {
+    setLocal(value)
+  }, [value])
+  const commit = (): void => {
+    if (local !== value) onChange(local)
+  }
+  return (
+    <div className="flex items-center gap-2 py-1.5">
+      <span className="w-16 shrink-0 text-[12px] text-secondary">{label}</span>
+      <input
+        type="range"
+        aria-label={ariaLabel}
+        title={`${label}（${range.min} ~ ${range.max}）`}
+        className="min-w-0 flex-1"
+        min={range.min}
+        max={range.max}
+        step={range.step}
+        value={local}
+        onChange={(e) => setLocal(Number(e.target.value))}
+        onPointerUp={commit}
+        onKeyUp={commit}
+        onBlur={commit}
+      />
+      <span className="w-10 shrink-0 text-right font-mono text-[12px] text-secondary">
+        {local.toFixed(2)}
+      </span>
+      <button
+        type="button"
+        title={`重置${label}为默认（${range.default.toFixed(2)}）`}
+        aria-label={`重置${label}为默认`}
+        className={`h-5 w-5 shrink-0 rounded-full text-[13px] leading-none text-tertiary transition hover:bg-elevated hover:text-primary ${
+          value === range.default ? 'invisible' : ''
+        }`}
+        onClick={onReset}
+      >
+        ×
+      </button>
+    </div>
+  )
+}
+
+/**
+ * 折叠区标题行（2026-11-22 重排：「标题行 + −/+」展开收起，组件内 useState 实现，
+ * 不引第三方）。整行可点，`aria-expanded` 保住展开状态的可读性。
+ */
+function WaveCollapseRow({
+  open,
+  onToggle,
+  title
+}: {
+  open: boolean
+  onToggle: () => void
+  title: string
+}) {
+  return (
+    <button
+      type="button"
+      aria-expanded={open}
+      onClick={onToggle}
+      className="flex w-full items-center justify-between border-t border-soft-line py-2.5 text-left text-[13.5px] font-medium leading-[1.25] text-primary transition hover:text-secondary"
+    >
+      <span>{title}</span>
+      <span className="w-5 text-center text-[14px] leading-none text-tertiary">
+        {open ? '−' : '+'}
+      </span>
+    </button>
+  )
+}
+
 /**
  * 设置页的一行（**布局实现**，设计语言「标题 + 一行摘要 + 右侧控件」）。
  *
@@ -312,7 +548,12 @@ function Row({
       <div className="min-w-0 flex-1">
         <div className="text-[13.5px] font-medium leading-[1.25] text-primary">{title}</div>
         {desc && <div className="mt-1 text-[12px] leading-[1.5] text-tertiary">{desc}</div>}
-        {notice}
+        {/* 2026-11-23 排版修复：notice 裸渲染时字符串继承根字号 16px，在 12px 的 desc
+            旁边突兀成"大字"（真机截图实锤：数据备份 SketchUp 插件行）。包一层默认
+            字号 —— 自带样式的 notice JSX（诊断日志 11px mono 等）不受影响。 */}
+        {notice && (
+          <div className="mt-1 text-[12px] leading-[1.6] text-secondary">{notice}</div>
+        )}
       </div>
       {children && (
         <div className="flex shrink-0 flex-nowrap items-center justify-end gap-2">{children}</div>
@@ -818,9 +1059,8 @@ function AliasTab() {
         title="别名映射表"
         note={
           <>
-            左列是原文件名（大小写 / 空格 / 下划线 / 「4K」尾巴 / 知末 ID 都会被忽略），
-            一条词典对所有同名资产生效；右侧「显示名」失焦即保存。共 {aliases.length} /{' '}
-            {MAX_ALIASES} 条。别名只参与「自动分类」匹配，不进落盘路径。
+            左列填原始文件名（大小写、空格、知末 ID 等差异自动忽略），一条词典对所有同名资产生效；
+            右侧「显示名」失焦即保存。共 {aliases.length} / {MAX_ALIASES} 条，只影响显示。
           </>
         }
       >
@@ -999,6 +1239,203 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const settings = useVault((s) => s.settings)
   const saveSettings = useVault((s) => s.saveSettings)
   const rescan = useVault((s) => s.rescan)
+  // 一键打包（docs/58 T5）：两个入口只唤起 store 动作 —— 导出选项 / 验包确认 /
+  // 逐项裁决都在 PackageDialog 里，本卡不重复实现任何打包逻辑。
+  const openPackageDialog = useVault((s) => s.openPackageDialog)
+
+  // ── V1.0 首页自定义（docs/55 §2.1）的本地 UI 状态 ──────────────────────
+  /** HEX 文本框草稿（键 = `light.waterColor` 等）；无草稿时直接显示已落盘值。 */
+  const [hexDrafts, setHexDrafts] = useState<Record<string, string>>({})
+  /** URL 输入框草稿；`null` = 显示已落盘的 `sourceUrl`。 */
+  const [bgUrlDraft, setBgUrlDraft] = useState<string | null>(null)
+  /** HEX 非法 / 背景图下载失败的提示：**只提示不写盘**。 */
+  const [homeCustomHint, setHomeCustomHint] = useState('')
+  /** 背景图下载 / 复制中（防重复点击）。 */
+  const [bgBusy, setBgBusy] = useState(false)
+
+  // ── 2026-11-22 海浪参数重排：预设下拉 + 两个折叠区的本地状态 ────────────────
+  /** 当前海浪配色（缺键 / 旧档回落全 null = 跟随主题默认）。 */
+  const waveColors = settings?.homeWaveColors ?? DEFAULT_SETTINGS.homeWaveColors
+  /** 四片颜色叶子任一非 null = 用户自定义过 → 预设下拉显示「自定义」。 */
+  const hasCustomWaveColors =
+    waveColors.light.waterColor !== null ||
+    waveColors.light.crestColor !== null ||
+    waveColors.dark.waterColor !== null ||
+    waveColors.dark.crestColor !== null
+  /** 「海浪形态与交互」折叠区开关（默认收起，照截图层级）。 */
+  const [waveFormOpen, setWaveFormOpen] = useState(false)
+  const [waveParamsOpen, setWaveParamsOpen] = useState(false)
+  /**
+   * 「自定义配色」折叠区开关；`null` = 用户还没手动碰过 → 跟随 `hasCustomWaveColors`
+   * （已自定义过的用户打开设置直接看到自己的配色，不用再点一次）。
+   */
+  const [waveColorsOpen, setWaveColorsOpen] = useState<boolean | null>(null)
+  const waveColorsShown = waveColorsOpen ?? hasCustomWaveColors
+
+  // ── 配色预设的自绘浮层（照 App.tsx 排序胶囊 sortMenu 范式逐条同构）──────────
+  // 原生 <select> 是本项目硬红线（zhimoSettings.test.ts 守卫「整份设置页零原生
+  // <select>」）：appearance-none 只改控件外观、改不了系统弹层。改成
+  // `button + 自绘面板`：fixed 定位（打开时取一次按钮矩形）+ 单选即收起 +
+  // 点外面 / Esc（捕获阶段）/ resize 关闭 —— 与排序浮层完全同一套路。
+  const [presetPanel, setPresetPanel] = useState(false)
+  const [presetPos, setPresetPos] = useState<{ left: number; top: number } | null>(null)
+  const presetRef = useRef<HTMLDivElement | null>(null)
+  /** 触发按钮上显示的当前档位名（两档选项与 WAVE_PRESET_OPTIONS 同源）。 */
+  const wavePresetLabel =
+    WAVE_PRESET_OPTIONS.find((o) => (o.value === 'custom') === hasCustomWaveColors)?.label ??
+    '跟随主题默认'
+
+  /** 点按钮：已展开则收起；否则按按钮矩形定位后展开（浮层左对齐按钮，不越出卡片）。 */
+  const togglePresetPanel = (e: React.MouseEvent<HTMLButtonElement>): void => {
+    if (presetPanel) {
+      setPresetPanel(false)
+      return
+    }
+    const rect = e.currentTarget.getBoundingClientRect()
+    setPresetPos({ left: Math.round(rect.left), top: Math.round(rect.bottom + 6) })
+    setPresetPanel(true)
+  }
+
+  /**
+   * Esc 归层栈（T-ESC 裁定：弹窗内浮层不许自挂 keydown，见 modalEsc 守卫）。
+   *
+   * 浮层打开时 `useEscLayer` 压栈 → 排在设置外壳（`useEscLayer(onClose, !!settings)`）
+   * 之上，是栈顶：Esc 只关浮层、不透传（stopPropagation 由层栈统一做）；浮层关闭时
+   * 出栈，Esc 重新由设置外壳应答（关弹窗）。与分类选择器的一级/二级浮层完全同构 ——
+   * 这是 `escLayer.ts` 文档里写明的「弹窗内部的第二层」标准接法，不另造轮子。
+   */
+  useEscLayer(() => setPresetPanel(false), presetPanel)
+
+  /**
+   * 浮层的**非 Esc** 关闭路径：点浮层外 / 窗口 resize（fixed 坐标在打开那一刻写死，
+   * 尺寸一变就错位）。Esc 不在这里管 —— 归上面那层 `useEscLayer`（modalEsc 守卫）。
+   */
+  useEffect(() => {
+    if (!presetPanel) return
+    const onPointerDown = (e: MouseEvent): void => {
+      const root = presetRef.current
+      if (root && e.target instanceof Node && root.contains(e.target)) return
+      setPresetPanel(false)
+    }
+    const onResize = (): void => setPresetPanel(false)
+    window.addEventListener('mousedown', onPointerDown)
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown)
+      window.removeEventListener('resize', onResize)
+    }
+  }, [presetPanel])
+
+  /** 当前背景设置（缺键 / 旧档回落默认 = `source:'none'`）。 */
+  const homeBg = settings?.homeBackground ?? DEFAULT_SETTINGS.homeBackground
+
+  /**
+   * 写一单片自定义海浪色：整组 `{light,dark}` 一起写（主进程是浅合并，局部 patch 会丢另一主题）。
+   * `hex === null` = 重置为未自定义 → 渲染层回落该主题 palette。
+   */
+  const commitWaveColor = (
+    theme: 'light' | 'dark',
+    slot: keyof ThemeWaveColors,
+    hex: string | null
+  ): void => {
+    const prev = settings?.homeWaveColors ?? DEFAULT_SETTINGS.homeWaveColors
+    const next = { light: { ...prev.light }, dark: { ...prev.dark } }
+    next[theme][slot] = hex
+    setHomeCustomHint('')
+    void saveSettings({ homeWaveColors: next })
+    flash()
+  }
+
+  /** 删除一个 HEX 草稿键（合法落盘 / 清空重置后调用）。 */
+  const clearHexDraft = (key: string): void => {
+    setHexDrafts((drafts) => {
+      const next = { ...drafts }
+      delete next[key]
+      return next
+    })
+  }
+
+  /**
+   * 海浪配色预设下拉（2026-11-22 重排）：
+   * - `default`：四叶全写 null = 回落主题 palette（与逐项重置等价的"一键回默认"）；
+   * - `custom`：只展开自定义配色折叠区 —— 颜色本身由用户逐项挑，这里**不写**任何假色
+   *   （写一张占位色会让渲染层立刻用它，画面突变）。
+   */
+  const applyWavePreset = (preset: 'default' | 'custom'): void => {
+    setWaveColorsOpen(preset === 'custom')
+    if (preset === 'default') {
+      void saveSettings({
+        homeWaveColors: {
+          light: { waterColor: null, crestColor: null },
+          dark: { waterColor: null, crestColor: null }
+        }
+      })
+    }
+    flash()
+  }
+
+  /** 海浪数值参数统一写入口（落盘前 clamp 与 settings.ts 写档 clamp 同口径双保险）。 */
+  const saveWaveNumber = (
+    patch: Partial<Pick<Settings, WaveNumberField>>
+  ): void => {
+    void saveSettings(patch)
+    flash()
+  }
+
+  /**
+   * 背景图落地：主进程只返回缓存文件名，成功后再写 settings；失败仅提示、保留旧图。
+   * 替换成功时删掉旧缓存文件（单槽位，S-6）。
+   */
+  const applyHomeBackground = async (
+    input: HomeBackgroundSaveInput,
+    source: 'local' | 'url',
+    sourceUrl: string | null
+  ): Promise<void> => {
+    setBgBusy(true)
+    setHomeCustomHint('')
+    try {
+      const result = await window.modvault.saveHomeBackground(input)
+      if (!result.ok) {
+        setHomeCustomHint(`背景图设置失败：${result.error}`)
+        return
+      }
+      const current = settings?.homeBackground ?? DEFAULT_SETTINGS.homeBackground
+      if (current.fileName && current.fileName !== result.fileName) {
+        void window.modvault.clearHomeBackground(current.fileName)
+      }
+      await saveSettings({
+        homeBackground: { ...current, source, fileName: result.fileName, sourceUrl }
+      })
+      flash()
+    } catch {
+      setHomeCustomHint('背景图设置失败，请稍后重试')
+    } finally {
+      setBgBusy(false)
+    }
+  }
+
+  /** 移除背景：清缓存 + 写 `source='none'`，首页回到今天的样子。 */
+  const removeHomeBackground = (): void => {
+    const current = settings?.homeBackground ?? DEFAULT_SETTINGS.homeBackground
+    if (current.fileName) void window.modvault.clearHomeBackground(current.fileName)
+    setBgUrlDraft(null)
+    setHomeCustomHint('')
+    void saveSettings({
+      homeBackground: { ...current, source: 'none', fileName: null, sourceUrl: null }
+    })
+    flash()
+  }
+
+  /** 选本地图片（复用既有 `dialog:pickArchives` 文件对话框，含图片过滤器，零新增通道）。 */
+  const pickLocalBackground = async (): Promise<void> => {
+    try {
+      const paths = await window.modvault.pickArchives()
+      const filePath = paths[0]
+      if (filePath) await applyHomeBackground({ kind: 'local', filePath }, 'local', null)
+    } catch {
+      setHomeCustomHint('选择图片失败，请稍后重试')
+    }
+  }
   /**
    * DEF-19-3：库目录漂移体检（只读派生数据）。
    *
@@ -1216,16 +1653,25 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   // 本轮是否被用户主动取消（store 的 cancelRequested 结束时会复位，读不到历史）
   const [zhimoBackfillCancelled, setZhimoBackfillCancelled] = useState(false)
   /**
-   * 「导出 SketchUp 插件包（.rbz）」的结果（docs/39 §4.3 形态①，用户 2026-11-04 拍板）。
-   *
-   * 三态分开存：`ok` / `error` / `null`（还没导出过）。**取消不入这三态**——用户主动放弃
-   * 保存不是失败，把取消显示成红字等于凭空报错（主进程用 `canceled` 单独表达）。
+   * 「安装插件」（.rbz 导出）的忙碌态。2026-11-22 用户拍板：导出功能从「数据与备份」
+   * 搬进「同步插件」tab，结果**不再在本 tab 里铺结果块**，统一走全局 notice 提示
+   * （成功含保存路径，失败给主进程返回的中文原因），所以原来的 `rbzExport` 三态
+   * state 整体删除，只留忙碌标志。
    * 必须是 hook（写在 `if (!settings) return null` 之前），否则违反 hooks 规则。
    */
-  const [rbzExport, setRbzExport] = useState<
-    { kind: 'ok'; path: string; bytes: number } | { kind: 'error'; message: string } | null
-  >(null)
   const [rbzExporting, setRbzExporting] = useState(false)
+
+  /**
+   * SketchUp 插件联通状态（2026-11-22 用户需求「联通绿点」）。
+   *
+   * 挂载/切到「同步插件」tab 时查一次（`tab` 进依赖数组：每次切进来都刷新，
+   * 关掉设置再开也能拿到新状态）。主进程**永不 reject**，这里 `.catch` 只是把
+   * 意外（桥缺失等）也收敛成"没连上"，绿点绝不变成报错源。
+   */
+  const [pluginLink, setPluginLink] = useState<PluginLinkStatus>({
+    connected: false,
+    generatedAt: null
+  })
 
   useEffect(() => {
     void window.modvault.sevenZipPath().then(setSevenZip)
@@ -1244,6 +1690,16 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const refreshThumbStat = () => {
     void window.modvault.thumbStats().then(setThumbStat).catch(() => undefined)
   }
+
+  // 联通绿点（2026-11-22）：「同步插件」tab 每次被切到时查一次本地 manifest。
+  // 不轮询、不 watch —— 用户看到绿点的时机就是他切进这个 tab 的那一刻，足够了。
+  useEffect(() => {
+    if (tab !== 'syncPlugins') return
+    void window.modvault
+      .getPluginLinkStatus()
+      .then(setPluginLink)
+      .catch(() => setPluginLink({ connected: false, generatedAt: null }))
+  }, [tab])
 
   const refreshLogStat = () => {
     void window.modvault.logStats().then(setLogStat).catch(() => undefined)
@@ -1445,28 +1901,31 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   }
 
   /**
-   * 导出 SketchUp 插件包（`.rbz`）—— 用户 2026-11-04 拍板：**ID BOX 只导出文件**。
+   * 导出 SketchUp 插件包（`.rbz`）—— 2026-11-22 用户拍板：入口搬到「同步插件」tab，
+   * 「数据与备份」里的导出行删除（功能不重复提供）。
    *
    * 打包（`plugin-src` → 恰好两项的 ZIP）、原子写、`shell.showItemInFolder` 全在主进程；
-   * 渲染层只负责按钮忙碌态与结果文案。前置校验（`pluginIndexEnabled` 关着 → 报错）也在
+   * 渲染层只负责按钮忙碌态与结果提示。前置校验（`pluginIndexEnabled` 关着 → 报错）也在
    * 主进程，这里不做二次判断（两处判断必然漂移）。
+   *
+   * 结果走**全局 notice**（与日志导出同款）：成功含保存路径；取消什么都不提示；
+   * 失败给主进程返回的中文原因。
    */
   const exportRbz = async () => {
     setRbzExporting(true)
-    setRbzExport(null)
     try {
       const r = await window.modvault.exportPluginRbz().catch(() => null)
       if (!r) {
-        setRbzExport({ kind: 'error', message: '导出失败（程序没有响应，请重试）' })
+        useVault.setState({ notice: '导出失败（程序没有响应，请重试）' })
         return
       }
       // 用户取消：不提示、不置红（他不是做错事，只是改了主意）
       if (r.canceled) return
       if (r.ok && r.path) {
-        setRbzExport({ kind: 'ok', path: r.path, bytes: r.bytes ?? 0 })
+        useVault.setState({ notice: `插件包已导出（已在文件夹中显示）：${r.path}` })
         return
       }
-      setRbzExport({ kind: 'error', message: r.error || '导出失败' })
+      useVault.setState({ notice: r.error || '导出失败，请稍后重试' })
     } finally {
       setRbzExporting(false)
     }
@@ -1737,6 +2196,367 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             />
           }
         />
+
+        {/* ── 2026-11-22 海浪参数重排（用户原话：「海浪颜色以及海浪大小在设置里的层级
+            看上去非常糟糕和混乱……重新整理一下设置」；层级照 TuneShape 调参面板截图）──
+            四区块：① 海浪配色预设（下拉）→ ② 海浪参数滑块区（速度/高度/大小/密度，
+            数值回显 + × 重置）→ ③ 折叠「海浪形态与交互」（波长 + 指针交互/点击涟漪）
+            → ④ 折叠「自定义配色」（浅/深两组水体+浪峰）。首页背景图区块保留在后。 */}
+        <SettingsRow
+          title="海浪配色预设"
+          desc="默认跟随主题配色；选「自定义」展开下方折叠区逐色调整"
+          actions={
+            /* 自绘浮层触发器 + 选项面板（原生 <select> 红线，见 WAVE_PRESET_OPTIONS 注释）。
+               容器 / 定位 / 尺寸照 App.tsx 排序浮层：fixed + 打开时取按钮矩形、
+               `rounded-btn border border-line bg-card p-1 shadow-modal`、行高 h-7、
+               `rounded-nav`、选中 `bg-accent-tint`；z-40 与排序浮层同档 —— 设置弹窗
+               自身已是顶层 Modal，z 只在弹窗内部比较，不越级。 */
+            <div ref={presetRef} className="relative inline-flex">
+              <button
+                type="button"
+                className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-btn border border-panel-line bg-card px-2.5"
+                title="海浪配色预设"
+                aria-haspopup="listbox"
+                aria-expanded={presetPanel}
+                aria-label={`海浪配色预设：${wavePresetLabel}`}
+                onClick={togglePresetPanel}
+              >
+                <span className="text-[12px] text-secondary">{wavePresetLabel}</span>
+                <span aria-hidden className="pointer-events-none text-[9px] text-tertiary">
+                  ▾
+                </span>
+              </button>
+
+              {presetPanel && presetPos ? (
+                <div
+                  className="fixed z-40 w-[160px] rounded-btn border border-line bg-card p-1 shadow-modal"
+                  style={{ left: presetPos.left, top: presetPos.top }}
+                >
+                  {/* 标题放在 listbox 外面：listbox 的直接子节点只能是 option / group */}
+                  <div className="px-2 pb-1 pt-1 text-[10px] text-tertiary">海浪配色预设</div>
+                  <div role="listbox" aria-label="海浪配色预设">
+                    {WAVE_PRESET_OPTIONS.map((opt) => {
+                      const active = (opt.value === 'custom') === hasCustomWaveColors
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          role="option"
+                          aria-selected={active}
+                          className={`flex h-7 w-full items-center rounded-nav px-2 text-left text-[12px] transition ${
+                            active
+                              ? 'bg-accent-tint font-medium text-accent-text'
+                              : 'text-secondary hover:bg-elevated/60'
+                          }`}
+                          onClick={() => {
+                            setPresetPanel(false)
+                            applyWavePreset(opt.value)
+                          }}
+                        >
+                          {opt.label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          }
+        />
+
+        {/* ② 滑块区：速度 / 高度 / 粒子大小 / 粒子密度。规格全部来自 shared 的
+            HomeTideRange 常量（单一真源）；默认值 = 改动前引擎定稿值，画面不变。
+            海浪高度这一行保留旧的 clampWaveHeight(Number(...)) 内联写法（守卫锚点）。 */}
+        {/* ② 滑块区（2026-11-23 用户口径：滑块**不需要长显示** —— 改折叠默认收起，
+            与「形态与交互」「自定义配色」同一套 WaveCollapseRow，首页卡恢复紧凑）。
+            规格全部来自 shared 的 HomeTideRange 常量（单一真源）。 */}
+        <WaveCollapseRow
+          open={waveParamsOpen}
+          onToggle={() => setWaveParamsOpen((v) => !v)}
+          title="海浪参数"
+        />
+        {waveParamsOpen ? (
+        <div className="pl-1">
+          <WaveSliderRow
+            label="海浪速度"
+            ariaLabel="海浪速度"
+            range={HOME_WAVE_SPEED_RANGE}
+            value={settings?.homeWaveSpeed ?? DEFAULT_SETTINGS.homeWaveSpeed}
+            onChange={(v) =>
+              saveWaveNumber({ homeWaveSpeed: clampHomeTideNumber(v, HOME_WAVE_SPEED_RANGE) })
+            }
+            onReset={() => saveWaveNumber({ homeWaveSpeed: HOME_WAVE_SPEED_RANGE.default })}
+          />
+          {/* 2026-11-23：海浪高度行并入 WaveSliderRow（旧内联写法每个 input 事件直写
+              settings，与滑块卡顿同根因）。clamp 语义保持 clampWaveHeight。 */}
+          <WaveSliderRow
+            label="海浪高度"
+            ariaLabel="海浪大小"
+            range={{ min: 0.2, max: 1.5, step: 0.05, default: DEFAULT_SETTINGS.homeWaveHeight }}
+            value={settings?.homeWaveHeight ?? DEFAULT_SETTINGS.homeWaveHeight}
+            onChange={(v) => void saveSettings({ homeWaveHeight: clampWaveHeight(v) })}
+            onReset={() => saveWaveNumber({ homeWaveHeight: DEFAULT_SETTINGS.homeWaveHeight })}
+          />
+          <WaveSliderRow
+            label="粒子大小"
+            ariaLabel="粒子大小"
+            range={HOME_PARTICLE_SIZE_RANGE}
+            value={settings?.homeParticleSize ?? DEFAULT_SETTINGS.homeParticleSize}
+            onChange={(v) =>
+              saveWaveNumber({ homeParticleSize: clampHomeTideNumber(v, HOME_PARTICLE_SIZE_RANGE) })
+            }
+            onReset={() => saveWaveNumber({ homeParticleSize: HOME_PARTICLE_SIZE_RANGE.default })}
+          />
+          <WaveSliderRow
+            label="粒子密度"
+            ariaLabel="粒子密度"
+            range={HOME_PARTICLE_DENSITY_RANGE}
+            value={settings?.homeParticleDensity ?? DEFAULT_SETTINGS.homeParticleDensity}
+            onChange={(v) =>
+              saveWaveNumber({
+                homeParticleDensity: clampHomeTideNumber(v, HOME_PARTICLE_DENSITY_RANGE)
+              })
+            }
+            onReset={() =>
+              saveWaveNumber({ homeParticleDensity: HOME_PARTICLE_DENSITY_RANGE.default })
+            }
+          />
+        </div>
+        ) : null}
+
+        {/* ③ 折叠区「海浪形态与交互」：波长滑块 + 指针交互 / 点击涟漪两个自绘复选行。
+            两开关独立且都默认开（= 改动前行为）；引擎侧 clickRipples 还会再看
+            interactive 总闸 —— 关总闸涟漪自然失效。 */}
+        <WaveCollapseRow
+          open={waveFormOpen}
+          onToggle={() => setWaveFormOpen((v) => !v)}
+          title="海浪形态与交互"
+        />
+        {waveFormOpen ? (
+          <div className="pb-2 pl-1">
+            <WaveSliderRow
+              label="波长"
+              ariaLabel="海浪波长"
+              range={HOME_WAVE_LENGTH_RANGE}
+              value={settings?.homeWaveLength ?? DEFAULT_SETTINGS.homeWaveLength}
+              onChange={(v) =>
+                saveWaveNumber({ homeWaveLength: clampHomeTideNumber(v, HOME_WAVE_LENGTH_RANGE) })
+              }
+              onReset={() => saveWaveNumber({ homeWaveLength: HOME_WAVE_LENGTH_RANGE.default })}
+            />
+            <div className="flex flex-col gap-2 pt-2">
+              <CheckRow
+                checked={settings?.homeWaveInteractive !== false}
+                onChange={(v) => {
+                  void saveSettings({ homeWaveInteractive: v })
+                  flash()
+                }}
+                title="关掉后海浪不再响应鼠标（涌浪与视差一并停用）"
+              >
+                指针交互
+              </CheckRow>
+              <CheckRow
+                checked={settings?.homeWaveClickRipples !== false}
+                onChange={(v) => {
+                  void saveSettings({ homeWaveClickRipples: v })
+                  flash()
+                }}
+                title="点击海面激起一圈涟漪（需「指针交互」开启）"
+              >
+                点击涟漪
+              </CheckRow>
+            </div>
+          </div>
+        ) : null}
+
+        {/* ④ 折叠区「自定义配色」：原「海浪颜色」行的浅/深两组色板 + HEX 双向绑定
+            原样收纳（控件一字未改，只是位置进了折叠区）。选预设「自定义」会自动展开；
+            选「跟随主题默认」四叶全写 null 并收起。 */}
+        <WaveCollapseRow
+          open={waveColorsShown}
+          onToggle={() => setWaveColorsOpen(!waveColorsShown)}
+          title="自定义配色"
+        />
+        {waveColorsShown ? (
+          <div className="pb-2 pl-1">
+            {/* V1.0 海浪颜色（Q-1/Q-2/Q-3）：色板 + HEX 双向绑定同一字段，浅深各一份。
+                色板 onChange 写 6 位 hex；HEX 文本框 onBlur / Enter 走 validHexOrNull 校验，
+                非法只给提示不写盘；“重置”写 null = 回落该主题 palette。 */}
+            <div className="flex w-full max-w-[430px] flex-col gap-1.5">
+              {(['light', 'dark'] as const).flatMap((theme) =>
+                (['waterColor', 'crestColor'] as const).map((slot) => {
+                  const key = `${theme}.${slot}`
+                  const current = (settings?.homeWaveColors ?? DEFAULT_SETTINGS.homeWaveColors)[
+                    theme
+                  ][slot]
+                  const fallback = WAVE_FALLBACK_HEX[theme][slot]
+                  const label = `${theme === 'light' ? '浅色' : '深色'}${
+                    slot === 'waterColor' ? '水体' : '浪峰'
+                  }`
+                  return (
+                    <div key={key} className="flex items-center gap-1.5">
+                      <span className="w-[56px] shrink-0 text-[11px] text-tertiary">{label}</span>
+                      <input
+                        type="color"
+                        aria-label={`${label}色板`}
+                        title={`${label}色板`}
+                        className="h-6 w-8 shrink-0 cursor-pointer rounded border border-panel-line bg-transparent p-0"
+                        value={current ?? fallback}
+                        onChange={(e) => commitWaveColor(theme, slot, e.target.value)}
+                      />
+                      <input
+                        type="text"
+                        aria-label={`${label}HEX`}
+                        className="input w-[108px] font-mono text-[12px]"
+                        value={hexDrafts[key] ?? current ?? ''}
+                        placeholder={fallback}
+                        spellCheck={false}
+                        onChange={(e) => setHexDrafts((d) => ({ ...d, [key]: e.target.value }))}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                        }}
+                        onBlur={() => {
+                          const raw = (hexDrafts[key] ?? '').trim()
+                          if (raw === '') {
+                            clearHexDraft(key)
+                            commitWaveColor(theme, slot, null)
+                            return
+                          }
+                          const hex = validHexOrNull(raw)
+                          if (!hex) {
+                            setHomeCustomHint(`${label}的 HEX 无效，请输入 #RRGGBB（本次未保存）`)
+                            return
+                          }
+                          clearHexDraft(key)
+                          commitWaveColor(theme, slot, hex)
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="rounded px-1.5 py-0.5 text-[11px] text-tertiary hover:bg-elevated hover:text-secondary"
+                        title="重置为默认色"
+                        onClick={() => {
+                          clearHexDraft(key)
+                          commitWaveColor(theme, slot, null)
+                        }}
+                      >
+                        重置
+                      </button>
+                    </div>
+                  )
+                })
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        {/* 首页背景图（Q-5/Q-6）：本地文件 + URL 两张来源共用一张图。
+            2026-11-22 用户拍板：压暗整体移除（「换了背景以后暗化得有点严重」），
+            渲染层不再读取 dimAlpha —— 压暗滑块删除；`dimAlpha` 字段保留仅为旧档
+            schema 兼容，不再有写入入口。壁纸现铺满整个窗口（含顶栏），顶栏毛玻璃
+            代替压暗保证可读性。 */}
+        <SettingsRow
+          title="首页背景图"
+          desc="本地图片或图片 URL，深浅主题共用一张；运行期只读本地缓存，断网照常显示"
+          actions={
+            <div className="flex w-full max-w-[430px] flex-col gap-2">
+              <div className={SEG_GROUP_CLASS} role="radiogroup" aria-label="首页背景图来源">
+                {(
+                  [
+                    ['none', '无'],
+                    ['local', '本地文件'],
+                    ['url', '图片 URL']
+                  ] as const
+                ).map(([source, label]) => (
+                  <button
+                    key={source}
+                    type="button"
+                    role="radio"
+                    aria-checked={homeBg.source === source}
+                    className={segItemClass(homeBg.source === source)}
+                    onClick={() => {
+                      if (source === 'none') {
+                        removeHomeBackground()
+                        return
+                      }
+                      setHomeCustomHint('')
+                      void saveSettings({
+                        homeBackground: {
+                          ...homeBg,
+                          source,
+                          fileName: null,
+                          sourceUrl: null
+                        }
+                      })
+                      flash()
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {homeBg.source === 'local' ? (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={bgBusy}
+                    className="rounded-[8px] border border-panel-line bg-elevated px-2.5 py-1 text-[12px] text-secondary hover:text-primary disabled:opacity-50"
+                    onClick={() => void pickLocalBackground()}
+                  >
+                    选择图片
+                  </button>
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-tertiary">
+                    {/* 2026-11-23：不再显示缓存文件名 —— 那是 sha256 内部命名，用户看不懂
+                        （copy-audit 纪律：内部实现名词不许漏到 UI）。只报状态与格式。 */}
+                    {homeBg.fileName
+                      ? `已设置（${(homeBg.fileName.split('.').pop() ?? '').toUpperCase() || '图片'}）`
+                      : '尚未选择图片'}
+                  </span>
+                </div>
+              ) : null}
+
+              {homeBg.source === 'url' ? (
+                <div className="flex items-center gap-2">
+                  <input
+                    type="url"
+                    className="input min-w-0 flex-1 font-mono text-[12px]"
+                    placeholder="https://example.com/bg.jpg"
+                    value={bgUrlDraft ?? homeBg.sourceUrl ?? ''}
+                    onChange={(e) => setBgUrlDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key !== 'Enter') return
+                      const url = (bgUrlDraft ?? homeBg.sourceUrl ?? '').trim()
+                      if (url) void applyHomeBackground({ kind: 'url', url }, 'url', url)
+                    }}
+                  />
+                  <button
+                    type="button"
+                    disabled={bgBusy}
+                    className="shrink-0 rounded-[8px] border border-panel-line bg-elevated px-2.5 py-1 text-[12px] text-secondary hover:text-primary disabled:opacity-50"
+                    onClick={() => {
+                      const url = (bgUrlDraft ?? homeBg.sourceUrl ?? '').trim()
+                      if (!url) {
+                        setHomeCustomHint('请输入图片地址')
+                        return
+                      }
+                      void applyHomeBackground({ kind: 'url', url }, 'url', url)
+                    }}
+                  >
+                    {bgBusy ? '下载中…' : '下载并应用'}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          }
+        />
+        {/* 提示条（2026-11-22 重排后移到卡底通栏）：HEX 非法与背景图下载失败共用 ——
+            原先挂在「海浪颜色」行内，重排后配色进了折叠区，收起时会吞掉背景图错误。 */}
+        {homeCustomHint ? (
+          <div className="border-t border-soft-line py-2 text-[11px] text-danger">
+            {homeCustomHint}
+          </div>
+        ) : null}
       </SettingsCard>
     </div>
   )
@@ -1786,7 +2606,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
 
       <SettingsCard
         title="解压"
-        note="未安装 7-Zip 时 .rar / .7z 只能用内置 zip 引擎，遇到不支持的格式会提示你安装 7-Zip。"
+        note="未装 7-Zip 时，.rar / .7z 会提示你先安装它。"
       >
         <SettingsRow
           title="同时解压任务数"
@@ -1831,9 +2651,13 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           title="7-Zip"
           desc={
             <span className="flex flex-wrap items-center gap-1.5">
-              <code className="font-mono text-[11.5px] text-secondary" title={sevenZip ?? undefined}>
-                {sevenZip ?? '未检测到 7z.exe'}
-              </code>
+              {/* 2026-11-23 排版：完整路径不再直接展示（内部路径泄漏），收进悬停 */}
+              <span
+                className="font-mono text-[11.5px] text-secondary"
+                title={sevenZip ?? '未检测到 7z.exe'}
+              >
+                {sevenZip ? '7z.exe 已就位' : '未检测到 7z.exe'}
+              </span>
               <span className="text-muted">·</span>
               {sevenZip ? (
                 <StatusBadge tone="ok">已找到</StatusBadge>
@@ -2008,12 +2832,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     <div className="flex flex-col gap-[13px]">
       <SettingsCard
         title="导入时"
-        note={
-          <>
-            站方类目在本地没有对应时，按已核准的「相近类目」归并，日志里标{' '}
-            <code className="font-mono text-[11px]">approx</code>，可回溯。
-          </>
-        }
+        note="站方类目本地没有对应时，按核准的相近类目归并；拿不准的资产随时可以在右侧改派。"
       >
         <SettingsRow
           title="按站方分类自动落库"
@@ -2039,7 +2858,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         title="存量重排"
         note={
           <>
-            两个重排都只处理「未分类」的资产；移动前自动备份，各自只保留最近 3 份 —— 当前
+            两个重排都只处理「未分类」的资产，移动前自动备份，各自只保留最近 3 份 —— 当前
             {reclassifyBackupCount + zhimoReclassBackupCount > 0 ? (
               <>
                 可撤销备份{' '}
@@ -2050,7 +2869,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               <>暂无可撤销备份。</>
             )}
             「按站方分类自动落库」开关只约束导入后的自动任务，手动按钮不受此开关影响。
-            检查只读，用于发现三类偏差：磁盘已删的索引记录、拖进库但没索引的资产、目录改名导致的分类不一致。
+            一致性检查只读，不改任何东西。
           </>
         }
       >
@@ -2637,7 +3456,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         <SettingsRow
           title="SketchUp 插件"
           desc="为 SketchUp 插件持续导出索引快照（只读）。"
-          notice="关闭时插件会提示「未开导出」；打开后只在确有变化时落盘，最迟 5 秒写一次。落盘位置：用户目录下的 idbox/plugin/。"
+          notice="开关控制插件读取的索引是否落盘（用户目录 idbox/plugin/）。"
           actions={
             <CheckRow
               checked={settings.pluginIndexEnabled === true}
@@ -2660,41 +3479,31 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </CheckRow>
           }
         />
-        {/* 导出 .rbz（docs/39 §4.3 形态①）：这一行**必须是按钮，不能是 CheckRow**——
-            它不是开关，而且设置页的自绘复选框数量有守卫钉着（tests/settingsCheckbox.test.ts）。
-            文案必须写清"安装发生在 SketchUp 里"：ID BOX 不下载、不执行、不往 Plugins 目录
-            复制任何东西（形态② V1.0 不采用），用户唯一的下一步是扩展管理器。 */}
+        {/* 「导出 SketchUp 插件包（.rbz）」行已于 2026-11-22 按用户口径移出本 tab：
+            入口搬到「同步插件」tab 的 SketchUp 卡（「安装插件」按钮），功能不重复提供。
+            「SketchUp 插件」索引导出开关行保留不动（插件读盘的开关仍是它）。 */}
+      </SettingsCard>
+
+      {/* 一键打包 · 本地搬素材（docs/58 T5 + docs/57 §6 F-1）：设置页只留一个入口。
+          导出区与导入区都在 PackageDialog 里，避免外面两个按钮、里面又各一块的重复。
+          纯本地搬运，不涉及任何在线服务，也不上传素材或路径。 */}
+      <SettingsCard
+        title="素材打包"
+        note="全程只在本机：点开弹窗后可选导出或导入，把素材打成一个包自己保管，换电脑时接着用。"
+      >
         <SettingsRow
-          title="导出 SketchUp 插件包（.rbz）"
-          desc="在 SketchUp 里用「扩展 → 安装扩展」选中该文件；装完重启 SketchUp 生效"
+          title="素材打包与同步"
+          desc="弹窗里可选导出或导入，两件事都在同一处完成。"
           actions={
             <button
               className="btn !py-1 text-xs"
-              disabled={rbzExporting}
-              onClick={() => void exportRbz()}
-              title="生成 .rbz 并打开所在文件夹；安装由 SketchUp 扩展管理器完成"
+              onClick={() => openPackageDialog()}
+              title="打开素材打包弹窗，可选导出或导入"
             >
-              <IconDownload />
-              {rbzExporting ? '打包中…' : '导出 .rbz'}
+              素材打包与同步
             </button>
           }
         />
-        {rbzExport && (
-          <div className="mt-2 rounded-lg border border-line bg-canvas px-3 py-2 text-[11px] leading-relaxed">
-            {rbzExport.kind === 'ok' ? (
-              <>
-                <span className="font-semibold text-primary">插件包已导出</span>
-                <span className="text-secondary">
-                  {' '}
-                  · {formatBytes(rbzExport.bytes)} · 已在文件夹中显示
-                </span>
-                <div className="mt-1 break-all text-muted">{rbzExport.path}</div>
-              </>
-            ) : (
-              <span className="text-danger">{rbzExport.message}</span>
-            )}
-          </div>
-        )}
       </SettingsCard>
 
       {/* 一键重扫 · 从知末获取封面（2026-10 用户拍板）：只补没有 cover 文件的资产，
@@ -3001,6 +3810,124 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
     </div>
   )
 
+  // ── 同步插件内容区（2026-11-22 三卡重构 · 2026-11-23 安装态修复）──────────
+  // 边界：本段起止之间的源码被 tests/syncPluginsTab.test.ts 逐字守卫。
+  // 硬约束：零网络（状态全部来自主进程只读本地盘的 IPC）、不新增 z 层、
+  // 不复用紫色例外、不动 D-2 的引导位。
+  // 布局：三张卡走**单列**（grid-cols-1）—— 双列会剩一个空位，单列三行更整齐，
+  // 且每张卡能放下更长的说明文字。
+  const syncPluginsTab = (
+    <div className="flex flex-col gap-[13px]">
+      <SettingsCard
+        title="插件同步入口"
+        note="SketchUp 插件可一键导出安装包，安装由 SketchUp 扩展管理器完成；Rhino / 3ds Max 插件待开发。"
+      >
+        <div className="grid grid-cols-1 gap-[11px] py-[13px]">
+          {SYNC_PLUGIN_CARDS.map((card) => {
+            const Icon = card.icon
+            const isSketchUp = card.name === 'SketchUp'
+            // 安装态只属于 SketchUp（Rhino / 3ds Max 还没有插件，谈不到装与没装）
+            const install = isSketchUp ? pluginLink.install : undefined
+            // 绿点判据（2026-11-23 用户拍板）：必须是**真机扫到插件文件**。
+            // 旧的 `connected` 只是"本体自己写过索引"，自证不算已安装，已不再参与。
+            const installed = install !== undefined && install.state !== 'missing'
+            const bestHit = install?.hits[0]
+            // 「需要更新的是哪一台」：outdated 的成因可能是"某一台还是旧版"，
+            // 而 bestHit 是版本最高的那台 —— 用它写 tooltip 会把旧的那台说成新版。
+            const oldestHit = install
+              ? [...install.hits].reverse().find((hit) => hit.version !== null)
+              : undefined
+            const linkDot =
+              isSketchUp && installed ? (
+                <span
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-success"
+                  title={`已安装于 ${bestHit?.sketchup ?? 'SketchUp'}`}
+                />
+              ) : null
+            return (
+              <div
+                key={card.name}
+                className={`flex min-w-0 items-center gap-2.5 rounded-[10px] border border-panel-line px-[11px] py-[10px] ${
+                  card.disabled ? 'bg-canvas' : 'bg-card'
+                }`}
+              >
+                <span
+                  className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-[9px] bg-canvas ${
+                    card.disabled ? 'text-muted opacity-50 grayscale' : 'text-accent'
+                  }`}
+                >
+                  <Icon width={26} height={26} />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-baseline gap-1.5">
+                    <span className="truncate text-[12.5px] font-medium text-primary">
+                      {card.name}
+                    </span>
+                    {linkDot}
+                    {install && (
+                      <span className="shrink-0 text-[10.5px] text-muted">
+                        v{install.shippedVersion}
+                      </span>
+                    )}
+                  </span>
+                  <span className="mt-[3px] block truncate text-[10.5px] text-tertiary">
+                    {sketchupInstallText(install) ?? card.supportText}
+                  </span>
+                </span>
+                {card.disabled ? (
+                  <button
+                    type="button"
+                    disabled
+                    className="btn shrink-0 !px-2 !py-1 text-[11px] opacity-60"
+                    title="该插件待开发，暂不提供安装"
+                  >
+                    待开发
+                  </button>
+                ) : !install || install.state === 'missing' ? (
+                  <button
+                    type="button"
+                    className="btn btn-primary shrink-0 !px-2.5 !py-1 text-[11px]"
+                    disabled={rbzExporting}
+                    onClick={() => void exportRbz()}
+                    title="导出 SketchUp 插件包（.rbz）并打开所在文件夹；在 SketchUp 里用「扩展 → 安装扩展」安装"
+                  >
+                    {rbzExporting ? '打包中…' : '安装插件'}
+                  </button>
+                ) : install.state === 'outdated' ? (
+                  /* 真机版本比本体旧：给主按钮更新入口。SketchUp 没有"静默覆盖安装"的
+                     公开接口，所以动作仍是导出 .rbz，由用户在扩展管理器里覆盖安装。 */
+                  <button
+                    type="button"
+                    className="btn btn-primary shrink-0 !px-2.5 !py-1 text-[11px]"
+                    disabled={rbzExporting}
+                    onClick={() => void exportRbz()}
+                    title={`${
+                      oldestHit
+                        ? `${oldestHit.sketchup} 仍是 ${
+                            oldestHit.version ? `v${oldestHit.version}` : '旧版本'
+                          }`
+                        : '有 SketchUp 仍是旧版'
+                    }，导出后在 SketchUp 里用扩展管理器覆盖安装`}
+                  >
+                    {rbzExporting ? '打包中…' : `更新到 ${install.shippedVersion}`}
+                  </button>
+                ) : (
+                  /* installed / ahead：真机版本不旧于本体 —— 灰胶囊不可点。
+                     ahead（用户手动装过更新的）不给降级入口。 */
+                  <span
+                    className="inline-flex shrink-0 items-center rounded-full bg-success/15 px-2.5 py-1 text-[11px] text-success"
+                    title={`已安装于 ${bestHit?.sketchup ?? 'SketchUp'}`}
+                  >
+                    {install.installedVersion ? `已安装 v${install.installedVersion}` : '已安装'}
+                  </span>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </SettingsCard>
+    </div>
+  )
 
   // 强制重扫弹窗里的数字：未取到预览时用 0 兜底（该分支只在 preview 就绪时渲染）
   const forceGone = forcePreview?.gone ?? 0
@@ -3087,6 +4014,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                 {tab === 'alias' && <AliasTab />}
                 {tab === 'data' && dataTab}
                 {tab === 'about' && aboutTab}
+                {tab === 'syncPlugins' && syncPluginsTab}
               </div>
             </div>
             {tabHasMore && (

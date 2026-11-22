@@ -27,14 +27,38 @@
  * 所以 cleanup 必须把 RAF / observer / 事件监听 / renderer 全部拆干净（幂等）。
  */
 import { useEffect, useRef, type ReactElement } from 'react'
+import { useVault } from '../../store'
 import { MOTION_PROFILES } from '../../../shared/motionQuality'
-import type { MotionQuality } from '../../../shared/types'
+import { HEX_PATTERN } from '../../../shared/homeTide'
+import { clampWaveHeight, validHexOrNull } from '../../../shared/homeTide'
+import { DEFAULT_SETTINGS } from '../../../shared/types'
+import type { MotionQuality, Settings, ThemeWaveColors } from '../../../shared/types'
 import { createTideRenderer, type TideRenderer, type TideSettings } from './particleTide'
 
-/** 组件 props（由 `HomeCover` 传入；签名定死，勿改）。 */
+/** 组件 props（由 `HomeCover` 传入；`quality` 契约不变，后两项为首页自定义新增）。 */
 export interface HomeParticlesProps {
   /** 动效性能档位（决定 DPR 上限 / 粒子密度 / 是否限帧） */
   quality: MotionQuality
+  /**
+   * 两套主题的自定义水色 / 浪峰色（来自 `settings.homeWaveColors`，App 侧 `useMemo` 稳定引用）。
+   *
+   * 为什么传**整组**而不是当前主题那一组：主题切换的真实时序是「React 渲染 → App 的
+   * effect 写 `document.documentElement.dataset.theme` → 本组件的 observer 触发」，
+   * 若在渲染期读 DOM 拿主题会读到**旧值**（effect 尚未跑），自定义色就会错配一整个会话。
+   * 这里在 effect / observer 里按 `resolveThemeName()` 现取，与底色同帧切换，Q-3 才成立。
+   * `null` 字段 = 未自定义 → 回落该主题 palette。
+   */
+  waveColors?: Settings['homeWaveColors']
+  /** 浪高（已由 shared 纯函数 clamp 到 `[0.2, 1.5]`；缺省走 palette 的 0.65）。 */
+  waveHeight?: number
+  /**
+   * 画布是否清成**透明底**（2026-11-22 壁纸全屏化）。
+   *
+   * 首页挂了自定义壁纸时为 `true`：壁纸层已上移到 App 根部的 fixed 层，画布每帧只画
+   * 粒子不铺底色（clear alpha 0），壁纸从画布底下透出。无壁纸时省略 / `false`，
+   * 走 `readCanvasBackground` 的不透明底色 —— 行为与改动前逐字一致。
+   */
+  transparentBackground?: boolean
 }
 
 /** 密度乘数的物理边界（与 `particleTide.ts` 内部夹取范围一致）。 */
@@ -42,13 +66,15 @@ const MIN_DENSITY = 0.3
 const MAX_DENSITY = 2
 
 /**
- * 与主题无关的基准量：波长 / 速度。两套主题共用一份（物理量不随配色变）。
+ * 与主题无关的基准量：波长 / 速度 → **2026-11-22 海浪参数重排后改由 settings 提供**。
  *
- * 取值 = 用户在参考站（TuneShape「粒子海浪」）调参面板上定稿的值：
- * 海浪速度 1.6 / 波长 1.1。**不要再在 palette 里各写一份** —— 它们和颜色无关。
+ * 历史口径保留备查：这两个值的定稿来自用户在参考站（TuneShape「粒子海浪」）调参
+ * 面板上调好的效果 —— 海浪速度 1.6 / 波长 1.1。现在它们分别是
+ * `settings.homeWaveSpeed` / `settings.homeWaveLength`，默认值即定稿值
+ * （`shared/types.ts` 的 `HOME_WAVE_SPEED_RANGE` / `HOME_WAVE_LENGTH_RANGE`），
+ * 旧档缺键回落默认 → 默认画面与重排前**逐帧一致**。本文件不再持有第二份数字，
+ * 防止"设置默认值"与"渲染层常量"漂移。
  */
-const BASE_WAVELENGTH = 1.1
-const BASE_SPEED = 1.6
 
 /**
  * 档位 → 粒子密度乘数（**降级口径的唯一来源**）。
@@ -270,8 +296,8 @@ const PALETTES: Record<'light' | 'dark', TidePalette> = {
   dark: DARK_PALETTE
 }
 
-/** 六位十六进制颜色（与 `particleTide.ts` 的解析口径一致）。 */
-const HEX_PATTERN = /^#[0-9a-f]{6}$/i
+/** 六位十六进制颜色：主进程 settings 与本模块共用 shared 的同一份校验（避免正则漂移）。 */
+export { HEX_PATTERN } from '../../../shared/homeTide'
 
 /** 读当前主题名：只有明确写了 `dark` 才算深色（缺省 = 浅色）。 */
 function resolveThemeName(): 'light' | 'dark' {
@@ -291,28 +317,86 @@ function readCanvasBackground(fallback: string): string {
 }
 
 /**
+ * 把用户对当前主题的海浪自定义色 / 浪高覆盖到主题基准调色板上（docs/55 §2.1.2）。
+ *
+ * **只覆盖三样**：`waterColor` / `crestColor` / `waveHeight`。
+ * `backgroundColor` 原样来自 `base` —— 画布底色仍走 `buildSettings()` 里的
+ * `readCanvasBackground()`（Q-1：底色不动，且与页面底色同值才不出现接缝）。
+ * 其余旋钮（opacity / alphaScale / density / particleSize / swell / parallax /
+ * clickRipples）一律不碰引擎口径。
+ *
+ * 非法 / 缺失的自定义值经 `validHexOrNull` / `clampWaveHeight` 回落基准值，
+ * 旧档缺键（四片 null + 浪高缺省）时行为与改动前逐字一致。
+ *
+ * @param base 当前主题的基准调色板（`PALETTES[theme]`）
+ * @param custom 当前主题的自定义两色（可为 `undefined`）
+ * @param waveHeight 用户设置的浪高（可能是脏值，内部 clamp）
+ */
+export function resolveTidePalette(
+  base: TidePalette,
+  custom: ThemeWaveColors | undefined,
+  waveHeight: number
+): TidePalette {
+  return {
+    ...base,
+    waterColor: validHexOrNull(custom?.waterColor) ?? base.waterColor,
+    crestColor: validHexOrNull(custom?.crestColor) ?? base.crestColor,
+    waveHeight: clampWaveHeight(waveHeight)
+  }
+}
+
+/**
+ * 2026-11-22 设置重排：透传给引擎的用户参数（六项全部有 shared 区间 clamp 兜底，
+ * 到这里的一定是合法值 —— settings.ts 读/写档两处 + 设置页写入前都过 `clampHomeTideNumber`）。
+ */
+interface HomeTideParams {
+  /** 海浪速度倍率（相位推进乘数） */
+  speed: number
+  /** 波长乘数（u = x/λ, v = z/λ） */
+  wavelength: number
+  /** 粒子直径乘数（顶点着色器 footprint 主项） */
+  particleSize: number
+  /** 粒子密度乘数（还会再乘动效档位系数） */
+  density: number
+  /** 指针交互总闸（涌浪 + 视差） */
+  interactive: boolean
+  /** 点击涟漪开关 */
+  clickRipples: boolean
+}
+
+/**
  * 组装一帧的渲染设置。
  *
  * @param palette 当前主题配色（含该主题的基准密度 / 浪高 / 颗粒直径 / alpha 系数）
  * @param quality 当前动效档位（只在基准密度上再乘一次系数）
+ * @param transparentBackground 画布是否透底（首页挂壁纸时 true，见 props 注释）
+ * @param params 用户海浪参数（2026-11-22 设置重排；默认值 = 引擎定稿值，画面不变）
  */
-function buildSettings(palette: TidePalette, quality: MotionQuality): TideSettings {
-  const density = Math.min(MAX_DENSITY, Math.max(MIN_DENSITY, palette.density * DENSITY_FACTOR[quality]))
+function buildSettings(
+  palette: TidePalette,
+  quality: MotionQuality,
+  transparentBackground: boolean,
+  params: HomeTideParams
+): TideSettings {
+  const density = Math.min(MAX_DENSITY, Math.max(MIN_DENSITY, params.density * DENSITY_FACTOR[quality]))
   return {
     backgroundColor: readCanvasBackground(palette.backgroundColor),
     waterColor: palette.waterColor,
     crestColor: palette.crestColor,
     density,
-    particleSize: palette.particleSize,
+    particleSize: params.particleSize,
     waveHeight: palette.waveHeight,
-    wavelength: BASE_WAVELENGTH,
-    speed: BASE_SPEED,
+    wavelength: params.wavelength,
+    speed: params.speed,
     alphaScale: palette.alphaScale,
-    interactive: palette.interactive,
+    transparentBackground,
+    // 用户开关与 palette（两套目前都是 true）求与：palette 层保留"主题级总闸"语义，
+    // 用户关掉任一侧都算关 —— 与改动前（palette 恒 true）相比默认行为不变。
+    interactive: params.interactive && palette.interactive,
+    clickRipples: params.clickRipples && palette.clickRipples,
     swell: palette.swell,
     swellRadius: palette.swellRadius,
-    parallax: palette.parallax,
-    clickRipples: palette.clickRipples
+    parallax: palette.parallax
   }
 }
 
@@ -321,8 +405,31 @@ function buildSettings(palette: TidePalette, quality: MotionQuality): TideSettin
  *
  * @param props 见 `HomeParticlesProps`
  */
-export function HomeParticles({ quality }: HomeParticlesProps): ReactElement {
+export function HomeParticles({
+  quality,
+  waveColors,
+  waveHeight = 0.65,
+  transparentBackground = false
+}: HomeParticlesProps): ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  // ── 2026-11-22 海浪参数重排：六项用户参数直接读全局设置 ─────────────────────
+  // 为什么不经 HomeCover 透传：HomeCover 本批禁碰，且这些是外观设置（与 quality /
+  // waveColors 同类），渲染组件自己读 store 是既有先例（HomeCover 读 motionQuality）。
+  // 每项都用**原始值 selector**（标量，zustand 默认严格相等不会多余重渲染）；
+  // 缺键 / undefined 回落 DEFAULT_SETTINGS（= 引擎定稿值）。
+  const waveSpeed = useVault((s) => s.settings?.homeWaveSpeed ?? DEFAULT_SETTINGS.homeWaveSpeed)
+  const waveLength = useVault((s) => s.settings?.homeWaveLength ?? DEFAULT_SETTINGS.homeWaveLength)
+  const particleSize = useVault(
+    (s) => s.settings?.homeParticleSize ?? DEFAULT_SETTINGS.homeParticleSize
+  )
+  const particleDensity = useVault(
+    (s) => s.settings?.homeParticleDensity ?? DEFAULT_SETTINGS.homeParticleDensity
+  )
+  // 布尔两项「只认严格 false 才关」—— 与 settings.ts 的归一化方向一致，
+  // 缺键 / 脏值（undefined）都按开处理 = 改动前"永远开"的行为。
+  const waveInteractive = useVault((s) => s.settings?.homeWaveInteractive !== false)
+  const waveClickRipples = useVault((s) => s.settings?.homeWaveClickRipples !== false)
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -333,8 +440,30 @@ export function HomeParticles({ quality }: HomeParticlesProps): ReactElement {
     const minFrameMs = quality === 'smooth' ? SMOOTH_MIN_FRAME_MS : 0
     const renderer: TideRenderer = createTideRenderer(canvas)
 
-    let palette = PALETTES[resolveThemeName()]
-    let settings = buildSettings(palette, quality)
+    /** 当前主题名（`light` / `dark`），与调色板标量快照一起做 observer 的无效重绘短路。 */
+    let paletteKey: 'light' | 'dark' = resolveThemeName()
+    /** 取当前主题的自定义两色（整组 props 在 effect 内按 DOM 主题现取，见 props 注释）。 */
+    const customFor = (theme: 'light' | 'dark'): ThemeWaveColors | undefined =>
+      waveColors?.[theme]
+    /**
+     * 调色板标量快照。observer 里 `resolveTidePalette` 每次都返回新对象，原来的
+     * `next === palette` 引用相等短路必然失效 → 改为比较「主题键 + 两色 + 浪高」，
+     * 主题未变且值未变时不做无意义重建（S-3）。
+     */
+    const signatureOf = (theme: string, p: TidePalette): string =>
+      `${theme}|${p.waterColor}|${p.crestColor}|${p.waveHeight}`
+
+    let palette = resolveTidePalette(PALETTES[paletteKey], customFor(paletteKey), waveHeight)
+    /** 用户海浪参数快照（effect 闭包内不可变；参数变化走整块重建）。 */
+    const tideParams: HomeTideParams = {
+      speed: waveSpeed,
+      wavelength: waveLength,
+      particleSize,
+      density: particleDensity,
+      interactive: waveInteractive,
+      clickRipples: waveClickRipples
+    }
+    let settings = buildSettings(palette, quality, transparentBackground, tideParams)
     canvas.style.opacity = String(palette.opacity)
 
     // ── 时钟状态（累计相位秒数；暂停/恢复都不重置） ──────────────────────────
@@ -527,10 +656,13 @@ export function HomeParticles({ quality }: HomeParticlesProps): ReactElement {
 
     // ── 主题切换：重设 settings（配色 + 画布底色）并立即重绘 ────────────────
     const themeObserver = new MutationObserver((): void => {
-      const next = PALETTES[resolveThemeName()]
-      if (next === palette) return
+      const theme = resolveThemeName()
+      // 按当前主题取对应的自定义色（Q-3：浅深各存一份、各用各的）
+      const next = resolveTidePalette(PALETTES[theme], customFor(theme), waveHeight)
+      if (signatureOf(theme, next) === signatureOf(paletteKey, palette)) return
+      paletteKey = theme
       palette = next
-      settings = buildSettings(palette, quality)
+      settings = buildSettings(palette, quality, transparentBackground, tideParams)
       canvas.style.opacity = String(palette.opacity)
       // 主题可能改了 interactive / clickRipples（两套目前都是 true，但别把口径写死）
       if (settings.interactive) attachPointer()
@@ -563,7 +695,20 @@ export function HomeParticles({ quality }: HomeParticlesProps): ReactElement {
       // 交给组件自己的样式，别把 opacity 留在节点上（StrictMode 会复用同一块 canvas）
       canvas.style.removeProperty('opacity')
     }
-  }, [quality])
+    // 用户改色 / 改浪高 / 壁纸挂上或摘下 / 海浪参数（2026-11-22）变化 → 整块重建
+    // （低频，架构师已定可接受）；App 侧 useMemo 稳住 waveColors 引用
+  }, [
+    quality,
+    waveColors,
+    waveHeight,
+    transparentBackground,
+    waveSpeed,
+    waveLength,
+    particleSize,
+    particleDensity,
+    waveInteractive,
+    waveClickRipples
+  ])
 
   return <canvas ref={canvasRef} aria-hidden="true" className="pointer-events-none block h-full w-full" />
 }

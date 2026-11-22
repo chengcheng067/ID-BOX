@@ -60,7 +60,7 @@ module IDBoxPanel
     #   `Sketchup.require` 进来的 —— 也就是说 `apply_metadata` 执行时 PLUGIN_VERSION **还不存在**。
     #   而「根 .rb 只做注册、不得加载额外文件」是硬约束（docs/42 §2 文件 1），
     #   不能为了取一个版本号提前 require core。⇒ 只能保持字面量 + 人工同步。
-    EXT_VERSION = '1.0.5'.freeze
+    EXT_VERSION = '1.1.0'.freeze
     EXT_CREATOR = 'ID BOX'.freeze
     EXT_COPYRIGHT = 'ID BOX'.freeze
     EXT_DESCRIPTION =

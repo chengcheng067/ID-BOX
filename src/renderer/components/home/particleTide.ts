@@ -93,6 +93,14 @@
 export interface TideSettings {
   /** 画布底色（同时是 WebGL 的 clearColor；不透明，和页面底色一致） */
   backgroundColor: string
+  /**
+   * 画布是否清成**全透明**（**可选**，缺省 `false` = 不透明底色，即 2026-11-22 之前的行为）。
+   *
+   * 2026-11-22「壁纸延伸到顶栏」：壁纸层上移到 App 根部的 fixed 层后，粒子画布必须
+   * 透底（clear alpha 0），壁纸才能从画布底下透出来。没有壁纸时保持不透明底色 ——
+   * 两条路径在 paint() / paintCanvas2d() 里各有一个显式分支，无壁纸路径逐帧等价。
+   */
+  transparentBackground?: boolean
   /** 水体色（深海/低谷处的粒子色） */
   waterColor: string
   /** 浪峰色（crest 越高的粒子越接近它） */
@@ -624,8 +632,11 @@ function paintCanvas2d(
   const height = ctx.canvas.height
   ctx.setTransform(width / LOGICAL_WIDTH, 0, 0, height / LOGICAL_HEIGHT, 0, 0)
   ctx.clearRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT)
-  ctx.fillStyle = s.backgroundColor
-  ctx.fillRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+  // 透明模式（壁纸透底）只 clearRect、不再铺底色；不透明模式与历史行为一致
+  if (!s.transparentBackground) {
+    ctx.fillStyle = s.backgroundColor
+    ctx.fillRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+  }
 
   const water = toRgb(s.waterColor, [199, 210, 222])
   const crest = toRgb(s.crestColor, [255, 255, 255])
@@ -807,7 +818,9 @@ void main(){
  float radius=length(gl_PointCoord-.5);
  if(radius>.5)discard;
  float edge=1.-smoothstep(.22,.5,radius);
- gl_FragColor=vec4(mix(waterColor,crestColor,ink),alpha*edge);
+ float a=alpha*edge;
+ // 预乘 alpha（rgb *= a）：配合 (ONE, ONE_MINUS_SRC_ALPHA) 混合，见 initWebgl 的注释
+ gl_FragColor=vec4(mix(waterColor,crestColor,ink)*a,a);
 }`
 
 /** WebGL 主路径持有的资源 */
@@ -981,7 +994,10 @@ export function createTideRenderer(host: HTMLElement): TideRenderer {
     let gl: WebGLRenderingContext | null = null
     try {
       gl = canvas.getContext('webgl', {
-        alpha: false,
+        // alpha 必须为 true：transparentBackground 时 clear alpha 0，壁纸从画布底下透出。
+        // 不透明模式 clear alpha 仍是 1，配合下方预乘混合，合成结果与旧的 alpha:false
+        // 路径逐像素一致（目标 alpha 恒为 1，合成器不吃页面底色）。
+        alpha: true,
         antialias: false,
         preserveDrawingBuffer: true
       }) as WebGLRenderingContext | null
@@ -1024,7 +1040,12 @@ export function createTideRenderer(host: HTMLElement): TideRenderer {
       const locations: Record<string, WebGLUniformLocation | null> = {}
       for (const name of UNIFORM_NAMES) locations[name] = context.getUniformLocation(program, name)
       context.enable(context.BLEND)
-      context.blendFunc(context.SRC_ALPHA, context.ONE_MINUS_SRC_ALPHA)
+      // 预乘混合（ONE, ONE_MINUS_SRC_ALPHA）+ 片元着色器里预乘（见 FRAGMENT_SHADER_SOURCE）：
+      // 画布上下文开 alpha 后合成器按「预乘 alpha」解释画布内容，继续用 (SRC_ALPHA, ...)
+      // 会让目标 alpha 累积成 a²（粒子在合成时被二次衰减）。改成预乘后 RGB 混合结果
+      // 与旧实现逐位一致，且 alpha 通道语义正确：不透明模式目标 alpha 恒为 1，
+      // 透明模式（壁纸透底）正确累积。
+      context.blendFunc(context.ONE, context.ONE_MINUS_SRC_ALPHA)
       context.disable(context.DEPTH_TEST)
       return { gl: context, program, buffer, locations }
     } catch (error) {
@@ -1101,7 +1122,13 @@ export function createTideRenderer(host: HTMLElement): TideRenderer {
       const { gl, program, locations } = glResources
       gl.viewport(0, 0, width, height)
       const background = toUnitRgb(settings.backgroundColor, [0.96, 0.98, 0.99])
-      gl.clearColor(background[0], background[1], background[2], 1)
+      // 透明模式（壁纸透底）：**rgb 必须一并清零**。上下文 premultipliedAlpha 默认
+      // true —— 合成器把画布像素当预乘值，预乘不变式要求 a=0 ⇔ rgb=0；若只清 alpha
+      // 而 rgb 留底色（非零），Chromium 合成时会漏出 rgb 分量形成一层半透明白雾，
+      // 正好把底下的壁纸糊掉（2026-11-23 真机 CDP 红色实验实锤）。不透明模式保持
+      // alpha 1 + 底色 rgb，与历史行为逐位一致。
+      if (settings.transparentBackground) gl.clearColor(0, 0, 0, 0)
+      else gl.clearColor(background[0], background[1], background[2], 1)
       gl.clear(gl.COLOR_BUFFER_BIT)
       gl.useProgram(program)
       gl.uniform2f(locations.resolution, width, height)

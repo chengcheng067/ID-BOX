@@ -355,6 +355,9 @@ module IDBoxPanel
         'mainFile' => main_file,
         'suMajor' => Support.normalize_su_major(raw_record['suMajor']),
         'thumbRel' => Support.nil_text(raw_record['thumbRel']),
+        # A 级只增：主进程派生的副标题指标；旧快照缺字段 → nil → 只显示分类路径（Q-19）
+        'displayMetric' => Support.nil_text(raw_record['displayMetric']),
+        # 排序档「按文件数」仍内部使用（docs/55 §3-C）：副标题不再显示，但派生保留
         'fileCount' => raw_record['files'].is_a?(Array) ? raw_record['files'].length : 0
       }
     end
@@ -555,6 +558,21 @@ module IDBoxPanel
     SCAN_LIMIT = 200
     SCAN_DEPTH = 2
 
+    # ── 插入尺寸（2026-11-13 用户要求）──────────────────────────────────────
+    # 用户原话：「我希望 SketchUp 插件的贴图在插入时，应该是以长边 1000mm 的尺寸插入。
+    #   因为现在进入 SketchUp 时的插入尺寸是 254mm，这个就不太常规，有点小」。
+    # 根因：SU 的 `Material#texture = 图片` 默认纹理尺寸是 10 英寸 = 254mm（SU 自身行为），
+    #   不显式设置就是 254 × 254。改法：挂完贴图后用 `Texture#size=`（单位**英寸**，
+    #   SU API 的纹理尺寸一律英寸）显式设为「长边 1000mm、短边按像素宽高比换算」。
+    # 口径：长边固定 1000mm；短边 = 1000mm × (短像素 / 长像素)。
+    #   例：1024×512 → 1000mm × 500mm；正方形 → 1000mm × 1000mm。
+    # 宽高来源：**插件侧现场读图片文件头**（PNG IHDR / JPEG SOF / BMP 头），零快照改动
+    #   （`PluginFileEntry` 契约保持 rel/ext 不动）；自实现小解析、不引 gem（零原生件纪律）。
+    #   读不出宽高（TIFF / 头损坏 / 非以上三种格式）⇒ 回退 SU 默认 254mm 正方形，不报错
+    #   （材质本身照样建好，尺寸只是次要属性，不能让它把「创建材质」变成失败）。
+    TEXTURE_LONG_SIDE_MM = 1000.0
+    MM_PER_INCH = 25.4
+
     # albedo 词表（`pbrSlots.ts` PBR_SLOT_WORDS.albedo 的子串项）
     ALBEDO_WORDS = %w[albedo basecolor basecol diffuse diff color].freeze
     # albedo 词表里只允许「整 token 相等」的短词（`col` 做子串会命中 column）
@@ -643,6 +661,10 @@ module IDBoxPanel
       rescue StandardError => error
         texture_error = error.message
       end
+      # 插入尺寸：长边 1000mm、短边按像素宽高比（2026-11-13 用户要求，见常量注释）。
+      # ⚠️ 必须在**同一个事务内**（commit 之前），这样 Ctrl+Z 一步能连尺寸一起撤销。
+      #   失败静默回落 SU 默认 254mm：材质已建好，尺寸设不上不该让成功变 warn。
+      set_texture_size(created, image)
       # 事务里先设一次（面板刷新通常跟着这次一起走）
       activate_error = activate(model, created)
       begin
@@ -837,6 +859,128 @@ module IDBoxPanel
         return 9 if tokens.include?(word)
       end
       3
+    end
+
+    # ── 插入尺寸（长边 1000mm；2026-11-13 用户要求）─────────────────────────
+    # 挂完贴图后把纹理尺寸显式设为「长边 1000mm、短边按像素宽高比」（单位英寸）。
+    # 任何失败都静默（只打控制台一行）：不设 = SU 默认 254mm，材质照样可用。
+    def set_texture_size(material, image)
+      dims = image_dimensions(image)
+      if dims.nil?
+        puts("[ID BOX] texture size: no pixel size from image header, keep SU default (254mm): #{Support.text(image)}")
+        return false
+      end
+      size_in = target_texture_size_inch(dims[0], dims[1])
+      if size_in.nil?
+        puts("[ID BOX] texture size: bad pixel size #{dims.inspect}, keep SU default (254mm)")
+        return false
+      end
+      texture = material.texture
+      if texture.nil?
+        puts('[ID BOX] texture size: material has no texture, skip sizing')
+        return false
+      end
+      texture.size = size_in
+      true
+    rescue StandardError => error
+      puts("[ID BOX] texture size failed: #{error.class}: #{error.message}")
+      false
+    end
+
+    # 长边 1000mm（英寸），短边按像素比换算；返回 [宽英寸, 高英寸]（保持横竖方向）。
+    # 例：1024×512 → [39.37, 19.69]（= 1000mm × 500mm）；正方形 → 两个相同值。
+    def target_texture_size_inch(width_px, height_px)
+      w = width_px.to_f
+      h = height_px.to_f
+      return nil unless w.positive? && h.positive?
+      long_in = TEXTURE_LONG_SIDE_MM / MM_PER_INCH
+      return [long_in, long_in] if w == h
+      return [long_in, long_in * (h / w)] if w > h
+      [long_in * (w / h), long_in]
+    end
+
+    # 读图片文件头拿像素宽高，返回 [宽, 高] 或 nil（不抛异常；纯读，不写盘）。
+    # 覆盖 PNG（IHDR）/ JPEG（SOF 段）/ BMP（信息头）；TIFF 的 IFD 结构复杂、且在
+    # SU 里当纹理用得极少 ⇒ 不解析，走 254mm 回退（与常量注释口径一致）。
+    def image_dimensions(path)
+      raw = Support.read_binary(path)
+      return nil if raw.nil? || raw.bytesize < 26
+      if png_signature?(raw)
+        png_dimensions(raw)
+      elsif jpeg_signature?(raw)
+        jpeg_dimensions(raw)
+      elsif bmp_signature?(raw)
+        bmp_dimensions(raw)
+      else
+        nil
+      end
+    rescue StandardError
+      nil
+    end
+
+    # 宽高 sanity：> 0 且不超过 100000（现实贴图远小于此；防解析错位读出垃圾值）
+    def valid_dims(width, height)
+      return nil unless width.is_a?(Integer) && height.is_a?(Integer)
+      return nil unless width.positive? && height.positive?
+      return nil if width > 100_000 || height > 100_000
+      [width, height]
+    end
+
+    def png_signature?(raw)
+      raw.bytesize >= 24 && raw[0, 8] == "\x89PNG\r\n\x1a\n".b
+    end
+
+    # PNG：8 字节签名 + 8 字节 IHDR 块长/类型后，第 16–23 字节 = 宽、高（各 4 字节大端）
+    def png_dimensions(raw)
+      valid_dims(raw[16, 4].unpack1('N'), raw[20, 4].unpack1('N'))
+    end
+
+    def jpeg_signature?(raw)
+      raw.bytesize >= 4 && raw.getbyte(0) == 0xFF && raw.getbyte(1) == 0xD8
+    end
+
+    # JPEG：SOI 后逐段走（FF marker + 2 字节段长），遇到 SOF 段读宽高（高在前）。
+    # 只扫段头不读段体；遇到 SOS（真正的图像数据开始）还没见 SOF 就放弃。
+    def jpeg_dimensions(raw)
+      index = 2
+      size = raw.bytesize
+      while index + 9 <= size
+        return nil unless raw.getbyte(index) == 0xFF
+        marker = raw.getbyte(index + 1)
+        if marker == 0xFF # 填充字节：只推进 1 字节再认（JPEG 规范允许 marker 前有任意个 0xFF）
+          index += 1
+          next
+        end
+        return nil if marker == 0xD9 || marker == 0xDA # EOI / SOS：SOF 缺失，放弃
+        seg_len = (raw.getbyte(index + 2) << 8) | raw.getbyte(index + 3)
+        return nil if seg_len < 2 # 段长非法，放弃
+        if sof_marker?(marker)
+          height = (raw.getbyte(index + 5) << 8) | raw.getbyte(index + 6)
+          width = (raw.getbyte(index + 7) << 8) | raw.getbyte(index + 8)
+          return valid_dims(width, height)
+        end
+        index += 2 + seg_len
+      end
+      nil
+    rescue StandardError
+      nil
+    end
+
+    # SOF0–SOF15 里除 DHT(C4) / JPG(C8) / DAC(CC) 之外的都带宽高（含渐进式 SOF2）
+    def sof_marker?(marker)
+      marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+    end
+
+    def bmp_signature?(raw)
+      raw.bytesize >= 26 && raw[0, 2] == 'BM'
+    end
+
+    # BMP：「BM」后信息头第 18–21 字节 = 宽、22–25 = 高（小端有符号；负值 = 自顶向下存储）
+    def bmp_dimensions(raw)
+      width = raw[18, 4].unpack1('V')
+      height = raw[22, 4].unpack1('l<')
+      height = -height if height.is_a?(Integer) && height.negative?
+      valid_dims(width, height)
     end
 
     # ── 命名 ────────────────────────────────────────────────────────────────

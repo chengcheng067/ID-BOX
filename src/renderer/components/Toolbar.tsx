@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useVault } from '../store'
 import { IconGrid, IconList } from '../icons'
 import brandMark from '../assets/brand/mark.png'
@@ -109,6 +109,32 @@ export function Toolbar({
   const [searchOpenSignal, setSearchOpenSignal] = useState(0)
 
   /**
+   * 顶栏毛玻璃（2026-11-22 用户需求：「换的壁纸是全屏幕的……延伸到上方的顶栏，
+   * 只不过顶栏需要做高斯模糊处理」）。
+   *
+   * **只在首页态（`homeMode`）启用**：壁纸层（App 根部的 `fixed inset-0 -z-10`）此时
+   * 铺满整个视口，顶栏改半透明底 + `backdrop-filter: blur(14px)`，壁纸透过顶栏呈
+   * 毛玻璃。普通视图保持 `.topbar` 的不透明底色 —— 资产网格滚动时顶栏透底会非常
+   * 难看，口径已拍板（毛玻璃 = 首页态专属）。
+   *
+   * 半透明底色用 `color-mix(in srgb, var(--bg-canvas) 55%, transparent)`：浅 / 深主题
+   * 都从同一个主题 token 推导（浅 #f8fafc@55% / 深 #111113@55%），不写死色值。
+   * 内联 style 会盖过 `.topbar` 类的 `background: var(--bg-canvas)`；深色主题那条
+   * 1px 底线不受影响。全仓 backdrop-filter 禁令以 Toolbar 的首页态为唯一豁免
+   * （`HomeCover.tsx` 内仍然禁止，守卫测试看得到）。
+   */
+  const glassStyle: CSSProperties | undefined = homeMode
+    ? {
+        // 2026-11-23 用户口径：顶栏只要**高斯模糊**、不要白底 —— background 不再
+        // 叠 color-mix(--bg-canvas)，纯 blur 让壁纸直接透过顶栏。文字可读性交给
+        // 顶栏自身内容的固有对比（Logo/窗口控制是深浅主题各自的 token 色）。
+        background: 'transparent',
+        backdropFilter: 'blur(14px)',
+        WebkitBackdropFilter: 'blur(14px)'
+      }
+    : undefined
+
+  /**
    * 首页 → 网格的**焦点交接**（v0.9.4，换件后语义不变）。
    *
    * 首页那块搜索框长在 `HomeCover` 里。用户打进第一个字，`App` 的 `isHome` 立刻变成 false、
@@ -134,7 +160,10 @@ export function Toolbar({
   }, [homeMode])
 
   return (
-    <header className="topbar app-drag relative z-20 flex h-14 shrink-0 items-center gap-3 px-4">
+    <header
+      className="topbar app-drag relative z-20 flex h-14 shrink-0 items-center gap-3 px-4"
+      style={glassStyle}
+    >
       {/* 左段：22×22 真图标 + "ID BOX" 15px Semi Bold（§3.1）。
           2026-10 用户要求换图标：原来这里是内联立方体 svg，现在换成品牌徽标 mark.png。
           为什么用 `src/renderer/assets/brand/mark.png` 而不是 `build/icon.png`：

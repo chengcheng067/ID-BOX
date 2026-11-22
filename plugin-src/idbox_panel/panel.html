@@ -1090,8 +1090,15 @@
     var body = make('div', 'card-body');
     body.appendChild(make('div', 'card-name', textOf(record.name) || '（未命名）'));
     var meta = categoryPath(record);
-    var files = Number(record.fileCount);
-    if (isFinite(files) && files > 0) { meta += ' · ' + files + ' 个文件'; }
+    /* 真实指标由主进程派生并写进 displayMetric：所有 kind 统一为主文件体积
+       （用户 2026-11-20 最终口径，早先的材质分辨率/模型体积双指标已作废）。
+       卡片其余部分（封面、名称、分类路径）一律不动，这里只在末尾追加指标。
+       字段缺失或非法值 → 空串 → 副标题只剩分类路径（Q-19）。
+       下一行只挡手工损坏的旧快照里的非法字面量；根因 guard 在
+       deriveDisplayMetric，插件侧不格式化、不读盘。 */
+    var metric = textOf(record.displayMetric);
+    if (metric === 'NaN' || metric === 'undefined' || metric === '-') { metric = ''; }
+    if (metric) { meta += ' · ' + metric; }
     body.appendChild(make('div', 'card-meta', meta));
     card.appendChild(body);
 

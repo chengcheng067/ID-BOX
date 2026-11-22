@@ -86,7 +86,7 @@ export function HomeStats({ stats }: HomeStatsProps): JSX.Element {
        都落在这一张卡上，不再有外层容器。
        `role="group"` + aria-label 让读屏软件把这三行念成"素材库概览"一组数据，
        而不是念成三段互不相干的文字。 */
-    <section className="hs-card hs-card--stats" role="group" aria-label="素材库概览">
+    <section className="hs-card hs-card--stats" data-guide="stats" role="group" aria-label="素材库概览">
       {STAT_ITEMS.map((item) => (
         <div key={item.label} className="hs-stat">
           <span className="hs-stat-value">{formatStatValue(stats[item.valueKey])}</span>

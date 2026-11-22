@@ -180,8 +180,13 @@ export function ImportConflictDialog() {
   )
 }
 
-/** 三档小按钮（顶部批次档与行内处置共用同一套样式，选中走 accent tint） */
-function ResolutionButton({
+/**
+ * 三档小按钮（顶部批次档与行内处置共用同一套样式，选中走 accent tint）。
+ *
+ * 2026-11 T4：导出为公共原语，给「一键打包」的逐项裁决沿用同一套三档按钮 ——
+ * 两处文案与选中态只保留一份实现，避免新弹窗另写一套漂移。
+ */
+export function ResolutionButton({
   resolution,
   active,
   onClick

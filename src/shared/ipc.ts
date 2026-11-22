@@ -3,6 +3,8 @@
  * 约定：新增通道必须同时改 `shared/ipc.ts` + `preload/index.ts` + `main/index.ts`，三处缺一不可。
  * `drag:start` 必须走 `ipcRenderer.send`（同步），不能用 invoke。
  */
+import type { PluginInstallStatus } from './pluginInstall'
+
 export const IPC = {
   importPaths: 'import:paths',
   importEvent: 'import:event',
@@ -21,6 +23,18 @@ export const IPC = {
    * ⚠️ 只在**写盘成功后**发。写盘失败时渲染层必须保持旧值，否则"界面说改了、重启又变回去"。
    */
   settingsChanged: 'settings:changed',
+  // ── 首页自定义背景图（docs/55 §2.1.4，Q-5/Q-6） ────────────────
+  /**
+   * 保存背景图（invoke）：本地文件复制 / URL 下载到 `<userData>/home-bg/`。
+   * 入参 `HomeBackgroundSaveInput`，返回 `HomeBackgroundSaveResult`（**永不 reject**，
+   * 失败原因写在 `error` 字段给界面直接展示）。
+   */
+  homeBackgroundSave: 'homeBackground:save',
+  /**
+   * 清理一张缓存背景图（invoke，单槽位替换 / 移除时删旧文件）。
+   * 入参 `string | null`，幂等、永不抛错。
+   */
+  homeBackgroundClear: 'homeBackground:clear',
   chooseLibrary: 'settings:chooseLibrary',
   pickArchives: 'dialog:pickArchives',
   pickWatchDir: 'dialog:pickWatchDir',
@@ -282,6 +296,18 @@ export const IPC = {
    * 取消带 `canceled:true`，失败带中文 `error`（含「先开启插件索引导出」这一类前置校验）。
    */
   pluginExportRbz: 'plugin:exportRbz',
+  /**
+   * 渲染进程 → 主进程：**查询 SketchUp 插件联通状态**（2026-11-22 用户需求「联通绿点」）。
+   *
+   * 只读一个本地文件：`%APPDATA%\idbox\plugin\manifest.json`（插件索引快照的信封，
+   * 字段表见 `shared/pluginSnapshot.ts` 的 `PluginManifest`）。文件存在、JSON 可解析、
+   * 且（若有 enabled 类字段）未被置 false ⇒ 视为「检测到联通」。
+   * 读不到 / 解析失败 / 异常一律返回 `{ connected: false, generatedAt: null }`，
+   * **绝不抛错** —— 绿点只是状态提示，不能变成报错源。零网络：这条链路只碰本地盘。
+   *
+   * 返回 `PluginLinkStatus`（本文件下方定义）。
+   */
+  pluginLinkStatus: 'plugin:linkStatus',
   // ── SketchUp 插件收件箱（docs/probe/su-export-to-idbox.md · 方案 A）────────
   //
   // 插件把「业务产物」写到 `%APPDATA%\idbox_export\incoming\<jobId>\`（manifest 最后
@@ -343,5 +369,80 @@ export const IPC = {
    * ⚠️ 主进程只接受**文件名**，且必须过 `isInboxUsageFileName`（单段、无分隔符）——
    * 这是本通道唯一的安全边界，防止渲染层被注入后借它删任意文件。
    */
-  inboxUsageAck: 'inbox:usageAck'
+  inboxUsageAck: 'inbox:usageAck',
+  // ── 一键打包与素材同步（docs/58 §2.5 · T1 骨架，8 条新通道）────────────
+  //
+  // 铁律 `ipc.ts:3`：这 8 条必须同时存在于 shared/ipc.ts + preload/index.ts + main/index.ts。
+  // 全部「不抛错、结果带 ok/error」沿用 HomeBackgroundSaveResult（本文件 :384-387）。
+  /** invoke：弹保存对话框定库包落点，返回路径 / null（取消）。 */
+  packageExportPick: 'package:exportPick',
+  /** invoke：主进程流式写单文件 zip（ZIP64 + store），返回 PackageExportResult。 */
+  packageExport: 'package:export',
+  /** main → renderer on：导出进度 `{ phase:'assets'|'finalize', done, total }`。 */
+  packageExportProgress: 'package:exportProgress',
+  /** send：请求取消导出；只置代次计数，在写的那一个正常收尾后删 .tmp。 */
+  packageExportCancel: 'package:exportCancel',
+  /** invoke：弹打开对话框选库包，返回路径 / null（取消）。 */
+  packageImportPick: 'package:importPick',
+  /** invoke：**只读**验包（central directory + 校验器），返回 PackageInspectResult。 */
+  packageImportInspect: 'package:importInspect',
+  /** invoke：按清单白名单提取 + 还原记录，返回 PackageImportResult。 */
+  packageImportApply: 'package:importApply',
+  /** main → renderer on：导入进度 `{ done, total }`。 */
+  packageImportProgress: 'package:importProgress'
 } as const
+
+/**
+ * `homeBackground:save` 的入参（shared 定义：main / preload / renderer 共用同一份契约，
+ * 避免 preload 反向 import main —— 见 `preload/index.ts` 文件头约定）。
+ *
+ * 本地只交绝对路径，URL 只交 http/https 串；落盘后的 `fileName` 由主进程决定
+ * （`<sha256>.<ext>`），渲染层不拼文件名。
+ */
+export type HomeBackgroundSaveInput =
+  | { kind: 'local'; filePath: string }
+  | { kind: 'url'; url: string }
+
+/** `homeBackground:save` 的返回：**永不 reject**，失败原因写在 `error` 字段。 */
+export type HomeBackgroundSaveResult =
+  | { ok: true; fileName: string }
+  | { ok: false; error: string }
+
+/**
+ * `plugin:linkStatus` 的返回（2026-11-22 用户需求「同步插件 · 联通绿点」）。
+ *
+ * - `connected:true` = `%APPDATA%\idbox\plugin\manifest.json` 存在、JSON 可解析、
+ *   且（若有 enabled 类字段）未被置 false —— SketchUp 卡名称后方据此亮绿点；
+ * - `generatedAt` = manifest 信封的落盘时刻（ISO8601 UTC），用于绿点 title；
+ *   非字符串 / 缺失 → null（title 只写「已检测到插件连接」）。
+ * - 任何失败形态（文件不存在 / 解析失败 / 读盘异常）都**收敛为**
+ *   `{ connected: false, generatedAt: null }`，主进程不抛错、渲染层不报红。
+ */
+export interface PluginLinkStatus {
+  connected: boolean
+  generatedAt: string | null
+  /**
+   * 1.1.0 增：**真机插件安装情况**（扫 SketchUp Plugins 目录，2026-11-23 用户拍板）。
+   *
+   * 可选字段：旧壳 / 旧 preload / 扫描失败时都不会有它，渲染层必须按
+   * `install === undefined` 回退成「安装插件」按钮（向后兼容，不硬依赖）。
+   * 判据与四态见 `shared/pluginInstall.ts`。
+   */
+  install?: PluginInstallStatus
+}
+
+// ── 一键打包与素材同步：契约类型从 packageFormat.ts 单一定义、此处转出 ──────
+//
+// 放在这里是为了让 preload / main 沿用既有习惯「IPC 载荷与结果类型从 shared/ipc.ts 取」，
+// 与 HomeBackgroundSaveResult 同款；定义本体只在 packageFormat.ts，避免两处漂移。
+export type {
+  PackageExportInput,
+  PackageExportProgressEvent,
+  PackageExportResult,
+  PackageImportApplyInput,
+  PackageImportProgressEvent,
+  PackageImportResult,
+  PackageInspectResult,
+  PackageResolution,
+  PackageResolutions
+} from './packageFormat'

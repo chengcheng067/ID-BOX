@@ -5,6 +5,9 @@ import { Sidebar } from './components/Sidebar'
 import { Toolbar } from './components/Toolbar'
 import { HomeCover } from './components/home/HomeCover'
 import type { HomeFolderItem, HomeStatsData } from './components/home/HomeCover'
+// V1.0 首页分步引导（docs/55 §2.3）：挂载条件与写位纯函数都在 HomeGuide 里，
+// App 只负责取版本 + 判定 + 与 HomeCover 同级挂一次。
+import { HomeGuide, shouldShowHomeGuide } from './components/home/HomeGuide'
 // 首页 → 分类库的过场（卡片长成全屏 → 淡出 → 露出库）。类型来自 GlassFolder：
 // 那是**量起点矩形**的地方，App 只是接力播放，不自己定义一份坐标契约。
 import { HomeOutro } from './components/home/HomeOutro'
@@ -17,6 +20,9 @@ import { ImportQueue } from './components/ImportQueue'
 import { SettingsDialog } from './components/SettingsDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ImportConflictDialog } from './components/ImportConflictDialog'
+// 一键打包（docs/58 T5）：导出选项 / 验包确认 / 逐项裁决 / 进度全在弹窗内部；
+// 它自己管 Esc 层与 z-index，全应用只挂这一个实例（与其它 Modal 同级）。
+import { PackageDialog } from './components/PackageDialog'
 import { NoticeToast } from './components/NoticeToast'
 import { CategoryPicker } from './components/CategoryPicker'
 import { RenameDialog } from './components/RenameDialog'
@@ -125,6 +131,8 @@ import { isAllSelected } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
 import { isCategoryIncomplete } from './logic/category'
 import type { AssetKind } from '../shared/types'
+import { DEFAULT_SETTINGS } from '../shared/types'
+import { clampWaveHeight } from '../shared/homeTide'
 import { hasAssetDragPayload } from './logic/dragAssign'
 import { isInternalDragOut, resetInternalDragOut } from './logic/dragOut'
 import { pathsOutsideLibrary } from './logic/libraryPath'
@@ -908,6 +916,45 @@ export default function App() {
     () => planLibraryDrift(allAssets, settingsLibraryDir),
     [allAssets, settingsLibraryDir]
   )
+  // ── V1.0 首页自定义（docs/55 §2.1）：海浪色 / 浪高 / 背景图 ──────────────
+  // waveColors 必须 useMemo 稳定引用：HomeParticles 的主 effect 依赖它
+  // （[quality, waveColors, waveHeight]），若每次 render 都是新对象会导致渲染器反复重建（R-15）。
+  // settings 由主进程 normalizeSettings 返回，未变时同一字段就是同一引用；缺键（旧档）回落默认。
+  const homeWaveColors = useVault((s) => s.settings?.homeWaveColors)
+  const homeWaveHeight = useVault((s) => s.settings?.homeWaveHeight)
+  const homeBackground = useVault((s) => s.settings?.homeBackground)
+  const stableHomeWaveColors = useMemo(
+    () => homeWaveColors ?? DEFAULT_SETTINGS.homeWaveColors,
+    [homeWaveColors]
+  )
+  const stableHomeBackground = useMemo(
+    () => homeBackground ?? DEFAULT_SETTINGS.homeBackground,
+    [homeBackground]
+  )
+  /** 脏值兜底：shared 纯函数非数 / 越界都收口，HomeParticles 拿到的恒为合法浪高。 */
+  const safeHomeWaveHeight = clampWaveHeight(homeWaveHeight)
+
+  // ── V1.0 首页 SVG 引导（docs/55 §2.3 / §4-T4）────────────────────────────
+  // 版本走 preload 桥好的 getAppVersion()，与设置页「关于」同源；首帧 '' 不挂载，
+  // 避免旧档在版本异步回来前闪一下引导。纯函数只认字符串不等，不做 semver 排序。
+  const [appVersion, setAppVersion] = useState('')
+  const [guideDismissedThisSession, setGuideDismissedThisSession] = useState(false)
+  useEffect(() => {
+    let active = true
+    void window.modvault
+      .getAppVersion()
+      .then((version) => {
+        if (active) setAppVersion(version)
+      })
+      .catch(() => undefined)
+    return () => {
+      active = false
+    }
+  }, [])
+  // 跳过（本次）只置这个本地位：不写任何设置字段，下次启动仍会触发。
+  const homeGuideFirstRunShown = useVault((s) => s.settings?.homeGuideFirstRunShown ?? false)
+  const homeGuideLastVersion = useVault((s) => s.settings?.homeGuideLastVersion ?? null)
+  const homeGuideDisabled = useVault((s) => s.settings?.homeGuideDisabled ?? false)
   /**
    * 浮层那行小字的内容（`null` = 不渲染）。裁决在纯函数里，单测可直接证明
    * 「选了档位 + 可见结果为 0 + 有路径漂移 → 提示出现」，组件这里不重复判条件。
@@ -962,6 +1009,17 @@ export default function App() {
     filters.query.trim() === '' &&
     !dupOnly &&
     !folderViewAssetId
+
+  // 判据依赖上面的 isHome，放在它声明之后（版本异步到位才允许挂载，避免首帧闪现）。
+  const shouldShowHomeGuideNow =
+    isHome &&
+    ready &&
+    !guideDismissedThisSession &&
+    appVersion !== '' &&
+    shouldShowHomeGuide(
+      { homeGuideFirstRunShown, homeGuideLastVersion, homeGuideDisabled },
+      appVersion
+    )
 
   // 大类筛选可能是分组哨兵（materialGroup）→ 显示名统一走 kindFilterLabel
   const headerTitle =
@@ -1402,6 +1460,24 @@ export default function App() {
   // 布局（规范 §3.1）：顶栏全窗宽（含窗口控制），其下 左栏 / 中栏 / 右栏 三列
   return (
     <div className="flex h-full flex-col overflow-hidden">
+      {/* 2026-11-22 壁纸全屏化：自定义背景图层从 `HomeCover` 上移到 App 根部。
+          `fixed inset-0` 铺满**整个窗口**（含顶栏区域），负 z-index（-z-10）压在
+          body 底色之上、一切内容（粒子画布 / 文件夹 / Toolbar 毛玻璃 / 引导浮层）
+          之下 —— 粒子画布同批改了透明底（见 `HomeParticles`），壁纸从画布底下透出，
+          顶栏 `backdrop-filter` 毛玻璃把壁纸虚化上来（只在首页态启用）。
+          仅首页态渲染；`source === 'none'` 或无文件时不渲染，首页与无壁纸路径
+          和改动前逐字一致。离线只读 bg://<fileName> 本地缓存，运行期不发网络请求。 */}
+      {isHome && stableHomeBackground.source !== 'none' && stableHomeBackground.fileName ? (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none fixed inset-0 z-0"
+          style={{
+            backgroundImage: `url(bg://${encodeURIComponent(stableHomeBackground.fileName)})`,
+            backgroundSize: 'cover',
+            backgroundPosition: 'center'
+          }}
+        />
+      ) : null}
       {/* 顶栏搜索（v0.10.x）：与首页**同一个**变形搜索框组件，`variant="toolbar"`
           让它从左上角向右下展开；查询词受控写回 `filters.query`，中栏靠它实时过滤。
           `groups` / `onPick` 与首页 `HomeCover` 共用同一对，口径完全一致。 */}
@@ -1413,7 +1489,12 @@ export default function App() {
         onPickSearch={pickFromHomeSearch}
       />
 
-      <div className="flex min-h-0 flex-1">
+      {/* 2026-11-22 深夜修：负 z-index 的 fixed 层在 Electron 合成器里会被画布背景盖住
+          （真机 CDP 取证实锤：z=-10 连顶栏毛玻璃都透不出壁纸），改 z-0 —— fixed z-0
+          画在全部非定位流内容之上、z-0 定位内容按 DOM 顺序比较（壁纸层是根 div 第一个
+          子节点，粒子/内容在其后 → 在上）。三列容器因此补 relative：z-auto 定位与
+          z-0 同层且 DOM 靠后，保证中栏内容永远压在壁纸之上。 */}
+      <div className="relative flex min-h-0 flex-1">
         {/* 0.8.3 左栏折叠：包裹层动画宽度 + 裁切，Sidebar 内容保持 216 固定宽不变形。
             v0.9.4 首页态：左栏**始终折起**（传 `isHome || 用户偏好`，180ms 滑动动画复用
             `CollapsibleColumn` 既有实现，不做第二套动效）。
@@ -1443,17 +1524,31 @@ export default function App() {
           {!ready ? (
             <div className="flex flex-1 items-center justify-center text-sm text-muted">正在加载素材库…</div>
           ) : isHome ? (
-            /* 首页封面页（v0.9.4）：**排在 `empty` 之前** —— 空库也要渲染封面页
-               （文件夹显示 0 + 「还没有素材」），不能被"拖压缩包进来"的 CTA 顶掉：
-               首页是导航第一项，任何时候点它都该回到同一块封面。 */
-            <HomeCover
-              folders={homeFolders}
-              stats={homeStats}
-              searchGroups={homeSearchGroups}
-              onPickSearch={pickFromHomeSearch}
-              onOpenKind={activateKindFromHome}
-              onOpenSettings={() => setSettingsOpen(true)}
-            />
+            <>
+              {/* 首页封面页（v0.9.4）：**排在 `empty` 之前** —— 空库也要渲染封面页
+                 （文件夹显示 0 + 「还没有素材」），不能被"拖压缩包进来"的 CTA 顶掉：
+                 首页是导航第一项，任何时候点它都该回到同一块封面。 */}
+              <HomeCover
+                folders={homeFolders}
+                stats={homeStats}
+                searchGroups={homeSearchGroups}
+                onPickSearch={pickFromHomeSearch}
+                onOpenKind={activateKindFromHome}
+                onOpenSettings={() => setSettingsOpen(true)}
+                waveColors={stableHomeWaveColors}
+                waveHeight={safeHomeWaveHeight}
+                homeBackground={stableHomeBackground}
+              />
+              {/* V1.0 分步引导：与 HomeCover 同级的一次性浮层。锚点在各组件根节点上，
+                  引导不包任何 div、不改封面布局；关闭后首页交互原样保留。 */}
+              {shouldShowHomeGuideNow ? (
+                <HomeGuide
+                  version={appVersion}
+                  saveSettings={saveSettings}
+                  onDismissed={() => setGuideDismissedThisSession(true)}
+                />
+              ) : null}
+            </>
           ) : empty ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-4">
               {/* 图标规格 A：空态图形走统一 SVG（40px、单色 currentColor） */}
@@ -2250,6 +2345,10 @@ export default function App() {
       {/* docs/27 T-07：导入重复处置（跳过 / 覆盖 / 保留两者）。
           `conflictAsk` 为 null 时组件自己返回 null，所以这里无条件挂载。 */}
       <ImportConflictDialog />
+      {/* docs/58 T5：一键打包（导出选项 / 验包 / 逐项裁决 / 进度）。
+          `packageDialogOpen` 为 false 时组件自己返回 null，所以这里无条件挂载；
+          内部自管 useEscLayer 与 zStack，与其它 Modal 同级。 */}
+      <PackageDialog />
       {/* T07：分类级联选择器（详情面板 / 右键菜单 / 多选批量共用） */}
       <CategoryPicker />
       {/* 0.6.0：批量重命名（模板 + 预览 + 失败回滚；只改文件夹名） */}

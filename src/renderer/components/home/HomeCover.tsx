@@ -2,6 +2,11 @@ import { useEffect, useState } from 'react'
 import { useVault } from '../../store'
 import { IconSettings } from '../../icons'
 import { HomeParticles } from './HomeParticles'
+import {
+  WALLPAPER_TONE_SAMPLE,
+  wallpaperToneFromImageData,
+  type WallpaperTone
+} from '../../logic/wallpaperTone'
 import { HomeStats } from './HomeStats'
 import { GlassFolder } from './GlassFolder'
 import type { GlassFolderOpenPayload } from './GlassFolder'
@@ -10,7 +15,7 @@ import {
   type HomeSearchGroup,
   type HomeSearchItem
 } from './HomeSearchCommand'
-import type { MotionQuality } from '../../../shared/types'
+import type { HomeBackgroundSettings, MotionQuality, Settings } from '../../../shared/types'
 // 退场（`data-leaving`）那套规则的宿主。它和过场的时间轴是同一件事的两半，所以与
 // `HomeOutro` 共用一份 CSS（本组件没有自己的样式文件，理由见 `home-outro.css` 里
 // 「首页退场」那一节的注释）。显式 import，不依赖"HomeOutro 先渲染过"这种隐式前提。
@@ -36,7 +41,7 @@ import './home-outro.css'
  * （`settings.motionQuality`），它既不是业务数据也不该由 App 逐层往下透传 ——
  * 与 `HomeParticles` 的 props 契约（`quality: MotionQuality`）对齐后只在这里读一次。
  *
- * 仓库纪律提醒：本文件**自己**不写任何 CSS 渐变、不用 `backdrop-filter`。
+ * 仓库纪律提醒：本文件**自己**不写任何 CSS 渐变、不用背景虚化类属性。
  * 玻璃质感由 `GlassFolder`（`glass-folder.css`）与 `HomeStats`（`home-stats.css`，
  * 用户明确要求「磨砂玻璃框住展示」的第二处豁免）各自负责；`HomeSearchCommand`
  * 只用 token 的实色 + 阴影 + 一条功能性 mask，无装饰渐变。
@@ -197,8 +202,90 @@ export function HomeCover(props: {
    */
   onOpenKind: (key: HomeFolderItem['key'], payload: GlassFolderOpenPayload) => void
   onOpenSettings: () => void
+  /** 首页海浪两套主题的自定义色（透传给 `HomeParticles`，主题联动在那边按 DOM 现取） */
+  waveColors: Settings['homeWaveColors']
+  /** 已 clamp 的浪高（透传给 `HomeParticles`） */
+  waveHeight: number
+  /**
+   * 自定义背景图设置（2026-11-23 用户口径：**壁纸与海浪互斥**）。
+   *
+   * 背景图层**不在本组件**：它在 `App.tsx` 根部，`fixed inset-0 z-0` 铺满整个窗口
+   * （含顶栏区域，顶栏毛玻璃透出壁纸）。本组件只拿它推导 `hasWallpaper` ——
+   * 挂壁纸时粒子层整体不渲染（壁纸就是背景本身）；没挂壁纸时粒子照常渲染
+   * 不透明底色（v1.1.0 之前行为）。
+   * `source === 'none'` / 无文件时 = 无壁纸。
+   */
+  homeBackground: HomeBackgroundSettings
 }): JSX.Element {
-  const { folders, stats, searchGroups, onPickSearch, onOpenKind, onOpenSettings } = props
+  const {
+    folders,
+    stats,
+    searchGroups,
+    onPickSearch,
+    onOpenKind,
+    onOpenSettings,
+    waveColors,
+    waveHeight,
+    homeBackground
+  } = props
+
+  /**
+   * 是否挂了壁纸（2026-11-23 用户口径：**壁纸与海浪互斥**）。
+   * 与 App 根部壁纸层的渲染条件保持同一口径 —— 挂壁纸时本组件不渲染粒子层，
+   * 壁纸就是背景本身；没挂壁纸时粒子照常，与 v1.1.0 之前的画面逐字一致。
+   */
+  const hasWallpaper = homeBackground.source !== 'none' && Boolean(homeBackground.fileName)
+
+  /**
+   * 壁纸明暗档位（2026-11-23 用户需求：左下齿轮 / 底部提示行的**自适应对比度**）。
+   * 壁纸亮 → 控件切深色；壁纸暗 → 控件切白色。取样判定见
+   * `logic/wallpaperTone.ts`；判定失败（图挂了 / canvas taint）为 null，
+   * 控件回退主题 token 原色 —— 取色失败绝不能搞挂首页。
+   */
+  const [wallTone, setWallTone] = useState<WallpaperTone | null>(null)
+  const wallFileName = homeBackground.fileName
+  useEffect(() => {
+    if (!hasWallpaper || !wallFileName) {
+      setWallTone(null)
+      return
+    }
+    let cancelled = false
+    const img = new Image()
+    img.onload = () => {
+      if (cancelled) return
+      try {
+        const c = document.createElement('canvas')
+        c.width = WALLPAPER_TONE_SAMPLE
+        c.height = WALLPAPER_TONE_SAMPLE
+        const ctx = c.getContext('2d')
+        if (!ctx) {
+          setWallTone(null)
+          return
+        }
+        ctx.drawImage(img, 0, 0, WALLPAPER_TONE_SAMPLE, WALLPAPER_TONE_SAMPLE)
+        const px = ctx.getImageData(0, 0, WALLPAPER_TONE_SAMPLE, WALLPAPER_TONE_SAMPLE)
+        setWallTone(wallpaperToneFromImageData(px.data, WALLPAPER_TONE_SAMPLE, WALLPAPER_TONE_SAMPLE))
+      } catch {
+        // canvas 被 taint / 读像素失败：回退主题色
+        setWallTone(null)
+      }
+    }
+    img.onerror = () => {
+      if (!cancelled) setWallTone(null)
+    }
+    img.src = `bg://${encodeURIComponent(wallFileName)}`
+    return () => {
+      cancelled = true
+    }
+  }, [hasWallpaper, wallFileName])
+
+  /** 左下齿轮 / 底部提示行的自适应用色（无壁纸或判定失败 → 主题 token 原样） */
+  const wallUiClass =
+    hasWallpaper && wallTone === 'dark'
+      ? { gear: 'text-white/80 hover:bg-white/15 hover:text-white', hint: 'text-white/70' }
+      : hasWallpaper && wallTone === 'bright'
+        ? { gear: 'text-black/60 hover:bg-black/10 hover:text-black', hint: 'text-black/55' }
+        : { gear: 'text-tertiary hover:bg-elevated hover:text-primary', hint: 'text-tertiary' }
 
   /** 粒子背景的档位（唯一一次读 store，理由见文件头 doc） */
   const quality: MotionQuality = useVault((s) => s.settings?.motionQuality ?? 'balanced')
@@ -285,10 +372,16 @@ export function HomeCover(props: {
       }}
     >
       {/* ① 粒子层：铺满内容区、在一切内容之下、不吃点击（否则会吞掉文件夹的 hover）。
+          2026-11-23 用户口径修正：**壁纸与海浪互斥** —— 挂了壁纸（source !== 'none'
+          且有文件）时粒子层整体不渲染，壁纸就是背景本身；无壁纸时粒子画布走不透明
+          底色，与 v1.1.0 之前的画面逐字一致。transparentBackground 传参随之移除
+          （引擎能力保留在 particleTide 里，当前无调用场景）。
           退场时只压暗到 0.25、不位移（理由见 `home-outro.css` 的 `.hc-exit--faint`）。 */}
-      <div className="hc-exit hc-exit--faint pointer-events-none absolute inset-0 z-0" aria-hidden="true">
-        <HomeParticles quality={quality} />
-      </div>
+      {!hasWallpaper ? (
+        <div className="hc-exit hc-exit--faint pointer-events-none absolute inset-0 z-0" aria-hidden="true">
+          <HomeParticles quality={quality} waveColors={waveColors} waveHeight={waveHeight} />
+        </div>
+      ) : null}
 
       {/* ② 设置齿轮：**左下角**（用户 2026-11-09：「首页的设置放到左下角去」）。
           原先在右上角，和磨砂数据卡抢同一块视觉重心；挪到左下后右上只留数据卡，
@@ -296,9 +389,11 @@ export function HomeCover(props: {
           `app-no-drag` 是顶栏拖动区纪律的配套类 —— 虽然这里不在顶栏内，
           但内容区与顶栏拖动条视觉相连，保持一致并无害。
           退场时向左退 32px 并淡出（`hc-exit--left`）。 */}
+      {/* 设置齿轮（T4 首页引导第 4 步锚点 data-guide：纯属性，不改布局 / 不改交互） */}
       <button
         type="button"
-        className="hc-exit hc-exit--left app-no-drag absolute bottom-[24px] left-[24px] z-20 flex h-8 w-8 items-center justify-center rounded-[8px] text-tertiary transition-colors hover:bg-elevated hover:text-primary"
+        data-guide="settings"
+        className={`hc-exit hc-exit--left app-no-drag absolute bottom-[24px] left-[24px] z-20 flex h-8 w-8 items-center justify-center rounded-[8px] transition-colors ${wallUiClass.gear}`}
         onClick={onOpenSettings}
         title="设置"
         aria-label="设置"
@@ -328,7 +423,8 @@ export function HomeCover(props: {
             祖先链上**不能**出现 `overflow:hidden` / `overflow:clip`。
             本组是 flex-col + justify-end，下方余量够，但改布局时要注意。
             退场时整条向下退 28px 并淡出（`hc-exit--down` 挂在下面这层包裹上）。 */}
-        <div className="hc-exit hc-exit--down mx-auto shrink-0">
+        {/* T4 引导第 1 步锚点：搜索（纯属性，不改布局） */}
+        <div className="hc-exit hc-exit--down mx-auto shrink-0" data-guide="search">
           <HomeSearchCommand
             groups={searchGroups}
             onPick={onPickSearch}
@@ -373,9 +469,13 @@ export function HomeCover(props: {
             两个 setState 在同一个事件回调里，React 18 会合并成一次渲染。
             另外这一排的 class `hc-folder-row` 是退场规则的选择器锚点（左右半排分开退），
             见 `home-outro.css`。 */}
+        {/* T4 引导第 2 步锚点：文件夹排（纯属性，不改布局）。
+            第 3 步数据卡的锚点由 T4 在 HomeStats.tsx 根节点上加，本文件不包裹它 ——
+            包一层会改变 .hs-card 的绝对定位包含块，导致数据卡跳到左上角。 */}
         <div
           className="hc-folder-row mx-auto mt-10 flex w-full max-w-[820px] items-start justify-between [&>*]:shrink-0"
           data-count={folders.length}
+          data-guide="folders"
         >
           {folders.map((folder, index) => (
             <GlassFolder
@@ -419,7 +519,7 @@ export function HomeCover(props: {
             导入入口不只收压缩包，单张图片、模型文件、CAD 图纸、HDR、D5A 等都能直接拖入，
             写「压缩包」会把其他入口说没了。不要改回旧文案。
             退场时向下退 24px 并淡出（`hc-exit--down-soft`：它离底边更近，少退 4px）。 */}
-        <div className="hc-exit hc-exit--down-soft mt-[54px] text-center text-[12px] text-tertiary">
+        <div className={`hc-exit hc-exit--down-soft mt-[54px] text-center text-[12px] ${wallUiClass.hint}`}>
           双击文件夹进入 · 拖入文件即可导入
         </div>
       </div>

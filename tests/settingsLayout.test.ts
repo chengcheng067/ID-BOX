@@ -10,7 +10,7 @@
  * ② 文档编号泄漏到 UI —— 历史上设置页出现过「低频操作，已从顶栏移入设置（§4-7）」
  *    这类给开发者看的编号（`§` + 数字），用户看不懂。整份源码（去注释后）不许再有。
  *
- * 另外钉住三件事：tab 数量/顺序（新增 classify、删掉 advanced）、左栏四个分组标签、
+ * 另外钉住三件事：tab 数量/顺序（8 项：新增 classify 与 syncPlugins、删掉 advanced）、左栏五个分组标签、
  * 四个新原语（SettingsCard / SettingsRow / StatusBadge / PageHeader）都存在且真的被用。
  *
  * ── `onClick=` 基线是怎么数出来的（搬迁前，commit 前工作区的 SettingsDialog.tsx）──
@@ -51,20 +51,25 @@ function sliceBetween(src: string, from: string, to: string): string {
   return src.slice(a, b > a ? b : src.length)
 }
 
-/** 各 tab 的内容段（顺序与组件里的声明顺序一致：appearance → import → classify → library → data → about） */
+/** 各 tab 的内容段（顺序与组件里的声明顺序一致：appearance → import → classify → library → data → about → syncPlugins） */
 const TAB_SLICES: { key: string; from: string; to: string }[] = [
   { key: 'appearance', from: 'const appearanceTab = (', to: 'const importTab = (' },
   { key: 'import', from: 'const importTab = (', to: 'const classifyTab = (' },
   { key: 'classify', from: 'const classifyTab = (', to: 'const libraryTab = (' },
   { key: 'library', from: 'const libraryTab = (', to: 'const dataTab = (' },
   { key: 'data', from: 'const dataTab = (', to: 'const aboutTab = (' },
-  { key: 'about', from: 'const aboutTab = (', to: 'const forceGone' }
+  { key: 'about', from: 'const aboutTab = (', to: 'const syncPluginsTab = (' },
+  // T3（docs/55 §2.2）：同步插件 tab 独立成段。此前 about 段终点写 forceGone，
+  // 会把 syncPluginsTab 整段吞进去 —— about 的 onClick 计数虚高、syncPlugins 无从守卫。
+  { key: 'syncPlugins', from: 'const syncPluginsTab = (', to: 'const forceGone' }
 ]
 
 /**
  * 每个 tab 的 `onClick=` 下限（基线 × 0.9 向下取整，见文件头注释）。
  *
  * `alias` 的内容在独立组件 `AliasTab()` 里，单独切段统计。
+ * `syncPlugins` 的 8 张卡由 `SYNC_PLUGIN_CARDS.map()` 渲染，源码里只有 1 处 onClick；
+ * 具体卡数 / 灰卡 / 说明态由 `tests/syncPluginsTab.test.ts` 单独守，这里只保结构不丢。
  */
 const CLICK_BASELINE: Record<string, number> = {
   appearance: 2,
@@ -73,18 +78,29 @@ const CLICK_BASELINE: Record<string, number> = {
   library: 7,
   alias: 6,
   data: 6,
-  about: 2
+  about: 2,
+  syncPlugins: 1
 }
 
-// ── ① tab 结构：7 项、顺序固定、没有 advanced ─────────────────────────
-describe('tab 结构：7 项且顺序固定（新增 classify，删除 advanced）', () => {
-  it('TABS 恰好 7 项，key 顺序 = appearance/import/classify/library/alias/data/about', () => {
+// ── ① tab 结构：8 项、顺序固定、没有 advanced ─────────────────────────
+describe('tab 结构：8 项且顺序固定（新增 classify / syncPlugins，删除 advanced）', () => {
+  it('TABS 恰好 8 项，key 顺序 = appearance/import/classify/library/alias/data/about/syncPlugins', () => {
     const src = raw()
     const block = sliceBetween(src, 'const TABS: { key: SettingsTab; label: string }[] = [', ']')
     expect(block.length).toBeGreaterThan(0)
-    const keys = [...block.matchAll(/key:\s*'([a-z]+)'/g)].map((m) => m[1])
-    expect(keys).toEqual(['appearance', 'import', 'classify', 'library', 'alias', 'data', 'about'])
-    expect(keys).toHaveLength(7)
+    // `[a-z]+` 会漏掉驼峰 `syncPlugins`，导致 8 tab 下依然"7 项通过"的假绿 —— 必须允许大写。
+    const keys = [...block.matchAll(/key:\s*'([A-Za-z]+)'/g)].map((m) => m[1])
+    expect(keys).toEqual([
+      'appearance',
+      'import',
+      'classify',
+      'library',
+      'alias',
+      'data',
+      'about',
+      'syncPlugins'
+    ])
+    expect(keys).toHaveLength(8)
   })
 
   it('SettingsTab 联合类型里没有 advanced', () => {
@@ -139,14 +155,16 @@ describe('弹窗尺寸：900×680，小屏按视口收缩', () => {
 })
 
 // ── ③ 左栏分组 ────────────────────────────────────────────────────────
-describe('左栏四个分组（偏好 / 素材 / 数据 / 其他）', () => {
+describe('左栏五个分组（偏好 / 素材 / 数据 / 扩展 / 其他）', () => {
   const src = raw()
   const groups = sliceBetween(src, 'const TAB_GROUPS:', 'const TAB_SUB')
 
-  it('四个分组标签逐字存在', () => {
-    for (const label of ['偏好', '素材', '数据', '其他']) {
+  it('五个分组标签逐字存在（T3 新增「扩展」组承载 syncPlugins）', () => {
+    for (const label of ['偏好', '素材', '数据', '扩展', '其他']) {
       expect(groups).toContain(`label: '${label}'`)
     }
+    // 扩展组只含 syncPlugins，且与业务数据组分离（docs/55 §2.2.1 架构师定）
+    expect(groups).toContain("{ label: '扩展', keys: ['syncPlugins'] }")
   })
 
   it('分组只列 key，不复制第二份标签文字（标签真源仍是 TABS）', () => {

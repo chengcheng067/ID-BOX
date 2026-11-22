@@ -1,8 +1,18 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, nativeImage, type NativeImage } from 'electron'
 import fs from 'node:fs/promises'
-import { existsSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { IPC } from '../shared/ipc'
+import {
+  IPC,
+  type HomeBackgroundSaveInput,
+  type PackageExportInput,
+  type PackageExportProgressEvent,
+  type PackageExportResult,
+  type PackageImportApplyInput,
+  type PackageImportProgressEvent,
+  type PackageImportResult,
+  type PackageInspectResult
+} from '../shared/ipc'
 import { resolveExternalUrl, truncateUrlForLog } from '../shared/urlPolicy'
 import {
   DEFAULT_SETTINGS,
@@ -74,13 +84,27 @@ import {
   rollbackMaterialMerge
 } from './materialMerge'
 import { isWithinRoot } from '../shared/vault'
-import { createPluginWriter, getPluginWriter, pluginRootDir } from './pluginExport'
+import { createPluginWriter, getPluginWriter, pluginManifestPath, pluginRootDir } from './pluginExport'
+import { parsePluginLinkStatus } from './pluginLink'
+import { scanInstalledPlugins } from './pluginScan'
+import { summarizeInstallStatus } from '../shared/pluginInstall'
 import { buildRbz, defaultRbzFileName, resolvePluginSrcDir } from './pluginPackage'
+import { pickPersonalSettings } from '../shared/packageFormat'
+import {
+  cancelPackageExport,
+  createArchiverZipWriter,
+  currentPackageExportGen,
+  defaultPackageFileName,
+  walkLibraryFiles,
+  writePackage
+} from './packageExport'
+import { applyPackage, inspectPackage } from './packageImport'
 import {
   isPluginTrigger,
   type PluginRbzExportResult,
   type PluginSnapshotPayload
 } from '../shared/pluginSnapshot'
+import type { PluginLinkStatus } from '../shared/ipc'
 import { probeSizes } from './probeSizes'
 import { isKindFolderName } from '../shared/classify'
 import { composeRelFolder, normalizeCategoryPair } from '../shared/naming'
@@ -135,6 +159,11 @@ import {
   type InboxUsageEvent
 } from '../shared/inboxUsage'
 import { registerVaultScheme, serveVault } from './protocol'
+import {
+  backgroundCacheDir,
+  clearHomeBackground,
+  saveHomeBackground
+} from './homeBackground'
 import { normalizeTargetWidth, prepareHdrFile } from './hdrDecode'
 import { isHdrExt } from '../shared/hdrExts'
 import { sanitizeName } from '../shared/naming'
@@ -1056,7 +1085,9 @@ function bootstrap(): void {
     serveVault(() => ({
       libraryDir: settings.libraryDir,
       thumbsDir: thumbsDir(),
-      hdrDir: hdrCacheDir()
+      hdrDir: hdrCacheDir(),
+      // 首页自定义背景图缓存（bg://<sha256>.<ext>，V1.0 docs/55 §2.1.4）
+      bgDir: backgroundCacheDir()
     }))
     await fs.mkdir(settings.libraryDir, { recursive: true }).catch(() => {})
     // 启动时先清掉上次崩溃可能留下的 .staging 垃圾
@@ -1211,6 +1242,18 @@ ipcMain.handle(IPC.setSettings, async (_e, patch: Partial<Settings>) => {
   // verboseLogging 已生效），不会出现"UI 说改了、后台还是旧配置"的窗口期。
   broadcastSettingsChanged(settings)
   return settings
+})
+
+// ── 首页自定义背景图（docs/55 §2.1.4，Q-5/Q-6） ──────────────────────────
+// 两条通道都**不写 settings**：save 只落字节到 <userData>/home-bg/ 并返回文件名，
+// 由渲染层拿到成功结果后再 saveSettings({ homeBackground })。失败原因写 error 字段，
+// 界面保留旧图 —— 绝不让一次坏下载把 fileName 写坏（R-11）。
+ipcMain.handle(IPC.homeBackgroundSave, async (_e, input: HomeBackgroundSaveInput) => {
+  return saveHomeBackground(input)
+})
+
+ipcMain.handle(IPC.homeBackgroundClear, async (_e, fileName: string | null) => {
+  await clearHomeBackground(fileName)
 })
 
 ipcMain.handle(IPC.chooseLibrary, async () => {
@@ -2187,6 +2230,46 @@ ipcMain.handle(IPC.pluginExportRbz, async (): Promise<PluginRbzExportResult> => 
   return { ok: true, path: outPath, bytes: built.bytes, entries: built.entries }
 })
 
+/**
+ * 查询 SketchUp 插件联通 / 安装状态（2026-11-22 绿点需求 + 2026-11-23 安装判定修复）。
+ *
+ * 两段**互相独立**、都要永不抛：
+ * 1. `connected` / `generatedAt`：读 `%APPDATA%\idbox\plugin\manifest.json`（本体写索引的快照）。
+ *    ⚠️ 它只是"本体写过索引"，**不能**当"插件已安装"用（1.0.x 的 bug 就在这）；
+ * 2. `install`：真扫 SketchUp 的 Plugins 目录，拿真机版本与 `app.getVersion()` 比。
+ *    这一段整体 try/catch —— 扫描失败就不带 `install` 字段，**绝不**因此把 connected 也变 false。
+ *
+ * **零网络**：整条链路只碰本地盘，不 fetch、不探端口。
+ */
+ipcMain.handle(IPC.pluginLinkStatus, async (): Promise<PluginLinkStatus> => {
+  let status: PluginLinkStatus = { connected: false, generatedAt: null }
+  try {
+    const root = pluginRootDir()
+    if (root) {
+      // readFileSync 而非 promises 版：这是一次 <2KB 的小文件读，不值得切微任务
+      const raw = existsSync(pluginManifestPath(root))
+        ? readFileSync(pluginManifestPath(root), 'utf-8')
+        : null
+      status = parsePluginLinkStatus(raw)
+    }
+  } catch {
+    // 读不到 / 权限 / 任何意外：一律"没连上"，绝不把状态查询变成报错源
+    status = { connected: false, generatedAt: null }
+  }
+
+  try {
+    const hits = await scanInstalledPlugins({
+      appData: app.getPath('appData'),
+      programData: process.env.ProgramData
+    })
+    status.install = summarizeInstallStatus(app.getVersion(), hits)
+  } catch (err) {
+    // 扫描失败：保持 connected 原样、不附带 install（渲染层回退成「安装插件」按钮）
+    logWarn('plugin:scan:failed', { error: err instanceof Error ? err.message : String(err) })
+  }
+  return status
+})
+
 // ── T06 新增：分类指派 / 遗留布局迁移 ─────────────────────────────
 
 /**
@@ -2417,6 +2500,129 @@ ipcMain.on(IPC.cancelImport, () => {
 
 /** 设置·关于 tab 的版本胶囊 / tab 栏左下角小字（§3.6） */
 ipcMain.handle(IPC.getAppVersion, () => app.getVersion())
+
+// ── 一键打包与素材同步（docs/58 §2.5 · T1 骨架占位）─────────────────────────
+//
+// 两条 progress 是 **main → renderer** 方向，主进程是发送方而非接收方，
+// 故这里放 `webContents.send` 发射桩（不是 ipcMain.on）；其余 6 条按方向 handle/on。
+// 所有结果走「不抛错 + ok:false / null」形状，接线的渲染层可安全调用。
+// T2 已接：packageExportPick / packageExport / packageExportProgress / packageExportCancel。
+// T3 已接：packageImportPick / packageImportInspect / packageImportApply / packageImportProgress
+//          → src/main/packageImport.ts（yauzl lazyEntries 白名单提取 + 验包）
+
+/** 弹保存对话框（zip filter + C-7 默认名），取消返回 null。 */
+ipcMain.handle(IPC.packageExportPick, async (): Promise<string | null> => {
+  const options: Electron.SaveDialogOptions = {
+    title: '导出素材库',
+    defaultPath: path.join(app.getPath('downloads'), defaultPackageFileName()),
+    filters: [{ name: 'ID BOX 素材包', extensions: ['zip'] }]
+  }
+  const r = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options)
+  if (r.canceled || !r.filePath) return null
+  return r.filePath.toLowerCase().endsWith('.zip') ? r.filePath : `${r.filePath}.zip`
+})
+
+/** 导出器每完成一批文件调用一次，发进度给渲染层。 */
+function emitPackageExportProgress(ev: PackageExportProgressEvent): void {
+  win?.webContents.send(IPC.packageExportProgress, ev)
+}
+
+/** 真正流式写包：库根用当前 settings.libraryDir，个人设置经白名单裁剪后传入。 */
+ipcMain.handle(
+  IPC.packageExport,
+  async (_e, input: PackageExportInput): Promise<PackageExportResult> => {
+    if (
+      !input ||
+      typeof input.destPath !== 'string' ||
+      !Array.isArray(input.records) ||
+      !Array.isArray(input.includedKinds)
+    ) {
+      return { ok: false, error: '导出参数无效' }
+    }
+    try {
+      const result = await writePackage(
+        input.destPath,
+        input.records,
+        {
+          includedKinds: input.includedKinds,
+          includePersonalSettings: input.includePersonalSettings === true
+        },
+        {
+          libraryDir: settings.libraryDir,
+          diskFree: freeBytesOf,
+          walk: walkLibraryFiles,
+          zipFactory: createArchiverZipWriter,
+          now: () => new Date(),
+          appVersion: app.getVersion(),
+          personalSettings: input.includePersonalSettings ? pickPersonalSettings(settings) : undefined,
+          onProgress: (ev) => emitPackageExportProgress(ev)
+        }
+      )
+      // F-3：writePackage 永不抛错（失败都在 result.error 里），所以只靠 catch 取证会漏掉
+      // 全部真实失败 —— V1.1.0 用户日志里没有任何 package:export 记录就是这个原因。
+      // 这里补一条带 destPath 的日志；result.error 已含「目标盘 X：需要 Y / 可用 Z」等真实数字。
+      if (!result.ok && !result.canceled) {
+        logError('package:export-failed', new Error(result.error), { destPath: input.destPath })
+      }
+      return result
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      logError('package:export-failed', err, { destPath: input.destPath })
+      return { ok: false, error: message }
+    }
+  }
+)
+
+/** 只置代次计数 +1；在写的那一个正常收尾后删 .tmp，不留半包。 */
+ipcMain.on(IPC.packageExportCancel, () => {
+  cancelPackageExport()
+  logInfo('package:export-cancel', { gen: currentPackageExportGen() })
+})
+
+/** 弹 openFile 对话框（zip filter），取消返回 null。 */
+ipcMain.handle(IPC.packageImportPick, async (): Promise<string | null> => {
+  const options: Electron.OpenDialogOptions = {
+    title: '选择素材包',
+    properties: ['openFile'],
+    filters: [{ name: 'ID BOX 素材包', extensions: ['zip'] }]
+  }
+  const r = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+  if (r.canceled || !r.filePaths[0]) return null
+  return r.filePaths[0]
+})
+
+/** 只读验包：inspectPackage 不改库、不解压素材；坏包原因随 reason 返回，不抛错。 */
+ipcMain.handle(
+  IPC.packageImportInspect,
+  async (_e, packagePath: string): Promise<PackageInspectResult> => {
+    return inspectPackage(packagePath)
+  }
+)
+
+/** 验包 + 按 collectExpectedEntries 白名单提取；库根用当前 settings.libraryDir。 */
+ipcMain.handle(
+  IPC.packageImportApply,
+  async (_e, input: PackageImportApplyInput): Promise<PackageImportResult> => {
+    if (!input || typeof input.path !== 'string' || input.path.length === 0) {
+      return { ok: false, error: '素材包路径无效' }
+    }
+    try {
+      return await applyPackage(input.path, input.resolutions ?? {}, {
+        libraryDir: settings.libraryDir,
+        onProgress: (ev) => emitPackageImportProgress(ev)
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      logError('package:import-apply-failed', err, { path: input.path })
+      return { ok: false, error: message }
+    }
+  }
+)
+
+/** 导入器每提取一个白名单条目调用一次。 */
+function emitPackageImportProgress(ev: PackageImportProgressEvent): void {
+  win?.webContents.send(IPC.packageImportProgress, ev)
+}
 
 // ── 2026-10 自动检查更新（GitHub Releases，关于页） ────────────────────
 //
