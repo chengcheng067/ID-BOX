@@ -1,5 +1,7 @@
 import type { BallParamScales } from './ballParams'
 import type { ClassifyConfidence } from './classifyCrossCheck'
+import { DEFAULT_PROJECT_TEMPLATES } from './projectTemplate'
+import type { PinnedViewPrefsMap } from './pinnedViewPrefs'
 
 /** 7-Zip 官方下载页（未就绪时给用户的可行动入口） */
 export const SEVEN_ZIP_DOWNLOAD_URL = 'https://7-zip.org/'
@@ -692,6 +694,53 @@ export function clampHomeTideNumber(value: unknown, range: HomeTideRange): numbe
 /** 首页自定义背景图的来源：`none` = 不渲染图片层与压暗层（旧档 / 默认行为）。 */
 export type HomeBackgroundSource = 'none' | 'local' | 'url'
 
+// ── 项目文件夹模板 + 首页快速访问 / 底纹（docs/60 §2 / §6，T-01 数据层） ──────
+
+/**
+ * 项目文件夹模板的树节点（docs/60 §2.3）。
+ *
+ * - **根节点**的 `name` 可含 `{编号}` / `{名称}` 占位符（Q-4：占位符**只限根名**）；
+ *   子目录名是纯字面量，生成时不做任何替换。
+ * - 树**深度 4 级封顶**（根 + 3 层子级，Q-6）、整棵树**总节点 256 上限**、
+ *   单名 ≤40 字（`naming.ts` 的 `MAX_SEGMENT_LEN`）—— 归一化见
+ *   `shared/projectTemplate.ts#normalizeProjectTemplate`（唯一实现，别处不得复制）。
+ */
+export interface ProjectTemplateNode {
+  /** 目录名；根目录名可含占位符字面量（归一化原样保留，不清洗） */
+  name: string
+  /** 子节点；叶子节点无此键（归一化会把空数组退化成叶子，落档形状干净） */
+  children?: ProjectTemplateNode[]
+}
+
+/**
+ * 一份项目文件夹模板（docs/60 §2.2：多模板，Q-2 用户批注）。
+ *
+ * `id` 是稳定锚点（向导选择 / 设置页删除 / 打包整组替换都按 id 定位）：
+ * 内置项固定 `'builtin'`，用户模板用 UUID（`shared/projectTemplate.ts#newTemplateId`，
+ * 与 `Asset.id` 同款生成方式）。`name` 是模板的界面名（如「公司标准模板」）。
+ */
+export interface ProjectTemplate {
+  id: string
+  name: string
+  root: ProjectTemplateNode
+}
+
+/**
+ * 首页快速访问的一条钉选（F-1，docs/60 §6.1）。
+ *
+ * ⚠️ **数组顺序即显示顺序**（不存 `order` 字段 —— 双真源迟早漂移，数组本身就是
+ * 唯一 order；左右移动 = 交换相邻两元素后整体 `saveSettings`）。
+ * `absPath` 是机器相关路径，**永不入打包白名单**（与 `libraryDir` 同理由，docs/60 §5.3）。
+ */
+export interface HomePinnedFolder {
+  /** 稳定锚点：`home:pinnedOpen` 按 id 从主进程自己的 settings 解析路径（不信渲染层） */
+  id: string
+  /** 显示名（钉选时的目录名；首版不追踪磁盘改名，右键移除重加即可纠正） */
+  name: string
+  /** 绝对路径（只用于显示与主进程白名单校验，打开动作绝不信渲染层传来的路径） */
+  absPath: string
+}
+
 /** 首页自定义背景图设置。 */
 export interface HomeBackgroundSettings {
   source: HomeBackgroundSource
@@ -928,6 +977,56 @@ export interface Settings {
    * 本地文件 / URL 两种来源只落数据，本层不改渲染。
    */
   homeBackground: HomeBackgroundSettings
+  /**
+   * 项目文件夹模板（多模板，Q-2 用户批注，docs/60 §2）。默认只含内置 4×15 一项
+   * （`DEFAULT_PROJECT_TEMPLATES`，旧档缺键回落到这里 = 升级零迁移）。
+   *
+   * 归一化唯一入口：`shared/projectTemplate.ts#normalizeProjectTemplates`
+   * （坏项丢弃 / id 去重重生成 / 条数 20 封顶 / 整表坏回落默认）。
+   * **纳入打包白名单** `PERSONAL_SETTINGS_KEYS`（Q-7，导入语义 = 整数组替换）；
+   * 下面的 `homePinnedFolders` / `homeFolderWallpaper` 则刻意**不入**（§5.3）。
+   */
+  projectTemplates: ProjectTemplate[]
+  /**
+   * 首页快速访问钉选（F-1，docs/60 §6.1）。**数组顺序即显示顺序**（不存 order 字段）；
+   * 20 封顶（文档 §5.3 同页口径；归一化实落 `MAX_HOME_PINNED_FOLDERS`，docs/60 §6.1 ④ 判据
+   * 写的是 32 条防排爆上限 —— 以 settings.ts 的归一化常量为准）。
+   * `absPath` 机器相关 → **不入打包白名单**（换机路径失效，与 `libraryDir` 同理由）。
+   */
+  homePinnedFolders: HomePinnedFolder[]
+  /**
+   * 钉选目录浏览器的**视图 / 排序偏好**（2026-11-25 用户需求①：「一旦选择了图标视图，
+   * 下一次进入这个文件夹时要保持为图标视图」）。
+   *
+   * key = `HomePinnedFolder.id`，value = `{ view, sortKey, sortDir }`。缺键 / 某个 pin
+   * 没有记录 = 回落 `DEFAULT_PINNED_VIEW_PREFS`（列表 + 名称升序）= 没有本功能时的行为。
+   * 归一化唯一入口：`shared/pinnedViewPrefs.ts#normalizePinnedViewPrefsMap`
+   * （脏值只丢那一条 / 键数 32 封顶），读档写档共用，绝不拖垮整份 settings.json。
+   * **不入打包白名单**（pin id 是机器本地锚点，换机即失效，与 `homePinnedFolders` 同理由）。
+   */
+  pinnedViewPrefs: PinnedViewPrefsMap
+  /**
+   * 文件夹底纹映射（F-3，docs/60 §6.3）：key → 缓存文件名。
+   *
+   * key 命名空间（两空间互不碰撞）：素材大类卡 = `kind:<AssetKind|KindGroup>`、
+   * 钉选卡 = `pin:<id>`。value 是 `<userData>/home-bg/` 下的缓存文件名
+   * （图本体走既有 `homeBackground:save` 机制落盘，**Settings 里绝不存临时路径**）；
+   * 缺文件回落默认底纹。**不入打包白名单**（缓存引用不随包走，docs/58 C-5 同裁定）。
+   */
+  homeFolderWallpaper: Record<string, string>
+  /**
+   * 首页文件夹排的**拖动排序**（2026-11-25 用户需求：「首页文件夹支持鼠标拖动调整顺序」）。
+   *
+   * 元素是槽位键：素材大类卡 = `kind:<HomeFolderItem['key']>`、钉选卡 = `pin:<id>`
+   * （与 `homeFolderWallpaper` 的键同形不同域，两套表独立）。**数组顺序即显示顺序**；
+   * 表里没有的卡按默认顺序（大类在前、钉选在后）追加到末尾，所以新增钉选 / 空分类
+   * 有素材后自动出现在排尾，不会凭空消失。「新建项目」虚卡不参与排序、恒在最后。
+   *
+   * 归一化唯一入口：`shared/homeFolderOrder.ts#normalizeHomeFolderOrder`
+   * （非字符串 / 空串丢弃、去重保序、64 条封顶、未知键保留），读档写档共用。
+   * **不入打包白名单**（含 pin id 这类机器本地锚点，与 `homePinnedFolders` 同理由）。
+   */
+  homeFolderOrder: string[]
   /** SVG 引导是否首启已展示过（默认 false = 再显示一次，宁可多提示）。 */
   homeGuideFirstRunShown: boolean
   /** 上次展示引导时记录的版本号；`null` = 从未展示。 */
@@ -1006,6 +1105,15 @@ export const DEFAULT_SETTINGS: Settings = {
   homeWaveInteractive: true,
   homeWaveClickRipples: true,
   homeBackground: { source: 'none', fileName: null, sourceUrl: null, dimAlpha: 0.35 },
+  // 项目文件夹模板 + 首页快速访问 / 底纹（docs/60 T-01）：默认 = 内置 4×15 一项 +
+  // 空钉选表 + 空底纹映射。旧档缺键 → 这三个默认值，升级零迁移、行为不变。
+  projectTemplates: DEFAULT_PROJECT_TEMPLATES,
+  homePinnedFolders: [],
+  // 视图 / 排序记忆默认空表 = 每个文件夹首次进入都是列表视图（与新增本功能前一致）
+  pinnedViewPrefs: {},
+  homeFolderWallpaper: {},
+  // 拖动排序默认空表 = 大类在前、钉选在后、虚卡末尾（与新增本功能前的排布逐字一致）
+  homeFolderOrder: [],
   homeGuideFirstRunShown: false,
   homeGuideLastVersion: null,
   homeGuideDisabled: false

@@ -141,11 +141,12 @@ describe('buildPluginRecord 复用 pickPrimaryFile 派生 displayMetric', () => 
     expect(record.displayMetric).toBe('1.5 KB') // formatBytes(1536)，而非 Asset.size=999999999
   })
 
-  it('A 级只增：13 旧字段 + 1 新字段，files 仍只有 rel/ext 两键', () => {
+  it('A 级只增：13 旧字段 + 1 新字段 + 4 排序字段，files 仍只有 rel/ext 两键', () => {
     const record = buildPluginRecord(asset('model', [f({ rel: 'm.skp', ext: 'skp', size: 512 })]))
     expect(Object.keys(record)).toEqual([
       'id', 'name', 'kind', 'category1', 'category2', 'source', 'zhimoId', 'relFolder',
-      'mainFile', 'files', 'thumbRel', 'suMajor', 'updatedAt', 'displayMetric'
+      'mainFile', 'files', 'thumbRel', 'suMajor', 'updatedAt', 'displayMetric',
+      'size', 'importedAt', 'lastUsedAt', 'useCount'
     ])
     expect(Object.keys(record.files[0])).toEqual(['rel', 'ext'])
   })
@@ -192,11 +193,15 @@ describe('源码守卫：panel.html / loader.rb', () => {
     expect(line).toContain('white-space: nowrap;')
   })
 
-  it('排序档「按文件数」内部实现保留（docs/55 §3-C）', () => {
-    expect(html).toContain("var SORT_KEYS = ['default', 'name', 'category1', 'fileCount'];")
+  it('排序档「按文件数」内部实现保留（docs/55 §3-C；T-SORT 后为 8 键新形态）', () => {
+    // T-SORT（2026-11-26）把 4 键循环 chip 改成对齐主程序的 8 键下拉 + 方向按钮，
+    // 但「按文件数」这一插件既有能力必须保留（守卫的真实意图）→ 断言更新到新字面。
+    expect(html).toContain(
+      "var SORT_KEYS = ['lastUsed', 'mostUsed', 'recent', 'name', 'size', 'su', 'category1', 'fileCount'];"
+    )
     expect(html).toContain("fileCount: '按文件数'")
-    expect(html).toContain("state.sortKey === 'fileCount'")
-    expect(html).toContain('Number(b.fileCount) - Number(a.fileCount)')
+    expect(html).toContain('if (key === \'fileCount\')')
+    expect(html).toContain('numOf(a.fileCount) - numOf(b.fileCount)')
   })
 
   it('loader.rb 透传 displayMetric，保留 fileCount，落位链 / A8 不动', () => {

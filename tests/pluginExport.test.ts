@@ -219,7 +219,12 @@ describe('插件快照字段形状（docs/39 §3.2）', () => {
       'suMajor',
       'updatedAt',
       // T5（docs/55 §1.2）：13 个旧字段逐字保留、相对顺序不变，仅尾部追加一个可选字段
-      'displayMetric'
+      'displayMetric',
+      // T-SORT：四个排序键紧随 displayMetric 之后，键序与接口声明一致
+      'size',
+      'importedAt',
+      'lastUsedAt',
+      'useCount'
     ])
     expect(record.id).toBe('a1b2c3d4-0001')
     expect(record.name).toBe('测试模型-中文名字')
@@ -988,5 +993,123 @@ describe('插件快照 displayMetric（A 级只增）', () => {
     expect(buildPluginRecord(sampleAsset({ files: null as never })).displayMetric).toBe(null)
     // 快照字段恒存在（可选是对旧快照而言），值为 null 时插件只显示分类路径
     expect(Object.prototype.hasOwnProperty.call(noSize, 'displayMetric')).toBe(true)
+  })
+})
+
+// ── T-SORT · 四个排序字段（主程序侧，字段契约与插件侧逐字一致）───────────────
+describe('插件快照排序字段（T-SORT，只增不改 apiVersion）', () => {
+  const SORT_KEYS = ['size', 'importedAt', 'lastUsedAt', 'useCount'] as const
+  const OLD_KEYS = [
+    'id',
+    'name',
+    'kind',
+    'category1',
+    'category2',
+    'source',
+    'zhimoId',
+    'relFolder',
+    'mainFile',
+    'files',
+    'thumbRel',
+    'suMajor',
+    'updatedAt',
+    'displayMetric'
+  ]
+
+  it('a) size 取 Asset.size 整目录总量（1536），不是 primary.size（512）—— R-12 不串味', () => {
+    // 样本：file() 主文件 size=512，sampleAsset().size=1536
+    expect(sampleAsset().files[0].size).toBe(512)
+    expect(sampleAsset().size).toBe(1536)
+    const r = buildPluginRecord(sampleAsset())
+    expect(r.size).toBe(1536)
+    // 同一资产的 displayMetric 仍按「仅主文件」口径：两套口径互不污染
+    expect(r.displayMetric).toBe('512 B')
+    // 换掉 files（主文件）不动 size；改 Asset.size 才动 size
+    expect(buildPluginRecord(sampleAsset({ files: [file('m.skp', 'skp', 'model')] })).size).toBe(1536)
+    expect(buildPluginRecord(sampleAsset({ size: 9999 })).size).toBe(9999)
+  })
+
+  it('b) importedAt 是毫秒数字、原值透传（0 也是合法值）', () => {
+    const ms = Date.UTC(2026, 10, 4, 10, 30, 15, 123)
+    const r = buildPluginRecord(sampleAsset({ importedAt: ms }))
+    expect(typeof r.importedAt).toBe('number')
+    expect(r.importedAt).toBe(ms)
+    expect(r.importedAt).toBeGreaterThan(1e12) // 毫秒，不是秒
+    expect(buildPluginRecord(sampleAsset({ importedAt: 0 })).importedAt).toBe(0)
+  })
+
+  it('c) lastUsedAt / useCount 为 undefined → null（键仍在，不是 0、不是键缺失）', () => {
+    const r = buildPluginRecord(sampleAsset({ lastUsedAt: undefined, useCount: undefined }))
+    for (const k of ['lastUsedAt', 'useCount'] as const) {
+      expect(Object.prototype.hasOwnProperty.call(r, k), k).toBe(true)
+      expect(r[k], k).toBe(null)
+      expect(r[k], k).not.toBe(0)
+    }
+    // 有值时原样透传；useCount=0 是合法计数，不当缺失
+    const used = buildPluginRecord(sampleAsset({ lastUsedAt: 1730000000000, useCount: 7 }))
+    expect(used.lastUsedAt).toBe(1730000000000)
+    expect(used.useCount).toBe(7)
+    expect(buildPluginRecord(sampleAsset({ useCount: 0 })).useCount).toBe(0)
+  })
+
+  it('d) NaN / Infinity / 字符串 / 负数 → null，四个键恒存在', () => {
+    const badValues: unknown[] = [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      '123',
+      -1
+    ]
+    for (const k of SORT_KEYS) {
+      for (const bad of badValues) {
+        const r = buildPluginRecord(sampleAsset({ [k]: bad } as never))
+        expect(Object.prototype.hasOwnProperty.call(r, k), `${k}=${String(bad)}`).toBe(true)
+        expect(r[k], `${k}=${String(bad)}`).toBe(null)
+      }
+    }
+  })
+
+  it('e) 旧 14 字段逐字保留、相对顺序不变，四个新键只追加在尾部', () => {
+    const r = buildPluginRecord(sampleAsset())
+    expect(Object.keys(r).slice(0, 14)).toEqual(OLD_KEYS)
+    expect(Object.keys(r)).toEqual([...OLD_KEYS, ...SORT_KEYS])
+    // 旧字段语义不因新字段漂移
+    expect(r.id).toBe('a1b2c3d4-0001')
+    expect(r.mainFile).toBe('测试模型.skp')
+    expect(r.files).toEqual([
+      { rel: '测试模型.skp', ext: 'skp' },
+      { rel: '预览图.jpg', ext: 'jpg' }
+    ])
+    expect(r.thumbRel).toBe('a1b2c3.jpg')
+    expect(r.suMajor).toBe(2024)
+    expect(r.updatedAt).toBe('2026-11-04T10:00:00.000Z')
+    expect(r.displayMetric).toBe('512 B')
+  })
+
+  it('f) 软删记录仍不入快照（新字段不绕过软删过滤）', () => {
+    const live = sampleAsset({ id: 'live', size: 1536, importedAt: 111, lastUsedAt: 222, useCount: 3 })
+    const deleted = sampleAsset({
+      id: 'gone',
+      deletedAt: 1730000000000,
+      size: 9999,
+      importedAt: 999,
+      lastUsedAt: 999,
+      useCount: 99
+    })
+    const records = buildPluginRecords([live, deleted])
+    expect(records.map((r) => r.id)).toEqual(['live'])
+    expect(records[0].size).toBe(1536)
+    expect(records.some((r) => r.id === 'gone')).toBe(false)
+  })
+
+  it('apiVersion 仍是 "1"、updatedAt 仍是 ISO 字符串（契约不因新字段升级）', () => {
+    expect(PLUGIN_API_VERSION).toBe('1')
+    const envelope = buildPluginEnvelope(buildPluginRecords([sampleAsset()]), {
+      generatedAt: '2026-11-04T10:00:00.000Z',
+      libraryRoot: LIB
+    })
+    expect(envelope.apiVersion).toBe('1')
+    expect(envelope.records[0].updatedAt).toBe('2026-11-04T10:00:00.000Z')
+    expect(envelope.records[0].updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
   })
 })

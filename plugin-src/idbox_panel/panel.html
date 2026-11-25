@@ -31,7 +31,9 @@
         菜单 / 工具栏关闭走 Ruby 的 close，A8「回调契约只增不删」故 Ruby 注册保留。
         勿据「页面没有入口」删此注册或本行契约。）
   Ruby 侧调用（execute_script）：
-    window.IDBOX.render(payload)    → 渲染整份数据（payload 只增字段：thumbsRoot、materialKinds）
+    window.IDBOX.render(payload)    → 渲染整份数据（payload 只增字段：thumbsRoot、materialKinds；
+                                       records 每条可选增 size / importedAt / lastUsedAt / useCount
+                                       四个排序字段 —— 旧快照缺键 ⇒ 对应排序键判为不可排、不进下拉）
     window.IDBOX.setStatus(obj)     → 底部状态行 { message, level }
 
   必须保留的 11 个 DOM id：
@@ -339,6 +341,34 @@
   .chip .caret { font-size: var(--fs-micro); color: inherit; }
   .header-count { margin-left: auto; font-size: var(--fs-body); color: var(--text-tertiary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
+  /* ── 排序：chip 触发器 + 浮层 + 独立方向按钮（T-SORT，对齐主程序形态）──
+     浮层绝对定位挂在 .sort-wrap（position:relative）上，z-index 抬到卡片之上；
+     只复用 --accent / --accent-tint 等既有 token，不引新主题、不引深色分支。 */
+  .sort-wrap { position: relative; display: inline-flex; align-items: center; gap: 6px; }
+  .sort-dir {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; padding: 0;
+    border: 1px solid var(--border); border-radius: var(--radius-chip);
+    background: var(--bg-canvas); color: var(--text-secondary);
+    font-size: var(--fs-body); font-family: inherit; line-height: 1; cursor: pointer;
+  }
+  .sort-dir:hover { border-color: var(--accent); color: var(--accent-text); }
+  .sort-dir:focus-visible, .sort-popover .sort-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .sort-popover {
+    display: none; position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
+    min-width: 148px; padding: 5px;
+    background: var(--bg-canvas); border: 1px solid var(--border);
+    border-radius: var(--radius-chip); box-shadow: var(--shadow-card);
+  }
+  .sort-popover.is-open { display: block; }
+  .sort-opt {
+    display: block; width: 100%; text-align: left; height: 30px; padding: 0 10px;
+    border: 0; border-radius: 4px; background: transparent;
+    color: var(--text-secondary); font-size: var(--fs-body); font-family: inherit; cursor: pointer;
+  }
+  .sort-opt:hover { background: var(--accent-tint); }
+  .sort-opt.is-active { background: var(--accent-tint); color: var(--accent-text); font-weight: 500; }
+
   /* ── ④ 卡片网格 ── */
   .grid {
     flex: 1 1 auto; overflow-y: auto; padding: 10px 14px 12px;
@@ -630,7 +660,9 @@
     activeCategory1: '',
     activeCategory2: '',   /* 二级分类；'' = 不筛选 */
     expandedL1: '',        /* 当前展开了哪个一级的二级树；'' = 都不展开 */
-    sortKey: 'default',
+    sortKey: 'recent',     /* 出厂默认 recent；旧快照 importedAt 全缺时 render() 回退 name */
+    sortDesc: null,        /* 三态：null=该键自然方向 / true=降序 / false=升序（T-SORT） */
+    sortOpen: false,       /* 排序浮层开合（T-SORT） */
     thumbsRoot: '',        /* 来自 payload（T04 才落字段），本卡默认空 ⇒ 首屏全 SVG 占位 */
     viewMode: 'grid',
     density: 'md',         /* 预览密度 lg/md/sm（= 网格 2/3/4 列，localStorage 记忆） */
@@ -664,8 +696,86 @@
     { key: 'other', label: '其他', icon: 'i-other', kinds: ['other'] }
   ];
 
-  var SORT_KEYS = ['default', 'name', 'category1', 'fileCount'];
-  var SORT_LABELS = { default: '默认排序', name: '按名称', category1: '按分类', fileCount: '按文件数' };
+  /* ── 排序键（T-SORT）──────────────────────────────────────────────────────
+     8 键 = 主程序 6 键（顺序 / 标签与 filters.ts::SORT_OPTIONS 逐字对齐）
+          + 插件独有 2 键（category1 / fileCount，插件既有能力保留，不删）。
+     ⚠️ 可得性：recent/size 需 importedAt/size 非 null；su 需 suMajor 非 null；
+        lastUsed/mostUsed 需 lastUsedAt/useCount 非 null；name/category1/fileCount 恒可得。
+        旧快照缺键 ⇒ 判为不可排、不进下拉，绝不把缺失当 0 排。 */
+  var SORT_KEYS = ['lastUsed', 'mostUsed', 'recent', 'name', 'size', 'su', 'category1', 'fileCount'];
+  var SORT_LABELS = {
+    lastUsed: '最近使用', mostUsed: '最常使用', recent: '按导入时间',
+    name: '按名称', size: '按大小', su: '按 SU 版本',
+    category1: '按分类', fileCount: '按文件数'
+  };
+  /* 镜像 src/renderer/logic/filters.ts:699-706 的 NATURAL_SORT_DESC：
+     true = 降序（新→旧 / 大→小），false = 升序（A→Z）。
+     ⚠️ 主程序与插件无法共享 TS 模块，这是手工镜像 —— 改主程序那张表时必须人工同步这里。
+     插件独有 category1（升序）/ fileCount（降序）沿用原插件分支的方向。 */
+  var NATURAL_SORT_DESC = {
+    lastUsed: true, mostUsed: true, recent: true, name: false,
+    size: true, su: true, category1: false, fileCount: true
+  };
+  var USAGE_HALF_LIFE_DAYS = 14;   /* 镜像 filters.ts::USAGE_HALF_LIFE_DAYS */
+  var MS_PER_DAY = 86400000;       /* 镜像 filters.ts::MS_PER_DAY */
+
+  /* 某排序键在当前快照是否可排（按可得性裁剪：不可排的键不进下拉）。 */
+  function sortKeyAvailable(key) {
+    if (key === 'name' || key === 'category1' || key === 'fileCount') { return true; }
+    var probeField = {
+      lastUsed: 'lastUsedAt', mostUsed: 'useCount', recent: 'importedAt',
+      size: 'size', su: 'suMajor'
+    }[key];
+    if (!probeField) { return false; }
+    var records = (state.data && state.data.records) ? state.data.records : [];
+    for (var i = 0; i < records.length; i += 1) {
+      var value = records[i] ? records[i][probeField] : null;
+      if (typeof value === 'number' && isFinite(value)) { return true; }
+    }
+    return false;
+  }
+
+  /* 某键（默认当前键）的自然方向；sortDesc 非 null 时用用户翻过的方向压过它。
+     ⚠️ visibleRecords 在当前键不可排时会兜底到 name，那里必须把兜底后的键传进来，
+     否则 sign 会错用旧键（recent 降序）的方向，把兜底的 name 排成 Z→A。 */
+  function effectiveSortDesc(key) {
+    var k = (key === undefined || key === null) ? state.sortKey : key;
+    return state.sortDesc === null ? !!NATURAL_SORT_DESC[k] : state.sortDesc;
+  }
+
+  /* 复位 / 出厂默认键：recent 可得就用 recent，旧快照 importedAt 全缺则回退 name。
+     方向随键复位到自然方向（调用处把 sortDesc 置 null）。 */
+  function defaultSortKey() {
+    return sortKeyAvailable('recent') ? 'recent' : 'name';
+  }
+
+  /* 「最常使用」的加权分（镜像 filters.ts::usageScore）：
+     score = useCount * 2 ** (-ageDays / 14)，ageDays = (now - lastUsedAt) / MS_PER_DAY。
+     边界：没用过（count<=0 / NaN）或时间非有限 ⇒ 0；时钟回拨（ageDays<0）按 0，
+     否则一次故障就能把某条顶成「最常用」。 */
+  function usageScore(record, now) {
+    var count = record.useCount;
+    if (!(typeof count === 'number' && isFinite(count) && count > 0)) { return 0; }
+    var at = record.lastUsedAt;
+    if (!(typeof at === 'number' && isFinite(at))) { return 0; }
+    var rawAgeDays = (now - at) / MS_PER_DAY;
+    var ageDays = rawAgeDays > 0 ? rawAgeDays : 0;
+    return count * Math.pow(2, -ageDays / USAGE_HALF_LIFE_DAYS);
+  }
+
+  /* 「从未使用」在时间轴上没有位置：-Infinity（镜像 filters.ts::NEVER_USED_AT）。
+     两个都没用过时相减得 NaN ⇒ || 次级键自然兜底（NaN falsy）。 */
+  function lastUsedAtOf(record) {
+    var value = record.lastUsedAt;
+    return (typeof value === 'number' && isFinite(value)) ? value : -Infinity;
+  }
+  function suMajorOf(record) {
+    var value = record.suMajor;
+    return (typeof value === 'number' && isFinite(value)) ? value : 0;
+  }
+  function nameCmp(a, b) {
+    return textOf(a.name).localeCompare(textOf(b.name), 'zh-CN');
+  }
 
   /* 一级分类里「没有 category1」那一档的显示名。
      口径对齐 ID BOX 本体（logic/category.ts::countLevel1）：按 category1 分组计数，
@@ -1149,6 +1259,21 @@
     return false;
   }
 
+  /* 安全数值：非 number / NaN / Infinity ⇒ 0。只在「该键可排」时才走到这里（不可排的键
+     已被 sortKeyAvailable 挡在下拉之外、并由下方兜底到 name），不会对整份旧快照的缺失键
+     做 Number(undefined) 当 0 的排序。 */
+  function numOf(value) {
+    return (typeof value === 'number' && isFinite(value)) ? value : 0;
+  }
+
+  /* 排序（T-SORT，镜像 filters.ts::sortAssets，不修改入参）。
+     一次比较只算一个 sign：+1 = 升序（小→大 / 旧→新 / A→Z），-1 = 降序。
+     各键的「升序差值」统一定义，方向按钮只翻 sign：
+       name = localeCompare(zh-CN)、category1 = localeCompare、fileCount = 文件数、
+       size = size、su = suMajor、recent = importedAt、
+       lastUsed = 最近使用时刻（未使用恒垫底、不随方向翻）、mostUsed = usageScore。
+     ⚠️ 次级键（su/lastUsed/mostUsed 平局按名称、mostUsed 再平局按最近使用）
+        **都不跟 sign 反**（filters.ts:801-803）：两个方向下次级顺序一致。 */
   function visibleRecords() {
     if (!state.data || !state.data.ok) { return []; }
     var records = scopedRecords();
@@ -1156,13 +1281,55 @@
     for (var i = 0; i < records.length; i += 1) {
       if (matches(records[i])) { shown.push(records[i]); }
     }
-    if (state.sortKey === 'name') {
-      shown.sort(function (a, b) { return textOf(a.name).localeCompare(textOf(b.name)); });
-    } else if (state.sortKey === 'category1') {
-      shown.sort(function (a, b) { return textOf(a.category1).localeCompare(textOf(b.category1)); });
-    } else if (state.sortKey === 'fileCount') {
-      shown.sort(function (a, b) { return Number(b.fileCount) - Number(a.fileCount); });
-    }
+    /* 当前键不可排（旧快照缺字段）⇒ 兜底按名称，绝不拿 undefined 当 0 排。 */
+    var key = sortKeyAvailable(state.sortKey) ? state.sortKey : 'name';
+    var sign = effectiveSortDesc(key) ? -1 : 1;
+    var now = Date.now();   /* 同一批比较共用一个基准，不在比较函数里反复读时钟 */
+    shown.sort(function (a, b) {
+      var by;
+      if (key === 'name') {
+        return sign * nameCmp(a, b);
+      }
+      if (key === 'category1') {
+        by = textOf(a.category1).localeCompare(textOf(b.category1), 'zh-CN');
+        return sign * by || nameCmp(a, b);
+      }
+      if (key === 'fileCount') {
+        by = numOf(a.fileCount) - numOf(b.fileCount);
+        return sign * by || nameCmp(a, b);
+      }
+      if (key === 'size') {
+        by = numOf(a.size) - numOf(b.size);
+        return sign * by || nameCmp(a, b);
+      }
+      if (key === 'su') {
+        by = suMajorOf(a) - suMajorOf(b);
+        return sign * by || nameCmp(a, b);   /* 次级名称不翻方向 */
+      }
+      if (key === 'lastUsed') {
+        /* 「从未使用」在时间轴上没有位置 ⇒ 两个方向都恒垫底，不随 sign 翻到前面。 */
+        var aNever = lastUsedAtOf(a) === -Infinity;
+        var bNever = lastUsedAtOf(b) === -Infinity;
+        if (aNever !== bNever) { return aNever ? 1 : -1; }
+        /* 都没用过：差值是 NaN（-Inf - -Inf）⇒ falsy ⇒ 落到名称次级键。 */
+        by = sign * (lastUsedAtOf(a) - lastUsedAtOf(b));
+        return by || nameCmp(a, b);
+      }
+      if (key === 'mostUsed') {
+        var score = sign * (usageScore(a, now) - usageScore(b, now));
+        if (score > 0) { return 1; }
+        if (score < 0) { return -1; }
+        /* 平局①：最近用过的在前（不随 sign 翻，是事实排序）。 */
+        var byRecent = lastUsedAtOf(b) - lastUsedAtOf(a);
+        if (byRecent > 0) { return 1; }
+        if (byRecent < 0) { return -1; }
+        /* 平局②：名称 A→Z（同样不随 sign 翻）。 */
+        return nameCmp(a, b);
+      }
+      /* recent / default 兜底：按导入时间。 */
+      by = numOf(a.importedAt) - numOf(b.importedAt);
+      return sign * by || nameCmp(a, b);
+    });
     return shown;
   }
 
@@ -1481,13 +1648,46 @@
     all.setAttribute('data-chip', 'reset');
     chips.appendChild(all);
 
-    /* T03 第 7 步（D04）：type / category 两颗假 chip 已删——分类入口在左栏树里，
-       chips 无浮层、靠点击循环切换的降级方案对分类已无意义。这里只剩「清除筛选」+「排序」。 */
-    var sortChip = make('button', 'chip chip-ghost' + (state.sortKey !== 'default' ? ' is-active' : ''));
-    sortChip.type = 'button';
-    sortChip.setAttribute('data-chip', 'sort');
-    sortChip.appendChild(document.createTextNode(SORT_LABELS[state.sortKey] || '排序'));
-    chips.appendChild(sortChip);
+    /* T-SORT：排序从「点 chip 循环切换」改为「触发器开浮层 + 独立 ↑↓ 方向按钮」。
+       触发器 = data-chip="sort-toggle"，选项 = "sort-opt"（带 data-sort），方向 = "sort-dir"。
+       只把「可得」的键渲染成选项：旧快照缺字段的键不进下拉。 */
+    var sortWrap = make('span', 'sort-wrap');
+
+    var sortToggle = make('button', 'chip chip-ghost' + (state.sortOpen ? ' is-active' : ''));
+    sortToggle.type = 'button';
+    sortToggle.setAttribute('data-chip', 'sort-toggle');
+    sortToggle.setAttribute('aria-haspopup', 'listbox');
+    sortToggle.setAttribute('aria-expanded', state.sortOpen ? 'true' : 'false');
+    sortToggle.appendChild(document.createTextNode(SORT_LABELS[state.sortKey] || '排序'));
+    sortToggle.appendChild(make('span', 'caret', state.sortOpen ? '▴' : '▾'));
+    sortWrap.appendChild(sortToggle);
+
+    var sortDir = make('button', 'sort-dir');
+    sortDir.type = 'button';
+    sortDir.setAttribute('data-chip', 'sort-dir');
+    var dirDesc = effectiveSortDesc();
+    sortDir.textContent = dirDesc ? '↓' : '↑';
+    var dirHint = dirDesc ? '当前降序，点击切换为正序' : '当前正序，点击切换为降序';
+    sortDir.title = dirHint;
+    sortDir.setAttribute('aria-label', dirHint);
+    sortWrap.appendChild(sortDir);
+
+    var popover = make('div', 'sort-popover' + (state.sortOpen ? ' is-open' : ''));
+    popover.setAttribute('role', 'listbox');
+    for (var si = 0; si < SORT_KEYS.length; si += 1) {
+      var key = SORT_KEYS[si];
+      if (!sortKeyAvailable(key)) { continue; }
+      var opt = make('button', 'sort-opt' + (key === state.sortKey ? ' is-active' : ''));
+      opt.type = 'button';
+      opt.setAttribute('data-chip', 'sort-opt');
+      opt.setAttribute('data-sort', key);
+      opt.setAttribute('role', 'option');
+      opt.setAttribute('aria-selected', key === state.sortKey ? 'true' : 'false');
+      opt.appendChild(document.createTextNode(SORT_LABELS[key] || key));
+      popover.appendChild(opt);
+    }
+    sortWrap.appendChild(popover);
+    chips.appendChild(sortWrap);
 
     /* 「共 N 项」用 #count（§4.1 必保留 id），挂在 chips 行右侧 */
     if (countNode) { chips.appendChild(countNode); }
@@ -1592,6 +1792,16 @@
   /* ── 对 Ruby 暴露的入口 ──────────────────────────────────────────── */
   function render(data) {
     state.data = data || null;
+    /* T-SORT 默认键复位：出厂 recent，若当前快照没有一条记录带 importedAt（旧快照缺键）
+       ⇒ 回退 name，避免下拉里出现一个点了也排不动的「按导入时间」。用户已显式选过的
+       键若在新快照里变得不可排，同样回退，保证 chip 标签与实际排序口径一致。
+       这些 sort* 写入也统一塞进下面的 commit patch，不在这里直接改 state。 */
+    var sortPatch = {};
+    if (!sortKeyAvailable(state.sortKey)) {
+      sortPatch.sortKey = defaultSortKey();
+      sortPatch.sortDesc = null;
+    }
+    sortPatch.sortOpen = false;   /* 换整份数据时收起排序浮层 */
     /* 每次整份数据重绘（首开 ready / 手动刷新 / 轮询发现索引变化）都收起胶囊：
        旧的成功提示不该跨一次「重新读索引」继续显示。 */
     dismissUndoPill();
@@ -1606,8 +1816,9 @@
     renderBanner(data || { ok: false, message: '没有数据' });
     renderNotes(data);
     renderFreshness();
-    /* 整份数据重绘 = 四区全亮：走 commit(null, 'reset')，不再手抄四件套 */
-    commit(null, 'reset');
+    /* 整份数据重绘 = 四区全亮：把 sort* 复位并进 patch，走 commit(…, 'reset')，
+       不再手抄四件套；sort* 因此也只有 commit 这一个 state 写入口。 */
+    commit(sortPatch, 'reset');
   }
 
   window.IDBOX = {
@@ -1682,7 +1893,7 @@
     $('clear').className = 'clear hidden';
     commit({
       query: '', activeKind: '', activeCategory1: '', activeCategory2: '',
-      expandedL1: '', sortKey: 'default'
+      expandedL1: '', sortKey: defaultSortKey(), sortDesc: null, sortOpen: false
     }, 'reset');
   });
 
@@ -1821,30 +2032,48 @@
     }, 'category1');
   });
 
-  /* chips 无浮层（React 能力），降级为点击循环切换，三态 class 保留 */
+  /* T-SORT chips 事件：触发器开合浮层 / 选项应用（换键复位方向）/ 独立方向按钮翻转。
+     取值全部经 commit 写入 state，重绘范围由 REDRAW_MATRIX 决定。 */
   $('chips').addEventListener('click', function (event) {
     var chip = event.target;
     while (chip && !chip.getAttribute('data-chip')) { chip = chip.parentNode; }
     if (!chip) { return; }
     var which = chip.getAttribute('data-chip');
     if (which === 'reset') {
+      /* 清除筛选 = 排序也回出厂默认键 + 自然方向 + 收起浮层 */
       commit({
         activeKind: '', activeCategory1: '', activeCategory2: '',
-        expandedL1: '', sortKey: 'default'
+        expandedL1: '', sortKey: defaultSortKey(), sortDesc: null, sortOpen: false
       }, 'reset');
       return;
     }
-    /* T03 第 7 步（D04）：which === 'type' / 'category' 两个分支已随两颗假 chip 一起删除；
-       chips 只剩「清除筛选」与「排序」。nextIn 仍被 sort 使用，保留。 */
-    if (which === 'sort') {
-      commit({ sortKey: nextIn(SORT_KEYS, state.sortKey) }, 'sort');
+    if (which === 'sort-toggle') {
+      /* 只开 / 关浮层，不改排序键与方向 ⇒ 只重绘 chips */
+      commit({ sortOpen: !state.sortOpen }, 'sortOpen');
+      return;
+    }
+    if (which === 'sort-opt') {
+      var key = chip.getAttribute('data-sort') || '';
+      if (SORT_KEYS.indexOf(key) < 0 || !sortKeyAvailable(key)) { return; }
+      /* 换键 ⇒ 方向复位到该键自然方向（sortDesc=null）；重复点当前键只收起浮层、不动方向。 */
+      var patch = { sortKey: key, sortOpen: false };
+      if (key !== state.sortKey) { patch.sortDesc = null; }
+      commit(patch, 'sort');
+      return;
+    }
+    if (which === 'sort-dir') {
+      /* 写「生效方向取反」，不是三态轮转：null（自然方向）时第一次点击必须真的翻转。
+         只重绘 list；方向按钮的图标 / 文案就地更新（见下方 sortDir 分支）。 */
+      var nextDesc = !effectiveSortDesc();
+      commit({ sortDesc: nextDesc }, 'sortDir');
+      var glyph = nextDesc ? '↓' : '↑';
+      var hint = nextDesc ? '当前降序，点击切换为正序' : '当前正序，点击切换为降序';
+      chip.textContent = glyph;
+      chip.title = hint;
+      chip.setAttribute('aria-label', hint);
+      return;
     }
   });
-
-  function nextIn(list, current) {
-    var index = list.indexOf(current);
-    return list[(index + 1) % list.length];
-  }
 
   /* 重绘矩阵：哪些原因需要重绘哪些区域。true = 重绘。
      原则：改筛选 → 左栏高亮 + chips + 列表 + 计数都要变；
@@ -1854,7 +2083,9 @@
     kind:     { side: true,  chips: true,  list: true,  count: true },
     category1:{ side: true,  chips: true,  list: true,  count: true },
     category2:{ side: true,  chips: true,  list: true,  count: true },
-    sort:     { side: false, chips: true,  list: true,  count: false },
+    sort:     { side: false, chips: true,  list: true,  count: false }, /* 选项应用：换键 ⇒ chip 文案 + 列表都变 */
+    sortOpen: { side: false, chips: true,  list: false, count: false }, /* 浮层开合：只重绘 chips */
+    sortDir:  { side: false, chips: false, list: true,  count: false }, /* 方向翻转：只重绘 list；图标就地更新 */
     query:    { side: false, chips: false, list: true,  count: true },
     reset:    { side: true,  chips: true,  list: true,  count: true },
     density:  { side: false, chips: false, list: true,  count: false },
@@ -1890,8 +2121,8 @@
     }
   });
 
-  /* ESC：折叠态下先展开（用户下意识按 Esc 想退出窄条）；
-     否则沿用「取消 chips 筛选」语义。 */
+  /* ESC 优先级：折叠态先展开 → 排序浮层开着先只关浮层（保留筛选/排序）→ 最后才复位筛选。
+     T-SORT：浮层是"最上层"，Esc 应先收掉它而不是连带把用户调好的筛选一起清空。 */
   document.addEventListener('keydown', function (event) {
     var key = textOf(event && event.key);
     if (key !== 'Escape' && key !== 'Esc') { return; }
@@ -1900,10 +2131,15 @@
       setStatus({ message: '已展开面板（Esc）', level: 'info' });
       return;
     }
-    if (!state.activeKind && !state.activeCategory1 && !state.activeCategory2 && state.sortKey === 'default') { return; }
+    if (state.sortOpen) {
+      commit({ sortOpen: false }, 'sortOpen');
+      return;
+    }
+    if (!state.activeKind && !state.activeCategory1 && !state.activeCategory2 &&
+        state.sortKey === defaultSortKey() && state.sortDesc === null) { return; }
     commit({
       activeKind: '', activeCategory1: '', activeCategory2: '',
-      expandedL1: '', sortKey: 'default'
+      expandedL1: '', sortKey: defaultSortKey(), sortDesc: null, sortOpen: false
     }, 'reset');
     setStatus({ message: '已取消筛选（Esc）', level: 'info' });
   });

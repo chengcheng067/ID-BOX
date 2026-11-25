@@ -149,22 +149,29 @@
  * 中心消隐，见 `glass-folder.css` 的「退场」一节），它既不该被平移到边缘、也不该被淡出
  * —— 它正是这一刻画面中央的主角。这个 `:not` 就是"把主角从群众演员里摘出来"的开关。
  *
- * 为什么按 `nth-child(-n+2)` / `nth-child(n+3)` 切半：`GlassFolder` 的 props 里没有
- * `className` / `style`（签名定死），父级没法给某一张卡单独打标记；而这一排的子节点
- * **只可能是**这些文件夹卡，顺序与 `folders` 数组一一对应。
- * 切分与实际的文件夹数（当前 4 张，上限 5 张）：
+ * 为什么按 `data-exit-half` 而不是 `nth-child` 切半（2026-11-25 拖动排序）：
+ * 首页文件夹排可以鼠标拖动排序后，**视觉顺序靠 flex `order`、DOM 顺序仍是
+ * 「大类 map → 钉选 map」两段**，`nth-child` 切出来的一半和用户看到的左右两半
+ * 不再对应（会把视觉左半的卡往右赶）。所以由 `HomeCover` 按**排序后的视觉槽位
+ * 下标**给每张卡写 `data-exit-half='left' | 'right'`（n = 大类 + 钉选，虚卡不计；
+ * `i < ceil(n/2)` 为 left），这里只认属性，不猜 DOM。
+ * 切分与实际的文件夹数（当前 4 张，上限 5 张 + 若干钉选）：
  *   · 4 张：第 1、2 张向左，第 3、4 张向右 —— 正好对半，最理想；
- *   · 5 张：第 1、2 张向左，第 3、4、5 张向右 —— 中间那张（下标 2）归右，可接受
- *     （它本来就是中位线上的一张，往哪边都不会读错）。
- * 不为 5 张单独写一套规则：视觉上 2/3 与 2/2 的差别远小于"多一条要同步维护的规则"。
+ *   · 5 张：第 1、2、3 张向左，第 4、5 张向右（`ceil(5/2)=3`）。
+ * 「新建项目」虚卡恒在末位，由组件自己写死 `right`。
  */
 .hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self']) {
-  --ho-exit-x: -40px;
-  translate: var(--ho-exit-x) 0;
+  translate: var(--ho-exit-x, 0px) 0;
   opacity: 0;
 }
 
-.hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self']):nth-child(n + 3) {
+/* 左半排：向左退 40px */
+.hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self'])[data-exit-half='left'] {
+  --ho-exit-x: -40px;
+}
+
+/* 右半排：向右退 40px */
+.hc-root[data-leaving='true'] .hc-folder-row > .gf-root:not([data-leaving='self'])[data-exit-half='right'] {
   --ho-exit-x: 40px;
 }
 

@@ -1,0 +1,157 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 「新建项目」虚卡 · 文件夹形态（v1.2 反馈批 A 改版，原 docs/60 §4.3 W0 T-03）
+ *
+ * 用户原话：「如果要新建项目，我认为它的外观可以是现在这个期望的文件夹，只不过
+ * 中间有一个加号，下面有"新建项目"的字样。这个文件夹会比其他的文件夹更透明，
+ * 但不会完全透明，仅此而已。」（旧虚线框 + 灰字形态被否）
+ *
+ * 结构：根节点 = `gf-root np-new-card`（GlassFolder.tsx 的 NewProjectFolderCard）。
+ * 形状/层级/hover/入场全部来自 glass-folder.css 的 `.gf-root` 系（BACK_PATH /
+ * FRONT_PATH clip、stage 缩放、tilt、`--gf-scale` 尺寸阶梯、`.gf-root:hover`
+ * 三态），本文件**只**写"虚卡与真文件夹的差异"：
+ *
+ *   ① 更透明（但不是全透明）：在 `.np-new-card` 上整体调低 `--gf-back-fill` /
+ *      `--gf-front-tint` / `--gf-edge-shadow`，磨砂 blur 也轻一档 ——
+ *      自定义属性按级联继承，正好只影响这一张卡；
+ *   ② 中央「+」+ 下方「新建项目」（`.np-face`）：与 `.gf-label` 同一纪律 ——
+ *      **不参与缩放**（整组缩到 ~0.3 倍，进 stage 就读不清了），常驻可读字号；
+ *   ③ 地面投影更轻（虚卡是"还没存在的项目"，视觉重量应比真文件夹低半档）。
+ *
+ * ⚠️ glass-folder.css 的尺寸阶梯媒体查询直接命中 `.gf-root`，本文件末尾的阶梯
+ *    是同值副本（逐档同步的纪律原件）：改 glass-folder.css 的阶梯时，这里必须
+ *    同步 —— 两处注释互相点名。
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* ── ① 透明度档（浅 / 深两套，与 glass-folder.css 的 token 分档同构）────────── */
+.np-new-card {
+  --gf-back-fill: rgba(255, 255, 255, 0.32);
+  --gf-front-fill: rgba(255, 255, 255, 0.9);
+  /* 前翻盖 tint：整体比常态档（0.34→0.97）淡一档以上，但下沿仍保有 0.58 的白雾，
+     "更透但不全透"就是这个数感 —— 再淡就读成虚线框旧形态了 */
+  --gf-front-tint: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.16) 0%,
+    rgba(255, 255, 255, 0.3) 42%,
+    rgba(255, 255, 255, 0.58) 100%
+  );
+  --gf-edge-shadow: drop-shadow(0 1px 1px rgba(15, 23, 42, 0.05))
+    drop-shadow(0 8px 16px rgba(15, 23, 42, 0.1));
+}
+
+[data-theme='dark'] .np-new-card {
+  /* 2026-11-26：跟随常态卡深色背板 0.055→0.20，本虚卡同步 0.04→0.15，
+     仍比常态卡略透一档（虚卡"更透但不全透"的形态纪律不变）。 */
+  --gf-back-fill: rgba(255, 255, 255, 0.15);
+  --gf-front-fill: rgba(255, 255, 255, 0.07);
+  --gf-front-tint: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.04) 0%,
+    rgba(255, 255, 255, 0.08) 42%,
+    rgba(255, 255, 255, 0.13) 100%
+  );
+  --gf-edge-shadow: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.3))
+    drop-shadow(0 10px 20px rgba(0, 0, 0, 0.4));
+}
+
+/* 虚卡**不用** backdrop-filter（2026-11-25 圆角返工）：Chromium 130 下
+   backdrop-filter 叠 clip-path: path() 的 3D 合成层会把形状的圆弧拍平成直角，
+   且滤镜矩形比背板更宽（真机截图见 frost-check/real-third-hover*.png）。
+   虚卡背后只有纯色壁纸/页面底色，没有需要磨砂的内容，直接去掉即可；
+   它仍保留 --gf-front-tint 的浅玻璃渐变与 C 曲线圆角（与真卡同形状）。 */
+
+/* ── ③ 地面投影更轻 ─────────────────────────────────────────────────────────── */
+.np-new-card .gf-shadow {
+  opacity: 0.55;
+}
+
+/* ── ② 中央「+」+「新建项目」───────────────────────────────────────────────────
+   压在前翻盖区域内居中：stage 坐标系里前翻盖占 y=74..272，top 按 --gf-scale
+   换算到渲染坐标；bottom 留一点让整组重心略靠上（文件夹"开口"方向）。 */
+.np-face {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(74px * var(--gf-scale));
+  bottom: calc(22px * var(--gf-scale));
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  pointer-events: none;
+  transition: opacity 0.32s var(--gf-ease, cubic-bezier(0.2, 0.8, 0.2, 1))
+    calc(var(--gf-enter-delay, 0ms) + 0.22s);
+}
+
+.np-face-plus {
+  display: flex;
+  /* 字色跟卡片走（卡片恒为浅玻璃 ⇒ 图标恒为深色），与 .gf-name 同一取值口径 */
+  color: rgba(20, 20, 22, 0.85);
+  transition: color 160ms ease;
+}
+
+/* hover：与普通文件夹一致的 stage 三态之外，加号提亮到 accent ——
+   「这是个动作入口」的最小示意，不做尺寸/位移变化（位移已由翻盖三态承担） */
+.np-new-card:hover .np-face-plus,
+.np-new-card:focus-visible .np-face-plus {
+  color: var(--accent);
+}
+
+.np-face-label {
+  font-size: 12px;
+  line-height: 1.25;
+  color: rgba(20, 20, 22, 0.78);
+}
+
+/* 小窗字号回退：与 glass-folder.css 的 .gf-name 同一档（11px @ <1100） */
+@media (max-width: 1099px) {
+  .np-face-label {
+    font-size: 11px;
+  }
+}
+
+/* 入场：文字与文件夹本体同步淡入（本体由 glass-folder.css 的 not([data-entered]) 管） */
+.np-new-card:not([data-entered='true']) .np-face {
+  opacity: 0;
+}
+
+/* ── 尺寸阶梯：整段与 glass-folder.css「尺寸阶梯」节逐档同步 ─────────────── */
+@media (min-width: 1100px) {
+  .np-new-card {
+    --gf-scale: 0.33; /* 112px */
+  }
+}
+
+@media (min-width: 1200px) {
+  .np-new-card {
+    --gf-scale: 0.349; /* 119px */
+  }
+}
+
+@media (min-width: 1300px) {
+  .np-new-card {
+    --gf-scale: 0.388; /* 132px */
+  }
+}
+
+@media (min-width: 1400px) {
+  .np-new-card {
+    --gf-scale: 0.427; /* 145px */
+  }
+}
+
+@media (min-width: 1440px) {
+  .np-new-card {
+    --gf-scale: 0.443; /* 151px —— 1440 基准窗 */
+  }
+}
+
+@media (min-width: 1520px) {
+  .np-new-card {
+    --gf-scale: 0.474; /* 161px（上限） */
+  }
+}
+
+/* 减少动效：根节点与后代的过渡/动画由 glass-folder.css 的 `.gf-root *` 覆盖块
+   统一归零；`.np-face` 是 `.gf-root` 后代，无需重复声明。 */

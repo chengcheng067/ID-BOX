@@ -1,9 +1,31 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, nativeImage, type NativeImage } from 'electron'
 import fs from 'node:fs/promises'
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import path from 'node:path'
 import {
   IPC,
+  type FsCompressEntriesInput,
+  type FsCompressEntriesResult,
+  type FsEntry,
+  type FsEntryThumbInput,
+  type FsExtractArchiveInput,
+  type FsExtractArchiveResult,
+  type FsListDirInput,
+  type FsListDirResult,
+  type FsMkdirInput,
+  type FsMkdirResult,
+  type FsOpenEntryInput,
+  type FsOpenEntryResult,
+  type FsOpenWithInput,
+  type FsOpenWithResult,
+  type FsRenameEntryInput,
+  type FsRenameEntryResult,
+  type FsRevealEntryInput,
+  type FsRevealEntryResult,
+  type FsTrashEntriesInput,
+  type FsTrashEntriesResult,
+  type FsTrashFailedItem,
   type HomeBackgroundSaveInput,
   type PackageExportInput,
   type PackageExportProgressEvent,
@@ -11,7 +33,13 @@ import {
   type PackageImportApplyInput,
   type PackageImportProgressEvent,
   type PackageImportResult,
-  type PackageInspectResult
+  type PackageInspectResult,
+  type PickDirectoryInput,
+  type PinnedEntryThumbResult,
+  type ProjectCreateInput,
+  type ProjectCreateResult,
+  type TemplateScanInput,
+  type TemplateScanResult
 } from '../shared/ipc'
 import { resolveExternalUrl, truncateUrlForLog } from '../shared/urlPolicy'
 import {
@@ -76,6 +104,24 @@ import {
   validateBallImageBase64
 } from './ballThumb'
 import { applyLayoutMigration, moveAssetCategory, planLayoutMigration } from './layout'
+import { buildProjectPlan, createProjectDirs } from './projectCreate'
+import { scanTemplateFromDir } from './templateScan'
+import { readDirEntries, resolveWithinPinRoot } from './pinnedDirGuard'
+import { revealEntryInExplorer } from './pinnedReveal'
+import { pinnedThumbsDir, resolveThumbForEntry } from './pinnedThumb'
+import {
+  OPS_TIMEOUT_MS,
+  compressWithPowerShell,
+  compressWith7z,
+  deriveExtractDirName,
+  deriveZipName,
+  extractWith7z,
+  findPathEscape,
+  isArchiveName,
+  resolveEntryPath,
+  validateEntryName
+} from './archiveOps'
+import { SEVEN_ZIP_DOWNLOAD_URL } from '../shared/types'
 import { applyKindMigration, detectKindMigration, planKindMigration } from './kindMigrate'
 import {
   detectMaterialMerge,
@@ -1087,7 +1133,9 @@ function bootstrap(): void {
       thumbsDir: thumbsDir(),
       hdrDir: hdrCacheDir(),
       // 首页自定义背景图缓存（bg://<sha256>.<ext>，V1.0 docs/55 §2.1.4）
-      bgDir: backgroundCacheDir()
+      bgDir: backgroundCacheDir(),
+      // 钉选目录文件缩略图缓存（pinned-thumb://<缓存文件名>，图标视图预览）
+      pinnedThumbsDir: pinnedThumbsDir()
     }))
     await fs.mkdir(settings.libraryDir, { recursive: true }).catch(() => {})
     // 启动时先清掉上次崩溃可能留下的 .staging 垃圾
@@ -1301,6 +1349,660 @@ ipcMain.handle(IPC.pickWatchDir, async () => {
     buttonLabel: '监控此目录'
   })
   return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
+})
+
+/**
+ * 通用选目录（docs/60 §5.2 通道 1）：标题参数化，新建项目向导（T-03）与
+ * 首页「添加快速访问」（T-05）共用。返回目录绝对路径 / null（取消）。
+ * `createDirectory` 与 `pickWatchDir` 同款（允许在对话框里直接新建文件夹）。
+ */
+ipcMain.handle(IPC.pickDirectory, async (_e, input: PickDirectoryInput) => {
+  const title = typeof input?.title === 'string' && input.title.length > 0 ? input.title : '选择文件夹'
+  const buttonLabel =
+    typeof input?.buttonLabel === 'string' && input.buttonLabel.length > 0
+      ? input.buttonLabel
+      : '选择'
+  const r = await dialog.showOpenDialog(win!, {
+    properties: ['openDirectory', 'createDirectory'],
+    title,
+    buttonLabel
+  })
+  return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
+})
+
+/**
+ * 打开首页快速访问（钉选）文件夹（docs/60 §5.2 通道 3）。
+ *
+ * 安全边界（与 0.9.2 守卫同一防御思想，零放宽 `allowedOpenRoots`）：
+ * - 渲染层只传 `HomePinnedFolder.id`；主进程**按 id 从自己的 settings**
+ *   解析 `absPath`（不信渲染层传来的路径 —— 渲染层被注入也不能打开任意目录）；
+ * - `existsSync` 不通过（磁盘目录被改名 / 删除）→ 返回中文错误，不调 shell；
+ * - 成功走 `shell.showItemInFolder`（先例 `plugin:exportRbz`，本文件 :2229），
+ *   **不经** `shell:openPath` / `shell:reveal` 通道 —— 那两条的守卫只放行库根 ∪ 日志目录。
+ *
+ * 返回 `null` = 成功；字符串 = 中文错误（渲染层可直接展示）。永不 reject。
+ */
+ipcMain.handle(IPC.homePinnedOpen, (_e, id: unknown) => {
+  if (typeof id !== 'string' || id.length === 0) return '未找到对应的快速访问文件夹'
+  const pinned = settings?.homePinnedFolders ?? []
+  const target = pinned.find((p) => p.id === id)
+  if (!target) {
+    logWarn('ipc:guard', { channel: 'homePinnedOpen', reason: 'unknown-id' })
+    return '未找到对应的快速访问文件夹，请重新添加'
+  }
+  if (!existsSync(target.absPath)) {
+    return '文件夹不存在或已被移动，可从快速访问移除后重新添加'
+  }
+  shell.showItemInFolder(target.absPath)
+  return null
+})
+
+/**
+ * 新建项目（docs/60 §5.2 通道 2，T-03）。两阶段：全量预检 → 逐个 mkdir。
+ *
+ * 安全边界（docs/60 §4.3 安全拒绝分支表，W6-W9）：
+ * - **W6 加固**：渲染层传来的 `template` 不可信 —— `buildProjectPlan` 重跑
+ *   `normalizeProjectTemplate`（清洗 / 4 级剪枝 / 256 节点截断），根名走
+ *   `resolveRootName` 两分支（编号可选）。渲染层被注入也写不出超深 / 超多目录；
+ * - **W7 预检**：任一目标路径已存在 → 整体拒绝、零创建，错误串指明冲突目录；
+ * - **W8 落盘**：半程 IO 失败不回滚不删除，`dirsCreated` 如实回传；
+ * - **W9 收尾**：成功后主进程 `shell.showItemInFolder(rootPath)`（不经渲染层
+ *   `shell:reveal` / `shell:openPath` —— 0.9.2 守卫只放行库根 ∪ 日志目录，
+ *   先例 `plugin:exportRbz`）；自动钉选由渲染层做（`addHomePinnedFolder`）。
+ *
+ * 失败日志记 `project:create-failed`（docs/57 §6 F-3/F-4：失败必须留日志）。
+ * 全程 try/catch 收口 `{ok:false, error:中文单行}`，**永不 reject**。
+ */
+ipcMain.handle(IPC.projectCreate, (_e, input: ProjectCreateInput): ProjectCreateResult => {
+  try {
+    const plan = buildProjectPlan(input)
+    if (!plan.ok) return plan
+    const result = createProjectDirs(plan)
+    if (!result.ok) {
+      logWarn('project:create-failed', {
+        parentDir: plan.parentDir,
+        rootName: plan.rootName,
+        error: result.error,
+        dirsCreated: result.dirsCreated ?? 0
+      })
+      return result
+    }
+    logInfo('project:create', { rootPath: result.rootPath, dirsCreated: result.dirsCreated })
+    shell.showItemInFolder(result.rootPath)
+    return result
+  } catch (err) {
+    logError('project:create-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, error: '创建项目文件夹失败，请重试' }
+  }
+})
+
+/**
+ * 拖入文件夹扫描 → 项目模板草稿（v1.2 反馈批 C，设置页「项目文件夹模板」卡）。
+ *
+ * **纯只读**：实现全部在 `templateScan.ts`（扫描 / 清洗 / 限额 / 丢弃统计），
+ * handler 只做日志与永不 reject 收口。写入侧由渲染层走既有
+ * `saveSettings({ projectTemplates })` 链路，且**必须经预览确认层**（用户点
+ * 「生成模板」才落草稿）—— 本通道绝不写盘、绝不静默入档。
+ *
+ * 失败日志记 `template:scan-failed`（docs/57 §6 F-3/F-4：失败必须留日志）。
+ */
+ipcMain.handle(IPC.templateScanFromDir, (_e, input: TemplateScanInput): TemplateScanResult => {
+  try {
+    const result = scanTemplateFromDir(input)
+    if (!result.ok) {
+      logWarn('template:scan-failed', { error: result.error })
+      return result
+    }
+    logInfo('template:scan', {
+      scannedDirs: result.scannedDirs,
+      truncatedDepth: result.truncated.depth,
+      truncatedNodes: result.truncated.nodes
+    })
+    return result
+  } catch (err) {
+    logError('template:scan-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, error: '扫描文件夹失败，请重试' }
+  }
+})
+
+/**
+ * 按 `pinId` 从**主进程自己的 settings** 解析钉选根（`fs:listDir` / `fs:openEntry`
+ * 共用的第一步）。渲染层传来的任何路径都不信 —— 只收 id，路径由这里给出。
+ * 找不到 id 记一条 `ipc:guard` warn（钉选可能已被移除 / 渲染层状态过期）。
+ *
+ * @returns `{ok:true, absPath}` = 已登记且仍存在的钉选根；否则 `{ok:false, error:中文单行}`
+ */
+function resolvePinnedRootById(pinId: unknown): { ok: true; absPath: string } | { ok: false; error: string } {
+  if (typeof pinId !== 'string' || pinId.length === 0) {
+    return { ok: false, error: '未找到对应的快速访问文件夹' }
+  }
+  const pinned = settings?.homePinnedFolders ?? []
+  const pin = pinned.find((p) => p.id === pinId)
+  if (!pin) {
+    logWarn('ipc:guard', { channel: 'pinnedFs', reason: 'unknown-id' })
+    return { ok: false, error: '未找到对应的快速访问文件夹，请重新添加' }
+  }
+  if (!existsSync(pin.absPath)) {
+    return { ok: false, error: '文件夹不存在或已被移动，可从快速访问移除后重新添加' }
+  }
+  return { ok: true, absPath: pin.absPath }
+}
+
+/**
+ * 只读列出钉选（快速访问）目录的一层条目（v1.2 反馈批 B，`fs:listDir`）。
+ *
+ * 应用内浏览（`PinnedFolderBrowser`）的数据面：双击钉选卡不再弹资源管理器，
+ * 渲染层每下钻一层调一次本通道。**守卫零放宽**：
+ * - 钉选根按 id 白名单解析（`resolvePinnedRootById`，不信渲染层路径）；
+ * - `relPath` 经 `resolveWithinPinRoot` 逐段 resolve + 前缀校验
+ *   （`..` 穿越 / 绝对路径注入 / 盘符切换全被拒，越界记 `ipc:guard` warn）；
+ * - 0.9.2 的 `allowedOpenRoots` **不为钉选目录开口** —— 钉选目录走自己的 id 白名单；
+ * - 只读：列目录实现在 `main/pinnedDirGuard.ts#readDirEntries`（跳隐藏 / 跳软链 /
+ *   目录在前 / 2000 条硬上限），本 handler 不写任何盘。
+ *
+ * 全程 try/catch 收口 `FsListDirResult`，**永不 reject**。
+ */
+ipcMain.handle(IPC.fsListDir, (_e, input: FsListDirInput): FsListDirResult => {
+  try {
+    const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+    const relPath = typeof input?.relPath === 'string' ? input.relPath : ''
+    const root = resolvePinnedRootById(pinId)
+    if (!root.ok) return { ok: false, error: root.error }
+    const guard = resolveWithinPinRoot(root.absPath, relPath)
+    if (!guard.ok) {
+      logWarn('ipc:guard', { channel: 'fsListDir', reason: 'out-of-root' })
+      return { ok: false, error: guard.error }
+    }
+    // 列的是目录不是文件：根下面的子段可能已被移走 / 换成了文件（竞态）
+    let st
+    try {
+      st = statSync(guard.absPath)
+    } catch {
+      return { ok: false, error: '文件夹不存在或已被移动，可从快速访问移除后重新添加' }
+    }
+    if (!st.isDirectory()) {
+      return { ok: false, error: '这不是一个文件夹' }
+    }
+    return readDirEntries(guard.absPath)
+  } catch (err) {
+    logError('fs:listDir-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, error: '读取文件夹失败，请重试' }
+  }
+})
+
+/**
+ * 用系统默认程序打开钉选目录内的一个条目（v1.2 反馈批 B，`fs:openEntry`）。
+ *
+ * 文件双击的「直达」：目录浏览留在软件内，文件仍按系统关联程序打开 ——
+ * 这是用户需求的原意（「软件代替资源管理器的**功能**」，不是替掉系统打开文件）。
+ * 守卫与 `fs:listDir` 完全同一套（id 白名单 + `resolveWithinPinRoot` 前缀校验，
+ * 两条通道**没有**任何一条共用 0.9.2 的 `allowedOpenRoots`，也没有放宽它）；
+ * `shell.openPath` 是 Electron 官方给「系统默认程序打开」的唯一入口，错误串
+ * （可能多行的系统消息）压成中文单行返回。全程**永不 reject**。
+ */
+ipcMain.handle(IPC.fsOpenEntry, async (_e, input: FsOpenEntryInput): Promise<FsOpenEntryResult> => {
+  try {
+    const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+    const relPath = typeof input?.relPath === 'string' ? input.relPath : ''
+    const root = resolvePinnedRootById(pinId)
+    if (!root.ok) return { ok: false, error: root.error }
+    const guard = resolveWithinPinRoot(root.absPath, relPath)
+    if (!guard.ok) {
+      logWarn('ipc:guard', { channel: 'fsOpenEntry', reason: 'out-of-root' })
+      return { ok: false, error: guard.error }
+    }
+    if (!existsSync(guard.absPath)) {
+      return { ok: false, error: '文件不存在或已被移动' }
+    }
+    const err = await shell.openPath(guard.absPath)
+    if (err) {
+      // 系统错误串可能是多行（如「文件被另一个进程占用\n...」），压成单行再给渲染层
+      const message = err.replace(/\s*[\r\n]+\s*/g, ' ').trim()
+      return { ok: false, error: message.length > 0 ? `打开失败：${message}` : '打开失败，请重试' }
+    }
+    return { ok: true }
+  } catch (err) {
+    logError('fs:openEntry-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, error: '打开文件失败，请重试' }
+  }
+})
+
+// ── 钉选目录浏览器 v2 · 写操作 + 归档（docs/61 §批注结果 · 方案二）────────────
+//
+// 共同纪律（与上面两条只读通道同一套守卫思想，只读边界之外另开的写边界）：
+// - 钉选根只认 id（resolvePinnedRootById —— 渲染层传来的任何路径都不信）；
+// - `dirRel` 过 `resolveWithinPinRoot` 前缀校验；条目名是**单段**，过
+//   `validateEntryName`（`..` / 路径分隔符 / Windows 非法字符全拒）——
+//   两条都收口在 `archiveOps.resolveEntryPath`，这是写通道的唯一新增注入面；
+// - 0.9.2 的 `allowedOpenRoots` **不为写通道开口**：写边界 = 该钉选根之内；
+// - 失败一律收口 `{ok:false, reason, error:中文单行}`，**永不 reject**；
+//   守卫拒绝记 `ipc:guard` warn（与只读通道同一取证口径）。
+
+/** 批量写通道（`fs:trashEntries` / `fs:compressEntries`）单次条目数上限 */
+const FS_BATCH_MAX_ENTRIES = 500
+
+/** 把一次 stat 结果转成 `FsEntry`（条目形状与 `fs:listDir` 完全一致） */
+function fsEntryOf(abs: string, name: string): FsEntry | null {
+  try {
+    const st = statSync(abs)
+    const isDir = st.isDirectory()
+    const entry: FsEntry = isDir ? { name, isDir: true } : { name, isDir: false }
+    entry.mtimeMs = st.mtimeMs
+    if (!isDir) entry.size = st.size
+    return entry
+  } catch {
+    return null
+  }
+}
+
+/**
+ * `fs:mkdir`（浏览器 v2）：在 `dirRel` 下新建文件夹。
+ *
+ * - 名字过单段校验（含分隔符即拒，防借 `name` 逃出 `dirRel`）；中文名放行；
+ * - 重名（文件系统口径 `existsSync`）→ `{ok:false, reason:'exists'}`；
+ * - 成功返回新目录的 `FsEntry`（渲染层直接插入列表，不必再 list 一次）。
+ */
+ipcMain.handle(IPC.fsMkdir, (_e, input: FsMkdirInput): FsMkdirResult => {
+  try {
+    const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+    const dirRel = typeof input?.dirRel === 'string' ? input.dirRel : ''
+    const name = typeof input?.name === 'string' ? input.name : ''
+    const root = resolvePinnedRootById(pinId)
+    if (!root.ok) return { ok: false, reason: 'guard', error: root.error }
+    const guard = resolveEntryPath(root.absPath, dirRel, name)
+    if (!guard.ok) {
+      logWarn('ipc:guard', { channel: 'fsMkdir', reason: 'guard' })
+      const reason = validateEntryName(name) !== null ? 'invalid' : 'guard'
+      return { ok: false, reason, error: guard.error }
+    }
+    if (existsSync(guard.absPath)) {
+      return { ok: false, reason: 'exists', error: '同名文件夹已存在' }
+    }
+    mkdirSync(guard.absPath)
+    logInfo('fs:mkdir', { dirRel })
+    return { ok: true, entry: fsEntryOf(guard.absPath, name) ?? { name, isDir: true } }
+  } catch (err) {
+    logError('fs:mkdir-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, reason: 'io', error: '新建文件夹失败，请重试' }
+  }
+})
+
+/**
+ * `fs:renameEntry`（浏览器 v2）：重命名 `dirRel` 下的一条目。
+ *
+ * - 新旧同名 → 直接 ok（幂等）；**仅大小写变化**跳过 exists 检查
+ *   （Windows 的 existsSync 会被源自身命中，而原地大小写改名是合法操作）；
+ * - 目标已存在 → `{ok:false, reason:'exists'}`（重命名竞态的第一道防线）；
+ * - 成功返回改名后的 `FsEntry`。
+ */
+ipcMain.handle(IPC.fsRenameEntry, (_e, input: FsRenameEntryInput): FsRenameEntryResult => {
+  try {
+    const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+    const dirRel = typeof input?.dirRel === 'string' ? input.dirRel : ''
+    const oldName = typeof input?.oldName === 'string' ? input.oldName : ''
+    const newName = typeof input?.newName === 'string' ? input.newName : ''
+    const root = resolvePinnedRootById(pinId)
+    if (!root.ok) return { ok: false, reason: 'guard', error: root.error }
+    const bad = validateEntryName(oldName) ?? validateEntryName(newName)
+    if (bad !== null) return { ok: false, reason: 'invalid', error: bad }
+    const dir = resolveWithinPinRoot(root.absPath, dirRel)
+    if (!dir.ok) {
+      logWarn('ipc:guard', { channel: 'fsRenameEntry', reason: 'out-of-root' })
+      return { ok: false, reason: 'guard', error: dir.error }
+    }
+    const oldAbs = path.join(dir.absPath, oldName)
+    const newAbs = path.join(dir.absPath, newName)
+    let st = fsEntryOf(oldAbs, oldName)
+    if (st === null) return { ok: false, reason: 'io', error: '原文件或文件夹不存在，可能已被移动' }
+    if (oldName === newName) return { ok: true, entry: st }
+    const caseOnly = oldName.toLowerCase() === newName.toLowerCase()
+    if (!caseOnly && existsSync(newAbs)) {
+      return { ok: false, reason: 'exists', error: '目标名称已存在' }
+    }
+    renameSync(oldAbs, newAbs)
+    logInfo('fs:renameEntry', { dirRel })
+    return { ok: true, entry: fsEntryOf(newAbs, newName) ?? { ...st, name: newName } }
+  } catch (err) {
+    logError('fs:renameEntry-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, reason: 'io', error: '重命名失败，请重试' }
+  }
+})
+
+/**
+ * `fs:trashEntries`（浏览器 v2，docs/61 A9 批注：删除 = 回收站化）：
+ * 把 `dirRel` 下的多条目逐个 `shell.trashItem` 移入**系统回收站** ——
+ * 绝不做永久删除，用户可从回收站找回。
+ *
+ * - 单次上限 `FS_BATCH_MAX_ENTRIES`（500）；
+ * - **部分失败不整批失败**：每个条目独立执行，失败项（非法名 / 不存在 / 被占用）进
+ *   `failed` 数组（name + 中文单行 message），其余照常成功；
+ * - `dirRel` 越界 / pinId 未登记 → 整批拒绝（reason:'guard'，记 ipc:guard）。
+ */
+ipcMain.handle(
+  IPC.fsTrashEntries,
+  async (_e, input: FsTrashEntriesInput): Promise<FsTrashEntriesResult> => {
+    try {
+      const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+      const dirRel = typeof input?.dirRel === 'string' ? input.dirRel : ''
+      const names = Array.isArray(input?.names) ? input.names : []
+      const root = resolvePinnedRootById(pinId)
+      if (!root.ok) return { ok: false, reason: 'guard', error: root.error }
+      if (names.length === 0) {
+        return { ok: false, reason: 'invalid', error: '没有选择要删除的条目' }
+      }
+      if (names.length > FS_BATCH_MAX_ENTRIES) {
+        return {
+          ok: false,
+          reason: 'too-many',
+          error: `一次最多删除 ${FS_BATCH_MAX_ENTRIES} 项，请分批操作`
+        }
+      }
+      const dir = resolveWithinPinRoot(root.absPath, dirRel)
+      if (!dir.ok) {
+        logWarn('ipc:guard', { channel: 'fsTrashEntries', reason: 'out-of-root' })
+        return { ok: false, reason: 'guard', error: dir.error }
+      }
+      const failed: FsTrashFailedItem[] = []
+      for (const raw of names) {
+        const name = typeof raw === 'string' ? raw : ''
+        const bad = validateEntryName(name)
+        if (bad !== null) {
+          failed.push({ name: typeof raw === 'string' ? raw : '', message: bad })
+          continue
+        }
+        const abs = path.join(dir.absPath, name)
+        if (!existsSync(abs)) {
+          failed.push({ name, message: '文件不存在或已被移动' })
+          continue
+        }
+        try {
+          await shell.trashItem(abs)
+        } catch (err) {
+          const message = (err instanceof Error ? err.message : String(err))
+            .replace(/\s*[\r\n]+\s*/g, ' ')
+            .trim()
+          failed.push({ name, message: message.length > 0 ? message : '移入回收站失败' })
+        }
+      }
+      if (failed.length > 0) {
+        logWarn('fs:trashEntries-partial', { failed: failed.length, total: names.length })
+      } else {
+        logInfo('fs:trashEntries', { total: names.length })
+      }
+      return { ok: true, failed }
+    } catch (err) {
+      logError('fs:trashEntries-failed', { err: err instanceof Error ? err.message : String(err) })
+      return { ok: false, reason: 'io', error: '删除失败，请重试' }
+    }
+  }
+)
+
+/**
+ * `fs:extractArchive`（浏览器 v2）：7z 解压 `dirRel` 下的压缩包到**同目录**的
+ * 「压缩包主名」文件夹（`foo.tar.gz` → `foo/`）。
+ *
+ * - 压缩包按扩展名识别（`isArchiveName`，比 importer 的导入管线宽：tar/gz/bz2/xz 也认 ——
+ *   导入要建资产目录所以收窄，浏览器内是「打开」语义）；
+ * - 7z 探测复用 importer 同一条路（`main/paths.ts#findSevenZip`，含 `IDBOX_7Z` /
+ *   `MODVAULT_7Z` 环境变量），缺失 → `reason:'no-7z'`（错误文案带下载地址）；
+ * - **防穿越**：解压后 `findPathEscape` 递归校验整棵产物树都在目标目录内
+ *   （符号链接同样算违规）—— 命中即整目录删除并拒绝，恶意压缩包的 `../` 逃逸走不出去；
+ * - 半成品纪律：解压中途失败 → 目标目录整个删除，不留半个包。
+ */
+ipcMain.handle(
+  IPC.fsExtractArchive,
+  async (_e, input: FsExtractArchiveInput): Promise<FsExtractArchiveResult> => {
+    try {
+      const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+      const dirRel = typeof input?.dirRel === 'string' ? input.dirRel : ''
+      const name = typeof input?.name === 'string' ? input.name : ''
+      const root = resolvePinnedRootById(pinId)
+      if (!root.ok) return { ok: false, reason: 'guard', error: root.error }
+      if (!isArchiveName(name)) {
+        return {
+          ok: false,
+          reason: 'not-archive',
+          error: '这不是支持的压缩包格式（zip / rar / 7z / tar / gz / bz2 / xz）'
+        }
+      }
+      const guard = resolveEntryPath(root.absPath, dirRel, name)
+      if (!guard.ok) {
+        logWarn('ipc:guard', { channel: 'fsExtractArchive', reason: 'guard' })
+        return { ok: false, reason: 'guard', error: guard.error }
+      }
+      const st = await fs.stat(guard.absPath).catch(() => null)
+      if (st === null) return { ok: false, reason: 'io', error: '文件不存在或已被移动' }
+      if (!st.isFile()) return { ok: false, reason: 'invalid', error: '这不是一个文件' }
+      const sevenZip = findSevenZip()
+      if (!sevenZip) {
+        return {
+          ok: false,
+          reason: 'no-7z',
+          error: `需要 7-Zip 才能解压：请安装（${SEVEN_ZIP_DOWNLOAD_URL}）或在设置中指定 7z.exe 路径`
+        }
+      }
+      const dirName = deriveExtractDirName(name)
+      const dest = path.join(path.dirname(guard.absPath), dirName)
+      if (existsSync(dest)) {
+        return { ok: false, reason: 'exists', error: '同名文件夹已存在' }
+      }
+      mkdirSync(dest)
+      try {
+        await extractWith7z(sevenZip, guard.absPath, dest, OPS_TIMEOUT_MS)
+        const escape = await findPathEscape(dest)
+        if (escape !== null) {
+          await fs.rm(dest, { recursive: true, force: true }).catch(() => undefined)
+          logWarn('ipc:guard', { channel: 'fsExtractArchive', reason: 'path-escape' })
+          return { ok: false, reason: 'io', error: '压缩包内包含不安全的路径，已停止解压' }
+        }
+        logInfo('fs:extractArchive', { dirRel, dirName })
+        return { ok: true, dirName }
+      } catch (err) {
+        await fs.rm(dest, { recursive: true, force: true }).catch(() => undefined)
+        const message = err instanceof Error ? err.message : '解压失败'
+        logError('fs:extractArchive-failed', { error: message.slice(0, 200) })
+        return { ok: false, reason: 'io', error: message }
+      }
+    } catch (err) {
+      logError('fs:extractArchive-failed', { err: err instanceof Error ? err.message : String(err) })
+      return { ok: false, reason: 'io', error: '解压失败，请重试' }
+    }
+  }
+)
+
+/**
+ * `fs:compressEntries`（浏览器 v2）：把 `dirRel` 下的多个条目压缩成**同目录**一个 zip。
+ *
+ * - 输出名（规则钉在 `archiveOps.deriveZipName`）：单条目 → 该条目主名（文件去扩展名）；
+ *   多条目 → `归档 YYYY-MM-DD HHmm`（本地时间）。重名 → `reason:'exists'`；
+ * - 引擎：优先 7z（`7z a -tzip`，资源管理器原生可开）；**7z 缺失降级** PowerShell
+ *   `Compress-Archive`（`engine:'system'`）；降级也失败 → `reason:'system-fallback-failed'`
+ *   （半成品 0 字节 zip 一并清理）；
+ * - 名字非法 / 源不存在是**整批拒绝**（压缩是单次原子动作，没有部分成功可言）。
+ */
+ipcMain.handle(
+  IPC.fsCompressEntries,
+  async (_e, input: FsCompressEntriesInput): Promise<FsCompressEntriesResult> => {
+    try {
+      const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+      const dirRel = typeof input?.dirRel === 'string' ? input.dirRel : ''
+      const names = Array.isArray(input?.names) ? input.names : []
+      const root = resolvePinnedRootById(pinId)
+      if (!root.ok) return { ok: false, reason: 'guard', error: root.error }
+      if (names.length === 0) {
+        return { ok: false, reason: 'invalid', error: '没有选择要压缩的条目' }
+      }
+      if (names.length > FS_BATCH_MAX_ENTRIES) {
+        return {
+          ok: false,
+          reason: 'too-many',
+          error: `一次最多压缩 ${FS_BATCH_MAX_ENTRIES} 项，请分批操作`
+        }
+      }
+      const dir = resolveWithinPinRoot(root.absPath, dirRel)
+      if (!dir.ok) {
+        logWarn('ipc:guard', { channel: 'fsCompressEntries', reason: 'out-of-root' })
+        return { ok: false, reason: 'guard', error: dir.error }
+      }
+      const srcs: string[] = []
+      for (const raw of names) {
+        const name = typeof raw === 'string' ? raw : ''
+        const bad = validateEntryName(name)
+        if (bad !== null) return { ok: false, reason: 'invalid', error: bad }
+        const abs = path.join(dir.absPath, name)
+        if (!existsSync(abs)) {
+          return { ok: false, reason: 'io', error: `「${name}」不存在或已被移动` }
+        }
+        srcs.push(abs)
+      }
+      const zipName = deriveZipName(srcs.map((_, i) => String(names[i])), new Date())
+      const destZip = path.join(dir.absPath, zipName)
+      if (existsSync(destZip)) {
+        return { ok: false, reason: 'exists', error: '同名压缩包已存在' }
+      }
+      const sevenZip = findSevenZip()
+      if (sevenZip) {
+        try {
+          await compressWith7z(sevenZip, srcs, destZip, OPS_TIMEOUT_MS)
+          logInfo('fs:compressEntries', { zipName, engine: '7z', count: srcs.length })
+          return { ok: true, zipName, engine: '7z' }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : '压缩失败'
+          logError('fs:compressEntries-failed', { error: message.slice(0, 200) })
+          return { ok: false, reason: 'io', error: message }
+        }
+      }
+      try {
+        await compressWithPowerShell(srcs, destZip, OPS_TIMEOUT_MS)
+        logInfo('fs:compressEntries', { zipName, engine: 'system', count: srcs.length })
+        return { ok: true, zipName, engine: 'system' }
+      } catch (err) {
+        await fs.rm(destZip, { force: true }).catch(() => undefined)
+        const message = err instanceof Error ? err.message : '压缩失败'
+        logWarn('fs:compressEntries-fallback-failed', { error: message.slice(0, 200) })
+        return { ok: false, reason: 'system-fallback-failed', error: message }
+      }
+    } catch (err) {
+      logError('fs:compressEntries-failed', { err: err instanceof Error ? err.message : String(err) })
+      return { ok: false, reason: 'io', error: '压缩失败，请重试' }
+    }
+  }
+)
+
+/**
+ * `fs:openWith`（浏览器 v2）：对 `dirRel` 下的文件弹 **Windows「打开方式」对话框**
+ * （标准做法 `rundll32 shell32.dll,OpenAs_RunDLL <文件>`）。
+ *
+ * - 对话框是 fire-and-forget：spawn 受理即 `{ok:true}`，rundll32 之后的失败只落日志
+ *   （对话框本身没有可回收的错误通道，渲染层无需提示）；
+ * - `{ok:false}` 仅在守卫拒绝 / 源不存在 / spawn 本身发不出去时出现；
+ * - 守卫与其它通道同一套（id 白名单 + dirRel 前缀 + 单段名）。
+ */
+ipcMain.handle(IPC.fsOpenWith, (_e, input: FsOpenWithInput): FsOpenWithResult => {
+  try {
+    const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+    const dirRel = typeof input?.dirRel === 'string' ? input.dirRel : ''
+    const name = typeof input?.name === 'string' ? input.name : ''
+    const root = resolvePinnedRootById(pinId)
+    if (!root.ok) return { ok: false, error: root.error }
+    const guard = resolveEntryPath(root.absPath, dirRel, name)
+    if (!guard.ok) {
+      logWarn('ipc:guard', { channel: 'fsOpenWith', reason: 'guard' })
+      return { ok: false, error: guard.error }
+    }
+    const st = statSync(guard.absPath)
+    if (!st.isFile()) return { ok: false, error: '只能对文件使用「打开方式」' }
+    const child = spawn('rundll32', ['shell32.dll,OpenAs_RunDLL', guard.absPath], {
+      windowsHide: true,
+      stdio: 'ignore'
+    })
+    child.on('error', (err) => {
+      logWarn('fs:openWith-spawn', { error: err.message })
+    })
+    child.unref()
+    logInfo('fs:openWith', { dirRel })
+    return { ok: true }
+  } catch (err) {
+    logError('fs:openWith-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, error: '无法打开「打开方式」对话框' }
+  }
+})
+
+/**
+ * `fs:entryThumb`（图标视图缩略图）：取钉选目录里一个文件的预览图。
+ *
+ * 分派与缓存全部收在 `main/pinnedThumb.ts#resolveThumbForEntry`（本 handler 只做
+ * pinId 解析与日志收口）：图片解码降采样 ≤512、SKP 复用 `skpPreview.ts` 提取内嵌
+ * 预览、其他扩展名 `not-available`（渲染层自绘类型图标兜底，**不做**系统级缩略图）。
+ * 缓存 `<userData>/pinned-thumbs/`，URL 走专用协议 `pinned-thumb://`（禁止 file://）；
+ * 并发由模块内 promise 池限到 4，大文件夹批量请求不会卡死主进程。
+ * 守卫与其它 fs:* 通道同一套（id 白名单 → resolveThumbForEntry 内做 dirRel/name 校验），
+ * 越界记 `ipc:guard` warn（与只读通道同一取证口径）。全程**永不 reject**。
+ */
+ipcMain.handle(IPC.fsEntryThumb, (_e, input: FsEntryThumbInput): Promise<PinnedEntryThumbResult> => {
+  try {
+    const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+    const dirRel = typeof input?.dirRel === 'string' ? input.dirRel : ''
+    const name = typeof input?.name === 'string' ? input.name : ''
+    const root = resolvePinnedRootById(pinId)
+    if (!root.ok) {
+      return Promise.resolve({ ok: false, reason: 'guard', error: root.error })
+    }
+    return resolveThumbForEntry(root.absPath, dirRel, name).then((result) => {
+      if (!result.ok && result.reason === 'guard') {
+        logWarn('ipc:guard', { channel: 'fsEntryThumb', reason: 'guard' })
+      } else if (!result.ok && result.reason === 'io') {
+        logError('fs:entryThumb-io', { dirRel, name })
+      }
+      return result
+    })
+  } catch (err) {
+    logError('fs:entryThumb-failed', { err: err instanceof Error ? err.message : String(err) })
+    return Promise.resolve({ ok: false, reason: 'io' })
+  }
+})
+
+/**
+ * 在资源管理器中按**条目**揭示钉选目录里的一个文件 / 子目录（`fs:revealEntry`，
+ * 2026-11-25 缺陷修复）。
+ *
+ * 缺陷：渲染层右键「在资源管理器中显示」复用 `home:pinnedOpen`，那条通道的语义是
+ * 「打开钉选根」——**不带子路径**，所以在子目录里右键任何文件都弹到钉选根。
+ * 既有的 `shell:reveal` 又有 0.9.2 守卫（只放行库根 ∪ 日志目录），钉选路径会被拒，
+ * 不能把钉选根塞进它的白名单（等于给整条 reveal 通道开口子），故单开本条通道。
+ *
+ * 守卫与其它 `fs:*` 同源、零放宽：
+ * - 只收 `pinId`（`resolvePinnedRootById` 从主进程自己的 settings 解析钉选根）；
+ * - `relPath` 过 `resolveWithinPinRoot` 逐段 resolve + 前缀校验（`..` 穿越 /
+ *   绝对路径注入 / 盘符切换全拒），越界记 `ipc:guard` warn；
+ * - 路径交给 `revealEntryInExplorer`（`main/pinnedReveal.ts`）做 stat + shell 调用，
+ *   文件与目录都走 `shell.showItemInFolder`（目录 = 在父目录里选中它）。
+ *
+ * 全程 try/catch 收口 `FsRevealEntryResult`，**永不 reject**。
+ */
+ipcMain.handle(IPC.fsRevealEntry, (_e, input: FsRevealEntryInput): FsRevealEntryResult => {
+  try {
+    const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+    const relPath = typeof input?.relPath === 'string' ? input.relPath : ''
+    const root = resolvePinnedRootById(pinId)
+    if (!root.ok) {
+      logWarn('ipc:guard', { channel: 'fsRevealEntry', reason: 'unknown-id' })
+      return { ok: false, reason: 'guard', error: root.error }
+    }
+    const guard = resolveWithinPinRoot(root.absPath, relPath)
+    if (!guard.ok) {
+      logWarn('ipc:guard', { channel: 'fsRevealEntry', reason: 'out-of-root' })
+      return { ok: false, reason: 'guard', error: guard.error }
+    }
+    const result = revealEntryInExplorer(guard.absPath)
+    if (!result.ok) {
+      logWarn('fs:revealEntry-miss', { relPath, error: result.error })
+    }
+    return result
+  } catch (err) {
+    logError('fs:revealEntry-failed', { err: err instanceof Error ? err.message : String(err) })
+    return { ok: false, reason: 'io', error: '无法在资源管理器中显示这个条目，请重试' }
+  }
 })
 
 /**

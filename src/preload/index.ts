@@ -1,6 +1,25 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import {
   IPC,
+  type FsCompressEntriesInput,
+  type FsCompressEntriesResult,
+  type FsEntryThumbInput,
+  type FsExtractArchiveInput,
+  type FsExtractArchiveResult,
+  type FsListDirInput,
+  type FsListDirResult,
+  type FsMkdirInput,
+  type FsMkdirResult,
+  type FsOpenEntryInput,
+  type FsOpenEntryResult,
+  type FsOpenWithInput,
+  type FsOpenWithResult,
+  type FsRenameEntryInput,
+  type FsRenameEntryResult,
+  type FsRevealEntryInput,
+  type FsRevealEntryResult,
+  type FsTrashEntriesInput,
+  type FsTrashEntriesResult,
   type HomeBackgroundSaveInput,
   type HomeBackgroundSaveResult,
   type PackageExportInput,
@@ -10,7 +29,13 @@ import {
   type PackageImportProgressEvent,
   type PackageImportResult,
   type PackageInspectResult,
-  type PluginLinkStatus
+  type PickDirectoryInput,
+  type PinnedEntryThumbResult,
+  type PluginLinkStatus,
+  type ProjectCreateInput,
+  type ProjectCreateResult,
+  type TemplateScanInput,
+  type TemplateScanResult
 } from '../shared/ipc'
 import type { ProbedImageSize } from '../shared/imageSize'
 import type {
@@ -153,6 +178,93 @@ const api = {
   chooseLibrary: (): Promise<Settings | null> => ipcRenderer.invoke(IPC.chooseLibrary),
   pickArchives: (): Promise<string[]> => ipcRenderer.invoke(IPC.pickArchives),
   pickWatchDir: (): Promise<string | null> => ipcRenderer.invoke(IPC.pickWatchDir),
+  /**
+   * 通用选目录（docs/60 §5.2 通道 1）：标题 / 确认按钮文案由调用方给。
+   * 返回目录绝对路径；取消 → null。与 `pickWatchDir` 并存（老通道零改动）。
+   */
+  pickDirectory: (input: PickDirectoryInput): Promise<string | null> =>
+    ipcRenderer.invoke(IPC.pickDirectory, input),
+  /**
+   * 打开首页快速访问（钉选）文件夹（docs/60 §5.2 通道 3）：只传 id，
+   * 主进程按 id 从自己的 settings 解析路径（id 白名单）。null = 成功；字符串 = 中文错误。
+   */
+  homePinnedOpen: (id: string): Promise<string | null> =>
+    ipcRenderer.invoke(IPC.homePinnedOpen, id),
+  /**
+   * 新建项目（docs/60 §5.2 通道 2）：两阶段落盘（全量预检 → 逐个 mkdir）。
+   * **永不 reject**：失败是 `{ok:false, error:中文单行}`（冲突指明冲突目录名；
+   * 半程失败带 `dirsCreated`，已建目录保留）。成功返回根路径 + 创建数量。
+   */
+  projectCreate: (input: ProjectCreateInput): Promise<ProjectCreateResult> =>
+    ipcRenderer.invoke(IPC.projectCreate, input),
+  /**
+   * 拖入文件夹扫描 → 项目模板草稿（v1.2 反馈批 C）：**纯只读**，主进程递归读目录树
+   * （跳过文件 / 符号链接 / 隐藏目录）+ 清洗 + 深度 4 / 节点 256 限额。
+   * **永不 reject**：失败是 `{ok:false, error:中文单行}`（不存在 / 是文件 /
+   * 无权限 / 没有子文件夹）。⚠️ 结果只是预览草稿，渲染层必须弹预览确认层、
+   * 用户点「生成模板」才写入模板列表 —— 绝不静默写入。
+   */
+  templateScanFromDir: (input: TemplateScanInput): Promise<TemplateScanResult> =>
+    ipcRenderer.invoke(IPC.templateScanFromDir, input),
+  /**
+   * **只读**列出钉选（快速访问）目录的一层条目（v1.2 反馈批 B，应用内浏览的数据面）。
+   * 入参 `{pinId, relPath}`（relPath 相对钉选根，空串 = 根）；主进程按 id 白名单
+   * 解析钉选根 + 前缀校验（越界返回 `{ok:false}`）。**永不 reject**。
+   */
+  listPinnedDir: (input: FsListDirInput): Promise<FsListDirResult> =>
+    ipcRenderer.invoke(IPC.fsListDir, input),
+  /**
+   * 用系统默认程序打开钉选目录内的一个条目（v1.2 反馈批 B：文件双击的「直达」）。
+   * 主进程同样做 pin 根前缀校验；`shell.openPath` 的错误串压成中文单行。**永不 reject**。
+   */
+  openPinnedEntry: (input: FsOpenEntryInput): Promise<FsOpenEntryResult> =>
+    ipcRenderer.invoke(IPC.fsOpenEntry, input),
+  /**
+   * 在**资源管理器**里按条目揭示钉选目录内的一个文件 / 子目录（2026-11-25 缺陷修复）。
+   * 入参 `{pinId, relPath}`（relPath 相对钉选根、`/` 分隔，空串 = 根）；主进程按 id
+   * 白名单解析钉选根 + `resolveWithinPinRoot` 前缀校验，再 `shell.showItemInFolder`。
+   * 文件与目录都定位到该条目（目录在父目录里被选中）。**永不 reject**。
+   */
+  revealPinnedEntry: (input: FsRevealEntryInput): Promise<FsRevealEntryResult> =>
+    ipcRenderer.invoke(IPC.fsRevealEntry, input),
+
+  // ── 钉选目录浏览器 v2 · 写操作 + 归档（docs/61 §批注结果 · 方案二）─────────
+  //
+  // 全部入参带 `pinId` + 相对钉选根的 `dirRel` + **单段**条目名；主进程按 id 白名单
+  // 解析钉选根并做前缀校验。**永不 reject**：失败是 `{ok:false, reason, error:中文单行}`，
+  // `reason` 稳定枚举（exists / guard / invalid / io / no-7z / not-archive / too-many /
+  // system-fallback-failed），渲染层按 reason 分支、error 直接展示。
+  /** 在 `dirRel` 下新建文件夹；重名 `reason:'exists'`；成功带新目录的条目形状。 */
+  makePinnedDir: (input: FsMkdirInput): Promise<FsMkdirResult> =>
+    ipcRenderer.invoke(IPC.fsMkdir, input),
+  /** 重命名条目；重名拒绝；新旧同名直接 ok；成功带改名后的条目形状。 */
+  renamePinnedEntry: (input: FsRenameEntryInput): Promise<FsRenameEntryResult> =>
+    ipcRenderer.invoke(IPC.fsRenameEntry, input),
+  /**
+   * 把多条目移入**系统回收站**（shell.trashItem，绝不做永久删除）。
+   * 单次 ≤500；部分失败不整批失败 —— 失败项在 `failed` 数组（name + 中文 message）。
+   */
+  trashPinnedEntries: (input: FsTrashEntriesInput): Promise<FsTrashEntriesResult> =>
+    ipcRenderer.invoke(IPC.fsTrashEntries, input),
+  /**
+   * 7z 解压压缩包到同目录「主名」文件夹（防穿越校验；7z 缺失 `reason:'no-7z'`）。
+   * 顶部菜单的批量解压 = 渲染层对选中压缩包逐个调用本通道。
+   */
+  extractPinnedArchive: (input: FsExtractArchiveInput): Promise<FsExtractArchiveResult> =>
+    ipcRenderer.invoke(IPC.fsExtractArchive, input),
+  /** 压缩成同目录一个 zip；7z 缺失自动降级 PowerShell（`engine:'system'`）。 */
+  compressPinnedEntries: (input: FsCompressEntriesInput): Promise<FsCompressEntriesResult> =>
+    ipcRenderer.invoke(IPC.fsCompressEntries, input),
+  /** 弹 Windows「打开方式」对话框；fire-and-forget，`{ok:false}` 仅守卫/不存在/spawn 失败。 */
+  openPinnedEntryWith: (input: FsOpenWithInput): Promise<FsOpenWithResult> =>
+    ipcRenderer.invoke(IPC.fsOpenWith, input),
+  /**
+   * 取钉选目录里一个文件的缩略图（图标视图预览）：图片降采样 ≤512、SKP 提取内嵌
+   * 预览、其他扩展名 `not-available`。`url` 走专用协议 `pinned-thumb://<缓存文件名>`，
+   * `<img src>` 可直接用。**永不 reject**（失败在 `reason` 里，渲染层回退自绘图标）。
+   */
+  pinnedFileThumb: (input: FsEntryThumbInput): Promise<PinnedEntryThumbResult> =>
+    ipcRenderer.invoke(IPC.fsEntryThumb, input),
 
   // ── Shell ───────────────────────────────────────────────────
   openPath: (p: string): Promise<string | null> => ipcRenderer.invoke(IPC.openPath, p),

@@ -1,0 +1,120 @@
+/*
+ * 应用内文件浏览器（PinnedFolderBrowser）· 组件级样式
+ *
+ * 只放 Tailwind 表达不了 / 不该表达的三条规则：
+ * ① 框选矩形（accent 1px 虚线 + 8% tint 填充，照设计稿 F6b）——
+ *    颜色必须走 token（var(--accent)），矩形几何由 JS 写内联 transform，不在这里；
+ * ② 框选期间的条目禁用态（不出 hover、不误触双击）—— 与 styles.css 里
+ *    `[data-marquee='1'] [data-asset-card]` 同一语言，只是命中目标换成浏览器的条目行/磁贴；
+ * ③ 行内重命名输入框的基础样式（复用 token，Tailwind 里写会更长）。
+ * ④ 头部 / 底部提示行的**雾面浮岛卡片**（2026-11-25 可读性批 → 同日浮岛化返工）：
+ *    浏览态壁纸层（App 根部 `fixed inset-0`）仍然可见，面包屑 / 视图切换 / 计数 /
+ *    底部快捷键提示直接压在壁纸上，浅色壁纸 + 浅色字几乎不可读。
+ *    第一版托底是通栏矩形条，与下方圆角列表卡片衔接生硬（用户反馈「太粗暴」），
+ *    返工为**上下两块圆角浮岛**（上：头部卡 / 下：列表卡，同一套圆角与边距语言）。
+ *    方案：`color-mix` 半透明实底（**禁 backdrop-filter**——全仓禁玻璃拟态，
+ *    glass-folder.css 是唯一豁免区；2026-11-25 起本文第 ⑤ 条的 Quick Look 遮罩
+ *    `.ql-scrim` 是第二处**明确豁免**：用户点名要"真高斯模糊"）+ 1px 白色半透明描边
+ *    （项目 #FFFFFF 8-12% 描边语言）让边缘柔和。
+ *    色值来源 = `--bg-canvas`（深 #111113 / 浅 #f8fafc）80% + 壁纸 20%：
+ *    深色主题下白字（--text-primary #f2f2f4）对浅灰壁纸的等效底对比 ≥10:1，
+ *    次级字（--text-secondary #98989e，底部提示已从 muted 提到 secondary）≈4:1；
+ *    浅色主题下深字压亮底同理成立。圆角对齐下方列表卡片同一 token
+ *    （--radius-modal 14px），左右同 mx-5，中间留呼吸间隙。
+ */
+
+/* 头部浮岛（导航行 + 工具行）：圆角 / 描边与下方 `rounded-modal border` 列表卡同语言 */
+.pinned-browser-head {
+  background: color-mix(in srgb, var(--bg-canvas) 80%, transparent);
+  border: 1px solid color-mix(in srgb, #ffffff 10%, transparent);
+  border-radius: var(--radius-modal);
+}
+
+/* 底部快捷键提示小浮岛（低调胶囊）：描边降到 8%，比头部更收敛 */
+.pinned-browser-foot {
+  background: color-mix(in srgb, var(--bg-canvas) 80%, transparent);
+  border: 1px solid color-mix(in srgb, #ffffff 8%, transparent);
+  border-radius: 9999px;
+}
+
+/* 框选矩形：画在滚动容器内（绝对定位随内容滚动），几何由 marquee 状态机直接改样式 */
+.pinned-marquee-box {
+  position: absolute;
+  display: none; /* 起手未越过 4px 阈值前不显示 */
+  z-index: 10;
+  pointer-events: none;
+  border: 1px dashed var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* 框选期间条目（列表行 / 图标磁贴）交出指针事件：不出 hover、不误触双击/单击 */
+[data-marquee='1'] [data-pin-entry] {
+  pointer-events: none;
+}
+
+/* 行内重命名 / 新建文件夹输入框（照设计稿 F7-1 / F7-2：accent 描边圆角框） */
+.pinned-name-input {
+  height: 26px;
+  width: 100%;
+  min-width: 0;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--surface-card);
+  color: var(--text-primary);
+  padding: 0 8px;
+  font-size: 13px;
+  line-height: 24px;
+  outline: none;
+}
+.pinned-name-input:focus {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.pinned-name-input[data-conflict='1'] {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+/* ⑤ Quick Look 浮层遮罩（2026-11-25 用户需求：「背景应该是全部都高斯模糊掉，
+ *   而不是单纯压黑，同时注意文字对比度」）。
+ *
+ * 为什么不改 `.dialog-scrim`：删除确认层 / 其它弹窗仍在共用那个类（在 styles.css），
+ * 全局加 blur 会连带改变它们的观感与性能预算。这里只服务 PinnedQuickLook。
+ *
+ * backdrop-filter 生效的前提：`position: fixed` 的祖先链上不能有非 none 的
+ * transform / filter / will-change / contain（否则 fixed 的包含块从视口变成该祖先，
+ * 模糊采样范围会错位）。本轮核对过的链路：
+ *   PinnedQuickLook → PinnedFolderBrowser 根节点（`.pinned-browser-enter`，入场动画
+ *   fill-mode = backwards，180ms 后 transform 交还 none，见 pinned-enter.css 第 24-35 行）
+ *   → App 的 `div.relative.flex.min-w-0.flex-1` → `div.flex.min-w-0.flex-1.flex-col`
+ *   → 外壳。这些容器都没有 transform / filter / will-change / contain。
+ * 因此稳态下遮罩采样的是整个视口（壁纸 + 面板 + 列表），是"真模糊"而非压黑。
+ *
+ * 浓度：模糊为主、压暗为辅。浅色 #f8fafc 30%、深色 #0a0a0c 45%，都比 dialog-scrim
+ * （0.42 / 0.6）淡 —— 靠 blur 把底层糊掉，而不是靠黑盖住。
+ */
+.ql-scrim {
+  background: rgba(248, 250, 252, 0.3);
+  -webkit-backdrop-filter: blur(24px) saturate(1.15);
+  backdrop-filter: blur(24px) saturate(1.15);
+}
+[data-theme='dark'] .ql-scrim {
+  background: rgba(10, 10, 12, 0.45);
+}
+
+/* Quick Look 信息行 / 键盘提示的局部托底（同一需求第二句「注意文字对比度」）。
+ *
+ * 模糊背景会透出任意壁纸（可能纯白也可能纯黑），裸字对比度不可控。托底用
+ * `--bg-canvas` 88%（比头部浮岛的 80% 更实：这里是最小的 11px 字）+ 白 10% 描边。
+ * 对比度核算（最坏情况 = 深色主题 + 亮壁纸）：
+ *   托底 = 0.88 × #111113 + 0.12 × #ffffff ≈ #2e2e30（相对亮度 ≈ 0.027）
+ *   次级字 --text-secondary #98989e（相对亮度 ≈ 0.316）
+ *   → (0.316 + 0.05) / (0.027 + 0.05) ≈ 4.7:1 ✓（≥4.5:1）
+ *   浅色主题 + 暗壁纸：托底 ≈ #dcdcdc，--text-secondary #4b5563 仍 ≈5.4:1 ✓
+ * 名称用 --text-primary（更高一档）；元信息 / 提示从 tertiary 提到 secondary。
+ * 只做局部托底，不改浮层整体浓度，也不改 Quick Look 的固定画框尺寸。
+ */
+.ql-caption {
+  background: color-mix(in srgb, var(--bg-canvas) 88%, transparent);
+  border: 1px solid color-mix(in srgb, #ffffff 10%, transparent);
+  border-radius: var(--radius-modal);
+}

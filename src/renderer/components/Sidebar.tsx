@@ -1270,7 +1270,7 @@ export function Sidebar({ onOpenSettings, collapsed = false }: SidebarProps) {
             )}
           </div>
           {savedViews.length === 0 ? (
-            <div className="px-2.5 pb-1 text-[11px] leading-relaxed text-muted">
+            <div className="hook-save-hint px-2.5 pb-1 text-[11px] leading-relaxed text-muted">
               在中栏头点「＋ 存为集合」保存当前筛选
             </div>
           ) : (

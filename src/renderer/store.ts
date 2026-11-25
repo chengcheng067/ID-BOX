@@ -43,6 +43,14 @@ import {
 } from './logic/filters'
 import { dedupeIds, pruneToVisible, selectRangeIds } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
+// 首页快速访问 / 文件夹底纹（docs/60 §6，T-05）：增删移 / 查重 / key 命名空间都是纯函数，
+// store 只负责"取当前 settings → 调纯函数 → 走 saveSettings 落档"这一条窄通道。
+import {
+  addPinnedFolder,
+  movePinnedFolder,
+  removePinnedFolderById,
+  wallpaperMapPatch
+} from './logic/homePinned'
 // 插件快照（docs/39 §2.1）：渲染层只**生成内容**（它没有 Node 能力，写不了文件），
 // 落盘由主进程执行。字段表与判据都在 `shared/pluginSnapshot`，这里不复制第二份。
 import { buildPluginRecords, isPluginTrigger, type PluginTrigger } from '../shared/pluginSnapshot'
@@ -1134,6 +1142,14 @@ function enqueueZhimoCover(asset: Asset): void {
   // 手动按钮能点、自动任务却永远不入队 → 默认开启的「导入后自动补封面」对它们静默失效。
   const storedId = typeof asset.zhimoId === 'string' ? asset.zhimoId.trim() : ''
   if (!(storedId || zhimoIdOf(asset.name))) return
+  // ── 口径统一（2026-11 用户实测缺陷）：根层已有封面文件的一律不入队 ──────────
+  // 两套判据曾不一致：设置页补抓候选（`isZhimoCoverBackfillCandidate` ④）看
+  // `hasCoverAssetFile`，自动任务只看 `coverSource` —— 结果带截图封面
+  // （coverSource='named'）+ 名字残留 `ID_<数字>` 的知末资产会被自动流水线
+  // 静默发起知末抓取，落库时把用户已有封面顶成站方图。
+  // 统一后口径：**盘上有 `.cover.(jpg|png)` = 已有成品封面，自动通道一律不动**；
+  // 手动按钮（`refreshZhimoCover`，force）保留强制替换能力，不受此闸门约束。
+  if (hasCoverAssetFile(asset.files)) return
   if (pendingZhimoIds.includes(asset.id)) return
   pendingZhimoIds.push(asset.id)
 }
@@ -1563,6 +1579,13 @@ function newSavedViewId(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto
   if (c && typeof c.randomUUID === 'function') return c.randomUUID()
   return `view-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+/** 首页钉选 id（docs/60 §6.1）：与智能集合同口径（UUID 优先，时间戳退化兜底）。 */
+function newHomePinnedId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID()
+  return `pin-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 
 interface VaultState {
@@ -2132,6 +2155,24 @@ interface VaultState {
    */
   refreshZhimoCover: (id: string) => Promise<FetchZhimoCoverResult>
   saveSettings: (patch: Partial<Settings>) => Promise<void>
+  // ── 首页快速访问 / 文件夹底纹（docs/60 §6，T-05）─────────────────────────
+  /**
+   * 添加一条首页钉选（快速访问）。查重按 `absPath`（同路径已钉 → `duplicate`，
+   * 不重复追加）、32 条封顶（`limit`）。成功后数组顺序即显示顺序。
+   * `name` 由调用方给（通常 = `folderNameOfPath(absPath)`）。
+   */
+  addHomePinnedFolder: (name: string, absPath: string) => Promise<'added' | 'duplicate' | 'limit'>
+  /** 移除一条钉选（只删 Settings 键，**绝不**碰磁盘目录）。id 不存在时幂等。 */
+  removeHomePinnedFolder: (id: string) => Promise<void>
+  /** 钉选左右移动（`delta` = -1 左移 / +1 右移），只在钉选之间交换相邻元素。 */
+  moveHomePinnedFolder: (id: string, delta: -1 | 1) => Promise<void>
+  /**
+   * 写 / 清一个文件夹底纹（`homeFolderWallpaper[key]`）。
+   * `key` = `kind:<分类键>` 或 `pin:<钉选id>`（命名空间见 `logic/homePinned.ts`）；
+   * `fileName` 传 `null` = 清除（**不删** `<userData>/home-bg/` 缓存文件 —— 同图可能
+   * 被多个文件夹引用，引用计数首版不做，docs/60 §6.3）。
+   */
+  setHomeFolderWallpaper: (key: string, fileName: string | null) => Promise<void>
   /**
    * 新增一条自定义分类词条（2026-10）。`level: 'level2'` 时 `parent` = 所属一级名。
    *
@@ -5657,6 +5698,10 @@ export const useVault = create<VaultState>((set, get) => ({
               if (!opts?.force) {
                 if (asset.coverSource === 'manual') return { skipped: true, reason: 'manual' }
                 if (asset.coverSource === 'zhimo') return { skipped: true, reason: 'zhimo' }
+                // 与入队闸门同口径（见 `enqueueZhimoCover` 注释）：入队后到抓取前
+                // 这段时间里用户可能已设了封面文件（如手动换图落成 `.cover.jpg`），
+                // 盘上有封面文件的一律跳过 —— 防止排队期间的状态变化绕过入队闸门。
+                if (hasCoverAssetFile(asset.files)) return { skipped: true, reason: 'cover-file' }
               }
 
               const res = await window.modvault
@@ -5751,6 +5796,46 @@ export const useVault = create<VaultState>((set, get) => ({
         dupOnly: reset.dupOnly
       }))
     }
+  },
+
+  // ── 首页快速访问 / 文件夹底纹（docs/60 §6，T-05）─────────────────────────
+  // 全部走唯一写入口 saveSettings（主进程 normalizeSettings 再洗一遍，双保险）。
+  // 归一化 / 查重 / 交换都在 logic/homePinned 的纯函数里，这里不复制规则。
+
+  async addHomePinnedFolder(name, absPath) {
+    const current = get().settings?.homePinnedFolders ?? []
+    const { list, outcome } = addPinnedFolder(current, {
+      id: newHomePinnedId(),
+      name,
+      absPath
+    })
+    if (outcome !== 'added') return outcome
+    await get().saveSettings({ homePinnedFolders: list })
+    return 'added'
+  },
+
+  async removeHomePinnedFolder(id) {
+    const current = get().settings?.homePinnedFolders ?? []
+    // 顺手清掉该 pin 的视图 / 排序记忆（pinId 是每次添加新生成的 UUID，留着永远匹配不到）。
+    // 只在与当前设置同时写入时带上，避免无谓地多写一次 settings.json。
+    const prefs = get().settings?.pinnedViewPrefs ?? {}
+    const nextPrefs: typeof prefs = { ...prefs }
+    const hadPrefs = Object.prototype.hasOwnProperty.call(prefs, id)
+    if (hadPrefs) delete nextPrefs[id]
+    await get().saveSettings({
+      homePinnedFolders: removePinnedFolderById(current, id),
+      ...(hadPrefs ? { pinnedViewPrefs: nextPrefs } : {})
+    })
+  },
+
+  async moveHomePinnedFolder(id, delta) {
+    const current = get().settings?.homePinnedFolders ?? []
+    await get().saveSettings({ homePinnedFolders: movePinnedFolder(current, id, delta) })
+  },
+
+  async setHomeFolderWallpaper(key, fileName) {
+    const current = get().settings?.homeFolderWallpaper ?? {}
+    await get().saveSettings({ homeFolderWallpaper: wallpaperMapPatch(current, key, fileName) })
   },
 
   // ── 一键打包（docs/58 T4）──────────────────────────────────────────────

@@ -141,6 +141,29 @@ export interface PluginSnapshotRecord {
    * 声明为可选是为了兼容旧快照：字段缺失 / 非法值 ⇒ 插件只显示分类路径（Q-19）。
    */
   displayMetric?: string | null
+  /**
+   * 排序用：资产**整目录总量**，直接取 `Asset.size`（types.ts:275），与主程序
+   * `sortAssets()` 的 `a.size`（filters.ts:817-819）同口径。
+   * ⚠️ 不是 `primary.size` / `displayMetric` 的「仅主文件」口径（R-12 不串味）。
+   *
+   * 可选兼容旧快照：键缺失 ⇒ 插件判该排序键不可排；键存在为 null ⇒ 该资产无此值。
+   */
+  size?: number | null
+  /**
+   * 排序用：导入时刻，毫秒时间戳，直接取 `Asset.importedAt`（types.ts:417）。
+   * 可选兼容旧快照：键缺失 ⇒ 插件判该排序键不可排；键存在为 null ⇒ 该资产无此值。
+   */
+  importedAt?: number | null
+  /**
+   * 排序用：最近使用时刻，毫秒时间戳，取 `Asset.lastUsedAt`（types.ts:352，可能 undefined）。
+   * 可选兼容旧快照：键缺失 ⇒ 插件判该排序键不可排；键存在为 null ⇒ 该资产无此值。
+   */
+  lastUsedAt?: number | null
+  /**
+   * 排序用：使用次数，取 `Asset.useCount`（types.ts:341，可能 undefined）。
+   * 可选兼容旧快照：键缺失 ⇒ 插件判该排序键不可排；键存在为 null ⇒ 该资产无此值。
+   */
+  useCount?: number | null
 }
 
 /** `index.json` 信封（顶层是对象，不是数组） */
@@ -233,6 +256,17 @@ function nullableString(value: unknown): string | null {
 }
 
 /**
+ * 把排序用数字收口成「有限非负数或 null」。
+ *
+ * 四个排序字段（size / importedAt / lastUsedAt / useCount）统一走这一条口径：
+ * undefined / NaN / Infinity / 字符串 / 负数 ⇒ null（**键仍要写出来**，值为 null）。
+ * 0 是合法值（`v >= 0`），不能当成缺失。
+ */
+function finiteNonNegativeOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+/**
  * 软删判定。判据与 `src/renderer/logic/trashView.ts:52` **完全一致**（`deletedAt` 是
  * **有限数字**才算），但这里不能反向依赖渲染层（main/shared ← renderer 是层向违规，
  * `ballThumb.ts:27` 有过先例教训），所以独立实现，并由 `tests/pluginExport.test.ts`
@@ -311,7 +345,14 @@ export function buildPluginRecord(asset: Asset): PluginSnapshotRecord {
         ? new Date(asset.updatedAt).toISOString()
         : null,
     // A 级只增：新指标派生自同一份 primary，不额外读盘（用户 2026-11-20 最终口径）
-    displayMetric: deriveDisplayMetric(primary)
+    displayMetric: deriveDisplayMetric(primary),
+    // T-SORT：四个排序键恒写出来（可选是对旧快照而言）。
+    // size 取 Asset.size 整目录总量 —— 与主程序 sortAssets() 的 a.size 同口径，
+    // 绝不是 primary.size / displayMetric 的「仅主文件」口径（R-12 不串味）。
+    size: finiteNonNegativeOrNull(asset.size),
+    importedAt: finiteNonNegativeOrNull(asset.importedAt),
+    lastUsedAt: finiteNonNegativeOrNull(asset.lastUsedAt),
+    useCount: finiteNonNegativeOrNull(asset.useCount)
   }
 }
 

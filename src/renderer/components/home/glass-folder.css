@@ -9,13 +9,21 @@
  * 都是「左低右高」的 S 形斜切，这才是"文件夹形状"的来源。
  *
  *   BACK_PATH  viewBox 0 0 340 272
- *     M0 56 A22 22 0 0 1 22 34 L146 34 C170 34 172 0 198 0 L318 0
- *     A22 22 0 0 1 340 22 L340 250 A22 22 0 0 1 318 272 L22 272
- *     A22 22 0 0 1 0 250 Z
+ *     M0 56 C0 43.85 9.85 34 22 34 L146 34 C170 34 172 0 198 0 L318 0
+ *     C330.15 0 340 9.85 340 22 L340 250 C340 262.15 330.15 272 318 272
+ *     L22 272 C9.85 272 0 262.15 0 250 Z
  *   FRONT_PATH viewBox 0 0 340 198
- *     M0 22 A22 22 0 0 1 22 0 L118 0 C144 0 146 32 172 32 L318 32
- *     A22 22 0 0 1 340 54 L340 176 A22 22 0 0 1 318 198 L22 198
- *     A22 22 0 0 1 0 176 Z
+ *     M0 22 C0 9.85 9.85 0 22 0 L118 0 C144 0 146 32 172 32 L318 32
+ *     C330.15 32 340 41.85 340 54 L340 176 C340 188.15 330.15 198 318 198
+ *     L22 198 C9.85 198 0 188.15 0 176 Z
+ *
+ * ⚠️ 参考稿原文用的是 `A22 22 0 0 1 …` 圆弧；这里逐条改写成等价三次贝塞尔
+ *    （k = 22×0.55228475 ≈ 12.15）。**改写保留，但"Chromium 会把 A 圆弧拍平"这件事
+ *    未获确证**：四轮独立实测（参考稿 1:1、真 app DOM + A 圆弧、iframe + scale
+ *    0.443/0.7/1.0 + backdrop-filter、Electron 33 vs 45 逐像素）一次都没复现
+ *    （取证在 design-tmp/frost-check/ 与 design-tmp/electron-upgrade-probe/；33 与 45
+ *    逐像素无结构性差异）。保留 C 曲线的理由只有「与参考稿形状等价、无副作用」，
+ *    **不据"拍平"下任何结论**；若日后要重新认定，须先补可复现取证。
  *
  * 两条 path 的字符串常量放在 GlassFolder.tsx，**只**写进
  * `element.style.clipPath = "path(...)"`（设计稿要求无描边，`<svg><path>` 描边
@@ -49,13 +57,18 @@
  *
  * ── ⛔ 全局禁令的**单点例外**（重要，改之前先读完）─────────────────────────────
  * `src/renderer/styles.css` 头部（第 9 行）写的是「全局禁用橙色/棕色高亮、
- * 紫色系、玻璃拟态 backdrop-blur、渐变」。本文件是**唯一**获准的例外：
+ * 紫色系、玻璃拟态 backdrop-blur、渐变」。本文件是**唯一**获准的例外
+ * （`new-project-card.css` 曾与之写法相同，现已改为不用 backdrop-filter）：
  *   · 理由：这个组件是用户亲自点名的 glass-folder 复刻（"我会给你一个原封不动的
- *     参考，你直接做进去"），玻璃质感必须靠 backdrop-filter + 半透明渐变才成立；
+ *     参考，你直接做进去"），玻璃质感必须靠半透明渐变 + 磨砂才成立；
  *   · 禁令针对的是全站装饰性渐变，不针对这个被指定复刻的组件；
- *   · 例外范围仅限本文件 —— **除本文件外任何地方不许新增 backdrop-filter / 渐变**；
- *   · 代价控制在预算内：深色下 backdrop-filter 用 blur(18px)（参考 22px），
- *     因为首页 5 个文件夹并排压在 WebGL 粒子之上。
+ *   · 例外范围仅限本文件 —— 其它任何地方不许新增 backdrop-filter / 渐变；
+ *   · 玻璃质感**逐值照搬参考稿**（2026-11 用户裁定「我们的这个动态文件夹完全可以
+ *     照搬这个源代码来做」）：tint / spec 同参考稿逐值。
+ *   · 本文件**确实在用** backdrop-filter：`.gf-front` 的
+ *     `backdrop-filter: blur(22px) saturate(1.5)` 就是前板磨砂过渡的来源（见下方
+ *     「玻璃的成因」与 `.gf-front` 那一节的 ⚠️）。它目前是全仓**唯一**还在写
+ *     backdrop-filter 的组件 ——「新建项目」虚卡（new-project-card.css）已改为不用。
  *
  * ── 历史坑：已不适用 ─────────────────────────────────────────────────────────
  * 上一版（240×224 圆角矩形 + 86×32 标签齿）栽在「齿与翻盖各自 rotate(-1.5deg)
@@ -64,19 +77,49 @@
  * 那条坑自然消失；对应地，`.gf-tab` / `.gf-flap` / `.gf-flap-group` /
  * `.gf-flap-inner` 这几个类名一律删除，不要再"补回来"。
  *
- * ── 三态（hover / open 照参考件实测值；**静止态是唯一偏离参考的数值**）─────────
- *   静止：hinge   0deg / lift -44px / spread  4px / fan 0.8deg / stack 12px
- *   hover：hinge -11deg / lift -60px / spread 10px / fan 1.8deg / stack 10px
- *   open： hinge -24deg / lift -96px / spread 40px / fan 5deg   / stack 30px
- * 为什么静止不是参考的 `lift: 42px`：参考件把卡片全塞进口袋（展示用），
- * 那样首页 5 个入口在静止态就是 5 张白纸。这里上移到 -44px，探出 22px。
+ * ── 玻璃的成因（2026-11-25 第五次返工；结论已按 A/B 实测重写）─────────────────
+ * `.gf-front` **有** `-webkit-backdrop-filter` / `backdrop-filter: blur(22px)
+ * saturate(1.5)`（照参考稿逐值，见 `.gf-front` 一节）—— 前板那层磨砂过渡就在它身上。
+ *
+ * 它**曾被判定要移除**：在「父级 scale(0.443) + 自身 perspective(760px)」的合成层里
+ * 观测到 backdrop-filter 的结果在 clip 边缘以**未上 tint 的形态**多画约 1 个设备像素
+ * （卡片底边外 0.4px 处实测亮度 74/255，同位置背景 43、把 backdrop-filter 关掉后 23），
+ * 当时据此认为"用户反复看到的那圈白光"就是它。但随后的 A/B 实测推翻了这一判断
+ * （design-tmp/frost-check/glass-ab-A-*.png 无滤镜 vs glass-ab-B-*.png 有滤镜）：
+ * 结论是**零代价、零收益** —— 前板背后压着的就是卡片自己的**不透明背板图**，blur
+ * 几乎取不到背后的页面内容（色度签名 b−r：无滤镜 −64，有滤镜同向），有没有这层滤镜
+ * 肉眼与取色都分辨不出。因此**保留现状**，不要再以"漏 1px 亮边"为由删它。
+ *
+ * `.gf-frost`（背板图自体模糊烤成的位图）依旧存在，但它承担的是**另一件事**：
+ * 让沉进袋口的卡片被整片不透明磨砂盖住，不依赖合成层的 backdrop 采样。两者并存 ——
+ * `.gf-frost` 管「袋口与卡片」，`.gf-front` 的 backdrop-filter 管「前板与背板过渡」。
+ *
+ * 还剩一处**底边**的 1 设备像素亮缝：`.gf-back` 与 `.gf-front` 是两个独立栅格化
+ * 的合成层，两者 clip 的 AA 行在底边对不齐，亮层有一小截没被暗层盖住。修法是让
+ * 前板在底边**多盖 1px**（前板用 FRONT_PANEL_PATH，tint/spec 同步 bottom: -1px）。
+ * 静止态实测（Δ = 有卡片 − 同位置无卡片，3 次中位数）：底边外 1px 的 Δ 从
+ * 「含 backdrop-filter 的 +47 / 去掉滤镜的 +9」变为 **−28**（比没卡片时更暗），
+ * 上/左/右三边始终为 0。详见 GlassFolder.tsx 的 FRONT_PANEL_PATH 注释。
+ *
+ * ── 四态（前三档逐值照参考稿；第四档是本仓为"两阶段收起"新增的过渡档）────────
+ *   idle：   hinge   0deg / lift  42px / spread  0px / fan 0deg / stack 15px
+ *   hover：  hinge -11deg / lift -34px / spread  8px / fan 1.4deg / stack 10px
+ *   open：   hinge -24deg / lift -96px / spread 40px / fan 5deg   / stack 30px
+ *   closing：**等于 hover 档**（摘掉 data-open 后先落这一档、停留 780ms 再落 idle）
+ * idle 的 42px 是参考稿原值（三张卡全塞进口袋，玻璃上方只剩背板）。2026-11-25
+ * 用户明确否掉了我们上一版"静止就探出 22px"的偏离：「如果鼠标没有移到它面上，
+ * 是不会有里面的 3 张卡片的」。卡片消失靠几何（沉到前板下沿之内），**不靠透明度**。
+ * ⚠️ 唯一例外的透明度在 `.gf-files`：本仓的三张卡是**真缩略图**（有颜色），沉进
+ *    前板后仍会透过 tint 的 42%~50% 半透明区看到ghost；参考稿的三张卡是纯白纸
+ *    压在白色玻璃上所以看不见。因此 idle 档给 `.gf-files` 加 opacity:0（见下方），
+ *    hover / open / closing 三档恒为 1 —— 它只负责"沉入口袋后不许透出来"。
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* ── 配色 token（前缀 gf- 保证不与全局 token 相撞）──────────────────────────── */
 :root,
 [data-theme='light'] {
   --gf-back-fill: rgba(255, 255, 255, 0.55);
-  /* front 的实心底色只作为「无 backdrop-filter」时的兜底，见 @supports 那块 */
+  /* front 的实心底色只作为「浏览器不支持 backdrop-filter」时的兜底，见 @supports 那块 */
   --gf-front-fill: rgba(255, 255, 255, 0.97);
   /* ★ 外轮廓阴影：**唯一正确写法就是 filter**（box-shadow 会被 clip-path 裁掉），
      不要改回去。浅色下白色文件夹压在浅页面上会糊成一片，靠这层把轮廓"托"出来。
@@ -89,11 +132,13 @@
     rgba(255, 255, 255, 0.3) 0%,
     rgba(255, 255, 255, 0) 26%
   );
+  /* ★ 前翻盖 tint：参考稿 `.gf-tint` 浅色卡逐值（.16 → .5@42% → rgba(252,252,252,.93)）。
+     收尾是 252 不是 255，照搬不改。 */
   --gf-front-tint: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.34) 0%,
-    rgba(255, 255, 255, 0.72) 42%,
-    rgba(255, 255, 255, 0.97) 100%
+    rgba(255, 255, 255, 0.16) 0%,
+    rgba(255, 255, 255, 0.5) 42%,
+    rgba(252, 252, 252, 0.93) 100%
   );
   --gf-spec: rgba(255, 255, 255, 0.5);
   --gf-sheet-fill: #ffffff;
@@ -104,9 +149,12 @@
 }
 
 [data-theme='dark'] {
-  --gf-back-fill: rgba(255, 255, 255, 0.055);
+  /* 2026-11-26 用户拍板：原 0.055 太透、壁纸全透过去看不出有块板 → 0.20。
+     0.20 下板清晰成形、壁纸柔和透出，保留参考稿浅玻璃调性（A/B 选 C 档）。
+     浅色档 0.55 不动；新建项目卡深色档同步提到 0.15，保持略透一档的相对关系。 */
+  --gf-back-fill: rgba(255, 255, 255, 0.20);
   --gf-front-fill: rgba(255, 255, 255, 0.1);
-  /* 深色下 0.14 白的前翻盖压在近黑页面上本来就有明暗差，投影只需压住"飘"的感觉 */
+  /* 深色下前翻盖与页面同为深色调（tint 已照搬参考稿深色卡），投影只需压住"飘"的感觉 */
   --gf-edge-shadow: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4))
     drop-shadow(0 10px 20px rgba(0, 0, 0, 0.55));
   --gf-back-sheen: linear-gradient(
@@ -114,13 +162,17 @@
     rgba(255, 255, 255, 0.16) 0%,
     rgba(255, 255, 255, 0) 28%
   );
+  /* ★ 前翻盖 tint：参考稿 `.gf-root[data-tone="dark"] .gf-tint` 逐值
+     （.18 → .62@46% → rgba(8,8,10,.94)）。深色主题的玻璃从此是**深玻璃**，
+     名字/计数文字随之翻浅（见下方 [data-theme='dark'] .gf-name）。 */
   --gf-front-tint: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.1) 0%,
-    rgba(255, 255, 255, 0.16) 42%,
-    rgba(255, 255, 255, 0.22) 100%
+    rgba(18, 18, 20, 0.18) 0%,
+    rgba(14, 14, 16, 0.62) 46%,
+    rgba(8, 8, 10, 0.94) 100%
   );
-  --gf-spec: rgba(255, 255, 255, 0.16);
+  /* spec 高光本体两档同值（参考稿如此），深色的差别只在混合模式与不透明度 */
+  --gf-spec: rgba(255, 255, 255, 0.5);
   --gf-sheet-fill: #26262b;
   --gf-sheet-line: rgba(255, 255, 255, 0.08);
   --gf-sheet-shadow: 0 12px 28px -8px rgba(0, 0, 0, 0.62);
@@ -138,12 +190,11 @@
   --gf-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --gf-spring: cubic-bezier(0.34, 1.36, 0.5, 1);
   --gf-hinge: 0deg;
-  /* ★ 静止态就上移：参考件的 42px 是「全部塞进口袋」，那是展示用；
-     首页分类入口必须不 hover 就看出里面有东西（探出量见文件末尾注释） */
-  --gf-lift: -44px;
-  --gf-spread: 4px;
-  --gf-fan: 0.8deg;
-  --gf-stack: 12px;
+  /* ★ idle 档（参考稿原值）：三张卡全塞进口袋，玻璃上方只露背板 */
+  --gf-lift: 42px;
+  --gf-spread: 0px;
+  --gf-fan: 0deg;
+  --gf-stack: 15px;
   /* 入场整体延迟（按行内 index 由组件内联，避免 5 个同时炸开） */
   --gf-enter-delay: 0ms;
   /* ★ 唯一的尺寸旋钮：几何按 340×272 写死，整组等比缩放（阶梯见文件末尾）
@@ -271,14 +322,102 @@
   pointer-events: none;
 }
 
+/* ── 前板磨砂层（gf-frost · 2026-11-25 定稿）──────────────────────────────────
+ * 前情：
+ *   · 底纹卡的壁纸图案透过前板清晰可见 —— 原因见文件头「玻璃的成因」：前板背后压的
+ *     就是卡片自己的不透明背板图，backdrop-filter 取不到壁纸，前板只剩 tint
+ *     → 改成「壁纸自体模糊」；
+ *   · CSS filter 在静态合成层上被丢弃（「动画结束瞬间不漏、之后漏」）→ 改成
+ *     canvas 位图（ctx.filter 画一次，模糊成为像素）；
+ *   · 本轮：这层从"仅底纹卡"扩到**所有有背板图的卡**，负责"卡片沉进袋口后被整片
+ *     不透明磨砂盖住"。它**不替代** `.gf-front` 的 backdrop-filter —— 那层照旧在写
+ *     （见文件头「玻璃的成因」），两者分工是「袋口/卡片」与「前板/背板过渡」。
+ * 几何/层级：
+ *   · 与前板同几何（top 74 / 340×198 / FRONT_PATH clip，组件内联同一条 frontClip）；
+ *   · z6：**压在 .gf-files(z5) 之上**、.gf-front(z10) 之下。这一档是本轮特意
+ *     提上来的：本层是不透明磨砂位图，提到卡片之上后，夹内卡片
+ *     只要沉到前板上沿以下就被它整片盖住 —— 正好等于参考稿里"卡片被玻璃 blur
+ *     吞掉"的观感；若留在卡片之下，深色缩略图会透过 tint 在上半段半透明区糊成
+ *     一块黑板（实测截图）。卡片露在"袋口"以上的部分不受影响（在本层 clip 之外）。
+ *   · 必须**与前翻盖同角度翻**（同一套 perspective + rotateX + 弹簧过渡）：
+ *     hover -11deg / open -24deg 时前板绕底边后仰，磨砂层若是平的就会露馅。
+ * 图源与烤法：直接拿背板同一张图（底纹优先、回落 thumbs[0]，同 src 走缓存不闪），
+ * FrostCanvas 用 `ctx.filter = blur(20px) saturate(1.3)` 画一次、**烘进像素**。
+ * 无背板图（空分类 / 无底纹的钉选卡）→ 不渲染本层，前板只剩 tint（没有内容要糊）。
+ * ⛔ 归属：canvas 自体滤镜不属于全局禁令里的 backdrop-blur。 */
+.gf-frost {
+  position: absolute;
+  left: 0;
+  top: 74px;
+  width: 340px;
+  height: 198px;
+  /* 压在卡片(z5)之上、前板(z10)之下：沉进袋口的卡片被这层不透明磨砂整片盖住，
+     露在袋口以上的部分在本层 clip 之外、不受影响（见本节顶部说明） */
+  z-index: 6;
+  pointer-events: none;
+  /* ★ 2026-11-25 第三次根治（用户截图：「仍然漏底纹」）：
+     磨砂层必须**与前翻盖同角度翻**。`--gf-hinge` 在 hover 是 -11deg、单击展开
+     是 -24deg，前板绕底边后仰时会让出背后一片锐利壁纸 —— 之前 frost 是平的，
+     让出来的那块就露出清晰图案，看起来就是"玻璃没磨砂"。
+     所以这里逐值复刻 `.gf-front` 的 perspective + rotateX 与同一条弹簧过渡，
+     三层（背板 / 磨砂 / 玻璃）始终贴合。 */
+  transform-origin: 50% 100%;
+  transform: perspective(760px) rotateX(var(--gf-hinge));
+  transition:
+    transform 0.8s var(--gf-spring),
+    translate 1s var(--gf-ease),
+    opacity 1s var(--gf-ease);
+}
+
+.gf-frost-img {
+  /* 与 .gf-art 同一图坐标：容器原点在 stage(0,74)，故 top = -12 - 74 = -86。
+     ★ 这里现在是 <canvas>（模糊已烘进像素），不再是 <img> + CSS filter ——
+       活滤镜在静态合成层上会被丢弃（用户实测「动画结束瞬间不漏、之后漏」），
+       所以模糊在 GlassFolder 的 FrostCanvas 里用 ctx.filter 画一次就固化。
+       因此本层**不再写 filter**，只保留几何、视差与裁切。 */
+  position: absolute;
+  left: -12px;
+  top: -86px;
+  width: 364px;
+  height: 296px;
+  max-width: none;
+  transform: translate(calc(var(--gf-px) * -7px), calc(var(--gf-py) * -6px)) scale(1.173);
+  transform-origin: 50% 50%;
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
 /* ── 卡片层：三张缩略图卡（插在夹里，不含任何交互 —— 点击由根 button 接管）───
-   `inset(…10px…)`：无论叠多高，卡片底边都不许从口袋里漏出来。 */
+   `inset(…10px…)`：无论叠多高，卡片底边都不许从口袋里漏出来。
+   ★ 卡片在 idle 档怎么"藏"：有磨砂层的卡由 `.gf-frost`（z6，不透明位图）整片
+     盖住 —— 与参考稿同机制（卡从玻璃后面滑出来，全程不透明）；**没有**磨砂层的
+     卡（无背板图 → 无 frost）才退回透明度兜底（见下方 data-art='false' 一节）。
+     ★ 2026-11-25 第六次返工：这层透明度兜底**只留给没有磨砂层的卡**
+       （`data-art='false'`，即无背板图 → 无 .gf-frost）。有磨砂层的卡在 idle 档
+       由不透明磨砂整片盖住（z6 > z5），**不需要**透明度；保留它反而制造错帧 ——
+       单击展开时卡片一边上升一边淡入（0.36s），中途卡的上沿是一截**半透明的橙条**
+       横在文件夹上方（用户截图的"橙色条带"），参考稿里卡是全不透明的、纯靠几何
+       从玻璃后面滑出来。 */
 .gf-files {
   position: absolute;
   inset: 0;
   z-index: 5;
   pointer-events: none;
   clip-path: inset(-400px -400px 10px -400px);
+}
+
+/* 无磨砂层可依赖的卡（空图 / 图挂了）：idle 档收成 0，hover / open / closing 恒 1 */
+.gf-root[data-art='false'] .gf-files {
+  opacity: 0;
+  transition: opacity 0.36s var(--gf-ease);
+}
+
+.gf-root[data-art='false']:hover .gf-files,
+.gf-root[data-art='false']:focus-visible .gf-files,
+.gf-root[data-art='false'][data-open='true'] .gf-files,
+.gf-root[data-art='false'][data-closing='true'] .gf-files {
+  opacity: 1;
 }
 
 /* 单张卡：几何照抄参考件（272×184 @ 34,96，圆角 16，绕底边旋转） */
@@ -310,6 +449,42 @@
     opacity 0.9s var(--gf-ease);
 }
 
+/* ★ 收起方向给卡片一套更短、无过冲的时序（2026-11-25 修「收起错帧」）
+ * 症状（用户原话）：「前面那一层的磨砂层已经返回了，但是背后有一帧清晰的轮廓没有
+ *   来得及返回。」
+ * 取证（16ms 采样 + 物理屏连拍，见 design-tmp/frost-check/closelag-*.png、
+ *   _beforeB_vs_afterB.png）：收起时前板约 570ms 就落定，而三张 .gf-sheet 要到
+ *   约 900ms 才归位；中间约 330ms 里 sheet0 顶边还露在前板上沿之外
+ *   **105px**（整张带照片的卡明晃晃在外面），且 opacity 恒为 1。
+ *   无底纹卡（data-art='false'）有 .gf-files 的 opacity 0.36s 兜底，180ms 就淡到
+ *   0.067，所以只有带底纹的文件夹会明显看到那张卡。
+ * 修法：只改「收起方向」的 transform 时长与缓动，展开方向一个字不动。
+ *   · 0.75s → 0.42s：0.42s + 基线级联 40ms×2 = 500ms 到位，比前板的 ~570ms 早
+ *     约 70ms，错帧窗口归零（实测 sheet 顶边 1017ms 已沉到前板上沿以下，前板
+ *     1506ms 才最终稳定）。
+ *   · spring → --gf-ease：--gf-spring 是 cubic-bezier(.34,1.36,.5,1)，有过冲，
+ *     收起方向会让卡片先冲过口袋再弹回来，反而多出一次可见运动。
+ * ⚠️ 展开方向（idle → hover/open）命不中下面这两条选择器，仍用基线的
+ *   `transform 0.75s var(--gf-spring)`，「卡片从玻璃后面滑出来」的观感不变。
+ *   实测 hover 探头仍是 15.1 / 8.8px、约 500ms 稳住，与改前逐帧一致。
+ * ⚠️ 只写 duration / timing / property 三个长属性，**故意不碰 transition-delay**。
+ *   上方 `.gf-root[data-entered='true'] .gf-sheet` 那条是用 transition-delay 管入场
+ *   级联的（translate/opacity 走 0.18s + depth*90ms）；一旦这里用 `transition:`
+ *   简写，简写里的 delay 会以更高特异性把入场级联整个顶掉 → 卡片 translate 直接
+ *   跳到位、透明度立刻满上，入场动画就没了。拆成长属性写就不冲突。
+ *   代价：错峰仍是基线的 depth*40ms（不是最初设想的 18ms），500ms 到位已够用。
+ * ⚠️ translate / opacity 的时长必须保持基线 0.9s：入场动画的时长取自这里，
+ *   改成别的值会连带改掉入场手感。
+ * ⚠️ 不要顺手把 opacity 的 delay 缩到自己名下：有底纹的卡 opacity 恒为 1，用不上；
+ *   无底纹卡由 .gf-files 的 0.36s 单独管，两处叠加会变成双倍淡出。 */
+.gf-root:not(:hover):not([data-open='true']) .gf-sheet,
+.gf-root[data-closing='true'] .gf-sheet {
+  transition-property: transform, box-shadow, translate, opacity;
+  transition-duration: 0.42s, 0.4s, 0.9s, 0.9s;
+  transition-timing-function:
+    var(--gf-ease), var(--gf-ease), var(--gf-ease), var(--gf-ease);
+}
+
 .gf-sheet-img {
   position: absolute;
   inset: 0;
@@ -329,7 +504,20 @@
   background: var(--gf-thumb-bg);
 }
 
-/* ── 前翻盖（磨砂玻璃）────────────────────────────────────────────────────── */
+/* ── 前翻盖（磨砂玻璃）──────────────────────────────────────────────────────
+ * 磨砂过渡的来源 = 本层的 `backdrop-filter: blur(22px) saturate(1.5)`（照参考稿逐值）：
+ * 它把前板背后的背板浅色与夹内卡片一起模糊，在顶边 notch 的曲线处形成
+ * 「背板 → 雾面 → 前板」的柔和衔接。2026-11 曾为压底边漏光把它关掉、改用
+ * 扁平 ::before 渐变，结果那条衔接变成锐利直线切割（用户 0809 浅色卡截图反馈），
+ * 故本轮按参考稿恢复。
+ * ⚠️ 两个配套必须同时成立：
+ *    ① clip 用 C 贝塞尔（BACK_PATH/FRONT_PATH 已改）—— 理由是**与参考稿的 A 圆弧
+ *       形状等价、且不改动其它任何行为**，而不是"Chromium 会把 A(arc) 拍平"：那件事
+ *       四轮独立实测均未复现（取证位置见文件头「几何来源」一节），此处不再当结论写。
+ *       历史上"前板超宽/直角"曾归因于它，同样未获复现支持，排查时别直接采信。
+ *    ② 前板裁切用 FRONT_PANEL_PATH（下沿多盖 1px）+ tint/spec bottom:-1px ——
+ *       底边那条 1 设备像素亮缝（背板/前板两个栅格化层的 AA 行对不齐）靠它压住，
+ *       实测底边外 1px 的 Δ 由 +47 变 −28。详见文件头「玻璃的成因」。 */
 .gf-front {
   position: absolute;
   left: 0;
@@ -337,9 +525,9 @@
   width: 340px;
   height: 198px;
   z-index: 10;
-  /* ⛔ 全局禁令的单点例外，理由见文件头 */
-  -webkit-backdrop-filter: blur(14px) saturate(1.3);
-  backdrop-filter: blur(14px) saturate(1.3);
+  /* 参考稿原生磨砂：前板与背板之间那层柔和雾面过渡就靠它（0809 反馈恢复） */
+  -webkit-backdrop-filter: blur(22px) saturate(1.5);
+  backdrop-filter: blur(22px) saturate(1.5);
   transform-origin: 50% 100%;
   /* 翻盖绕底边向内翻（hinge 为负 = 上沿后仰） */
   transform: perspective(760px) rotateX(var(--gf-hinge));
@@ -349,28 +537,31 @@
     opacity 1s var(--gf-ease);
 }
 
-[data-theme='dark'] .gf-front {
-  -webkit-backdrop-filter: blur(18px) saturate(1.4);
-  backdrop-filter: blur(18px) saturate(1.4);
-}
-
-/* 没有 backdrop-filter 时的兜底：用实心色，宁可少一层玻璃也不留透明窟窿 */
+/* 浏览器不支持 backdrop-filter 时的兜底：`.gf-front` 真的在写 backdrop-filter
+   （见上一节），所以这条**会实实在在命中** —— 用实心 --gf-front-fill 保证前板不退化成
+   透明窟窿；少掉的只是那层雾面过渡，形状与文字对比由实心底色撑住。 */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .gf-front {
     background: var(--gf-front-fill);
   }
 }
 
+/* tint / spec 都多画 1px（bottom: -1px）：前板的裁切是「下沿 199」的那条 path
+   （FRONT_PANEL_PATH，比背板多盖 1px，见 GlassFolder.tsx 的同名注释）。这两层若仍只画
+   到 198，198~199 这条就只有裁切、没有颜色 —— 等于把漏光缝原样留着。
+   ⚠️ 别把这两行删掉，也别改成 inset: 0：静止态底边的 +10 亮缝就是靠它归零的。 */
 .gf-tint {
   position: absolute;
   inset: 0;
+  bottom: -1px;
   background: var(--gf-front-tint);
 }
 
-/* 高光：跟着指针轻微移动（soft-light 只提亮、不改色相） */
+/* 高光：跟着指针轻微移动（soft-light 只提亮、不改色相）。bottom: -1px 同上。 */
 .gf-spec {
   position: absolute;
   inset: 0;
+  bottom: -1px;
   background: radial-gradient(
     260px 200px at calc(50% + var(--gf-px) * 46%) calc(30% + var(--gf-py) * 40%),
     var(--gf-spec),
@@ -384,31 +575,81 @@
 
 [data-theme='dark'] .gf-spec {
   mix-blend-mode: screen;
-  opacity: 1;
+  opacity: 0.16;
 }
 
-/* ── 三态变量 ──────────────────────────────────────────────────────────────────
- *   静止：hinge   0deg / lift -44px / spread  4px / fan 0.8deg / stack 12px
- *   hover：hinge -11deg / lift -60px / spread 10px / fan 1.8deg / stack 10px
- *   open： hinge -24deg / lift -96px / spread 40px / fan 5deg   / stack 30px
- * open 保留参考件原值（-96 / 40 / 5 / 30），点击后的运动幅度不变。
- * 静止 -44px：卡片 top 96 → 顶边落在 y=52，翻盖顶在 y=74 → **探出 22px**。 */
+/* ── 自定义底纹模式（v1.2 反馈批 A；2026-11 按「照搬参考稿」返工）──────────────
+ * 用户原话：「我希望文件夹如果自定义了底纹的话，对比度可以强一些。现在咱们的
+ * 自定义底纹，只有最底下的那一层是能自定义的，那肯定跟我想达到的效果是有差别的。」
+ * 2026-11 用户裁定：「我们的这个动态文件夹完全可以照搬这个源代码来做」——
+ * 玻璃视觉**逐值照搬**权威参考稿（glass-folder-cards-clone.html），底纹模式与
+ * 常态**共用同一套玻璃**（blur(22px) saturate(1.5)，不再为底纹减档模糊），tint
+ * 由组件侧按底纹明暗内联参考稿对应档逐值（logic/folderWallpaperScrim）。
+ * 本文件在此只负责两件事：
+ *   ① 文字色按 data-wtone 切换（亮底纹 → 浅玻璃 → 深字；暗底纹 → 深玻璃 → 浅字）；
+ *   ② 钉选卡在底纹下隐藏夹内空槽。
+ * （原「blur 减档覆盖」两条规则与「.gf-wall-scrim 文字区罩层」已随裁定删除 ——
+ *   参考稿没有这两层，名字直接坐在 front 玻璃上，可读性由 tint 底部 .93/.94
+ *   的近实心保证。） */
+
+/* 亮底纹 → 浅玻璃 → 深字（浅色主题基线同值；写在深色主题基线之后把浅字压回去） */
+.gf-root[data-wallpaper='true'][data-wtone='bright'] .gf-name {
+  color: rgba(20, 20, 22, 0.94);
+}
+
+.gf-root[data-wallpaper='true'][data-wtone='bright'] .gf-count {
+  color: rgba(20, 20, 22, 0.62);
+}
+
+/* 暗底纹 → 深玻璃 → 浅字（参考稿 data-tone="dark" 卡同款判据） */
+.gf-root[data-wallpaper='true'][data-wtone='dark'] .gf-name {
+  color: rgba(245, 245, 247, 0.95);
+}
+
+.gf-root[data-wallpaper='true'][data-wtone='dark'] .gf-count {
+  color: rgba(245, 245, 247, 0.68);
+}
+
+/* 钉选卡 + 底纹：夹内三张空槽（灰块）没有任何信息量，压在底纹上只会脏画面 → 隐藏。
+   素材大类卡的夹内缩略图是真封面（内容层），照常显示在底纹之上。 */
+.gf-root[data-wallpaper='true'][data-pinned='true'] .gf-files {
+  display: none;
+}
+
+/* ── 四态变量 ──────────────────────────────────────────────────────────────────
+ *   idle：   hinge   0deg / lift  42px / spread  0px / fan 0deg / stack 15px
+ *   hover：  hinge -11deg / lift -34px / spread  8px / fan 1.4deg / stack 10px
+ *   open：   hinge -24deg / lift -96px / spread 40px / fan 5deg   / stack 30px
+ *   closing：= hover 档（放在 open 之后，保证摘掉 data-open 的那一刻先落这一档）
+ * hover 逐值照参考稿：卡片 top 96 + lift -34 − depth*10 → 42 / 52 / 62，
+ * 前板顶在 74 → 三张卡分别探出 32 / 22 / 12px。 */
 .gf-root:hover,
 .gf-root:focus-visible {
   --gf-hinge: -11deg;
-  --gf-lift: -60px;
-  --gf-spread: 10px;
-  --gf-fan: 1.8deg;
+  --gf-lift: -34px;
+  --gf-spread: 8px;
+  --gf-fan: 1.4deg;
   --gf-stack: 10px;
 }
 
-/* open 必须在 hover 之后：点击的 180ms 里指针通常还在组件上 */
+/* open 必须在 hover 之后：点击的那几百毫秒里指针通常还在组件上 */
 .gf-root[data-open='true'] {
   --gf-hinge: -24deg;
   --gf-lift: -96px;
   --gf-spread: 40px;
   --gf-fan: 5deg;
   --gf-stack: 30px;
+}
+
+/* closing = 收起的第一段（两阶段收起的"上一档"）：摘掉 data-open 后先回到
+   hover 档，组件在 780ms 后才摘这个属性 → 落到 idle。必须排在 open 之后：
+   两属性不会同时为 true（组件侧保证），这里只是让级联顺序与语义一致。 */
+.gf-root[data-closing='true'] {
+  --gf-hinge: -11deg;
+  --gf-lift: -34px;
+  --gf-spread: 8px;
+  --gf-fan: 1.4deg;
+  --gf-stack: 10px;
 }
 
 /* ── 名称区：压在文件夹**内部**左下角，不进 stage ─────────────────────────────
@@ -438,27 +679,56 @@
 }
 
 .gf-name {
+  /* 探针（.gf-name-probe）的定位锚点 */
+  position: relative;
   min-width: 0;
   max-width: 100%;
   font-size: 12px;
   font-weight: 600;
   line-height: 1.25;
   /**
-   * ⚠️ 这里**不能**用 `var(--text-primary)`（2026-11-09 修正）。
+   * ⚠️ 这里**不能**用 `var(--text-primary)`。
    *
-   * 曾经的写法是 `color: var(--text-primary)`，依据上面那条「深色下它是浅色字、
-   * 压在深色玻璃上没问题」——**那个前提是错的**：这张卡片在两种主题下都是
-   * **浅色磨砂玻璃**（`--gf-front-tint` 是白色渐变，下面还压着探出来的缩略图，
-   * 真实素材封面多为浅色室内照）。于是深色主题下变成「浅字压浅卡」，
-   * 首页最关键的四个入口标题几乎读不出来（深色实机截图里肉眼可见）。
-   *
-   * 判据：**文字色跟卡片底色走，不跟主题走**。卡片恒为浅色 ⇒ 字恒为深色。
-   * 用固定值而不是主题 token，是因为这里要的就是"不随主题变"。
+   * 判据（2026-11 玻璃照搬参考稿后修订）：**文字色跟玻璃底色走**——浅玻璃深字、
+   * 深玻璃浅字（参考稿浅卡 ink #141416 / 深卡 ink #f5f5f7 就是这么配的）。
+   * 玻璃底色由 tint 决定：浅色主题/亮底纹 → 浅玻璃（收 rgba(252,252,252,.93)）；
+   * 深色主题/暗底纹 → 深玻璃（收 rgba(8,8,10,.94)）。基线写深字（浅色主题），
+   * 深色主题与暗底纹的翻浅分别在 `[data-theme='dark'] .gf-name` 与
+   * `[data-wallpaper='true'][data-wtone='dark'] .gf-name` 覆盖。
+   * 用固定值而不是主题 token，是因为这里要的就是"跟玻璃走、不跟主题 token 走"。
    */
   color: rgba(20, 20, 22, 0.94);
+  /* ── 名字折行排版（v1.2 反馈批 A 续修）──────────────────────────────────
+   * 批 A 第一版只做了"不截断"（去 nowrap/ellipsis 允许换行），用户看真机指出
+   * 折行难看：「(2026-11) +桥上人家」折成「(2026-11) +桥上人 / 家」—— 编号和
+   * 正文混在一行、第二行只剩一个字。
+   * 续修策略（名字整串一起折，绝不把编号拆成独立行）：
+   *   ① 先缩号：组件侧用单行探针量"整串不折行的宽度"，超出可用宽 → 根节点打
+   *     `data-name-shrink='true'`，字号 12→10（窄窗 11→9.5），见下方规则；
+   *   ② 缩号后仍装不下才折行：`text-wrap: balance`（Chromium 130 支持）把各行
+   *     收得均匀，消灭"第二行只剩一个字"的孤行；
+   *   ③ **不回省略号**：批 A 硬要求完整显示；缩号 + 均衡折行后仍装不下的极端
+   *     长名整组向上长（标签 bottom 锚定，卡片外框尺寸不动）。
+   * `overflow-wrap: anywhere` 兜住无空格的长 ASCII 名。 */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-wrap: balance;
+}
+
+/* 单行探针：nowrap 镜像，只量宽不参与布局不进无障碍树。挂在 .gf-name 内部
+   （position:relative 已开在上方），字号/字重随宿主档位自动同步。 */
+.gf-name-probe {
+  position: absolute;
+  left: 0;
+  top: 0;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* 缩号档：常态字号装不下的长名先降一号（再装不下才折行 + balance） */
+.gf-root[data-name-shrink='true'] .gf-name {
+  font-size: 10px;
 }
 
 .gf-count {
@@ -471,6 +741,17 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* 深色主题：前翻盖 tint 已照搬参考稿深色卡（收 rgba(8,8,10,.94) 近实心深玻璃）
+   → 文字翻浅（参考稿 data-tone="dark" 的 --gf-ink: #f5f5f7 同款），否则深字压
+   深玻璃读不清。底纹模式的 data-wtone 判据在上一节，优先级更高（特异性更大）。 */
+[data-theme='dark'] .gf-name {
+  color: rgba(245, 245, 247, 0.94);
+}
+
+[data-theme='dark'] .gf-count {
+  color: rgba(245, 245, 247, 0.62);
+}
+
 /* 小窗字号回退：<1100 时 --gf-scale 只有 0.307，前翻盖渲染高 60.8px，
    12/10 的文字块（≈29.9px）要占到 49%，读起来"字偏大、底下偏满"。
    1080 是主用窗口，所以这一档收到 11 / 9.5（占比降到 ≈41%）。
@@ -481,6 +762,11 @@
   }
 
   .gf-count {
+    font-size: 9.5px;
+  }
+
+  /* 缩号档的窄窗对应值（常态 11 → 缩号 9.5） */
+  .gf-root[data-name-shrink='true'] .gf-name {
     font-size: 9.5px;
   }
 }
@@ -499,6 +785,13 @@
 }
 
 .gf-root:not([data-entered='true']) .gf-front {
+  translate: 0 46px;
+  opacity: 0;
+}
+
+/* 磨砂壁纸层与玻璃同进退：入场时若 frost 先落在最终位置而玻璃还在下方 46px，
+   会看到一条没有玻璃的磨砂壁纸先亮出来 */
+.gf-root:not([data-entered='true']) .gf-frost {
   translate: 0 46px;
   opacity: 0;
 }
@@ -522,6 +815,20 @@
 }
 
 .gf-root[data-entered='true'] .gf-front {
+  transition-delay:
+    0s,
+    calc(var(--gf-enter-delay, 0ms) + 0.42s),
+    calc(var(--gf-enter-delay, 0ms) + 0.42s);
+}
+
+/* frost 与 front 的入场错峰一致（translate / opacity 两项同用 0.42s 延迟）。
+ * ★ 2026-11-25 第七次返工（收起两层封面）：transform 必须写 0s，与 .gf-front 同延迟。
+ *   之前这里只有两项 0.42s/0.42s，但 transition-property 有 transform/translate/opacity
+ *   三项 —— CSS 循环填充把 0.42s 套到了 **transform** 上，磨砂层因此比前翻盖晚 420ms
+ *   才开始翻（实测 open→closing：front 0ms 起翻、frost 停 420ms 才动，最大旋转差 0.070）。
+ *   收起时就看到「前翻盖已回位、背后磨砂层还停在展开角度」的两层封面。补 0s 占位后
+ *   两层逐帧完全同步（实测最大差 0.0）。translate/opacity 的 0.42s 入场延迟保持不变。 */
+.gf-root[data-entered='true'] .gf-frost {
   transition-delay:
     0s,
     calc(var(--gf-enter-delay, 0ms) + 0.42s),
@@ -555,6 +862,12 @@
 /* ── 降级：prefers-reduced-motion ───────────────────────────────────────────
    全部过渡/动画归零（组件侧点击也直接跳转，不等待翻开动画）。 */
 @media (prefers-reduced-motion: reduce) {
+  /* 根节点自己的 transform 过渡（拖动让位 / 松手回位）也要归零；
+     拖动本身仍然可用 —— 只是没有 160ms 的滑动，直接落位。 */
+  .gf-root {
+    transition-duration: 0s !important;
+  }
+
   .gf-root *,
   .gf-root *::before,
   .gf-root *::after {
@@ -652,8 +965,8 @@
  * 边缘全部变成硬切边 —— 越是"干净的几何形状"，越像 bug。
  *
  * `filter: blur()` 则是在**光学层**把物体化开：先散焦、再淡出，边缘自然羽化，
- * 与"玻璃被推出焦点"这个物理直觉一致。代价是 blur 会让元素成为新的 backdrop root
- * （`.gf-tint` 的 backdrop-filter 在消隐期间失效）—— 那时它已经糊了，看不出来。
+ * 与"玻璃被推出焦点"这个物理直觉一致。代价是整个子树被提成一个滤镜层
+ * （`.gf-spec` 的 mix-blend-mode 从此只跟自己的子树混）—— 那时它已经糊了，看不出来。
  * ─────────────────────────────────────────────────────────────────────────── */
 
 .gf-root[data-leaving='self'] {
@@ -703,4 +1016,175 @@
     opacity: 0;
   }
 }
+
+/* ★ 模糊遮罩后面缩小直至没有（用户 2026-11-25 口径）：
+   dissolve 的 600–880ms 窗内，让卡片在模糊后面 scale 1→0。
+   ⚠️ 必须挂在 .gf-tilt 而不是 .gf-root：root 的 transform 正在做
+   translate(dx,dy) scale(1.5) 飞行，若在那里叠加 scale 会把位移一起乘小、
+   飞行终点漂离屏幕中心；tilt 只有 perspective 倾斜，独立的 scale 属性
+   与 root 的 transform 是两个属性、互不干扰，缩小时中心稳定不动。
+   用独立的 scale 属性（不是 transform 简写）对齐同一条 600ms/280ms 时间轴。 */
+.gf-root[data-leaving='self'] .gf-tilt {
+  animation: gf-folder-shrink 280ms ease-in 600ms both;
+}
+@keyframes gf-folder-shrink {
+  from { scale: 1; }
+  to   { scale: 0; }
+}
+
+/* ── 钉选卡标记点（2026-11-25 用户拍板替换原右上角「置顶」小圆钉）─────────────
+ * 用户原话：「文件夹右上方有一个置顶的小标，我觉得不太需要吧。因为这是项目的
+ * 文件夹，可能在前面的磨砂层帮我加一个绿色或者蓝色的小点，这样用户就方便区分
+ * 一些。」→ 取消角标，改为名字行前一颗 6px 小圆点。
+ * 颜色走强调蓝（--accent，浅色 #007AFF / 深色 #0A84FF），与全仓强调色一致；
+ * 直径不跟 --gf-scale 走（玻璃上的一枚定位点，缩到 4px 就看不见了）。
+ * ⛔ 只钉选卡（磁盘项目文件夹）渲染；素材大类卡零变化。 */
+.gf-name-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.gf-kind-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  /* 深色玻璃上补一圈极淡的暗边，避免浅背景上"糊成一团" */
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ── 首页文件夹排：横向滚动容器（T-05 F-2 悬停自动滚动，docs/60 §6.2）─────────
+ *
+ * 容器结构（HomeCover.tsx）：
+ *   .hc-folder-wrap（布局定位，尺寸与旧排逐字一致）
+ *     └ .hc-folder-scroll（真正的 overflow-x:auto；卡片本体 + 补偿 padding）
+ *         └ 卡片们
+ *
+ * ⚠️ 补偿 padding（--hc-scroll-pad-top / -bottom）：overflow-x:auto 会把
+ * overflow-y 一起算成非 visible —— 卡片 hover 翻盖 / 展开扇形会向上伸出盒子，
+ * 不留 padding 就会被竖向裁掉。padding 把可视域撑大、再用等量负 margin 把
+ * 布局位置补回原样：**视觉与旧排逐字一致**，只有 hover 伸出的部分在盒子内。
+ * 数值必须与 HomeCover.tsx 里 EDGE_BAND 的 topInset/bottomInset 同源：
+ * 热区方向判定用同一对常量把纵向安全带收回来（不收就等于"搜索框旁边悬停也滚动"）。
+ * ─────────────────────────────────────────────────────────────────────────── */
+.hc-folder-scroll {
+  --hc-scroll-pad-top: 110px;
+  --hc-scroll-pad-bottom: 64px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-top: var(--hc-scroll-pad-top);
+  padding-bottom: var(--hc-scroll-pad-bottom);
+  margin-top: calc(var(--hc-scroll-pad-top) * -1);
+  margin-bottom: calc(var(--hc-scroll-pad-bottom) * -1);
+  /* 隐藏滚动条：滚轮 / 触控板 / 拖动条（F-2 的手动兜底）都还能滚 */
+  scrollbar-width: none;
+}
+.hc-folder-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* ★ 退场裁一半（2026-11-25 真机钉死）：飞向中心的 .gf-root 仍是本容器的后代，
+   被 overflow-y:hidden 的 padding-box 顶边平切 —— 截图里那条水平线就是容器边界。
+   整页退场那一刻（hc-root[data-leaving='true']）把补偿 padding 与等量负 margin
+   同步放大，视口（padding-box）随之向上扩张、容纳飞到中心的卡；
+   但 overflow 模式保持 auto/hidden 不变 —— 这点关键：改成 overflow:visible 会把
+   scrollLeft 归零，让其余卡在退场起始帧右跳一个滚动量（窄窗口 / 钉选卡多时可见）。
+   padding 与 margin 等量互补，内容布局位置与 scrollLeft 都原样不动，零跳变。
+   退场结束 HomeCover 整体卸载，容器不再存在。 */
+.hc-root[data-leaving='true'] .hc-folder-scroll {
+  --hc-scroll-pad-top: 420px;
+  --hc-scroll-pad-bottom: 420px;
+}
+
+/* 边缘热区提示（箭头微光）：只在可滚方向上淡入，零布局位移（absolute）。
+   motionQuality==='smooth' 档下父级不打 data-edge-scroll，提示整体不渲染。 */
+.hc-folder-edge {
+  position: absolute;
+  top: 50%;
+  width: 48px;
+  height: 48px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 200ms ease;
+  color: var(--text-tertiary, #8a8f98);
+}
+.hc-folder-edge[data-side='left'] {
+  left: 0;
+}
+.hc-folder-edge[data-side='right'] {
+  right: 0;
+}
+.hc-folder-edge[data-visible='true'] {
+  opacity: 1;
+}
+/* 箭头图形：SVG 由组件内联，颜色跟文字 token 走（提示行同款灰阶） */
+.hc-folder-edge svg {
+  color: var(--text-tertiary, #8a8f98);
+  filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.35));
+}
+[data-theme='dark'] .hc-folder-edge svg {
+  filter: drop-shadow(0 0 6px rgba(0, 0, 0, 0.45));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ── 首页文件夹排：鼠标拖动调整顺序（2026-11-25 用户需求）─────────────────────
+ *
+ * 手势与几何由 `HomeCover.tsx` 负责（Pointer Events + setPointerCapture + rAF
+ * 直接写内联 `transform`），本文件只描述"拖起来长什么样"：
+ *   · 根节点的 160ms transform 过渡 = 其余卡**让位**的动画（被拖卡内联
+ *     `transition:none` 跟手，松手后撤掉内联值走这条）；
+ *   · `data-drag-source` = 被拖的那一张：抬升（位移/缩放由 JS 内联给）、阴影加深、
+ *     层级提升、**关掉指针倾斜**（避免倾斜与位移叠加抖动）；
+ *   · 行上的 `data-dragging` = 本次拖动进行中：抓取光标 + 禁选中，防止拖字。
+ * ⚠️ 只有 transform/opacity/滤镜，没有新增配色 —— 阴影沿用 `--gf-shadow` 与
+ *    `--gf-edge-shadow` 两个既有 token。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 让位 / 回位过渡：只作用在根节点自己的 transform（hover 的三态变量在子元素上，
+   不经过这里）。退场态有更具体的 360ms 规则，见文件末尾那一节。 */
+.gf-root {
+  transition: transform 160ms var(--gf-ease);
+}
+
+/* 拖动中：被拖卡跟手（内联也写了 transition:none，这条是兜底）*/
+.gf-root[data-drag-source='true'] {
+  transition: none;
+  cursor: grabbing;
+  will-change: transform;
+}
+
+/* 抬升时把指针倾斜关掉：--gf-px/--gf-py 还在被写，但不再参与变换 ——
+   否则"跟手位移 + 倾斜透视"会在视觉上互相拉扯。 */
+.gf-root[data-drag-source='true'] .gf-tilt {
+  transform: none;
+  transition: none;
+}
+
+/* 阴影加深（不是换颜色）：投影铺得更开、略放大，读起来是"被拎起来离地更远" */
+.gf-root[data-drag-source='true'] .gf-shadow {
+  opacity: 0.95;
+  filter: blur(30px);
+  transform: translateX(0) scale(1.06);
+  transition: filter 160ms var(--gf-ease), opacity 160ms var(--gf-ease);
+}
+
+/* 拖动进行中：整排进入"抓取"语义，且禁掉文字选中（快速拖动不会选到名字） */
+.hc-folder-row[data-dragging='true'] {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.hc-folder-row[data-dragging='true'] [data-slot-key] {
+  cursor: grabbing;
+}
+
 

@@ -262,6 +262,21 @@ interface ResolvedSettings extends TideSettings {
   clickRipples: boolean
 }
 
+/**
+ * 点击涟漪的**放行真值表**（2026-11-24 修复「涟漪跟总开关走」，docs/60 T-05 子项 4）。
+ *
+ * 口径：点击涟漪是**指针交互的子能力** —— 「指针交互」总开关（`interactive`）与
+ * 「点击涟漪」子开关（`clickRipples`）**任一关闭都不激涟漪**。
+ *
+ * 引擎侧 `ripple()` 早已双闸（`interactive && clickRipples`），本函数把同一判定
+ * 提到**调用侧**（HomeParticles 的 pointerdown 处理器）：总开关关掉时监听器虽然
+ * 已被整体拆掉（`attachPointer` 的守卫），但任何未来重构 / 竞态窗口下漏进来的
+ * pointerdown 也不能把涟漪激出来 —— 判定只此一份、两处共用，漂移即编译报错。
+ */
+export function clickRippleAllowed(interactive: boolean, clickRipples: boolean): boolean {
+  return interactive === true && clickRipples === true
+}
+
 /** 逻辑画布尺寸（参考实现的坐标系，绘制时拉伸铺满实际画布，不裁地平线）。 */
 const LOGICAL_WIDTH = 320
 const LOGICAL_HEIGHT = 230
@@ -1235,7 +1250,8 @@ export function createTideRenderer(host: HTMLElement): TideRenderer {
       if (disposed) return
       if (!Number.isFinite(x) || !Number.isFinite(y)) return
       const settings = lastSettings
-      if (!settings || !settings.interactive || !settings.clickRipples) return
+      // 双闸判定收敛到 clickRippleAllowed（与调用侧同一份真值表，不许两处漂移）
+      if (!settings || !clickRippleAllowed(settings.interactive, settings.clickRipples)) return
       const alive = collectRipples(lastTime)
       const logicalX = (x / Math.max(1, cssPixelWidth)) * LOGICAL_WIDTH
       const logicalY = (y / Math.max(1, cssPixelHeight)) * LOGICAL_HEIGHT

@@ -229,6 +229,50 @@ describe('fetchLatestRelease（全部路径都不抛错）', () => {
     expect(info.assetUrl).toBeNull()
   })
 
+  // ── T-UPD-ZIP：推荐下载优先 zip，老 Release 只有 exe 时退回 exe ──────────────
+  const zipAsset = {
+    name: 'IDBOX-Setup-0.6.9.zip',
+    browser_download_url: 'https://x/IDBOX-Setup-0.6.9.zip'
+  }
+  const exeAsset = {
+    name: 'IDBOX-Setup-0.6.9.exe',
+    browser_download_url: 'https://x/IDBOX-Setup-0.6.9.exe'
+  }
+
+  it('zip + exe 同时存在 → 只选 zip（不受资产顺序影响）', async () => {
+    for (const assets of [[zipAsset, exeAsset], [exeAsset, zipAsset]]) {
+      const { fetcher } = recordingFetcher(async () => fakeResponse(releaseBody({ assets })))
+      const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+      expect(info.assetUrl).toBe(zipAsset.browser_download_url)
+    }
+  })
+
+  it('只有 zip（新 Release 没传 exe）→ assetUrl 指向 zip', async () => {
+    const { fetcher } = recordingFetcher(async () =>
+      fakeResponse(releaseBody({ assets: [zipAsset] }))
+    )
+    const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+    expect(info.assetUrl).toBe(zipAsset.browser_download_url)
+  })
+
+  it('只有 exe（老 Release 无 zip）→ 退回 exe，不让下载按钮变空', async () => {
+    const { fetcher } = recordingFetcher(async () =>
+      fakeResponse(releaseBody({ assets: [exeAsset] }))
+    )
+    const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+    expect(info.assetUrl).toBe(exeAsset.browser_download_url)
+  })
+
+  it('zip / exe 都没有 → assetUrl=null，调用方退回 Release 页', async () => {
+    const { fetcher } = recordingFetcher(async () =>
+      fakeResponse(releaseBody({ assets: [{ name: 'other.zip', browser_download_url: 'https://x/o.zip' }] }))
+    )
+    const info = await fetchLatestRelease({ current: '0.6.8', fetcher })
+    expect(info.assetUrl).toBeNull()
+    // 调用方（UpdateNotesDialog）用 assetUrl || url 兜底，url 即 Release 页
+    expect(info.url).toBe('https://github.com/chengcheng067/ID-BOX/releases/tag/v0.6.9')
+  })
+
   it('current 带 v 前缀会被归一化（避免 v0.6.8 与 0.6.8 比错）', async () => {
     const { fetcher } = recordingFetcher(async () => fakeResponse(releaseBody()))
     const info = await fetchLatestRelease({ current: 'v0.6.8', fetcher })

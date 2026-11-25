@@ -57,7 +57,10 @@ module IDBoxPanel
   #   ⚠️ 历史各行（1.1.0 → 1.3.0）保留作变更记录，不回改；本条起两条编号合并成一条。
   #   以前那句「这不是主程序版本」不再成立：从 1.0.5 起两者同号（面板左上角仍显示 appVersion）。
   #   ⚠️ 必须与 idbox_panel.rb 的 Registrar::EXT_VERSION 同值（那边也有同样的提示，两处一起改）。
-  PLUGIN_VERSION = '1.1.0'.freeze
+  # 变更记录尾部（2026-11-20 T-SORT）：排序从「点 chip 循环切换」改为「下拉浮层 + 独立 ↑↓ 方向
+  #   按钮」，并移植主程序 sortAssets 的六键比较（含 usageScore 半衰期）。快照 records 新增
+  #   4 个可选排序字段（size/importedAt/lastUsedAt/useCount，缺失为 nil）；与 package.json 同号。
+  PLUGIN_VERSION = '1.2.0'.freeze
   MANIFEST_FILE = 'manifest.json'.freeze
   INDEX_FILE = 'index.json'.freeze
   # 支持目录名 = 根 .rb 同名（去掉 .rb），docs/39 §4.2 硬要求

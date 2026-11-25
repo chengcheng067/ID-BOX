@@ -20,6 +20,18 @@
  * - `named` / `root` / `largest`：包内自带的**成品图** → 由 `replacePacked` 决定：
  *   默认 `true`（知末的 400×300 无水印渲染图通常比包内杂图更准），
  *   用户关掉后保留包内图（`M10` 验收点）。
+ *
+ * ⚠️ **自动路径还有一道本文件之外的闸门（2026-11 口径统一，别删）**：
+ * `pickZhimoCoverTargets` 只看 `coverSource`，不看 `files` —— 而"根层已有
+ * `<x>.cover.(jpg|png)` 文件"（`hasCoverAssetFile`）才是与设置页补抓候选
+ * （`isZhimoCoverBackfillCandidate` ④）一致的"已有成品封面"判据。两套判据
+ * 不一致曾导致：知末下载的 skp 另存后经插件入库，`coverSource='named'` +
+ * 名字残留 `ID_<数字>` → `replacePacked=true`（默认）时自动任务静默抓取、
+ * 落库时**顶掉用户已有封面**。统一后的口径落在 store 侧：
+ * `enqueueZhimoCover` 入队前 + `runZhimoCovers` fetchOne 锁内重查，两处都
+ * `hasCoverAssetFile` 为 true 就不动；手动按钮（`force`）保留强制替换。
+ * 若要改"自动任务可以覆盖包内封面"的行为，必须同时改 store 那两处并
+ * 同步 `isZhimoCoverBackfillCandidate`，三处口径不许再分叉。
  */
 
 import type { Asset, AssetFile, AssetKind, FetchZhimoCoverResult, ZhimoCoverFailReason } from '../../shared/types'
@@ -207,8 +219,13 @@ export interface ZhimoCoverQueueResult {
  */
 export interface ZhimoCoverSkip {
   skipped: true
-  /** `manual` = 用户手工封面；`zhimo` = 别人刚抓过（非 force 时） */
-  reason: 'manual' | 'zhimo'
+  /**
+   * `manual` = 用户手工封面；`zhimo` = 别人刚抓过（非 force 时）；
+   * `cover-file` = 锁内重查发现根层已有 `.cover.(jpg|png)`（与设置页补抓候选
+   * `isZhimoCoverBackfillCandidate` ④ 同口径 —— 自动通道对"已有封面文件"
+   * 一律不动，见 store `enqueueZhimoCover` / fetchOne 重查处的统一注释）。
+   */
+  reason: 'manual' | 'zhimo' | 'cover-file'
 }
 
 /** `fetchOne` 的返回：正常结果，或"主动跳过" */

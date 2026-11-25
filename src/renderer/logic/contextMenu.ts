@@ -90,7 +90,12 @@ export const MENU_ICON = {
     'M4.2 9.6a8 8 0 0 1 13.2-3l3.2 3M19.8 14.4a8 8 0 0 1-13.2 3l-3.2-3'
   ],
   filterOff: ['M4 5.5h16l-6.4 7.6v5.4l-3.2 2v-7.4z', 'M3.4 3.4l17.2 17.2'],
-  external: ['M14 4.5h5.5V10', 'M19.5 4.5L11 13', 'M18 14v4.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 014 18.5v-11A1.5 1.5 0 015.5 6H10']
+  external: ['M14 4.5h5.5V10', 'M19.5 4.5L11 13', 'M18 14v4.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 014 18.5v-11A1.5 1.5 0 015.5 6H10'],
+  /** 左移 / 右移（钉选排序，docs/60 §6.1）：14px 下认得出的细 chevron，与整体同风格 */
+  chevronLeft: 'M14.5 5.5L8 12l6.5 6.5',
+  chevronRight: 'M9.5 5.5L16 12l-6.5 6.5',
+  /** 加号（「新建项目…」，docs/60 §4.3 W0）：24×24 网格细十字，与整体同风格 */
+  plus: ['M12 5.5v13', 'M5.5 12h13']
 } as const
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -505,4 +510,115 @@ export function rescanNoticeOf(outcome: { aborted: string | null; scanned: numbe
     return '已取消刷新：本次扫描到的资产数量骤减，可能库目录选错了（索引未改动）'
   }
   return `已刷新：${outcome.scanned} 个资产`
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 4. 首页文件夹排右键（docs/60 §6.1-§6.3，T-05）
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+export interface HomeKindMenuActions {
+  /** 「设置底纹…」：pickArchives 拾图 → homeBackground:save → 写 homeFolderWallpaper（App 接线） */
+  onSetWallpaper: () => void
+  /** 「恢复默认底纹」：删映射键（不删缓存文件，docs/60 §6.3） */
+  onClearWallpaper: () => void
+}
+
+/**
+ * 素材大类卡右键：底纹两件。没有更多项 —— 大类卡不参与排序 / 移除（产品口径候选序）。
+ */
+export function homeKindMenuItems(
+  hasWallpaper: boolean,
+  actions: HomeKindMenuActions
+): ContextMenuItem[] {
+  const items: ContextMenuItem[] = [
+    { label: '设置底纹…', icon: MENU_ICON.image, onClick: actions.onSetWallpaper }
+  ]
+  if (hasWallpaper) {
+    items.push({
+      label: '恢复默认底纹',
+      icon: MENU_ICON.filterOff,
+      onClick: actions.onClearWallpaper
+    })
+  }
+  return normalizeMenuItems(items)
+}
+
+export interface HomePinnedMenuActions {
+  /**
+   * 「在资源管理器中打开」：home:pinnedOpen（主进程按 id 解析路径，shell.showItemInFolder）。
+   * v1.2 反馈批 B 起这是**兜底出口** —— 双击钉选卡已改为应用内浏览
+   * （`PinnedFolderBrowser`，不再弹资源管理器），菜单保留系统出口给"要在资源
+   * 管理器里操作"的用户。
+   */
+  onOpen: () => void
+  onMoveLeft: () => void
+  onMoveRight: () => void
+  onSetWallpaper: () => void
+  onClearWallpaper: () => void
+  /** 「从快速访问移除」：只删 Settings 键，绝不删磁盘目录 */
+  onRemove: () => void
+  /** 端点禁用态（`pinnedMoveBounds` 的真值表） */
+  canLeft: boolean
+  canRight: boolean
+  hasWallpaper: boolean
+}
+
+/** 钉选卡右键：在资源管理器中打开（兜底出口）/ 排序 / 底纹 / 移除。 */
+export function homePinnedMenuItems(actions: HomePinnedMenuActions): ContextMenuItem[] {
+  const items: ContextMenuItem[] = [
+    { label: '在资源管理器中打开', icon: MENU_ICON.external, onClick: actions.onOpen },
+    'separator',
+    {
+      label: '左移',
+      icon: MENU_ICON.chevronLeft,
+      disabled: !actions.canLeft,
+      onClick: actions.onMoveLeft
+    },
+    {
+      label: '右移',
+      icon: MENU_ICON.chevronRight,
+      disabled: !actions.canRight,
+      onClick: actions.onMoveRight
+    },
+    'separator',
+    { label: '设置底纹…', icon: MENU_ICON.image, onClick: actions.onSetWallpaper }
+  ]
+  if (actions.hasWallpaper) {
+    items.push({
+      label: '恢复默认底纹',
+      icon: MENU_ICON.filterOff,
+      onClick: actions.onClearWallpaper
+    })
+  }
+  items.push('separator')
+  items.push({
+    label: '从快速访问移除',
+    icon: MENU_ICON.trash,
+    danger: true,
+    onClick: actions.onRemove
+  })
+  return normalizeMenuItems(items)
+}
+
+export interface HomeRowMenuActions {
+  /** 「新建项目…」（docs/60 §4.3 W0，T-03）：打开新建项目向导。不传 = 不渲染本项 */
+  onNewProject?: () => void
+  /** 「添加快速访问…」：pickDirectory 拾目录 → 追加钉选（查重 / 封顶在 store） */
+  onAddPinned: () => void
+}
+
+/**
+ * 首页文件夹排空白处右键：「新建项目…」在首位（docs/60 §4.3 W0：文件夹区右键菜单
+ * 是向导的第二入口），随后一条分隔线 + T-05 既有的「添加快速访问…」。
+ * `onNewProject` 不传时（旧宿主 / 未来拆用）整项连同分隔线一起不渲染。
+ * 不掺刷新 / 清筛选 —— 那些是网格空白处的口径。
+ */
+export function homeRowMenuItems(actions: HomeRowMenuActions): ContextMenuItem[] {
+  const items: ContextMenuItem[] = []
+  if (typeof actions.onNewProject === 'function') {
+    items.push({ label: '新建项目…', icon: MENU_ICON.plus, onClick: actions.onNewProject })
+    items.push('separator')
+  }
+  items.push({ label: '添加快速访问…', icon: MENU_ICON.folder, onClick: actions.onAddPinned })
+  return normalizeMenuItems(items)
 }

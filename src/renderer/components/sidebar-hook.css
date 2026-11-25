@@ -312,9 +312,12 @@
   color: var(--text-muted);
 }
 
-/* ── 折叠态（可选 prop `collapsed`）：只留轨道与图标，隐藏标签 / 计数 / 组头 ──
- * ⚠️ 当前 App 的折叠是**整列宽度归零**（`CollapsibleColumn`），本类只有
- * 在 App 改成传 `collapsed` + 窄宽度后才生效；见交付报告「需要 App.tsx 配合」。
+/* ── 折叠态（48px 图标轨道形态）：只留图标行，隐藏一切文本 ──
+ * App.tsx 的 `CollapsibleColumn` 会传入 collapsed + railWidth=48（首页态例外，
+ * 首页是 railWidth=0 的老形态），因此本类在实际运行中持续生效。
+ * 2026-11 用户反馈：清单曾漏 4 个元素（空态提示 / 回收站徽标 / 导入 CTA / 设置行），
+ * 在 48px 窄条里被裁成竖排；另折叠前树展开时 `.hook-sub` 会剩纯 padding 空行撑长竖条，
+ * 一并隐藏 —— 轨道态里这些元素都无图标形态，直接 display:none。
  */
 .sidebar-hook.is-collapsed .hook-label,
 .sidebar-hook.is-collapsed .hook-count,
@@ -322,6 +325,11 @@
 .sidebar-hook.is-collapsed .hook-group,
 .sidebar-hook.is-collapsed .hook-chips,
 .sidebar-hook.is-collapsed .hook-row-x,
+.sidebar-hook.is-collapsed .hook-sub,
+.sidebar-hook.is-collapsed .hook-save-hint,
+.sidebar-hook.is-collapsed .badge,
+.sidebar-hook.is-collapsed .btn-cta,
+.sidebar-hook.is-collapsed .hook-foot-row,
 .sidebar-hook.is-collapsed .sidebar-hook-head,
 .sidebar-hook.is-collapsed .hook-foot-path,
 .sidebar-hook.is-collapsed .hook-foot-version {

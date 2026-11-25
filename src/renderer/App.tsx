@@ -4,6 +4,7 @@ import { useVault, useVisibleAssets, SAVED_VIEW_LIMIT } from './store'
 import { Sidebar } from './components/Sidebar'
 import { Toolbar } from './components/Toolbar'
 import { HomeCover } from './components/home/HomeCover'
+import { PinnedFolderBrowser } from './components/home/PinnedFolderBrowser'
 import type { HomeFolderItem, HomeStatsData } from './components/home/HomeCover'
 // V1.0 首页分步引导（docs/55 §2.3）：挂载条件与写位纯函数都在 HomeGuide 里，
 // App 只负责取版本 + 判定 + 与 HomeCover 同级挂一次。
@@ -18,6 +19,7 @@ import { DetailPanel } from './components/DetailPanel'
 import { DropOverlay } from './components/DropOverlay'
 import { ImportQueue } from './components/ImportQueue'
 import { SettingsDialog } from './components/SettingsDialog'
+import { NewProjectWizard } from './components/home/NewProjectWizard'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ImportConflictDialog } from './components/ImportConflictDialog'
 // 一键打包（docs/58 T5）：导出选项 / 验包确认 / 逐项裁决 / 进度全在弹窗内部；
@@ -35,6 +37,10 @@ import { resolveQuickLookTarget } from './logic/quickLook'
 // DEF-19-3：库目录漂移体检。与设置页的警示条**共用同一个纯函数** ——
 // 两处各写一套"路径在不在库内 / 缺不缺尺寸"的判据，迟早会给出两个数字。
 import { planLibraryDrift, resolutionDriftHint } from './logic/libraryDrift'
+// 首页快速访问（T-05 F-1）：从拾到的目录取显示名的纯函数
+import { folderNameOfPath } from './logic/homePinned'
+// 首页文件夹排拖动排序（2026-11-25）：顺序表的归一化与 App 侧兜底共用这一份
+import { normalizeHomeFolderOrder } from '../shared/homeFolderOrder'
 
 /**
  * 舞台落点尺寸（2026-10-21 用户拍板：球放**标题下方居中**，不再放顶栏。
@@ -934,6 +940,42 @@ export default function App() {
   /** 脏值兜底：shared 纯函数非数 / 越界都收口，HomeParticles 拿到的恒为合法浪高。 */
   const safeHomeWaveHeight = clampWaveHeight(homeWaveHeight)
 
+  // ── T-05 首页快速访问 / 文件夹底纹（docs/60 §6.1/§6.3）────────────────────
+  // settings 由主进程 normalizeSettings 返回（T-01 已收口），缺键回落空值；
+  // useMemo 稳引用与 stableHomeBackground 同一理由（props 引用比较）。
+  const homePinnedFoldersRaw = useVault((s) => s.settings?.homePinnedFolders)
+  const stableHomePinnedFolders = useMemo(
+    () => homePinnedFoldersRaw ?? [],
+    [homePinnedFoldersRaw]
+  )
+  const homeFolderWallpapersRaw = useVault((s) => s.settings?.homeFolderWallpaper)
+  const stableHomeFolderWallpapers = useMemo(
+    () => homeFolderWallpapersRaw ?? {},
+    [homeFolderWallpapersRaw]
+  )
+  // 拖动排序（2026-11-25）：缺键 / 脏值都收口成空表 = 默认排布（大类在前、钉选在后）。
+  const homeFolderOrderRaw = useVault((s) => s.settings?.homeFolderOrder)
+  const stableHomeFolderOrder = useMemo(
+    () => normalizeHomeFolderOrder(homeFolderOrderRaw),
+    [homeFolderOrderRaw]
+  )
+  /**
+   * 松手落位 → 写一次顺序。`HomeCover` 拿到 `false` 就丢掉乐观顺序、回到拖动前。
+   *
+   * 写档失败**不需要**再写一次旧值来"回滚"：`saveSettings` 的 `set({ settings })`
+   * 只在 IPC 成功后执行，失败时 store 里的 `settings` 原封不动 —— 渲染读的就是它。
+   * 这里只补一句用户能看懂的中文提示（与其它 settings 写失败同口径：不抛到 UI）。
+   */
+  const reorderHomeFolders = useCallback(async (order: string[]): Promise<boolean> => {
+    try {
+      await useVault.getState().saveSettings({ homeFolderOrder: order })
+      return true
+    } catch {
+      useVault.getState().setNotice('保存文件夹顺序失败，已恢复原顺序')
+      return false
+    }
+  }, [])
+
   // ── V1.0 首页 SVG 引导（docs/55 §2.3 / §4-T4）────────────────────────────
   // 版本走 preload 桥好的 getAppVersion()，与设置页「关于」同源；首帧 '' 不挂载，
   // 避免旧档在版本异步回来前闪一下引导。纯函数只认字符串不等，不做 semver 排序。
@@ -1207,6 +1249,95 @@ export default function App() {
       }, HOME_OUTRO_SWITCH_MS)
     )
   }
+
+  // ── T-05：首页快速访问 / 文件夹底纹的动作接线（docs/60 §6.1/§6.3）──────────
+  // v1.2 反馈批 B 起这条链路只服务右键菜单「在资源管理器中打开」（兜底出口）：
+  // 主进程按 id 白名单解析路径 + shell.showItemInFolder —— `shell:reveal` /
+  // `shell:openPath` 的 0.9.2 守卫只放行库根 ∪ 日志目录，钉选目录会被拒，
+  // 守卫零放宽。错误串（中文）直接进 notice。
+  const openHomePinnedFolder = useCallback((id: string): void => {
+    void window.modvault
+      .homePinnedOpen(id)
+      .then((error) => {
+        if (error) useVault.getState().setNotice(error)
+      })
+      .catch(() => useVault.getState().setNotice('打开文件夹失败，请重试'))
+  }, [])
+
+  /**
+   * 双击 / Enter 钉选卡 → **应用内文件浏览**（v1.2 反馈批 B，用户原话「双击用户
+   * 自己的文件夹以后，进入的仍然是我们的软件界面」）。
+   *
+   * 不再弹资源管理器：把 `{id, name}` 记进局部 state，中栏内容由 HomeCover 换成
+   * `PinnedFolderBrowser`（见下方 isHome 分支）。名字在这里随 id 一起取出
+   * （面包屑根节点用），主进程的路径解析仍只认 id —— 绝对路径不进渲染层状态。
+   * 关闭 = `setPinnedBrowser(null)`（回首页），钉选与底纹都在 settings 里原样保留。
+   */
+  const [pinnedBrowser, setPinnedBrowser] = useState<{ id: string; name: string } | null>(null)
+  const browseHomePinnedFolder = useCallback((id: string): void => {
+    const pin = (useVault.getState().settings?.homePinnedFolders ?? []).find((p) => p.id === id)
+    if (!pin) {
+      useVault.getState().setNotice('未找到对应的快速访问文件夹，请重新添加')
+      return
+    }
+    setPinnedBrowser({ id: pin.id, name: pin.name })
+  }, [])
+
+  /** 右键文件夹排空白「添加快速访问…」：通用选目录 → 追加钉选（查重 / 封顶在 store）。 */
+  const addHomePinnedFromPicker = useCallback(async (): Promise<void> => {
+    const dir = await window.modvault.pickDirectory({
+      title: '选择要添加到快速访问的文件夹',
+      buttonLabel: '添加到快速访问'
+    })
+    if (!dir) return
+    const outcome = await useVault.getState().addHomePinnedFolder(folderNameOfPath(dir), dir)
+    if (outcome === 'added') useVault.getState().setNotice('已添加到首页快速访问')
+    else if (outcome === 'duplicate') useVault.getState().setNotice('该文件夹已在快速访问中')
+    else useVault.getState().setNotice('快速访问已满（最多 32 个），请先移除一些再添加')
+  }, [])
+
+  /** 钉选排序（左移 / 右移）与移除：只动 Settings，不碰磁盘。 */
+  const moveHomePinned = useCallback((id: string, delta: -1 | 1): void => {
+    void useVault.getState().moveHomePinnedFolder(id, delta)
+  }, [])
+  const removeHomePinned = useCallback((id: string): void => {
+    void useVault
+      .getState()
+      .removeHomePinnedFolder(id)
+      .then(() => useVault.getState().setNotice('已从快速访问移除'))
+  }, [])
+
+  // ── T-03：新建项目向导入口（docs/60 §4.3 W0）──────────────────────────────
+  // 双入口同开一个向导：① 文件夹排末尾「新建项目」虚卡（HomeCover onNewProject）；
+  // ② 文件夹排右键「新建项目…」（homeRowMenuItems.onNewProject）。
+  const [newProjectOpen, setNewProjectOpen] = useState<boolean>(false)
+  const openNewProjectWizard = useCallback((): void => {
+    setNewProjectOpen(true)
+  }, [])
+
+  /**
+   * F-3 设置底纹：pickArchives 拾一张图 → `homeBackground:save` 落盘（复制进
+   * `<userData>/home-bg/<sha256>.<ext>`，**临时路径绝不入 Settings**）→ 写映射键。
+   * key 由 HomeCover 拼好传上来（`kind:*` / `pin:*` 命名空间，logic/homePinned.ts）。
+   */
+  const setHomeFolderWallpaperFromPicker = useCallback(async (key: string): Promise<void> => {
+    const files = await window.modvault.pickArchives()
+    const filePath = files[0]
+    if (!filePath) return
+    const result = await window.modvault.saveHomeBackground({ kind: 'local', filePath })
+    if (!result.ok) {
+      useVault.getState().setNotice(`底纹设置失败：${result.error}`)
+      return
+    }
+    await useVault.getState().setHomeFolderWallpaper(key, result.fileName)
+    useVault.getState().setNotice('底纹已更新')
+  }, [])
+
+  /** 恢复默认底纹：只删映射键，**不删**缓存文件（同图可能被多个文件夹引用）。 */
+  const clearHomeFolderWallpaper = useCallback(async (key: string): Promise<void> => {
+    await useVault.getState().setHomeFolderWallpaper(key, null)
+    useVault.getState().setNotice('已恢复默认底纹')
+  }, [])
 
   /**
    * 首页搜索面板取结果的纯函数（`HomeSearchCommand` 每次按键调一次）。
@@ -1528,20 +1659,49 @@ export default function App() {
               {/* 首页封面页（v0.9.4）：**排在 `empty` 之前** —— 空库也要渲染封面页
                  （文件夹显示 0 + 「还没有素材」），不能被"拖压缩包进来"的 CTA 顶掉：
                  首页是导航第一项，任何时候点它都该回到同一块封面。 */}
-              <HomeCover
-                folders={homeFolders}
-                stats={homeStats}
-                searchGroups={homeSearchGroups}
-                onPickSearch={pickFromHomeSearch}
-                onOpenKind={activateKindFromHome}
-                onOpenSettings={() => setSettingsOpen(true)}
-                waveColors={stableHomeWaveColors}
-                waveHeight={safeHomeWaveHeight}
-                homeBackground={stableHomeBackground}
-              />
+              {/* v1.2 反馈批 B：双击钉选卡 → 应用内文件浏览（用户原话「进入的仍然是
+                  我们的软件界面」）。浏览器打开时**替换**中栏内容（HomeCover 不挂载），
+                  关闭即回首页 —— 钉选与底纹都在 settings 里，首页状态原样不破坏。
+                  HomeGuide 依赖封面 DOM 锚点，浏览态下一并挂起。 */}
+              {pinnedBrowser ? (
+                <PinnedFolderBrowser
+                  pinId={pinnedBrowser.id}
+                  pinName={pinnedBrowser.name}
+                  onClose={() => setPinnedBrowser(null)}
+                />
+              ) : (
+                <HomeCover
+                  folders={homeFolders}
+                  stats={homeStats}
+                  searchGroups={homeSearchGroups}
+                  onPickSearch={pickFromHomeSearch}
+                  onOpenKind={activateKindFromHome}
+                  onOpenSettings={() => setSettingsOpen(true)}
+                  waveColors={stableHomeWaveColors}
+                  waveHeight={safeHomeWaveHeight}
+                  homeBackground={stableHomeBackground}
+                  pinnedFolders={stableHomePinnedFolders}
+                  folderOrder={stableHomeFolderOrder}
+                  onReorderFolders={reorderHomeFolders}
+                  folderWallpapers={stableHomeFolderWallpapers}
+                  onOpenPinned={browseHomePinnedFolder}
+                  onRevealPinned={openHomePinnedFolder}
+                  onRemovePinned={removeHomePinned}
+                  onMovePinned={moveHomePinned}
+                  onAddPinned={() => void addHomePinnedFromPicker()}
+                  onSetFolderWallpaper={(key) => void setHomeFolderWallpaperFromPicker(key)}
+                  onClearFolderWallpaper={(key) => void clearHomeFolderWallpaper(key)}
+                  onNewProject={openNewProjectWizard}
+                />
+              )}
+              {/* T-03 新建项目向导：两个入口（虚卡 / 排右键）都开这一个实例。 */}
+              {newProjectOpen ? (
+                <NewProjectWizard onClose={() => setNewProjectOpen(false)} />
+              ) : null}
               {/* V1.0 分步引导：与 HomeCover 同级的一次性浮层。锚点在各组件根节点上，
-                  引导不包任何 div、不改封面布局；关闭后首页交互原样保留。 */}
-              {shouldShowHomeGuideNow ? (
+                  引导不包任何 div、不改封面布局；关闭后首页交互原样保留。
+                  浏览态（pinnedBrowser）下锚点不在 DOM，挂起引导。 */}
+              {!pinnedBrowser && shouldShowHomeGuideNow ? (
                 <HomeGuide
                   version={appVersion}
                   saveSettings={saveSettings}

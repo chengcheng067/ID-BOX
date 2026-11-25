@@ -1,0 +1,157 @@
+/* ── 主页文件夹类别筛选气泡（逆向 shadcnblocks gallery10 · Browse by type）─────
+ *
+ * 语义：主页内筛选，不离开主页。点气泡 → 下方文件夹排只留那一类卡片。
+ * 动效三件套（gallery10 逐项复刻）：
+ *   ① 实心高亮 pill 滑到选中气泡 —— translateX + width 过渡（本文件）；
+ *   ② 卡片错峰淡入上浮 —— 由 HomeCover 给 GlassFolder 换 key 触发其既有入场体系；
+ *   ③ 箭头到两端禁用 —— gallery10 有，本项目排是横向滚动 + 已有边缘热区，
+ *      此处不重复做箭头（HomeCover 的 hc-folder-edge 已是同一职能）。
+ *
+ * 配色纪律（项目铁律）：中性底 + macOS 系统蓝强调。选中态用 accent，不用橙/暖色。
+ *   ⚠️ 高亮 pill 是"实心深色块"在 gallery10 里是黑色；这里按项目调性改成
+ *      `--accent`（浅 #007AFF / 深 #0A84FF）+ 白字，仍保留"滑动实心块"的观感。
+ */
+
+.hff-root {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  flex: none;
+}
+
+/* 轨道：气泡横排；padding 给 pill 的阴影/圆角留呼吸 */
+.hff-track {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 999px;
+  background: var(--pill-bg);
+}
+
+/* 滑动高亮块：绝对定位，只动 transform + width（合成层友好，零重排）。
+ * data-ready=false → 首帧不显示，等量到选中气泡几何后再淡入，避免从 (0,0) 飞入。 */
+.hff-pill {
+  position: absolute;
+  top: 4px;
+  left: 0;
+  bottom: 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, width;
+  transition:
+    transform 0.42s var(--gf-ease, cubic-bezier(0.2, 0.8, 0.2, 1)),
+    width 0.42s var(--gf-ease, cubic-bezier(0.2, 0.8, 0.2, 1)),
+    opacity 0.2s ease;
+}
+
+.hff-pill[data-ready='true'] {
+  opacity: 1;
+}
+
+/* 平滑档 / 系统减少动效：pill 直接到位，不滑动 */
+.hff-pill[data-motion='false'] {
+  transition: opacity 0.2s ease;
+}
+
+.hff-chip {
+  position: relative;
+  z-index: 1; /* 盖在 pill 之上 */
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary, var(--tint-neutral-text));
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.24s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.hff-chip:hover:not(:disabled) {
+  color: var(--text-primary, #fff);
+}
+
+/* 选中：文字转白压在 accent 实心块上 */
+.hff-chip[data-active='true'] {
+  color: #fff;
+}
+
+.hff-chip:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.hff-count {
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.72;
+}
+
+.hff-chip[data-active='true'] .hff-count {
+  opacity: 0.9;
+}
+
+/* 深色主题：pill 蓝底白字已是高对比，无需改；未选中文字走主题变量即可 */
+
+/* ── 卡片错峰进场：HomeCover 切筛选时给文件夹排打 data-reveal ────────────────
+ * 只做 opacity + translateY（合成层），不动 scale —— 卡片自己的 hover 翻盖
+ * 已经是 scale 动效，两层 scale 叠加会打架。错峰 delay 由 HomeCover 按 index 内联。 */
+/* ★ 2026-11-26 修「闪烁 / 傻快 / 掉帧」三合一：
+ * ① 掉帧：.gf-root 是重合成层（backdrop-filter + clip-path + canvas 磨砂位图 +
+ *    isolation:isolate），对它做 transform 动画 = 每帧整棵子树重新栅格化 → 只做 opacity。
+ * ② 闪烁（用户第二次反馈）：切档时若用 rAF 延迟挂 animation，新卡片首帧是 opacity:1
+ *    完全显示、下一帧才拉回 0 淡入 = 肉眼可见的闪。改用**双名交替** hff-card-in-a/b：
+ *    HomeCover 每次切档翻 data-reveal 的 a↔b，animation-name 变化 → 动画重播，
+ *    且新卡片挂载首帧就命中新 name、opacity:0（fill:both），只有渐入没有闪。
+ * ③ 傻快：时长 0.44s→0.7s、错峰 55→80ms，节奏从容。 */
+@keyframes hff-card-in-a {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes hff-card-in-b {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']),
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']) {
+  animation-duration: 0.7s;
+  animation-timing-function: var(--gf-ease, cubic-bezier(0.2, 0.8, 0.2, 1));
+  animation-fill-mode: both;
+  /* 提前提升为合成层，避免动画中途的层提升抖动 */
+  will-change: opacity;
+}
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']) { animation-name: hff-card-in-a; }
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']) { animation-name: hff-card-in-b; }
+/* 错峰：逐卡 +80ms（放缓，原 55ms），用 nth-child 免传 style prop */
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(1),
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(1) { animation-delay: 0ms; }
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(2),
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(2) { animation-delay: 80ms; }
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(3),
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(3) { animation-delay: 160ms; }
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(4),
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(4) { animation-delay: 240ms; }
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(5),
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(5) { animation-delay: 320ms; }
+.hc-folder-wrap[data-reveal='a'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(n + 6),
+.hc-folder-wrap[data-reveal='b'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']):nth-child(n + 6) { animation-delay: 400ms; }
+
+/* 平滑档 / 系统减少动效：卡片不播错峰，直接到位 */
+.hc-folder-wrap[data-reveal-motion='false'] > .hc-folder-scroll > .hc-folder-row > *:not([data-leaving='self']) {
+  animation: none;
+}

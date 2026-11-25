@@ -153,3 +153,40 @@ describe('侧栏折叠 · 源码守卫（main 侧归一化收口）', () => {
     expect(settings).toMatch(/merged\.sidebarRightCollapsed = merged\.sidebarRightCollapsed === true/)
   })
 })
+
+describe('侧栏折叠 · 源码守卫（48px 轨道态隐藏清单完整）', () => {
+  // 2026-11 用户反馈：折叠成 48px 图标轨道后，`.sidebar-hook.is-collapsed` 的
+  // display:none 清单漏了 4 个元素 —— 空态提示 / 回收站徽标 / 导入 CTA / 设置行，
+  // 它们在窄条里被裁成竖排；另展开树残留的 `.hook-sub` 空行会把竖条撑长。
+  // 轨道态里这些元素都没有图标形态，必须全部隐藏。此处钉住清单，防止回归。
+  const css = read('renderer/components/sidebar-hook.css')
+  // display:none 清单块以 `.hook-label` 选择器开头（前面 line 22 还有一个 width:48px 块）
+  const collapsedBlock =
+    css.match(/\.sidebar-hook\.is-collapsed \.hook-label[\s\S]*?\n\}/)?.[0] ?? ''
+
+  it('折叠态清单包含：空态提示 / 徽标 / CTA / 设置行 / 子层容器', () => {
+    expect(collapsedBlock).not.toBe('')
+    expect(collapsedBlock).toContain('.hook-save-hint')
+    expect(collapsedBlock).toContain('.badge')
+    expect(collapsedBlock).toContain('.btn-cta')
+    expect(collapsedBlock).toContain('.hook-foot-row')
+    expect(collapsedBlock).toContain('.hook-sub')
+  })
+
+  it('清单仍覆盖原有元素（标签 / 计数 / 组头 / 头部 / 底部小字）', () => {
+    expect(collapsedBlock).toContain('.hook-label')
+    expect(collapsedBlock).toContain('.hook-count')
+    expect(collapsedBlock).toContain('.hook-caret')
+    expect(collapsedBlock).toContain('.hook-group')
+    expect(collapsedBlock).toContain('.hook-chips')
+    expect(collapsedBlock).toContain('.hook-row-x')
+    expect(collapsedBlock).toContain('.sidebar-hook-head')
+    expect(collapsedBlock).toContain('.hook-foot-path')
+    expect(collapsedBlock).toContain('.hook-foot-version')
+  })
+
+  it('空态提示 div 已挂上稳定类名 hook-save-hint（Sidebar.tsx）', () => {
+    const sidebar = read('renderer/components/Sidebar.tsx')
+    expect(sidebar).toContain('hook-save-hint')
+  })
+})

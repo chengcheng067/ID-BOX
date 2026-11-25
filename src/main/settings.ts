@@ -20,7 +20,11 @@ import { DEFAULT_LIBRARY_DIR } from './paths'
 import { freeBytesOf } from './disk'
 import { DEFAULT_UNDO_GRACE_MS, normalizeUndoGraceMs } from '../shared/undoGrace'
 import { normalizeCustomTaxonomy } from '../shared/customTaxonomy'
+import { normalizeProjectTemplates } from '../shared/projectTemplate'
+import { normalizePinnedViewPrefsMap } from '../shared/pinnedViewPrefs'
+import { normalizeHomeFolderOrder } from '../shared/homeFolderOrder'
 import { HEX_PATTERN, clampDimAlpha, clampWaveHeight, validHexOrNull } from '../shared/homeTide'
+import type { HomePinnedFolder } from '../shared/types'
 
 /** 首次运行选盘时的最低可用空间门槛（U3） */
 export const MIN_FREE_BYTES_FOR_LIBRARY = 20 * 1024 * 1024 * 1024
@@ -282,6 +286,38 @@ export const SettingsSchema = z.object({
     })
     .optional()
     .catch(DEFAULT_HOME_BACKGROUND),
+  /**
+   * 项目文件夹模板（docs/60 §2，多模板 · Q-2 用户批注）。
+   *
+   * schema 层放行任意形状（`z.unknown()`），逐项清洗 / 剪枝 / id 去重 / 条数封顶 /
+   * 整表坏回落默认统一交给 `normalizeProjectTemplates`（在 migrateSettings /
+   * normalizeSettings 两处收口）—— `customTaxonomy` 同款分工：脏模板只丢模板，
+   * 绝不让整份 settings.json 回落默认。
+   */
+  projectTemplates: z.unknown().optional(),
+  /**
+   * 首页快速访问钉选（F-1，docs/60 §6.1）。同上：schema 放行任意形状，
+   * 归一化在 `normalizeHomePinnedFolders` 收口（脏类型丢弃 / absPath 非绝对丢弃 /
+   * 同 absPath 去重 / 条数封顶），单项降级不拖垮整份 settings.json。
+   */
+  homePinnedFolders: z.unknown().optional(),
+  /**
+   * 钉选目录浏览器的视图 / 排序记忆（2026-11-25 用户需求①）。同上：schema 放行任意形状，
+   * 归一化在 `normalizePinnedViewPrefsMap` 收口（脏条目丢弃 / 未知视图回落列表 / 32 键封顶），
+   * 单项降级不拖垮整份 settings.json。
+   */
+  pinnedViewPrefs: z.unknown().optional(),
+  /**
+   * 文件夹底纹映射（F-3，docs/60 §6.3）。同上：归一化在 `normalizeHomeFolderWallpaper`
+   * 收口（未知命名空间键丢弃 / 空 fileName 丢弃 / 键数封顶）。
+   */
+  homeFolderWallpaper: z.unknown().optional(),
+  /**
+   * 首页文件夹排拖动排序（2026-11-25 用户需求）。同上：schema 放行任意形状，
+   * 归一化在 `normalizeHomeFolderOrder` 收口（脏项丢弃 / 去重保序 / 64 封顶 / 未知键保留），
+   * 单项降级不拖垮整份 settings.json。
+   */
+  homeFolderOrder: z.unknown().optional(),
   /** 首页引导首启是否已展示：脏值回落 `false` = 再显示一次（宁可多提示）。 */
   homeGuideFirstRunShown: z.boolean().optional().catch(false),
   /** 上次展示引导的版本号：脏值回落 `null`。 */
@@ -499,6 +535,80 @@ function normalizeHomeBackground(value: unknown): Settings['homeBackground'] {
   }
 }
 
+// ── 首页快速访问钉选 / 文件夹底纹（docs/60 §6.1 / §6.3，T-01） ────────────────
+//
+// 两条数据都是 docs/60 新增的 Settings 键：读档 / 写档共用同一归一化入口
+// （normalizeHomeWaveColors 同款纪律），**永不抛错**、单项降级不拖垮整份 settings.json。
+// ⚠️ 两者都**不入**打包白名单 `PERSONAL_SETTINGS_KEYS`（§5.3 写死：机器路径 / 缓存引用）。
+
+/** 宽松对象判定（数组不算对象入参；settings.ts 内部小工具，勿与 shared 版混用） */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/** 钉选条数上限（docs/60 §6.1 ④ 判据：「上限 32 条封顶防排爆」） */
+export const MAX_HOME_PINNED_FOLDERS = 32
+
+/** 底纹映射键数上限（docs/60 §6.3 ④ 判据：「上限 64 键封顶」） */
+export const MAX_HOME_FOLDER_WALLPAPER_KEYS = 64
+
+/** 底纹 key 的两个合法命名空间：`kind:<AssetKind|KindGroup>` / `pin:<钉选 id>` */
+const WALLPAPER_KEY_RE = /^(kind|pin):.+$/
+
+/**
+ * 首页快速访问钉选的**唯一归一化入口**（读档 / 写档共用，docs/60 §6.1 ④）。
+ *
+ * - 非数组 → 空数组（= 没有钉选，回落默认行为）；
+ * - 脏项（非对象 / `id`·`name`·`absPath` 缺失或非字符串）逐条丢弃；
+ * - `absPath` 必须是**绝对路径**（`path.isAbsolute`）—— 相对路径无法在主进程
+ *   `home:pinnedOpen` 里定位，带进 Settings 只会产出永远打不开的死卡；
+ * - 同 `absPath` 去重（保留先出现的那条 —— §6.1 添加入口已查重，这里是手改档兜底）；
+ * - 条数 > `MAX_HOME_PINNED_FOLDERS`(32) 截断（保序：数组顺序即显示顺序）。
+ */
+export function normalizeHomePinnedFolders(value: unknown): HomePinnedFolder[] {
+  if (!Array.isArray(value)) return []
+  const out: HomePinnedFolder[] = []
+  const seenAbs = new Set<string>()
+  for (const raw of value) {
+    if (out.length >= MAX_HOME_PINNED_FOLDERS) break
+    if (!isPlainObject(raw)) continue
+    const { id, name, absPath } = raw as Record<string, unknown>
+    if (typeof id !== 'string' || !id.trim()) continue
+    if (typeof name !== 'string' || !name.trim()) continue
+    if (typeof absPath !== 'string' || !path.isAbsolute(absPath)) continue
+    if (seenAbs.has(absPath)) continue
+    seenAbs.add(absPath)
+    out.push({ id, name, absPath })
+  }
+  return out
+}
+
+/**
+ * 文件夹底纹映射的**唯一归一化入口**（读档 / 写档共用，docs/60 §6.3 ④）。
+ *
+ * - 非对象 → 空映射（= 全部回落默认底纹）；
+ * - key 不在两个合法命名空间（`kind:` / `pin:`）内 → 丢弃（防手改档把任意键写进来）；
+ * - value 非字符串 / trim 后为空 → 丢弃（空引用只会渲染出坏图）；
+ * - 键数 > `MAX_HOME_FOLDER_WALLPAPER_KEYS`(64) 截断。
+ *
+ * ⚠️ 这里**不做** `<sha256>.<ext>` 形态校验：fileName 只是对 home-bg 目录的引用，
+ * 文件本体可能尚未落盘（异步时序）或由既有 `homeBackground:save` 机制命名 ——
+ * 形态正则断言归 `tests/homePinned.test.ts`（T-05）与真机 QA，归一化只保证"是合法引用"。
+ */
+export function normalizeHomeFolderWallpaper(value: unknown): Record<string, string> {
+  if (!isPlainObject(value)) return {}
+  const out: Record<string, string> = {}
+  for (const [key, val] of Object.entries(value)) {
+    if (Object.keys(out).length >= MAX_HOME_FOLDER_WALLPAPER_KEYS) break
+    if (!WALLPAPER_KEY_RE.test(key)) continue
+    if (typeof val !== 'string') continue
+    const fileName = val.trim()
+    if (!fileName) continue
+    out[key] = fileName
+  }
+  return out
+}
+
 /**
  * 旧档迁移（P0-5）：`trashArchiveAfterImport:true → 'recycle'`、`:false → 'keep'`；
  * 迁移后删掉 deprecated 键，写档不再带它。
@@ -544,6 +654,14 @@ export function migrateSettings(raw: RawSettings): Settings {
     homeWaveInteractive: raw.homeWaveInteractive !== false,
     homeWaveClickRipples: raw.homeWaveClickRipples !== false,
     homeBackground: normalizeHomeBackground(raw.homeBackground),
+    // 项目模板 / 快速访问钉选 / 底纹（docs/60 T-01）：旧档缺键 → 内置 4×15 模板 /
+    // 空钉选表 / 空底纹映射 —— 升级零迁移、行为不变。脏表只丢表，绝不拖垮整份 settings。
+    projectTemplates: normalizeProjectTemplates(raw.projectTemplates),
+    homePinnedFolders: normalizeHomePinnedFolders(raw.homePinnedFolders),
+    pinnedViewPrefs: normalizePinnedViewPrefsMap(raw.pinnedViewPrefs),
+    homeFolderWallpaper: normalizeHomeFolderWallpaper(raw.homeFolderWallpaper),
+    // 拖动排序（2026-11-25）：旧档缺键 → 空表 = 默认排布，升级零迁移。
+    homeFolderOrder: normalizeHomeFolderOrder(raw.homeFolderOrder),
     homeGuideFirstRunShown: raw.homeGuideFirstRunShown === true,
     homeGuideLastVersion:
       typeof raw.homeGuideLastVersion === 'string' ? raw.homeGuideLastVersion : null,
@@ -657,6 +775,17 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   merged.homeWaveInteractive = merged.homeWaveInteractive !== false
   merged.homeWaveClickRipples = merged.homeWaveClickRipples !== false
   merged.homeBackground = normalizeHomeBackground(merged.homeBackground)
+  // 项目模板 / 快速访问钉选 / 底纹（docs/60 T-01）：写档前再收口一次（与读档同一口径；
+  // 设置页单条编辑也可能带脏值进来）。归一化实现在 shared/projectTemplate.ts 与本文件
+  // 上方两个函数 —— 唯一实现，别处不得复制。
+  merged.projectTemplates = normalizeProjectTemplates(merged.projectTemplates)
+  merged.homePinnedFolders = normalizeHomePinnedFolders(merged.homePinnedFolders)
+  // 视图 / 排序记忆（2026-11-25）：写档前再收口一次（与读档同一口径；
+  // 渲染层 patch 也可能带脏值进来）。脏值只丢那一条，不拖垮整份 settings.json。
+  merged.pinnedViewPrefs = normalizePinnedViewPrefsMap(merged.pinnedViewPrefs)
+  merged.homeFolderWallpaper = normalizeHomeFolderWallpaper(merged.homeFolderWallpaper)
+  // 拖动排序（2026-11-25）：写档前再收口一次（与读档同一口径；渲染层 patch 也可能带脏值）。
+  merged.homeFolderOrder = normalizeHomeFolderOrder(merged.homeFolderOrder)
   merged.homeGuideFirstRunShown = merged.homeGuideFirstRunShown === true
   merged.homeGuideLastVersion =
     typeof merged.homeGuideLastVersion === 'string' ? merged.homeGuideLastVersion : null

@@ -24,9 +24,16 @@ export const GITHUB_LATEST_RELEASE_URL =
 /** 请求超时：8 秒。断网 / DNS 挂掉时不能让 UI 的「正在检查…」无限转。 */
 export const UPDATE_CHECK_TIMEOUT_MS = 8_000
 
-/** 安装包资产名规则：`IDBOX-Setup-<version>.exe`（见 package.json 的 artifactName） */
+/**
+ * 安装包资产名规则：`IDBOX-Setup-<version>.<ext>`（见 package.json 的 artifactName）。
+ * ★ 2026-11-26（用户 11-23 提出的 T-UPD-ZIP）：**优先 zip，退回 exe**。
+ * 未签名 exe 会被 Chrome/Edge 的 Safe Browsing 拦成「不安全文件」不让下；zip 不会被拦。
+ * 从 v1.1.0 起每个 Release 都同时传 exe + zip，但老 Release 只有 exe —— 所以保留 exe 兜底，
+ * 两个都没有时 pickAssetUrl 返回 null，调用方（UpdateNotesDialog 的 assetUrl || url）退回 Release 页。
+ */
 const ASSET_PREFIX = 'IDBOX-Setup-'
-const ASSET_SUFFIX = '.exe'
+const ZIP_SUFFIX = '.zip'
+const EXE_SUFFIX = '.exe'
 
 /**
  * Release 说明（`body`）的长度上限（字符数，UTF-16 码元）。
@@ -194,18 +201,26 @@ export function compareVersions(a: string, b: string): number {
   return preA < preB ? -1 : 1
 }
 
-/** 从 release JSON 里挑安装包直链（`IDBOX-Setup-*.exe`），挑不到返回 null */
+/**
+ * 从 release JSON 里挑「推荐下载」直链：**先找 zip，找不到退 exe，都没有返回 null**。
+ * 两趟扫描而不是一趟里"谁先出现用谁"—— 资产列表顺序不可控，必须 zip 绝对优先。
+ */
 function pickAssetUrl(value: unknown): string | null {
   if (!Array.isArray(value)) return null
+  const prefix = ASSET_PREFIX.toLowerCase()
+  // 归一化一次：只留合法 {name,url} 对，避免两趟重复做类型判断
+  const candidates: Array<{ lower: string; url: string }> = []
   for (const item of value) {
     if (item === null || typeof item !== 'object') continue
     const asset = item as Record<string, unknown>
     const name = typeof asset.name === 'string' ? asset.name.trim() : ''
     const url = typeof asset.browser_download_url === 'string' ? asset.browser_download_url : ''
     if (!name || !url) continue
-    const lower = name.toLowerCase()
-    if (lower.startsWith(ASSET_PREFIX.toLowerCase()) && lower.endsWith(ASSET_SUFFIX)) {
-      return url
+    candidates.push({ lower: name.toLowerCase(), url })
+  }
+  for (const suffix of [ZIP_SUFFIX, EXE_SUFFIX]) {
+    for (const { lower, url } of candidates) {
+      if (lower.startsWith(prefix) && lower.endsWith(suffix)) return url
     }
   }
   return null

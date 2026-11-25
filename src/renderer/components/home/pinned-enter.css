@@ -1,0 +1,109 @@
+/*
+ * 应用内文件浏览器 · 进入 / 退出工作文件夹的转场（2026-11-25）
+ *
+ * 用户口径：双击钉选文件夹进入浏览器 / 回首页都是硬切，没有任何转场。
+ * 机制照 `grid-enter.css` + `AssetGrid` 那套既有语言（CSS keyframes、只动
+ * transform / opacity 的合成层动画、reduce 时退化成短纯淡入），不引 JS 动画库。
+ *
+ * 分工：
+ * - 入场 = 浏览器面板挂载即播 `.pinned-browser-enter`（PinnedFolderBrowser 根节点）；
+ * - 退场 = 关闭动作先经组件内的统一 `requestClose`：挂 `.pinned-browser-exit`
+ *   播完 150ms 再真正 `onClose()` 卸载（回首页按钮 / Esc 层栈 / 错误卡的
+ *   「回首页」全部走这一个函数，键盘路径不会跳过动画）。
+ *
+ * ⚠️ 退场时长必须与 PinnedFolderBrowser.tsx 的 `EXIT_ANIM_MS`（150）一致：
+ *    JS 侧按它计时卸载，单边改动会出现"动画被掐断"或"白等"。
+ * ⚠️ 填充模式不对称且不可统一：入场 `backwards` / 退场 `both`。根节点一旦残留
+ *    非 none 的 transform，就会成为内部所有 `position: fixed` 元素（右键菜单 /
+ *    删除确认遮罩 / 多选浮条）的包含块，坐标被整体平移。详见入场段注释。
+ * ⚠️ 不用 backdrop-filter、不引入新色值 —— 这是纯合成层动画，不触发布局重绘。
+ */
+
+/* ── 入场：上移淡入 + 轻 scale（160~220ms 档的中位 180ms）──────────────────
+ *
+ * ⚠️⚠️ 填充模式必须是 `backwards`，**不能是 `both` / `forwards`**（2026-11-25 修）。
+ * `.pinned-browser-enter` 挂在浏览器面板**根节点**上，根节点内部的右键菜单
+ * （`PinnedBrowserMenu`，`position: fixed`）与删除确认层遮罩 / 多选浮条都是
+ * fixed 后代。CSS 规定：祖先只要有一个非 `none` 的 `transform`，fixed 后代的
+ * 包含块就从**视口**变成该祖先的 padding box。
+ * `both` 会把结束帧的 `transform: translateY(0) scale(1)` 一直留在计算样式里
+ * （`matrix(1,0,0,1,0,0)` ≠ `none`）→ 面板永久成为 containing block，
+ * 菜单落点被叠加面板原点（顶栏 56px / 左栏宽）、遮罩少盖顶栏一条。
+ * `backwards` 只在动画期间应用 keyframes，结束后 transform 交还 `none`
+ * （结束帧本来就是恒等 transform，视觉零变化）。
+ * 入场动效进行中的 180ms 内面板仍是 containing block —— 那段时间的菜单定位
+ * 由 `PinnedBrowserMenu` 的 portal 到 `<body>` 兜住，两条防线互补。
+ *
+ * ⚠️ 退场**必须保持 `both`**（见下），两者不同不是笔误：
+ *   退场要在 JS 计时器卸载组件之前把「淡出到底」的终态钉住，掉了填充会
+ *   在最后一帧闪回满不透明；而退场期间 `pointer-events: none`，不会有人在这
+ *   150ms 里开菜单 / 开弹窗，containing block 无副作用。 */
+.pinned-browser-enter {
+  animation: pinned-browser-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+@keyframes pinned-browser-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ── 退场：反向下移淡出（150ms，比入场短一档：离开要干脆）──────────────────
+ * ⚠️ 这里**必须** `both`（与入场刻意不同，理由见入场段注释）：终态要一直保持到
+ *    `PinnedFolderBrowser` 的 `EXIT_ANIM_MS` 计时器真正卸载组件，否则淡出到 0
+ *    的那一帧会闪回满不透明。退场期间 `pointer-events: none`，不会有人在这
+ *    150ms 里开菜单 / 弹窗，因此这段 containing block 不产生可见缺陷。 */
+.pinned-browser-exit {
+  animation: pinned-browser-out 150ms cubic-bezier(0.4, 0, 1, 1) both;
+  /* 飞走期间不许交互：连点回首页 / 再按 Esc 都不该命中正在退出的面板 */
+  pointer-events: none;
+}
+
+@keyframes pinned-browser-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+}
+
+/* ── 系统「减少动效」：位移整块不做，退化成短纯淡入 / 淡出（190ms / 150ms）──
+ * 与 styles.css / grid-enter.css 的 reduce 口径一致：无障碍兜底压过上面所有规则。 */
+@media (prefers-reduced-motion: reduce) {
+  .pinned-browser-enter {
+    animation-name: pinned-browser-fade-in;
+    animation-duration: 190ms;
+    animation-timing-function: linear;
+  }
+  .pinned-browser-exit {
+    animation-name: pinned-browser-fade-out;
+    animation-duration: 150ms;
+    animation-timing-function: linear;
+  }
+}
+
+@keyframes pinned-browser-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes pinned-browser-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}

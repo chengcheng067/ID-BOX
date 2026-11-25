@@ -169,13 +169,12 @@ describe('README：C 方案说明 + 网盘承诺守卫 + 隐私行逐字', () =>
   const raw = readSrc('README.md')
   const lines = raw.split('\n')
 
-  it('含 C 方案说明词（手动打包搬运 + 库目录放进同步文件夹）', () => {
+  it('含 C 方案说明词（同步工具搬运：库目录放进它们的同步文件夹）', () => {
     expect(raw).toContain('跨机同步')
-    expect(raw).toContain('打包本地素材')
-    expect(raw).toContain('导入素材包')
+    // v1.1.0 重写后的 C 方案实际表述，锚定句内不易被营销化改写的稳定片段
+    expect(raw).toContain('库目录放进它们的同步文件夹')
     expect(raw).toContain('Syncthing')
     expect(raw).toContain('绿联 NAS')
-    expect(raw).toContain('同步文件夹')
     expect(raw).toContain('ID BOX 只读取这个目录')
   })
 
@@ -194,9 +193,15 @@ describe('README：C 方案说明 + 网盘承诺守卫 + 隐私行逐字', () =>
     }
   })
 
-  it('README:350 隐私行逐字未动', () => {
-    // 第 350 行（1-based）= 索引 349；C 方案新段插在它之后，本行必须一字不改。
-    expect(lines[349]).toBe('- 不收集遥测，不上传任何素材或路径')
+  it('隐私行逐字未动且恰好出现一次（不随行号漂移）', () => {
+    // v1.1.0 重写后 README 变长，行号硬钉失效；改为内容锚定：
+    // 逐字存在 + 全文恰好一次 + 仍在「跨机同步」章节之前（保持原相对位置语义）。
+    const privacyLine = '- 不收集遥测，不上传任何素材或路径'
+    const hits = lines.filter((line) => line === privacyLine)
+    expect(hits.length, `隐私行应逐字出现且恰好一次，实际 ${hits.length} 次`).toBe(1)
+    const syncSectionIdx = raw.indexOf('## 跨机同步')
+    expect(raw.indexOf(privacyLine)).toBeGreaterThanOrEqual(0)
+    expect(raw.indexOf(privacyLine)).toBeLessThan(syncSectionIdx)
   })
 
   it('隐私段落「只在本机 / 不上传」的口径没有被 C 方案说明冲淡', () => {

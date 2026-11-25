@@ -128,7 +128,12 @@ export function Toolbar({
         // 2026-11-23 用户口径：顶栏只要**高斯模糊**、不要白底 —— background 不再
         // 叠 color-mix(--bg-canvas)，纯 blur 让壁纸直接透过顶栏。文字可读性交给
         // 顶栏自身内容的固有对比（Logo/窗口控制是深浅主题各自的 token 色）。
+        // 2026-11-25 用户反馈：深色主题下 `[data-theme='dark'] .topbar` 的
+        // `border-bottom: 1px solid var(--border)` 会孤零零横在壁纸上（一条黑线）。
+        // 壁纸态顶栏不该有分隔线，内联样式覆盖掉它（仅 homeMode 生效，
+        // 普通视图的深色底线保持原样）。
         background: 'transparent',
+        borderBottom: 'none',
         backdropFilter: 'blur(14px)',
         WebkitBackdropFilter: 'blur(14px)'
       }

@@ -440,16 +440,17 @@ describe('fromPortableAsset — 目标机现算 folder / 清缓存', () => {
 // ⑨ pickPersonalSettings / mergePersonalSettings
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('pickPersonalSettings — 11 键白名单', () => {
-  it('恰好产出 PERSONAL_SETTINGS_KEYS 的 11 个键（2 组 + 9 home*）', () => {
+describe('pickPersonalSettings — 12 键白名单', () => {
+  it('恰好产出 PERSONAL_SETTINGS_KEYS 的 12 个键（2 组 + 9 home* + projectTemplates）', () => {
     const patch = pickPersonalSettings(DEFAULT_SETTINGS)
     const keys = Object.keys(patch).sort()
     expect(keys).toEqual([...PERSONAL_SETTINGS_KEYS].sort())
-    expect(keys).toHaveLength(11)
+    expect(keys).toHaveLength(12)
     expect(keys.filter((k) => k.startsWith('home'))).toHaveLength(9)
+    expect(keys).toContain('projectTemplates')
   })
 
-  it('不含 libraryDir / 引导记位 / 侧栏折叠 / 插件与网络偏好', () => {
+  it('不含 libraryDir / 引导记位 / 侧栏折叠 / 插件与网络偏好 / 钉选 / 底纹', () => {
     const patch = pickPersonalSettings(DEFAULT_SETTINGS) as Record<string, unknown>
     for (const forbidden of [
       'libraryDir',
@@ -466,7 +467,10 @@ describe('pickPersonalSettings — 11 键白名单', () => {
       'zhimoCover',
       'savedViews',
       'theme',
-      'motionQuality'
+      'motionQuality',
+      // docs/60 §5.3 双向断言：机器路径 / 缓存引用永不随包走
+      'homePinnedFolders',
+      'homeFolderWallpaper'
     ]) {
       expect(forbidden in patch).toBe(false)
     }

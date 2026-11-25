@@ -883,6 +883,30 @@ describe('store.refreshZhimoCover：手动路径（force + 可区分文案）', 
     expect(modvault.fetchZhimoCover).toHaveBeenCalledTimes(1)
     expect(useVault.getState().assets[0]!.coverSource).toBe('zhimo')
   })
+
+  it('口径统一不拦手动：根层已有封面文件的资产，自动不碰、手动按钮（force）照样替换', async () => {
+    const a = fixture({
+      coverSource: 'named',
+      cover: '资产.cover.jpg',
+      files: [
+        { rel: '资产.cover.jpg', name: '资产.cover.jpg', ext: 'jpg', size: 50, kind: 'texture' },
+        { rel: '资产.skp', name: '资产.skp', ext: 'skp', size: 20, kind: 'model' }
+      ]
+    })
+    useVault.setState({ assets: [a] })
+    modvault.fetchZhimoCover.mockResolvedValue(okResult)
+
+    // 自动通道：入队闸门/锁内重查任一道都会拦住（pick 仍选中 named，锁内跳过）
+    await useVault.getState().runZhimoCovers({ ids: [a.id] })
+    expect(modvault.fetchZhimoCover).not.toHaveBeenCalled()
+    expect(useVault.getState().assets[0]!.coverSource).toBe('named')
+
+    // 手动按钮走 force：锁内重查的 force 分支放行 → 照常替换（语义不变）
+    await useVault.getState().refreshZhimoCover(a.id)
+    expect(modvault.fetchZhimoCover).toHaveBeenCalledTimes(1)
+    expect(useVault.getState().assets[0]!.coverSource).toBe('zhimo')
+    expect(useVault.getState().assets[0]!.cover).toBe(okResult.rel)
+  })
 })
 
 // ══════════════════════════════════════════════════════════════════
@@ -1089,6 +1113,41 @@ describe('store.coverLock：DEF-Z8 竞态复现（方向 1 / 方向 2 / 峰值�
     expect(useVault.getState().zhimoCoverBusyId).toBeNull()
     expect(useVault.getState().notice).toBeNull() // 自动任务静默：跳过不出声
   })
+
+  it('锁内重查：排队期间根层出现封面文件 → 跳过（cover-file，不算失败）', async () => {
+    // 与入队闸门同口径的兜底：入队后到抓取前这段时间里用户可能已设了封面
+    // （落成 `.cover.jpg` 进 files）。coverSource 保持 embedded，隔离出
+    // `hasCoverAssetFile` 这一道新闸门 —— 只看盘上有无封面文件。
+    const a = fixture({ coverSource: 'embedded', cover: '预览图.jpg' })
+    useVault.setState({ assets: [a] })
+
+    const box: { open?: () => void } = {}
+    const gate = new Promise<void>((resolve) => {
+      box.open = () => resolve()
+    })
+    const holder = withAssetCoverLock(a.id, () => gate)
+    const auto = useVault.getState().runZhimoCovers({ ids: [a.id] })
+
+    useVault.setState({
+      assets: [
+        {
+          ...a,
+          files: [
+            ...a.files,
+            { rel: '我的.cover.jpg', name: '我的.cover.jpg', ext: 'jpg', size: 777, kind: 'texture' }
+          ]
+        }
+      ]
+    })
+
+    box.open?.()
+    await holder
+    const res = await auto
+
+    expect(res).toEqual({ ok: 0, failed: 0, skipped: 1, stopped: false })
+    expect(modvault.fetchZhimoCover).not.toHaveBeenCalled()
+    expect(useVault.getState().assets[0]!.files.some((f) => f.rel === '我的.cover.jpg')).toBe(true)
+  })
 })
 
 describe('store：导入批次 → 自动抓取（事件驱动）', () => {
@@ -1176,6 +1235,33 @@ describe('store：导入批次 → 自动抓取（事件驱动）', () => {
     await new Promise((r) => setTimeout(r, 20))
 
     expect(modvault.fetchZhimoCover).not.toHaveBeenCalled()
+  })
+
+  it('口径统一：有封面文件 + coverSource=named + zhimoId 有值 → 不入队（不顶掉已有封面）', async () => {
+    // 用户实测缺陷：知末下载的 skp 在 SketchUp 里另存后经插件入库，文件名残留
+    // `ID_<数字>`，包里带截图封面（coverSource='named'）。旧判据只看 coverSource
+    // 且 replacePacked 默认 true → 自动流水线静默抓取并 commitCover('zhimo') 顶掉截图。
+    // 统一后：根层有 `.cover.(jpg|png)` 文件的资产不入队（与设置页补抓候选④同口径）。
+    const a = fixture({
+      name: '侘寂壁灯ID_1200166260',
+      kind: 'model',
+      coverSource: 'named',
+      cover: '资产.cover.jpg',
+      files: [
+        { rel: '资产.cover.jpg', name: '资产.cover.jpg', ext: 'jpg', size: 50, kind: 'texture' },
+        { rel: '资产.skp', name: '资产.skp', ext: 'skp', size: 20, kind: 'model' }
+      ],
+      zhimoId: '1200166260'
+    })
+    await useVault.getState().init()
+
+    importEventCb!({ item: 'a.zip', itemName: 'a.zip', status: 'done', asset: a })
+    batchDoneCb!()
+    await new Promise((r) => setTimeout(r, 20))
+
+    expect(modvault.fetchZhimoCover).not.toHaveBeenCalled()
+    expect(useVault.getState().assets[0]!.coverSource).toBe('named')
+    expect(useVault.getState().assets[0]!.cover).toBe('资产.cover.jpg')
   })
 
   it('开关关闭时导入 → 零请求（自动任务静默不抓）', async () => {

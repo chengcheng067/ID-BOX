@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { useVault } from '../../store'
 import { IconSettings } from '../../icons'
 import { HomeParticles } from './HomeParticles'
@@ -8,18 +9,61 @@ import {
   type WallpaperTone
 } from '../../logic/wallpaperTone'
 import { HomeStats } from './HomeStats'
-import { GlassFolder } from './GlassFolder'
+import { GlassFolder, NewProjectFolderCard } from './GlassFolder'
 import type { GlassFolderOpenPayload } from './GlassFolder'
+import {
+  HomeFolderFilter,
+  type HomeFolderFilterValue
+} from './HomeFolderFilter'
 import {
   HomeSearchCommand,
   type HomeSearchGroup,
   type HomeSearchItem
 } from './HomeSearchCommand'
-import type { HomeBackgroundSettings, MotionQuality, Settings } from '../../../shared/types'
+import { ContextMenu } from '../ContextMenu'
+import {
+  homeKindMenuItems,
+  homePinnedMenuItems,
+  homeRowMenuItems,
+  type ContextMenuItem
+} from '../../logic/contextMenu'
+// F-1/F-2/F-3 的纯逻辑（增删移 / 查重 / 边缘滚动 / 底纹 key）都在这里，组件只消费
+import {
+  EDGE_HOT_ZONE_PX,
+  edgeScrollDirection,
+  edgeScrollStep,
+  kindWallpaperKey,
+  nextScrollLeft,
+  pinWallpaperKey,
+  wallpaperUrlOf
+} from '../../logic/homePinned'
+// 拖动排序（2026-11-25）：槽位键 / 归一化 / 排序 / 移动全是 shared 里的纯函数（单测覆盖），
+// 组件只负责量几何、跟指针、让位与写档。
+import {
+  HOME_NEW_PROJECT_SLOT_KEY,
+  applyHomeFolderOrder,
+  buildHomeFolderSlots,
+  dragSlotShift,
+  homeKindFolderKey,
+  homePinFolderKey,
+  moveHomeFolderKey,
+  nearestSlotIndex,
+  normalizeHomeFolderOrder,
+  sortHomeFolderSlots
+} from '../../../shared/homeFolderOrder'
+import type {
+  HomeBackgroundSettings,
+  HomePinnedFolder,
+  MotionQuality,
+  Settings
+} from '../../../shared/types'
 // 退场（`data-leaving`）那套规则的宿主。它和过场的时间轴是同一件事的两半，所以与
 // `HomeOutro` 共用一份 CSS（本组件没有自己的样式文件，理由见 `home-outro.css` 里
 // 「首页退场」那一节的注释）。显式 import，不依赖"HomeOutro 先渲染过"这种隐式前提。
 import './home-outro.css'
+// 新建项目虚卡（docs/60 §4.3 W0，T-03）：样式独立成文件（不掺 T-05 定稿的
+// glass-folder.css），尺寸阶梯与 GlassFolder 逐档同步 —— 两处注释互相点名。
+import './new-project-card.css'
 
 /**
  * 首页封面页（v0.9.4「侧栏第一项『全部』→『首页』」的落地形态）。
@@ -48,6 +92,10 @@ import './home-outro.css'
  * 布局数值全部是设计稿量出来的真规格。
  */
 
+/** 类别筛选态下的稳定空集合（避免每次渲染新建 [] 让 slots useMemo 失效） */
+const EMPTY_FOLDERS: HomeFolderItem[] = []
+const EMPTY_PINNED: HomePinnedFolder[] = []
+
 /** 首页文件夹卡的数据项（key 与侧栏导航节点一一对应） */
 export interface HomeFolderItem {
   /**
@@ -73,6 +121,88 @@ export interface HomeStatsData {
   monthImports: number
   totalAssets: number
   pendingCategory: number
+}
+
+/**
+ * 首页文件夹排右键菜单的目标（T-05 F-1/F-3）。
+ * `kind` = 素材大类卡 / `pin` = 钉选卡 / `row` = 排的空白处。
+ */
+type HomeFolderMenu =
+  | { type: 'kind'; x: number; y: number; key: string }
+  | { type: 'pin'; x: number; y: number; id: string }
+  | { type: 'row'; x: number; y: number }
+
+/**
+ * 滚动容器的纵向补偿 padding（px）。**必须**与 `glass-folder.css`
+ * `.hc-folder-scroll` 的 `--hc-scroll-pad-top / -bottom` 同值 —— CSS 负责把可视域
+ * 撑大 + 负 margin 把布局补回原样；这里同一对数值把边缘热区的纵向安全带收回来
+ * （不收 = 搜索框旁边悬停也会触发滚动）。改一处必须改另一处。
+ */
+const SCROLL_PAD_TOP = 110
+const SCROLL_PAD_BOTTOM = 64
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 拖动排序（2026-11-25 用户需求：「首页文件夹支持鼠标拖动调整顺序」）
+ *
+ * 手势共存是这一块最要紧的约束：卡片自己已有 **单击翻开 / 双击进入 / 右键菜单 /
+ * 指针倾斜** 四套手势，拖动绝不能把它们误触掉。做法：
+ *   · 按下只记起点（不 preventDefault、不 setPointerCapture、不改任何状态）；
+ *   · 指针**横向**位移超过 `DRAG_THRESHOLD_PX` 才真正进入拖动态（竖向抖动不会
+ *     启动拖动）；
+ *   · 拖动真正开始后才捕获指针，并在松手那一帧把随后的 `click` 用捕获阶段的
+ *     `onClickCapture` 吞掉 —— **但只在"真的换了槽位"时才吞**。
+ *
+ * ⚠️ 这里曾经写成"只要越过阈值进入拖动态，松手就吞 click"，结果真人手点卡片时
+ * 4~8px 的横向手抖会越线 → 进入拖动态 → 松手落回原位 → 仍然把那次 click 吞掉
+ * → **单击翻开文件夹点了没反应**（双击是另一条链路、设置齿轮不在这一行里，所以
+ * 只有"单击卡片"坏掉，正是用户报的「点文件夹打不开」）。
+ * 正确语义：**没换槽位就不算拖动，不算拖动就不许吞 click。**
+ * 阈值只是把误触概率压低，真正保证"手抖还能点开"的是上面那条判断。
+ *
+ * 为什么不用 HTML5 drag-and-drop：`dragstart` 会与系统"拖出窗口"和卡片内
+ * `<img>` 的默认拖拽抢同一个手势，且 drag 事件在 Electron 里拿不到可靠的
+ * 指针坐标（只能靠 dragover 的节流数据）。Pointer Events + `setPointerCapture`
+ * 全程拿得到真实 clientX，取消路径（Esc / pointercancel）也干净。
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** 拖动起步阈值（px）：横向位移小于它 → 仍按单击 / 双击处理。
+ *  4px 对真人手速太窄（实测 4px 就能稳定触发误吞 click），提到 8px 与
+ *  dnd-kit / 浏览器原生拖拽一个量级；但注意**阈值只是降低误触概率**，
+ *  "手抖也能点开"靠的是 finishDrag 里"没换槽位就不吞 click"那条判断。 */
+const DRAG_THRESHOLD_PX = 8
+
+/**
+ * 一次拖动期间的运行态（**不进 state**：每帧都要改，进 state 会把整页重渲染 60 次/秒）。
+ * 指针移动只在 rAF 里直接写被拖卡与让位卡的 `transform`，React 只在
+ * 「开始 / 结束」两次重渲染（打 `data-dragging`、切 `pendingOrder`）。
+ */
+interface FolderDragState {
+  pointerId: number
+  /** 被拖卡的槽位键（`kind:<key>` / `pin:<id>`） */
+  key: string
+  /** 视觉顺序下的可拖卡键（不含虚卡）——移动与合入 order 都以它为准 */
+  keys: string[]
+  /** 键 → 根节点（拖动开始那一刻量好的快照） */
+  els: Map<string, HTMLElement>
+  /** 每张可拖卡的中心 x（视觉顺序，视口坐标）——落点判定按"最近中心" */
+  centers: number[]
+  /** 相邻两格的中心距（px）：让位平移量 */
+  step: number
+  /** 指针按下时的 clientX（位移以它为零点） */
+  startX: number
+  fromIndex: number
+  toIndex: number
+  dx: number
+  /** 被拖卡根节点（要单独 setPointerCapture / 抬升） */
+  sourceEl: HTMLElement
+}
+
+/** 只是"按下了，还没到拖动阈值"的起点记录 */
+interface FolderPressState {
+  pointerId: number
+  startX: number
+  startY: number
+  key: string
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +346,54 @@ export function HomeCover(props: {
    * `source === 'none'` / 无文件时 = 无壁纸。
    */
   homeBackground: HomeBackgroundSettings
+  /**
+   * 首页快速访问的钉选（T-05 F-1，docs/60 §6.1）：**数组顺序即显示顺序**，
+   * 整体追加在素材大类卡之后同排（不分区、不换行 —— §6.1 形态拍板）。
+   */
+  pinnedFolders: HomePinnedFolder[]
+  /**
+   * 文件夹排的顺序表（2026-11-25 拖动排序，`Settings.homeFolderOrder`）：
+   * 元素是槽位键 `kind:<key>` / `pin:<id>`，**数组顺序即显示顺序**。
+   * 归一化已由 App（`normalizeHomeFolderOrder`）与主进程做掉，这里只消费。
+   * 表里没有的卡按默认顺序（大类在前、钉选在后）追加到末尾。
+   */
+  folderOrder: string[]
+  /**
+   * 松手落位后写一次顺序（App → `saveSettings({ homeFolderOrder })`）。
+   * 返回 `false` = 写档失败 —— 本组件据此丢掉乐观顺序，界面回到拖动前（App 侧
+   * 同时给一句提示）。**拖动过程中绝不写档**，只在落位这一下写一次。
+   */
+  onReorderFolders: (order: string[]) => Promise<boolean>
+  /** 文件夹底纹映射（T-05 F-3）：key = `kind:<分类键>` / `pin:<钉选id>`（命名空间见 logic/homePinned.ts） */
+  folderWallpapers: Settings['homeFolderWallpaper']
+  /**
+   * 双击 / Enter 钉选卡 → **应用内文件浏览**（v1.2 反馈批 B：软件代替资源管理器，
+   * 用户原话「双击用户自己的文件夹以后，进入的仍然是我们的软件界面」）。
+   * App 侧接 `PinnedFolderBrowser`（按 pinId 打开），不再调 `home:pinnedOpen`。
+   */
+  onOpenPinned: (id: string) => void
+  /**
+   * 右键菜单「在资源管理器中打开」（v1.2 反馈批 B 由「打开」改名的**兜底出口**）：
+   * 仍走主进程 `home:pinnedOpen(id)`（shell.showItemInFolder），给要在系统资源
+   * 管理器里操作的用户留一条路。双击不经过它。
+   */
+  onRevealPinned: (id: string) => void
+  /** 右键钉选卡「从快速访问移除」→ 只删 Settings 键，绝不删磁盘目录 */
+  onRemovePinned: (id: string) => void
+  /** 右键钉选卡「左移 / 右移」→ 交换相邻两个钉选（数组顺序即 order） */
+  onMovePinned: (id: string, delta: -1 | 1) => void
+  /** 右键文件夹排空白「添加快速访问…」→ pickDirectory 拾目录 → 追加钉选（App 接线） */
+  onAddPinned: () => void
+  /** 右键任一文件夹卡「设置底纹…」→ pickArchives 拾图 → homeBackground:save → 写映射（App 接线） */
+  onSetFolderWallpaper: (key: string) => void
+  /** 右键有底纹的文件夹卡「恢复默认底纹」→ 删映射键（不删缓存文件） */
+  onClearFolderWallpaper: (key: string) => void
+  /**
+   * 「新建项目」虚卡（docs/60 §4.3 W0，T-03）：排在钉选卡**之后**的同排末尾。
+   * 可选 prop —— 不传（undefined）时整张卡不渲染，T-05 既有渲染逐字不变；
+   * 单击即开向导（虚卡无"双击"语义 —— 它不是文件夹，是动作入口）。
+   */
+  onNewProject?: () => void
 }): JSX.Element {
   const {
     folders,
@@ -226,7 +404,19 @@ export function HomeCover(props: {
     onOpenSettings,
     waveColors,
     waveHeight,
-    homeBackground
+    homeBackground,
+    pinnedFolders,
+    folderOrder,
+    onReorderFolders,
+    folderWallpapers,
+    onOpenPinned,
+    onRevealPinned,
+    onRemovePinned,
+    onMovePinned,
+    onAddPinned,
+    onSetFolderWallpaper,
+    onClearFolderWallpaper,
+    onNewProject
   } = props
 
   /**
@@ -300,6 +490,127 @@ export function HomeCover(props: {
   const reduced = usePrefersReducedMotion()
 
   /**
+   * 文件夹类别筛选（逆向 gallery10 的 Browse by type 气泡，2026-11-26）。
+   * 语义：**主页内筛选，不离开主页** —— kind 只留素材大类卡、pin 只留钉选文件夹卡
+   * + 新建项目虚卡、all 全显（但不带虚卡）。
+   * 可见集合在下方从 folders / pinnedFolders 派生，slots / 拖拽 / 退场分半全部跟着它走，
+   * 保证筛选态下拖拽只认当前可见卡（不会出现"拖一张看不见的卡"）。
+   */
+  const [folderFilter, setFolderFilter] = useState<HomeFolderFilterValue>('all')
+  /**
+   * 切档淡入用**交替的双 animation-name**（a↔b），而不是布尔开关：
+   * CSS animation 只在 animation-name *变化*时重播，布尔 true→true 不会重挂。
+   * 每次切档翻一次 variant → 同一次 React 渲染里新卡片带着新的 animation-name 挂载，
+   * 第一帧就是 opacity:0（animation-fill-mode:both），彻底消除"先闪一下再淡入"。
+   * reduced / smooth 档由 data-reveal-motion 关掉动画（见下方）。
+   */
+  const [revealVariant, setRevealVariant] = useState<'a' | 'b'>('a')
+  // 首次挂载不播错峰（卡片走自己的入场体系）；只有用户主动切气泡才播
+  const filterTouchedRef = useRef(false)
+
+  // ── 拖动排序：顺序合成 + 运行态（2026-11-25）────────────────────────────────
+  /**
+   * 乐观顺序：松手后立刻按新顺序渲染，等写档结果。
+   * `null` = 用 props 里的真值（`folderOrder`）。写档失败 → 清回 null =
+   * **界面自动回滚到拖动前的顺序**（settings 没变，props 就是旧顺序）。
+   */
+  const [pendingOrder, setPendingOrder] = useState<string[] | null>(null)
+  /** 非 null = 正在拖这一张（只在开始 / 结束各变一次，不是每帧） */
+  const [draggingKey, setDraggingKey] = useState<string | null>(null)
+  /** 排容器（事件委托 + 几何测量都在它上面） */
+  const rowRef = useRef<HTMLDivElement | null>(null)
+  /** 按下但还没到阈值的起点 */
+  const pressRef = useRef<FolderPressState | null>(null)
+  /** 拖动态运行快照（不进 state，理由见 FolderDragState 注释） */
+  const dragRef = useRef<FolderDragState | null>(null)
+  /** 指针 rAF（每帧只写 transform，不触发 React 渲染） */
+  const dragRafRef = useRef<number | null>(null)
+  /** 拖完那一下要吞掉的 click（捕获阶段拦，见 handleRowClickCapture） */
+  const suppressClickRef = useRef(false)
+
+  /**
+   * 实际生效的顺序（乐观值优先）。两个来源都已归一化过（props 由 App 归，
+   * 乐观值是本组件按同一套规则算出来的），这里不再重复洗一遍 —— 保持引用稳定，
+   * `slots` 的 useMemo 才有意义。
+   */
+  const effectiveOrder = pendingOrder ?? folderOrder
+
+  /**
+   * 类别筛选后的可见集合（gallery10 气泡）。全部三个下游（渲染 map、slots、退场分半）
+   * 都只读这两个派生值 —— 绝不在别处直接读 folders / pinnedFolders，否则筛选态下
+   * "显示的卡" 与 "参与拖拽/排序的卡" 会分叉。
+   * 虚卡（新建项目）在筛选态下也只跟随"全部"档：kind/pin 档里它不属于任何一类。
+   */
+  const visibleFolders = folderFilter === 'pin' ? EMPTY_FOLDERS : folders
+  const visiblePinned = folderFilter === 'kind' ? EMPTY_PINNED : pinnedFolders
+  /**
+   * 「新建项目」虚卡**只在「项目文件夹」档显示**（用户 2026-11-26 拍板）：
+   * 点「项目文件夹」气泡 → 钉选卡 + 新建项目卡一起出现；「全部」「素材板块」档都不显示。
+   * ⚠️ 这是用户两次纠正后的最终口径 —— 不是"恒显示"也不是"恒不显示"，是跟档位走。
+   */
+  const showNewProject = onNewProject !== undefined && folderFilter === 'pin'
+
+  const filterCounts: Record<HomeFolderFilterValue, number> = {
+    all: folders.length + pinnedFolders.length,
+    kind: folders.length,
+    pin: pinnedFolders.length
+  }
+
+  /**
+   * 切气泡：翻转 animation-name（a↔b）让每张可见卡的淡入动画从零重播。
+   * ★ 关键（用户 2026-11-26「闪烁」反馈的根因）：不能用 rAF 延迟挂 animation ——
+   *   那样新卡片第一帧是 opacity:1 完全显示、下一帧才被拉回 0 淡入 = 肉眼可见的闪。
+   *   现在把「换筛选集合」和「换 animation-name」放进**同一次渲染**：
+   *   新卡片挂载即命中新 name，首帧 opacity:0，只有渐入、没有闪。
+   */
+  const handleFilterChange = useCallback((next: HomeFolderFilterValue): void => {
+    if (next === folderFilter) return
+    filterTouchedRef.current = true
+    setFolderFilter(next)
+    setRevealVariant((v) => (v === 'a' ? 'b' : 'a'))
+  }, [folderFilter])
+
+  /**
+   * 渲染顺序：大类 + 钉选 + 虚卡拼成一张槽位表 → 按 order 排（缺失键追加到末尾，
+   * 虚卡恒末尾）。**统一排序**是本次需求的口径：钉选卡可以排到素材卡前面。
+   * ⚠️ 输入用**可见集合**：筛选态下只排当前类别的卡，拖拽目标下标也随之收窄。
+   */
+  const slots = useMemo(
+    () =>
+      sortHomeFolderSlots(
+        buildHomeFolderSlots(
+          visibleFolders.map((folder) => folder.key),
+          visiblePinned.map((pin) => pin.id),
+          showNewProject
+        ),
+        effectiveOrder
+      ),
+    [visibleFolders, visiblePinned, showNewProject, effectiveOrder]
+  )
+
+  /** 槽位键 → 视觉下标（同时作为 `index` 错峰与 CSS `order` 的唯一来源） */
+  const slotIndexByKey = useMemo(() => {
+    const map = new Map<string, number>()
+    slots.forEach((slot, index) => map.set(slot.key, index))
+    return map
+  }, [slots])
+
+  /**
+   * 退场分半的阈值（2026-11-25 拖动排序的配套修正）。
+   *
+   * `home-outro.css` 里"整排退场时左半向左、右半向右"原来按 DOM 的 `nth-child` 切，
+   * 拖动重排后 DOM 顺序与视觉顺序不再一致（大类 map 在前、钉选 map 在后，视觉靠
+   * flex `order`）→ 会把视觉左半的卡往右赶。现在由这里按**视觉槽位下标**算出
+   * `data-exit-half`，CSS 只认属性。
+   *
+   * n = 可见卡张数（大类 + 钉选，**末尾虚卡不计**）：`i < ceil(n/2)` 为 left。
+   */
+  const exitHalfSplit = useMemo(
+    () => Math.ceil(slots.filter((slot) => slot.type !== 'newProject').length / 2),
+    [slots]
+  )
+
+  /**
    * 正在退场的那个文件夹（`null` = 还没开始退场）。
    *
    * 用途有两个，都是纯视觉：
@@ -335,6 +646,427 @@ export function HomeCover(props: {
   useEffect(() => {
     setEntered(true)
   }, [])
+
+  // ── F-2 悬停自动横向滚动（docs/60 §6.2）────────────────────────────────────
+  // 排超宽（素材卡 + 钉选卡 > 820px）时：鼠标悬停左右 48px 热区 → rAF 匀速 ~320px/s。
+  // 降级口径：`motionQuality === 'smooth'` 档**整体禁用**（rAF 不启动、箭头微光不显示，
+  // 保留滚轮 / 触控板手动滚动 —— 项目唯一动效降级机制，`logic/motionProfile.ts` 同源）。
+  // 方向判定 / 步长 / 滚到头停的收口全在 `logic/homePinned` 纯函数里（单测覆盖）。
+  const edgeScrollEnabled = quality !== 'smooth'
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const edgeDirRef = useRef<-1 | 0 | 1>(0)
+  const edgeRafRef = useRef<number | null>(null)
+  const edgeLastTsRef = useRef<number>(0)
+  /** 边缘箭头微光的当前侧（null = 不显示）。纯视觉，不参与滚动判定。 */
+  const [edgeHint, setEdgeHint] = useState<'left' | 'right' | null>(null)
+
+  /** 停 rAF 循环（方向清零 + 提示熄灭）。卸载 / 移出排 / 滚到头 / 切换方向都会走到。 */
+  const stopEdgeScroll = useCallback((): void => {
+    if (edgeRafRef.current !== null) {
+      window.cancelAnimationFrame(edgeRafRef.current)
+      edgeRafRef.current = null
+    }
+    edgeDirRef.current = 0
+    edgeLastTsRef.current = 0
+    setEdgeHint(null)
+  }, [])
+
+  // 卸载时必须清 rAF（StrictMode 双挂载下漏清会出现幽灵滚动循环）
+  useEffect(() => stopEdgeScroll, [stopEdgeScroll])
+
+  const startEdgeScroll = useCallback((): void => {
+    if (!edgeScrollEnabled || edgeRafRef.current !== null) return
+    edgeLastTsRef.current = 0
+    const tick = (ts: number): void => {
+      const el = scrollRef.current
+      if (el === null) {
+        edgeRafRef.current = null
+        return
+      }
+      const dir = edgeDirRef.current
+      const max = el.scrollWidth - el.clientWidth
+      if (dir === 0 || max <= 0) {
+        edgeRafRef.current = null
+        return
+      }
+      // rAF 回拨兜底：首帧 / 挂起恢复后 dt 可能异常，edgeScrollStep 内部按 0 处理
+      const dt = edgeLastTsRef.current > 0 ? ts - edgeLastTsRef.current : 16
+      edgeLastTsRef.current = ts
+      const next = nextScrollLeft(el.scrollLeft, dir, edgeScrollStep(dt), 0, max)
+      el.scrollLeft = next
+      if ((dir === -1 && next <= 0) || (dir === 1 && next >= max)) {
+        // 滚到头自动停（docs/60 §6.2「边界」）
+        edgeRafRef.current = null
+        edgeDirRef.current = 0
+        edgeLastTsRef.current = 0
+        setEdgeHint(null)
+        return
+      }
+      edgeRafRef.current = window.requestAnimationFrame(tick)
+    }
+    edgeRafRef.current = window.requestAnimationFrame(tick)
+  }, [edgeScrollEnabled])
+
+  const handleRowMouseMove = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>): void => {
+      // 拖动态下关掉悬停自动滚动：否则排会自己横向跑，落点判定与让位全部错位
+      if (dragRef.current !== null) {
+        if (edgeDirRef.current !== 0) stopEdgeScroll()
+        return
+      }
+      const el = scrollRef.current
+      if (el === null) return
+      // 内容没超宽 = 没有可滚的东西，热区不吃任何行为（也不显示箭头微光）
+      if (el.scrollWidth <= el.clientWidth + 1) {
+        if (edgeDirRef.current !== 0) stopEdgeScroll()
+        return
+      }
+      if (!edgeScrollEnabled) return
+      const rect = el.getBoundingClientRect()
+      const dir = edgeScrollDirection(
+        event.clientX,
+        event.clientY,
+        { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
+        { topInset: SCROLL_PAD_TOP, bottomInset: SCROLL_PAD_BOTTOM },
+        EDGE_HOT_ZONE_PX
+      )
+      if (dir !== edgeDirRef.current) {
+        // 先停（清 rAF 与提示），再写新方向 —— 左热区直接划到右热区也要成立
+        stopEdgeScroll()
+        edgeDirRef.current = dir
+        if (dir !== 0) {
+          setEdgeHint(dir === -1 ? 'left' : 'right')
+          startEdgeScroll()
+        }
+      }
+    },
+    [edgeScrollEnabled, startEdgeScroll, stopEdgeScroll]
+  )
+
+  const handleRowMouseLeave = useCallback((): void => {
+    stopEdgeScroll()
+  }, [stopEdgeScroll])
+
+  // ── 拖动排序：指针手势（阈值 / 让位 / 取消 / 吞 click）──────────────────────
+  /** rAF 里唯一的写入口：被拖卡跟手抬升，其余卡按目标位置让位一格 */
+  const applyDragFrame = useCallback((): void => {
+    dragRafRef.current = null
+    const drag = dragRef.current
+    if (drag === null) return
+    for (let i = 0; i < drag.keys.length; i += 1) {
+      const key = drag.keys[i]
+      const element = drag.els.get(key)
+      if (element === undefined) continue
+      if (key === drag.key) {
+        // 抬升：上移 4px + 放大 1.04 + 跟手位移（阴影加深在 CSS 的 data-drag-source 上）
+        element.style.transform = `translate3d(${drag.dx.toFixed(1)}px, -4px, 0) scale(1.04)`
+        continue
+      }
+      const shift = dragSlotShift(drag.fromIndex, drag.toIndex, i)
+      const next = shift === 0 ? '' : `translate3d(${(shift * drag.step).toFixed(1)}px, 0, 0)`
+      if (element.style.transform !== next) element.style.transform = next
+    }
+  }, [])
+
+  const scheduleDragFrame = useCallback((): void => {
+    if (dragRafRef.current === null) {
+      dragRafRef.current = window.requestAnimationFrame(applyDragFrame)
+    }
+  }, [applyDragFrame])
+
+  /** 命中卡片 → 真正进入拖动态（固定捕获 / 打抬升标记 / 写第一帧） */
+  const beginDrag = useCallback(
+    (press: FolderPressState, pointerX: number): void => {
+      const row = rowRef.current
+      if (row === null) return
+      const els = new Map<string, HTMLElement>()
+      row.querySelectorAll<HTMLElement>('[data-slot-key]').forEach((element) => {
+        const key = element.dataset.slotKey
+        if (key !== undefined && key.length > 0) els.set(key, element)
+      })
+      // 可拖卡 = 视觉顺序里的全部真实卡（虚卡不入 order、也不可拖）
+      const keys = slots
+        .filter((slot) => slot.type !== 'newProject')
+        .map((slot) => slot.key)
+      const fromIndex = keys.indexOf(press.key)
+      const sourceEl = els.get(press.key)
+      if (fromIndex < 0 || sourceEl === undefined) return
+      const centers: number[] = []
+      for (const key of keys) {
+        const element = els.get(key)
+        if (element === undefined) return
+        const rect = element.getBoundingClientRect()
+        if (rect.width <= 0) return
+        centers.push(rect.left + rect.width / 2)
+      }
+      // 槽位等宽等距（同一套 --gf-scale + justify-between），相邻中心距即让位步长；
+      // 只有一张卡时退化成"卡宽 + 常见间隙"，拖动本身仍然可用（不会出现 0 步长）。
+      const firstRect = sourceEl.getBoundingClientRect()
+      const step =
+        centers.length > 1 ? centers[1] - centers[0] : firstRect.width + 16
+      dragRef.current = {
+        pointerId: press.pointerId,
+        key: press.key,
+        keys,
+        els,
+        centers,
+        step: Math.max(1, step),
+        startX: press.startX,
+        fromIndex,
+        toIndex: fromIndex,
+        dx: pointerX - press.startX,
+        sourceEl
+      }
+      pressRef.current = null
+      // 捕获落在被拖卡上：后续 move / up 全回这里（鼠标移出窗口也不会丢）
+      try {
+        sourceEl.setPointerCapture?.(press.pointerId)
+      } catch {
+        // 老浏览器 / 已释放的指针：捕获失败不影响拖动（move 仍冒泡到排容器）
+      }
+      sourceEl.dataset.dragSource = 'true'
+      sourceEl.style.transition = 'none' // 跟手：不许有 160ms 过渡拖尾
+      sourceEl.style.zIndex = '30'
+      setDraggingKey(press.key)
+      applyDragFrame()
+    },
+    [applyDragFrame, slots]
+  )
+
+  /**
+   * 结束一次拖动（`commit` = 落位写档；`false` = Esc / pointercancel 取消）。
+   *
+   * 收尾顺序很讲究（否则会"飞两次"）：
+   *   ① 先把**所有**卡的 transform 瞬时清零 —— 同时 React 在同一帧里把新的
+   *      CSS `order` 提交上去，base 位移与 transform 归零相互抵消，不会看见跳变；
+   *   ② 只有"原地松手（没换位）"的被拖卡保留默认过渡，让它 160ms 滑回原位；
+   *   ③ 下一帧把内联 transition 撤掉，交回 CSS（含 prefers-reduced-motion 的降级）。
+   */
+  const finishDrag = useCallback(
+    (commit: boolean): void => {
+      const drag = dragRef.current
+      if (drag === null) return
+      dragRef.current = null
+      pressRef.current = null
+      if (dragRafRef.current !== null) {
+        window.cancelAnimationFrame(dragRafRef.current)
+        dragRafRef.current = null
+      }
+      const moved = commit && drag.toIndex !== drag.fromIndex
+      const elements = [...drag.els.values()]
+      for (const [key, element] of drag.els) {
+        element.removeAttribute('data-drag-source')
+        element.style.zIndex = ''
+        if (moved || !commit || key !== drag.key) {
+          // 换位 / 取消 → 必须瞬时复位（理由见①）
+          element.style.transition = 'none'
+          element.style.transform = ''
+        } else {
+          // 原地松手 → 被拖卡走 CSS 的 160ms 过渡滑回原位（先撤掉跟手时的 none）
+          element.style.transition = ''
+          element.style.transform = ''
+        }
+      }
+      // 强制一次样式计算，让"无过渡复位"先落地，再在下一帧交回 CSS 过渡
+      void (rowRef.current?.offsetWidth ?? 0)
+      window.requestAnimationFrame(() => {
+        for (const element of elements) element.style.transition = ''
+      })
+      try {
+        if (drag.sourceEl.hasPointerCapture?.(drag.pointerId)) {
+          drag.sourceEl.releasePointerCapture(drag.pointerId)
+        }
+      } catch {
+        // 指针已消失（pointercancel / 窗口失焦）：无需释放
+      }
+      setDraggingKey(null)
+      if (!commit) {
+        // 取消路径（pointercancel / 指针离开）：本来就没有排序动作，但收尾仍可能有
+        // 一次 click 落下来，照旧吞掉，避免"取消拖动"变成"翻开文件夹"。
+        suppressClickRef.current = true
+        return
+      }
+
+      // 顺序没变（原地松手 / 落回原位）→ 一个字都不写，**也不吞 click**。
+      // 真人手点时的 4~8px 横向手抖会越过阈值进入拖动态，但落回原位什么都不改，
+      // 那次点击应当照常翻开文件夹；无条件吞掉正是"点文件夹打不开"的根因。
+      if (drag.toIndex === drag.fromIndex) return
+
+      // 真正的排序发生了：这一下 click 必须吞掉，否则拖完会顺手翻开 / 进入文件夹
+      suppressClickRef.current = true
+      const base = normalizeHomeFolderOrder(folderOrder)
+      const nextVisible = moveHomeFolderKey(drag.keys, drag.key, drag.toIndex)
+      const nextOrder = applyHomeFolderOrder(base, nextVisible)
+      if (nextOrder.length === base.length && nextOrder.every((key, i) => key === base[i])) return
+      setPendingOrder(nextOrder)
+      // 成功：props 已带着新顺序回来，清掉乐观值不会闪（同一批 setState）；
+      // 失败：清掉乐观值 = 回到 props 的旧顺序（**回滚**），提示由 App 给。
+      // 无论成败都不保留 pendingOrder —— 它只是"等写档"的临时遮罩。
+      void onReorderFolders(nextOrder)
+        .then(() => setPendingOrder(null))
+        .catch(() => setPendingOrder(null))
+    },
+    [folderOrder, onReorderFolders]
+  )
+
+  /** Esc 取消本次拖动（不动数据、不写档） */
+  useEffect(() => {
+    if (draggingKey === null) return
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      event.stopPropagation()
+      finishDrag(false)
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [draggingKey, finishDrag])
+
+  /** 卸载兜底：rAF 与指针捕获一个都不许漏 */
+  useEffect(() => {
+    return () => {
+      if (dragRafRef.current !== null) {
+        window.cancelAnimationFrame(dragRafRef.current)
+        dragRafRef.current = null
+      }
+    }
+  }, [])
+
+  /**
+   * 按下：只记起点。**不 preventDefault、不捕获指针、不改 state** ——
+   * 单击 / 双击 / 右键的默认路径在这一刻之后完全照旧；只有真的拖起来才改变手势。
+   */
+  const handleRowPointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>): void => {
+      suppressClickRef.current = false
+      if (event.pointerType === 'touch') return // 触屏留给横向滚动，不做拖动排序
+      if (event.button !== 0) return // 右键归 contextmenu
+      if (dragRef.current !== null) return
+      // 上一次的顺序还在写档（乐观值还没落定）→ 这一下先不接拖动，
+      // 否则第二次拖动会以"旧 base"为起点合入，把前一次的改动叠掉。
+      if (pendingOrder !== null) return
+      const target = event.target
+      if (!(target instanceof Element)) return
+      const card = target.closest<HTMLElement>('[data-slot-key]')
+      const key = card?.dataset.slotKey
+      if (card === null || key === undefined || key.length === 0) return
+      pressRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        key
+      }
+    },
+    [pendingOrder]
+  )
+
+  /** 移动：先过阈值（横向优先）再进拖动态；进入后每帧只改 transform */
+  const handleRowPointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>): void => {
+      const drag = dragRef.current
+      if (drag !== null) {
+        if (event.pointerId !== drag.pointerId) return
+        drag.dx = event.clientX - drag.startX
+        drag.toIndex = nearestSlotIndex(drag.centers, event.clientX)
+        scheduleDragFrame()
+        return
+      }
+      const press = pressRef.current
+      if (press === null || event.pointerId !== press.pointerId) return
+      const dx = event.clientX - press.startX
+      const dy = event.clientY - press.startY
+      // 阈值（≈4px）+ 横向优先：竖向手抖不抢单击 / 双击
+      if (Math.abs(dx) < DRAG_THRESHOLD_PX) return
+      if (Math.abs(dx) < Math.abs(dy)) return
+      beginDrag(press, event.clientX)
+    },
+    [beginDrag, scheduleDragFrame]
+  )
+
+  const handleRowPointerUp = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>): void => {
+      const drag = dragRef.current
+      if (drag === null) {
+        pressRef.current = null
+        return
+      }
+      if (event.pointerId !== drag.pointerId) return
+      finishDrag(true)
+    },
+    [finishDrag]
+  )
+
+  /** 系统打断（窗口失焦 / 触控被接管）→ 取消并复位，不写档 */
+  const handleRowPointerCancel = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>): void => {
+      const drag = dragRef.current
+      if (drag === null) {
+        pressRef.current = null
+        return
+      }
+      if (event.pointerId !== drag.pointerId) return
+      finishDrag(false)
+    },
+    [finishDrag]
+  )
+
+  /**
+   * 指针离开排（还没到阈值就在外面松手了）→ 丢掉起点。
+   * 鼠标的 `pointerId` 是跨按下/抬起恒定的，残留的起点会让"下一次悬停"被误判成
+   * 一次大位移拖动 —— 必须清。
+   */
+  const handleRowPointerLeave = useCallback((): void => {
+    if (dragRef.current === null) pressRef.current = null
+  }, [])
+
+  /**
+   * 拖动松手后的那一次 `click`（`dblclick` 同理）在**捕获阶段**吞掉：
+   * 卡片自己的 onClick / onDoubleClick 根本收不到，所以拖完绝不会翻开或进入。
+   * 标志位在下一次 pointerdown 复位，不会误吞后续的正常点击。
+   */
+  const handleRowClickCapture = useCallback((event: ReactMouseEvent<HTMLDivElement>): void => {
+    if (!suppressClickRef.current) return
+    suppressClickRef.current = false
+    event.preventDefault()
+    event.stopPropagation()
+  }, [])
+
+  // ── F-1/F-3 文件夹排右键菜单（docs/60 §6.1/§6.3）──────────────────────────
+  // 菜单项构成在 logic/contextMenu 的纯函数里（单测覆盖）；组件只画 + 调回调。
+  const [folderMenu, setFolderMenu] = useState<HomeFolderMenu | null>(null)
+  const openFolderMenu = useCallback((menu: HomeFolderMenu): void => {
+    setFolderMenu(menu)
+  }, [])
+  const buildFolderMenuItems = (): ContextMenuItem[] => {
+    const menu = folderMenu
+    if (menu === null) return []
+    if (menu.type === 'row') {
+      return homeRowMenuItems({ onAddPinned, onNewProject })
+    }
+    if (menu.type === 'kind') {
+      const key = kindWallpaperKey(menu.key)
+      return homeKindMenuItems(wallpaperUrlOf(folderWallpapers, key) !== null, {
+        onSetWallpaper: () => onSetFolderWallpaper(key),
+        onClearWallpaper: () => onClearFolderWallpaper(key)
+      })
+    }
+    const key = pinWallpaperKey(menu.id)
+    const index = pinnedFolders.findIndex((p) => p.id === menu.id)
+    return homePinnedMenuItems({
+      // v1.2 反馈批 B：菜单项「在资源管理器中打开」走 onRevealPinned（home:pinnedOpen 兜底出口）；
+      // 双击卡片走 onOpenPinned（应用内浏览）—— 两条路互不借用。
+      onOpen: () => onRevealPinned(menu.id),
+      onMoveLeft: () => onMovePinned(menu.id, -1),
+      onMoveRight: () => onMovePinned(menu.id, 1),
+      onSetWallpaper: () => onSetFolderWallpaper(key),
+      onClearWallpaper: () => onClearFolderWallpaper(key),
+      onRemove: () => onRemovePinned(menu.id),
+      canLeft: index > 0,
+      canRight: index >= 0 && index < pinnedFolders.length - 1,
+      hasWallpaper: wallpaperUrlOf(folderWallpapers, key) !== null
+    })
+  }
+
 
   /**
    * ⚠️ 这里**故意没有**驱动消隐的 effect。
@@ -469,47 +1201,175 @@ export function HomeCover(props: {
             两个 setState 在同一个事件回调里，React 18 会合并成一次渲染。
             另外这一排的 class `hc-folder-row` 是退场规则的选择器锚点（左右半排分开退），
             见 `home-outro.css`。 */}
-        {/* T4 引导第 2 步锚点：文件夹排（纯属性，不改布局）。
-            第 3 步数据卡的锚点由 T4 在 HomeStats.tsx 根节点上加，本文件不包裹它 ——
-            包一层会改变 .hs-card 的绝对定位包含块，导致数据卡跳到左上角。 */}
+        {/* T4 引导第 3 步数据卡的锚点由 T4 在 HomeStats.tsx 根节点上加，本文件不包裹它 ——
+            包一层会改变 .hs-card 的绝对定位包含块，导致数据卡跳到左上角。
+
+            ── T-05（docs/60 §6.1/§6.2）：同排追加钉选卡 + 悬停自动滚动 ─────────────
+            结构升级为「wrap（布局定位，尺寸与旧排逐字一致）→ scroll（overflow-x:auto，
+            隐藏滚动条）→ row（卡片）」：
+            · 钉选卡**同排追加**在素材大类卡之后（§6.1 拍板形态，不分区不换行）；
+            · 排超宽时 `.hc-folder-scroll` 横向滚动（滚轮 / 触控板仍可手动滚），
+              左右 48px 热区悬停自动滚（`edgeScrollEnabled` = 非 smooth 档）；
+            · `.hc-folder-scroll` 的补偿 padding 与本文件 SCROLL_PAD_* 是一对
+              （卡片 hover 翻盖伸出盒子的部分不再被竖向裁掉，布局位置不变）；
+            · 右键：卡片 → 钉选/底纹菜单，空白处 → 添加快速访问（卡片内
+              `stopPropagation` 抢在 wrap 之前）。 */}
         <div
-          className="hc-folder-row mx-auto mt-10 flex w-full max-w-[820px] items-start justify-between [&>*]:shrink-0"
-          data-count={folders.length}
+          className="hc-folder-wrap relative mx-auto mt-10 w-full max-w-[820px]"
           data-guide="folders"
+          data-reveal={filterTouchedRef.current ? revealVariant : 'none'}
+          data-reveal-motion={quality !== 'smooth' && !reduced ? 'true' : 'false'}
+          onMouseMove={handleRowMouseMove}
+          onMouseLeave={handleRowMouseLeave}
+          onContextMenu={(e) => {
+            // 卡片自己的 onContextMenu 会 stopPropagation；走到这里 = 排的空白处
+            e.preventDefault()
+            openFolderMenu({ type: 'row', x: e.clientX, y: e.clientY })
+          }}
         >
-          {folders.map((folder, index) => (
-            <GlassFolder
-              key={folder.key}
-              label={folder.label}
-              count={folder.count}
-              thumbs={folder.thumbs}
-              index={index}
-              /**
-               * `exit` 只给**被双击的那一个**（其余是 null → 走 CSS 的"向两侧退开"）。
-               * 用 `leavingKey` 判等而不是下标：`folders` 顺序将来变了也不影响。
-               */
-              exit={folder.key === leavingKey ? exitGeom : null}
-              onOpen={(payload) => {
-                /**
-                 * 顺序：**先算几何 / 打退场标记，再跳转**。
-                 * · `setExitGeom` + `setLeavingKey` 让这一个文件夹本体开始飞、整页其余
-                 *   信息向边缘退开；
-                 * · `onOpenKind` 只是把"880ms 后切视图"排进 `App` 的定时器。
-                 * 反过来的话 `App` 先切视图 → 本组件先卸载，退场动画根本不会播。
-                 * 三个 setState 在同一个事件回调里，React 18 合并成一次渲染 ——
-                 * 所以文件夹拿到 `exit` 的那一帧，也是整页开始退场的那一帧。
-                 *
-                 * `reduced`（系统要求减少动效）：什么都不做。`App` 会立刻切视图、
-                 * 本组件当场卸载；既不用飞、也不用消隐，连 rAF 都不该起。
-                 */
-                if (!reduced) {
-                  setExitGeom(computeExitGeom(payload.rect))
-                  setLeavingKey(folder.key)
-                }
-                onOpenKind(folder.key, payload)
-              }}
-            />
-          ))}
+          <div ref={scrollRef} className="hc-folder-scroll">
+            <div
+              ref={rowRef}
+              className="hc-folder-row flex w-full items-start justify-between [&>*]:shrink-0"
+              data-count={visibleFolders.length + visiblePinned.length + (showNewProject ? 1 : 0)}
+              /* 拖动排序（2026-11-25）：事件委托在这一层 —— 卡片不需要认识指针，
+                 只有 `data-slot-key` 与 CSS `order` 是它参与排序的全部接口。
+                 `onMouseMove/Leave` 还是原来的悬停自动滚动，两套互斥（拖动态里
+                 滚动直接短路，见 handleRowMouseMove 首行）。 */
+              data-dragging={draggingKey !== null ? 'true' : 'false'}
+              onPointerDown={handleRowPointerDown}
+              onPointerMove={handleRowPointerMove}
+              onPointerUp={handleRowPointerUp}
+              onPointerCancel={handleRowPointerCancel}
+              onPointerLeave={handleRowPointerLeave}
+              onClickCapture={handleRowClickCapture}
+              onDoubleClickCapture={handleRowClickCapture}
+            >
+              {visibleFolders.map((folder, index) => {
+                const slotKey = homeKindFolderKey(folder.key)
+                const slotIndex = slotIndexByKey.get(slotKey) ?? index
+                return (
+                  <GlassFolder
+                    key={folder.key}
+                    label={folder.label}
+                    count={folder.count}
+                    thumbs={folder.thumbs}
+                    index={slotIndex}
+                    slotKey={slotKey}
+                    order={slotIndex}
+                    exitHalf={slotIndex < exitHalfSplit ? 'left' : 'right'}
+                    wallpaperUrl={wallpaperUrlOf(folderWallpapers, kindWallpaperKey(folder.key))}
+                    /**
+                     * `exit` 只给**被双击的那一个**（其余是 null → 走 CSS 的"向两侧退开"）。
+                     * 用 `leavingKey` 判等而不是下标：`folders` 顺序将来变了也不影响。
+                     */
+                    exit={folder.key === leavingKey ? exitGeom : null}
+                    onContextMenu={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      openFolderMenu({ type: 'kind', x: e.clientX, y: e.clientY, key: folder.key })
+                    }}
+                    onOpen={(payload) => {
+                      /**
+                       * 顺序：**先算几何 / 打退场标记，再跳转**。
+                       * · `setExitGeom` + `setLeavingKey` 让这一个文件夹本体开始飞、整页其余
+                       *   信息向边缘退开；
+                       * · `onOpenKind` 只是把"880ms 后切视图"排进 `App` 的定时器。
+                       * 反过来的话 `App` 先切视图 → 本组件先卸载，退场动画根本不会播。
+                       * 三个 setState 在同一个事件回调里，React 18 合并成一次渲染 ——
+                       * 所以文件夹拿到 `exit` 的那一帧，也是整页开始退场的那一帧。
+                       *
+                       * `reduced`（系统要求减少动效）：什么都不做。`App` 会立刻切视图、
+                       * 本组件当场卸载；既不用飞、也不用消隐，连 rAF 都不该起。
+                       */
+                      if (!reduced) {
+                        setExitGeom(computeExitGeom(payload.rect))
+                        setLeavingKey(folder.key)
+                      }
+                      onOpenKind(folder.key, payload)
+                    }}
+                  />
+                )
+              })}
+              {/* 钉选卡（F-1）：同排追加、右上角角标、无计数（「外部」）、双击打开。
+                  入场错峰与视觉次序都取**合并排序后的槽位下标**（钉选现在可以排在
+                  素材大类卡前面，两段 map 只决定 DOM 顺序、不决定视觉顺序）。 */}
+              {visiblePinned.map((pin, pinIndex) => {
+                const slotKey = homePinFolderKey(pin.id)
+                const slotIndex = slotIndexByKey.get(slotKey) ?? visibleFolders.length + pinIndex
+                return (
+                  <GlassFolder
+                    key={`home-pin-${pin.id}`}
+                    label={pin.name}
+                    count={0}
+                    thumbs={[null, null, null]}
+                    pinned
+                    index={slotIndex}
+                    slotKey={slotKey}
+                    order={slotIndex}
+                    exitHalf={slotIndex < exitHalfSplit ? 'left' : 'right'}
+                    wallpaperUrl={wallpaperUrlOf(folderWallpapers, pinWallpaperKey(pin.id))}
+                    onOpen={() => onOpenPinned(pin.id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      openFolderMenu({ type: 'pin', x: e.clientX, y: e.clientY, id: pin.id })
+                    }}
+                  />
+                )
+              })}
+              {/* 「新建项目」虚卡：只在「项目文件夹」档显示（showNewProject 已按档位判定）。
+                  位置恒在该档末尾；「全部」「素材板块」档不渲染。 */}
+              {showNewProject ? (
+                <NewProjectFolderCard
+                  index={
+                    slotIndexByKey.get(HOME_NEW_PROJECT_SLOT_KEY) ??
+                    visibleFolders.length + visiblePinned.length
+                  }
+                  order={
+                    slotIndexByKey.get(HOME_NEW_PROJECT_SLOT_KEY) ??
+                    visibleFolders.length + visiblePinned.length
+                  }
+                  onClick={onNewProject}
+                />
+              ) : null}
+            </div>
+          </div>
+
+          {/* 边缘热区提示（F-2）：箭头微光淡入淡出，零布局位移（absolute + pointer-events:none）。
+              smooth 档下 edgeHint 恒为 null（rAF 循环不启动），提示永不出现 —— 降级口径。 */}
+          <span
+            className="hc-folder-edge"
+            data-side="left"
+            data-visible={edgeHint === 'left' ? 'true' : 'false'}
+            aria-hidden="true"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14.5 5.5L8 12l6.5 6.5" />
+            </svg>
+          </span>
+          <span
+            className="hc-folder-edge"
+            data-side="right"
+            data-visible={edgeHint === 'right' ? 'true' : 'false'}
+            aria-hidden="true"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9.5 5.5L16 12l-6.5 6.5" />
+            </svg>
+          </span>
+        </div>
+
+        {/* 类别筛选气泡（gallery10 Browse by type）：主页内筛选，不离开主页。
+            用户 2026-11-26 拍板放在**文件夹排下方**（原在上方，现下移）：
+            视觉顺序 = 搜索 → 文件夹排 → 气泡 → 提示字。mt-7 与提示行的 mt-54 分摊。 */}
+        <div className="hc-exit hc-exit--down mx-auto mt-7 w-full max-w-[820px] shrink-0">
+          <HomeFolderFilter
+            value={folderFilter}
+            onChange={handleFilterChange}
+            counts={filterCounts}
+            motion={quality !== 'smooth' && !reduced}
+          />
         </div>
 
         {/* 提示字：常驻，不做渐隐（首页控件 ≤ 1 图标 + 1 行提示的口径）。
@@ -523,6 +1383,17 @@ export function HomeCover(props: {
           双击文件夹进入 · 拖入文件即可导入
         </div>
       </div>
+
+      {/* F-1/F-3 右键菜单（钉选 / 底纹 / 添加快速访问）：共用 ContextMenu 外壳
+          （定位夹取 / 点外关闭 / Esc 关闭都在外壳里，z-50 与其它菜单同档）。 */}
+      {folderMenu !== null ? (
+        <ContextMenu
+          x={folderMenu.x}
+          y={folderMenu.y}
+          items={buildFolderMenuItems()}
+          onClose={() => setFolderMenu(null)}
+        />
+      ) : null}
     </div>
   )
 }

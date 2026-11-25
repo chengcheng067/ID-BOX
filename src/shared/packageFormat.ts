@@ -16,8 +16,9 @@
  *    `toPortableAsset` 落下时删字段，`fromPortableAsset` 用目标机库根现算补回。
  * 3. **缓存字段不进包**（docs/58 §4.2）：`thumbPath` / `thumbStatus` 由 `toPortableAsset`
  *    剔除，由 `fromPortableAsset` 补 `undefined` / `'none'`，目标机惰性重建。
- * 4. **个人设置白名单**（Q-8 / C-5）：只带 `aliases` + `customTaxonomy` + 9 个 `home*` 键；
- *    `mergePersonalSettings` 只覆盖白名单键，其余（尤其 `libraryDir`）逐字保留。
+ * 4. **个人设置白名单**（Q-8 / C-5 + docs/60 §5.3）：只带 `aliases` + `customTaxonomy` +
+ *    `projectTemplates` + 9 个 `home*` 键（12 键）；`mergePersonalSettings` 只覆盖白名单键，
+ *    其余（尤其 `libraryDir` / `homePinnedFolders` / `homeFolderWallpaper`）逐字保留。
  * 5. ** aliases 合并复用** `renderer/logic/aliasIndex.mergeAliasRecords`（docs/58 §4.3）
  *    —— 该模块只 import `shared/**`、零 node / 零 React 依赖，故本文件引用它不构成 IO，
  *    也不产生循环依赖（aliasIndex → shared/{aliasRules,aliasSuggest,naming}，均不回流本文件）。
@@ -72,9 +73,15 @@ export const PORTABLE_OMIT_KEYS = [
 ] as const
 
 /**
- * `personal.json` 的精确白名单（docs/58 §4.3 表 + C-5 批注）：11 键。
+ * `personal.json` 的精确白名单（docs/58 §4.3 表 + C-5 批注 + docs/60 §5.3 Q-7）：12 键。
+ *
+ * `projectTemplates`（docs/60 §5.3）**加入**：模板是自包含实体，导入语义 = 整数组替换
+ * （`mergePersonalSettings` 白名单键整键覆盖，零额外代码）。
  *
  * 明确**不含**：`libraryDir` / `watchDir` / `sevenZipPath`（机器路径）、
+ * `homePinnedFolders`（`absPath` 机器相关路径，换机即失效，docs/60 §5.3 与
+ * `libraryDir` 同理由）、`homeFolderWallpaper`（值是 userData 缓存文件名引用，
+ * 图本体不随包走，docs/58 C-5 对 `homeBackground` 的既有裁定同款）、
  * `homeGuide*` 三键（引导记位）、`sidebar*Collapsed`（侧栏折叠）、
  * `plugin*` / `autoCheckUpdate` / `zhimo*`（插件与网络偏好）、
  * `savedViews` / `renameTemplate` / `theme` / `motionLevel` 等其余 `Settings` 键。
@@ -90,7 +97,8 @@ export const PERSONAL_SETTINGS_KEYS = [
   'homeParticleDensity',
   'homeWaveInteractive',
   'homeWaveClickRipples',
-  'homeBackground'
+  'homeBackground',
+  'projectTemplates'
 ] as const
 
 export type PersonalSettingsKey = (typeof PERSONAL_SETTINGS_KEYS)[number]
@@ -512,7 +520,7 @@ export function fromPortableAsset(record: PortableAsset, targetLibraryDir: strin
 }
 
 /**
- * ⑨a `pickPersonalSettings`：`Settings` → `PersonalPatch`（白名单 11 键）。
+ * ⑨a `pickPersonalSettings`：`Settings` → `PersonalPatch`（白名单 12 键）。
  *
  * 只拷贝白名单里**实际存在**的键（缺键不写进补丁），深拷贝叶子数组 / 对象以免改入参；
  * `libraryDir` 等机器相关键永远不在结果里（C-3 / Q-8）。

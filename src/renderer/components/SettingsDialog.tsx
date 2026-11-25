@@ -48,6 +48,9 @@ import { RETENTION_OPTIONS } from '../logic/trashView'
 // 删除撤销期（2026-10 用户需求）：三档选项与文案只从 `logic/graceText.ts` 取，
 // 与删除链路（右键菜单 / 详情面板 / 确认弹窗）共用同一份口径，避免两处文案漂移。
 import { UNDO_GRACE_OPTIONS } from '../logic/graceText'
+// T-05 子项 5（docs/60）：首页挂静态图片背景（壁纸与海浪互斥）→ 海浪面板显隐判定。
+// 纯函数在 logic/homePinned.ts（与 HomeCover 的 hasWallpaper 同口径，单测覆盖）。
+import { homeWavePanelVisible } from '../logic/homePinned'
 import { normalizeUndoGraceMs } from '../../shared/undoGrace'
 // 知末「站方分类重排」：候选筛选与备份前缀都用**同一个**纯逻辑模块，
 // 与 `store.runZhimoCategoryReclass` 完全同一口径（渲染层不另写一套判定）。
@@ -68,6 +71,9 @@ import {
   useUpdateState
 } from '../logic/updateState'
 import { Modal } from './Modal'
+// 项目文件夹模板编辑器（docs/60 §3 T-02）：主体自带 store 订阅与保存
+// （走既有 saveSettings 链路），本文件只挂载，不复制任何模板逻辑。
+import { ProjectTemplatesEditor } from './ProjectTemplatesEditor'
 import { useEscLayer } from '../logic/escLayer'
 import { zClassForDepth } from '../logic/zStack'
 import {
@@ -2197,6 +2203,12 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           }
         />
 
+        {/* T-05 子项 5（docs/60）：首页挂了静态图片背景（壁纸与海浪互斥 —— HomeCover
+            粒子层此时整体不渲染）→ 海浪没有可调对象，下面四区块面板随之隐藏；
+            选回「无」（默认背景）或背景文件缺失后恢复显示。
+            判定走 logic/homePinned 的 homeWavePanelVisible（与 hasWallpaper 同口径）。 */}
+        {homeWavePanelVisible(homeBg) ? (
+        <>
         {/* ── 2026-11-22 海浪参数重排（用户原话：「海浪颜色以及海浪大小在设置里的层级
             看上去非常糟糕和混乱……重新整理一下设置」；层级照 TuneShape 调参面板截图）──
             四区块：① 海浪配色预设（下拉）→ ② 海浪参数滑块区（速度/高度/大小/密度，
@@ -2448,6 +2460,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               )}
             </div>
           </div>
+        ) : null}
+        </>
         ) : null}
 
         {/* 首页背景图（Q-5/Q-6）：本地文件 + URL 两张来源共用一张图。
@@ -2781,7 +2795,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         />
         <SettingsRow
           title="自动从知末获取模型封面"
-          desc="只对模型、且名字里带知末 ID 的资产生效；材质 / 贴图不做"
+          desc="只对模型、且名字里带知末 ID 的资产生效；材质 / 贴图不做；已有封面文件的资产不会被抓取覆盖"
           actions={
             <Toggle
               checked={settings.zhimoCover}
@@ -3270,6 +3284,17 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </button>
           }
         />
+      </SettingsCard>
+
+      {/* 项目文件夹模板（docs/60 §3，T-02）：多模板管理 + 4 级树编辑。
+          新建 / 复制 / 删除（内置禁删）/ 改名 / 恢复出厂 + 节点级增删改，
+          草稿态编辑、保存时整表归一化后走既有 saveSettings 链路。
+          底纹 / 钉选等首页功能不在这里（另属首页渲染任务）。 */}
+      <SettingsCard
+        title="项目文件夹模板"
+        note="「新建项目」从这里读取模板。改动只影响之后新建的项目，已建好的项目文件夹不受影响。"
+      >
+        <ProjectTemplatesEditor />
       </SettingsCard>
 
       {/* 危险区：红描边 + 独立卡（设计语言「⑦」）。红色只允许出现在这里。 */}

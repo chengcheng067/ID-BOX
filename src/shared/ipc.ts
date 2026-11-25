@@ -4,6 +4,7 @@
  * `drag:start` 必须走 `ipcRenderer.send`（同步），不能用 invoke。
  */
 import type { PluginInstallStatus } from './pluginInstall'
+import type { ProjectTemplate, ProjectTemplateNode } from './types'
 
 export const IPC = {
   importPaths: 'import:paths',
@@ -389,8 +390,409 @@ export const IPC = {
   /** invoke：按清单白名单提取 + 还原记录，返回 PackageImportResult。 */
   packageImportApply: 'package:importApply',
   /** main → renderer on：导入进度 `{ done, total }`。 */
-  packageImportProgress: 'package:importProgress'
+  packageImportProgress: 'package:importProgress',
+  // ── 项目文件夹模板 / 首页快速访问（docs/60 §4-§6）────────────────────────
+  //
+  // 铁律 `ipc.ts:3`：以下通道必须同时存在于 shared/ipc.ts + preload/index.ts + main/index.ts。
+  /**
+   * invoke：标题参数化的**通用**选目录对话框（docs/60 §5.2 通道 1）。
+   * 新建项目向导（T-03 选位置）与首页「添加快速访问」（T-05）共用同一条。
+   * 入参 `PickDirectoryInput`，返回目录绝对路径 / null（取消）。**不改既有 `pickWatchDir`**。
+   */
+  pickDirectory: 'dialog:pickDirectory',
+  /**
+   * invoke：打开一条首页快速访问（钉选）文件夹（docs/60 §5.2 通道 3）。
+   *
+   * 入参只有 `HomePinnedFolder.id`：主进程**按 id 从自己的 settings** 解析 `absPath`
+   * （不信渲染层传来的路径，`mergeMaterial` 同款防御），`existsSync` 通过后
+   * `shell.showItemInFolder`。**0.9.2 守卫（`allowedOpenRoots`）不放宽** ——
+   * 钉选打开不走 `shell:openPath` / `shell:reveal` 通道，走本通道的 id 白名单。
+   * 返回 `null` = 成功；字符串 = 中文错误（未找到 id / 文件夹不存在），**永不 reject**。
+   */
+  homePinnedOpen: 'home:pinnedOpen',
+  /**
+   * invoke：**新建项目**（docs/60 §5.2 通道 2，T-03）。主进程两阶段落盘：
+   * 阶段一对父目录 + 模板树展开出的**全部**目标路径逐条 `existsSync` 预检
+   * （任一已存在 → 整体拒绝、零创建，错误串指明冲突目录）；阶段二按先浅后深
+   * 逐个 mkdir（半程 IO 失败**不回滚不删除**，错误串如实报告已建数量）。
+   *
+   * W6 加固：渲染层传来的 `template` **不可信**，主进程重跑
+   * `normalizeProjectTemplate`（清洗 / 4 级剪枝 / 兄弟去重 / 256 节点截断），
+   * 根名用 `resolveRootName` 两分支解析（编号可选，docs/60 §2.4）。
+   *
+   * 返回 `ProjectCreateResult`（**永不 reject**，错误收口 `{ok:false, error:中文单行}`）。
+   * 成功后主进程顺手 `shell.showItemInFolder(rootPath)`（W9，不经渲染层 reveal ——
+   * 0.9.2 守卫只放行库根 ∪ 日志目录）；渲染层随后自动钉选（`addHomePinnedFolder`）。
+   */
+  projectCreate: 'project:create',
+  /**
+   * invoke：**只读**扫描一个文件夹的目录树，转成项目模板草稿（v1.2 反馈批 C，
+   * 设置页「项目文件夹模板」卡支持「拖入文件夹自动识别」）。
+   *
+   * 入参 `TemplateScanInput`（`dirPath` = 拖入文件夹的绝对路径，渲染层经
+   * `getPathForFile` 取得）。主进程 `fs.readdir withFileTypes` 递归下钻：
+   * 跳过文件 / 符号链接 / 隐藏目录（`.` 开头，如 `.git`）；目录名清洗与
+   * 深度 4 / 节点 256 限额全部收口到 `normalizeProjectTemplate`（唯一实现）。
+   * 扫描本身比模板上限**多探一层**（深度 5 / 节点 1024 硬上限即停），
+   * 用于统计「超出上限被丢弃」的数量（硬上限命中时丢弃数为**至少**口径）。
+   *
+   * ⚠️ **纯扫描零写盘**：不建目录、不写任何文件；目录不存在 / 无读权限 /
+   * 空目录（没有任何子文件夹）都给明确中文错误。
+   * 返回 `TemplateScanResult`（**永不 reject**，错误收口 `{ok:false, error:中文单行}`）。
+   * ⚠️ 「让用户选」的纪律：扫描结果只是**预览草稿**，渲染层必须弹预览确认层、
+   * 用户点「生成模板」才写入草稿（再走既有保存链）——绝不静默写入。
+   */
+  templateScanFromDir: 'template:scanFromDir',
+  // ── 钉选目录应用内浏览（v1.2 反馈批 B，docs/60 §5.2 延伸）────────────────
+  //
+  // 用户原话：「我希望双击用户自己的文件夹以后，进入的仍然是我们的软件界面，
+  // 也就是我们的软件代替了文件资源管理器的功能。」双击钉选卡不再弹资源管理器，
+  // 改为渲染层的 `PinnedFolderBrowser`；这两条通道是它的数据面。
+  // 铁律 `ipc.ts:3`：必须同时存在于 shared/ipc.ts + preload/index.ts + main/index.ts。
+  //
+  // ⚠️ 守卫零放宽：0.9.2 的 `allowedOpenRoots`（库根 ∪ 日志目录）**不为钉选目录开口**。
+  // 两条通道各自在 main 侧按 `pinId` 从主进程自己的 settings 解析钉选根
+  // （id 白名单，`home:pinnedOpen` 同款防御），再经 `main/pinnedDirGuard.ts` 的
+  // `resolveWithinPinRoot` 做「逐段 resolve 后必须仍以该根为前缀」校验
+  // （挡 `..` 穿越 / relPath 塞绝对路径 / 盘符切换），越界一律 `{ok:false}`。
+  /**
+   * invoke：**只读**列出钉选目录的**一层**条目（应用内浏览，每下钻一次调一次）。
+   *
+   * 入参 `FsListDirInput`（`pinId` + 相对钉选根的 `relPath`，空串 = 根）。
+   * 跳过隐藏文件（`.` 开头）与符号链接；目录在前排序；单层条目数硬上限
+   * `LIST_DIR_MAX_ENTRIES`（2000）防炸。返回 `FsListDirResult`
+   * （**永不 reject**，错误收口 `{ok:false, error:中文单行}`）。
+   * `home:pinnedOpen` 保留不动 —— 右键菜单「在资源管理器中打开」仍走它（兜底出口）。
+   */
+  fsListDir: 'fs:listDir',
+  /**
+   * invoke：用**系统默认程序**打开钉选目录内的一个条目（文件双击的「直达」——
+   * 用户要的仍是打开文件，只是目录浏览留在软件内）。
+   *
+   * 入参 `FsOpenEntryInput`；main 侧同样走 pin 根前缀校验，越界 / 不存在一律
+   * `{ok:false}`。返回 `FsOpenEntryResult`（**永不 reject**，`shell.openPath`
+   * 的错误串压成中文单行）。渲染层只对文件调用；目录的双击在渲染层内下钻。
+   */
+  fsOpenEntry: 'fs:openEntry',
+  // ── 钉选目录浏览器 v2 · 写操作 + 归档（docs/61 §批注结果 · 方案二）────────
+  //
+  // 铁律 `ipc.ts:3`：以下通道必须同时存在于 shared/ipc.ts + preload/index.ts + main/index.ts。
+  // 全部入参带 `pinId`（主进程按 id 白名单从自己的 settings 解析钉选根，不信渲染层路径），
+  // `dirRel` 相对钉选根（空串 = 根），过 `resolveWithinPinRoot` 前缀校验；条目名是
+  // **单段**（不含路径分隔符，`main/archiveOps.ts#validateEntryName` 拒 `\/:*?"<>|` 等）。
+  // 写通道失败统一收口 `{ ok:false, reason, error:中文单行 }`，**永不 reject**。
+  /** invoke：在 dirRel 下新建文件夹。重名 `{ok:false, reason:'exists'}`。 */
+  fsMkdir: 'fs:mkdir',
+  /** invoke：重命名 dirRel 下的条目。重名拒绝；新旧同名（含仅大小写变化）直接 ok。 */
+  fsRenameEntry: 'fs:renameEntry',
+  /** invoke：把多个条目移入系统回收站（shell.trashItem）。部分失败不整批失败；单次上限 500。 */
+  fsTrashEntries: 'fs:trashEntries',
+  /** invoke：7z 解压压缩包到同目录同名文件夹（防穿越校验；7z 缺失报 `no-7z`）。 */
+  fsExtractArchive: 'fs:extractArchive',
+  /** invoke：7z 压缩为同目录 zip；7z 缺失降级 PowerShell Compress-Archive。 */
+  fsCompressEntries: 'fs:compressEntries',
+  /** invoke：Windows「打开方式」对话框（rundll32 OpenAs_RunDLL；失败落日志不抛）。 */
+  fsOpenWith: 'fs:openWith',
+  /**
+   * invoke：取钉选目录里**一个文件**的缩略图（图标视图预览，主进程链路）。
+   *
+   * 入参 `FsEntryThumbInput`（`pinId` + `dirRel` + 单段 `name`），守卫与其它 fs:*
+   * 通道同一套（id 白名单 + `resolveWithinPinRoot` + `validateEntryName`）。
+   * 分派：图片（jpg/jpeg/png/webp/bmp/gif）→ 解码降采样 ≤512 落缓存；skp → 复用
+   * `main/skpPreview.ts` 提取内嵌预览；其余扩展名直接 `not-available`
+   * （**不做**系统级缩略图 API，渲染层自绘类型图标兜底）。
+   * 缓存在 `<userData>/pinned-thumbs/`，URL 走**专用协议** `pinned-thumb://<缓存文件名>`
+   * （`protocol.ts` 注册；禁止 `file://` 直连）。handler 内有并发上限 4 的 promise 池，
+   * 大文件夹一次请求几十张不会卡死主进程。
+   * 返回 `PinnedEntryThumbResult`（**永不 reject**）。
+   */
+  fsEntryThumb: 'fs:entryThumb',
+  /**
+   * invoke：在**资源管理器**里按条目揭示钉选目录内的一个文件 / 子目录
+   * （2026-11-25 缺陷：右键「在资源管理器中显示」弹的是钉选根而不是当前条目）。
+   *
+   * 为什么要新通道：渲染层原先复用 `home:pinnedOpen`，而它的语义是「打开钉选根」，
+   * **不带子路径**；既有的 `shell:reveal` 又有 0.9.2 守卫（只放行库根 ∪ 日志目录），
+   * 钉选路径会被拒。所以这里单开一条，守卫与其它 `fs:*` 完全同源：
+   * `pinId` 白名单（`resolvePinnedRootById`）+ `relPath` 过 `resolveWithinPinRoot`
+   * 逐段 resolve + 前缀校验（`..` 穿越 / 绝对路径 / 盘符切换全拒）。
+   *
+   * 入参 `FsRevealEntryInput`；`relPath` 用 `/` 分隔、空串 = 钉选根自己。
+   * 文件 / 目录都走 `shell.showItemInFolder`（Windows 上目录会在父目录里选中它）。
+   * 返回 `FsRevealEntryResult`（**永不 reject**，失败收口 `{ok:false, reason, error}`）。
+   */
+  fsRevealEntry: 'fs:revealEntry'
 } as const
+
+/**
+ * `fs:listDir` / `fs:openEntry` 的入参（v1.2 反馈批 B）。
+ *
+ * `pinId` = `HomePinnedFolder.id`（主进程按它从**自己的 settings** 解析钉选根，
+ * 不信渲染层传来的路径）；`relPath` = 相对钉选根的路径（**不可信**，main 侧
+ * `resolveWithinPinRoot` 逐段 resolve + 前缀校验；空串 = 根；目录段用 `/` 连接，
+ * Windows 下 `path.resolve` 接受正斜杠）。
+ */
+export interface FsListDirInput {
+  pinId: string
+  relPath: string
+}
+
+/** `fs:openEntry` 的入参（与 `FsListDirInput` 同形 —— 语义分开命名，防混用） */
+export interface FsOpenEntryInput {
+  pinId: string
+  relPath: string
+}
+
+/** 一层目录条目（实现见 `main/pinnedDirGuard.ts#readDirEntries`） */
+export interface FsEntry {
+  /** 文件 / 子目录名（不含路径） */
+  name: string
+  /** true = 子目录（渲染层双击下钻）；false = 文件（双击走 `fs:openEntry`） */
+  isDir: boolean
+  /** 文件字节数（仅文件；stat 失败省略） */
+  size?: number
+  /** 修改时间毫秒值（stat 失败省略） */
+  mtimeMs?: number
+}
+
+/**
+ * `fs:listDir` 的返回：**永不 reject**，错误是中文单行（目录消失 / 无权限 / 越界）。
+ *
+ * `truncated`（浏览器 v2，docs/61 A14「2000 截断明示」）：本层条目数超过
+ * `LIST_DIR_MAX_ENTRIES`（2000）被截断时为 `true` —— 渲染层必须在列表末尾单行提示，
+ * 不允许静默吞掉。**不是分页**：仍只返回前 2000 条。
+ */
+export type FsListDirResult =
+  | { ok: true; entries: FsEntry[]; truncated: boolean }
+  | { ok: false; error: string }
+
+/** `fs:openEntry` 的返回：**永不 reject**（`shell.openPath` 的系统错误串压成中文单行） */
+export type FsOpenEntryResult =
+  | { ok: true }
+  | { ok: false; error: string }
+
+/**
+ * `fs:revealEntry` 的入参（2026-11-25「揭示到当前条目」缺陷修复）。
+ *
+ * 形状与 `FsListDirInput` 同构：`pinId` 由主进程从**自己的 settings** 解析成钉选根
+ * （不信渲染层传来的路径）；`relPath` 相对钉选根、用 `/` 分隔（**不可信**，
+ * 主进程侧过 `resolveWithinPinRoot` 前缀校验），空串 = 钉选根自己。
+ */
+export interface FsRevealEntryInput {
+  pinId: string
+  relPath: string
+}
+
+/**
+ * `fs:revealEntry` 的返回：**永不 reject**。
+ *
+ * - `guard`：`pinId` 未登记 / 钉选根已不存在 / `relPath` 越界（`..`、绝对路径、盘符切换）；
+ * - `invalid`：入参形状不合法（保留给调用方分支，当前实现把坏入参并按 guard 收口）；
+ * - `io`：`stat` 失败（条目已不存在）或 `shell.showItemInFolder` 抛错；
+ *   `error` 是可直接展示的中文单行。
+ */
+export type FsRevealEntryResult =
+  | { ok: true }
+  | { ok: false; reason: 'guard' | 'invalid' | 'io'; error: string }
+
+// ── 钉选目录浏览器 v2 · 写操作 + 归档契约（docs/61 §批注结果 · 方案二）────────
+
+/**
+ * 浏览器写通道的公共入参骨架：`pinId` + `dirRel`。
+ *
+ * ⚠️ `pinId` 是守卫的根 —— 主进程只收 id，钉选根的绝对路径由主进程从**自己的 settings**
+ * 解析（`fs:listDir` 同款 id 白名单，渲染层传来的任何路径都不信）。`dirRel` 相对钉选根
+ * （空串 = 根），过 `resolveWithinPinRoot` 逐段 resolve + 前缀校验。
+ */
+export interface FsDirScopedInput {
+  pinId: string
+  dirRel: string
+}
+
+/** `fs:mkdir` 入参：在 `dirRel` 下新建名为 `name` 的文件夹（单段名） */
+export interface FsMkdirInput extends FsDirScopedInput {
+  name: string
+}
+
+/** `fs:renameEntry` 入参：把 `dirRel` 下的 `oldName` 改名为 `newName`（均为单段名） */
+export interface FsRenameEntryInput extends FsDirScopedInput {
+  oldName: string
+  newName: string
+}
+
+/** `fs:trashEntries` 入参：把 `dirRel` 下的这些条目移入系统回收站（单段名，≤500 个） */
+export interface FsTrashEntriesInput extends FsDirScopedInput {
+  names: string[]
+}
+
+/** `fs:extractArchive` 入参：解压 `dirRel` 下的压缩包 `name`（按扩展名识别） */
+export interface FsExtractArchiveInput extends FsDirScopedInput {
+  name: string
+}
+
+/** `fs:compressEntries` 入参：把 `dirRel` 下的这些条目压缩成同目录一个 zip（≤500 个） */
+export interface FsCompressEntriesInput extends FsDirScopedInput {
+  names: string[]
+}
+
+/** `fs:openWith` 入参：对 `dirRel` 下的 `name` 弹 Windows「打开方式」对话框 */
+export interface FsOpenWithInput extends FsDirScopedInput {
+  name: string
+}
+
+/**
+ * 写通道失败的统一收口：`reason` 是**稳定枚举**（渲染层按它分支），`error` 是
+ * 可直接展示的中文单行。**永不 reject** —— 所有失败形态都落在这一个形状里。
+ *
+ * - `exists`：目标名已存在（重命名 / 新建 / 解压 / 压缩输出重名）；
+ * - `guard`：`dirRel` 越界（`..` / 绝对路径 / 盘符切换）或 pinId 未登记；
+ * - `invalid`：条目名非法（空 / 带路径分隔符 / Windows 非法字符等）；
+ * - `io`：磁盘动作失败（源不存在 / 权限 / 压缩包损坏 / 有密码 / 超时）；
+ * - `no-7z`：本机没有 7-Zip，无法解压该格式；
+ * - `not-archive`：目标不是可识别的压缩包扩展名；
+ * - `too-many`：一次批量操作的条目数超上限（500）；
+ * - `system-fallback-failed`：7z 缺失走 PowerShell 降级压缩也失败了。
+ */
+export type FsWriteFailureReason =
+  | 'exists'
+  | 'guard'
+  | 'invalid'
+  | 'io'
+  | 'no-7z'
+  | 'not-archive'
+  | 'too-many'
+  | 'system-fallback-failed'
+
+/** 写通道失败的统一形状（`reason` 供分支，`error` 供展示） */
+export interface FsWriteFailure {
+  ok: false
+  reason: FsWriteFailureReason
+  error: string
+}
+
+/** `fs:mkdir` 返回：成功带新目录的条目形状（供渲染层直接插入列表） */
+export type FsMkdirResult = { ok: true; entry: FsEntry } | FsWriteFailure
+
+/** `fs:renameEntry` 返回：成功带改名后的条目形状 */
+export type FsRenameEntryResult = { ok: true; entry: FsEntry } | FsWriteFailure
+
+/** `fs:trashEntries` 的单个失败项（部分失败不整批失败） */
+export interface FsTrashFailedItem {
+  name: string
+  /** 中文单行失败原因（可直接展示） */
+  message: string
+}
+
+/**
+ * `fs:trashEntries` 返回：`ok:true` 表示批次已执行完，**个别条目的失败在 `failed`
+ * 里**（回收站化可能因占用 / 权限个别失败，其余条目照常成功）。
+ */
+export type FsTrashEntriesResult =
+  | { ok: true; failed: FsTrashFailedItem[] }
+  | FsWriteFailure
+
+/** `fs:extractArchive` 返回：`dirName` = 解压出的文件夹名（同目录下，渲染层刷新即见） */
+export type FsExtractArchiveResult = { ok: true; dirName: string } | FsWriteFailure
+
+/** `fs:compressEntries` 返回：`engine` 标明本次用的引擎（`system` = PowerShell 降级） */
+export type FsCompressEntriesResult =
+  | { ok: true; zipName: string; engine: '7z' | 'system' }
+  | FsWriteFailure
+
+/**
+ * `fs:openWith` 返回。对话框的唤起是 fire-and-forget：spawn 已受理即 `{ok:true}`，
+ * rundll32 之后的失败只落日志（对话框本身没有可回收的错误通道）；
+ * `{ok:false}` 仅表示守卫拒绝 / 源不存在 / spawn 本身没发出去。
+ */
+export type FsOpenWithResult =
+  | { ok: true }
+  | { ok: false; error: string }
+
+/**
+ * `fs:entryThumb` 入参：钉选目录 `dirRel` 下的单段文件名 `name`
+ * （守卫与写通道同款：pinId 白名单 + dirRel 前缀校验 + name 单段校验）。
+ */
+export interface FsEntryThumbInput extends FsDirScopedInput {
+  name: string
+}
+
+/**
+ * `fs:entryThumb` 返回：**永不 reject**。
+ *
+ * - `ok:true` → `url` 是 `pinned-thumb://<缓存文件名>`（`<img src>` 可直接用，
+ *   协议 handler 读 `<userData>/pinned-thumbs/` 并做越界夹取）；
+ * - `reason:'not-available'`：不是可预览的图片 / SKP 没有内嵌预览 / 源文件不存在
+ *   —— **不是错误**，渲染层回退自绘类型图标；
+ * - `reason:'io'`：读盘 / 写缓存失败（同样回退图标，不打扰用户）；
+ * - `reason:'guard'`：dirRel 越界或条目名非法（附中文 `error`，只落日志取证）。
+ */
+export type PinnedEntryThumbResult =
+  | { ok: true; url: string }
+  | { ok: false; reason: 'guard' | 'not-available' | 'io'; error?: string }
+
+/**
+ * `template:scanFromDir` 的入参（v1.2 反馈批 C）。
+ * `dirPath` = 拖入文件夹的绝对路径（渲染层从 `getPathForFile` 取得，不可信，主进程自校验）。
+ */
+export interface TemplateScanInput {
+  dirPath: string
+}
+
+/** `template:scanFromDir` 的丢弃统计：`depth` = 超出 4 级深度被剪的目录数；`nodes` = 超出 256 节点被截的目录数 */
+export interface TemplateScanTruncated {
+  depth: number
+  nodes: number
+}
+
+/**
+ * `template:scanFromDir` 的返回（**永不 reject**，v1.2 反馈批 C）。
+ *
+ * - 成功：`root` = 清洗后的模板树草稿（深度 4 / 节点 256 限额内），
+ *   `truncated` = 超限丢弃统计，`scannedDirs` = 实际访问过的目录数（含根）；
+ * - 失败：`error` 是**中文单行**（文件夹不存在 / 是文件 / 无权限 / 没有子文件夹）。
+ */
+export type TemplateScanResult =
+  | { ok: true; root: ProjectTemplateNode; truncated: TemplateScanTruncated; scannedDirs: number }
+  | { ok: false; error: string }
+
+/**
+ * `dialog:pickDirectory` 的入参（docs/60 §5.2 通道 1）。
+ * 标题与确认按钮文案都由调用方给 —— 向导与钉选添加两个场景的文案不同。
+ */
+export interface PickDirectoryInput {
+  title: string
+  buttonLabel: string
+}
+
+/**
+ * `project:create` 的入参（docs/60 §5.2 通道 2，W5）。
+ *
+ * `template` 传**完整的** `ProjectTemplate`（渲染层从 settings 里选中的那一份）——
+ * 主进程 W6 会重跑 `normalizeProjectTemplate` 加固，不信任这份树的任何内容；
+ * `code` 可为空串（编号可选，Q-3：留空 → 根名直接 `sanitizeName(名称)`）。
+ */
+export interface ProjectCreateInput {
+  template: ProjectTemplate
+  /** 项目编号（**可选**：空串 / 空白 = 用户跳过，走「直接用名称」分支） */
+  code: string
+  /** 项目名称（必填；主进程经 `resolveRootName` → `sanitizeName` 清洗） */
+  name: string
+  /** 存放位置（用户自选的父目录绝对路径；不允许盘根） */
+  parentDir: string
+}
+
+/**
+ * `project:create` 的返回（**永不 reject**，docs/60 §5.2 通道 2）。
+ *
+ * - 成功：`rootPath` = 新建根目录绝对路径，`dirsCreated` = 实际创建的目录数
+ *   （= 归一化后模板树节点数）；
+ * - 失败：`error` 是**中文单行**（冲突时指明首个冲突目录的相对名）；
+ *   `dirsCreated` 只在**阶段二半程失败**时有值（>0 = 已落盘的目录数，
+ *   按铁律不回滚不删除，错误串如实报告）；阶段一拒绝时恒为 0 / 缺省。
+ */
+export type ProjectCreateResult =
+  | { ok: true; rootPath: string; dirsCreated: number }
+  | { ok: false; error: string; dirsCreated?: number }
 
 /**
  * `homeBackground:save` 的入参（shared 定义：main / preload / renderer 共用同一份契约，

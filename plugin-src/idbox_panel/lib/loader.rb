@@ -358,7 +358,15 @@ module IDBoxPanel
         # A 级只增：主进程派生的副标题指标；旧快照缺字段 → nil → 只显示分类路径（Q-19）
         'displayMetric' => Support.nil_text(raw_record['displayMetric']),
         # 排序档「按文件数」仍内部使用（docs/55 §3-C）：副标题不再显示，但派生保留
-        'fileCount' => raw_record['files'].is_a?(Array) ? raw_record['files'].length : 0
+        'fileCount' => raw_record['files'].is_a?(Array) ? raw_record['files'].length : 0,
+        # T-SORT 排序用四字段（与 src/shared/pluginSnapshot.ts 契约逐字对齐）：
+        # size=整目录总量 / importedAt=导入时刻 ms / lastUsedAt=最近使用 ms / useCount=使用次数。
+        # ⚠️ 旧快照缺这些键 ⇒ num_or_nil 收口为 nil（绝不是 0），面板据此把相关排序键
+        #    判为「不可排、不进下拉」，不会把缺字段当 0 参与排序（Q-19 同款纪律）。
+        'size' => Support.num_or_nil(raw_record['size']),
+        'importedAt' => Support.num_or_nil(raw_record['importedAt']),
+        'lastUsedAt' => Support.num_or_nil(raw_record['lastUsedAt']),
+        'useCount' => Support.num_or_nil(raw_record['useCount'])
       }
     end
 

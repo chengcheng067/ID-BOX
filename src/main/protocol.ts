@@ -12,8 +12,10 @@ import { applyVaultCorsHeaders, isWithinRoot, routeVaultHost, vaultResponseHeade
  * - `vault://thumb/<id>-<salt>.jpg`        → 缩略图缓存目录（网格只读这个，P0-9）
  * - `hdr://<key>.hdr`                     → HDR 预览缓存目录（0.6.5，`<userData>/hdr-cache`）
  * - `bg://<sha256>.<ext>`                 → 首页背景图缓存（V1.0，`<userData>/home-bg`）
+ * - `pinned-thumb://<hash>-<mtime>.png`   → 钉选目录文件缩略图缓存（图标视图，
+ *                                           `<userData>/pinned-thumbs`）
  *
- * **四个目录都要做 `path.resolve` + `startsWith(dir + sep)` 越界检查**（不能只给库根做）。
+ * **五个目录都要做 `path.resolve` + `startsWith(dir + sep)` 越界检查**（不能只给库根做）。
  *
  * `hdr://` 单列一个 scheme 而不是加 vault host：`routeVaultHost`（`shared/vault.ts`）
  * 的 host 白名单被单测锁死，且那边的判据是"库内容 vs 缓存"两类；HDR 缓存是
@@ -68,6 +70,19 @@ export function registerVaultScheme(): void {
         bypassCSP: true,
         corsEnabled: true
       }
+    },
+    {
+      // 钉选目录文件缩略图（fs:entryThumb 产物）：`<img src="pinned-thumb://<缓存文件名>">`，
+      // 权限同 hdr / bg
+      scheme: 'pinned-thumb',
+      privileges: {
+        standard: true,
+        secure: true,
+        supportFetchAPI: true,
+        stream: true,
+        bypassCSP: true,
+        corsEnabled: true
+      }
     }
   ])
 }
@@ -81,6 +96,8 @@ export interface VaultDirs {
   hdrDir: string
   /** 首页背景图缓存目录（bg scheme；`<userData>/home-bg`） */
   bgDir: string
+  /** 钉选目录文件缩略图缓存目录（pinned-thumb scheme；`<userData>/pinned-thumbs`） */
+  pinnedThumbsDir: string
 }
 
 export function serveVault(getDirs: () => VaultDirs): void {
@@ -89,19 +106,22 @@ export function serveVault(getDirs: () => VaultDirs): void {
   protocol.handle('hdr', async (request) => serveStatic(request, getDirs, 'hdr'))
   // 首页背景图缓存：同上，复用同一份越界检查 + CORS 透传
   protocol.handle('bg', async (request) => serveStatic(request, getDirs, 'bg'))
+  // 钉选目录文件缩略图缓存：同上
+  protocol.handle('pinned-thumb', async (request) => serveStatic(request, getDirs, 'pinned-thumb'))
 }
 
 /**
- * 三个 scheme 共用的静态文件服务：host 判定 → resolve → 越界检查 → 透传 body + CORS 头。
+ * 四个 scheme 共用的静态文件服务：host 判定 → resolve → 越界检查 → 透传 body + CORS 头。
  *
- * `scheme === 'hdr' | 'bg'` 时 host 固定为缓存目录（`hdr://<key>.hdr` /
- * `bg://<sha256>.<ext>`，无 host 语义），因此只认 scheme host 自身（Electron 的 URL
- * 解析会把 `bg://abc.png` 的 host 解析成 `abc.png`），路径直接取 pathname。
+ * `scheme === 'hdr' | 'bg' | 'pinned-thumb'` 时 host 固定为缓存目录
+ * （`hdr://<key>.hdr` / `bg://<sha256>.<ext>` / `pinned-thumb://<缓存文件名>`，
+ * 无 host 语义），因此只认 scheme host 自身（Electron 的 URL 解析会把
+ * `bg://abc.png` 的 host 解析成 `abc.png`），路径直接取 pathname。
  */
 async function serveStatic(
   request: Request,
   getDirs: () => VaultDirs,
-  scheme: 'vault' | 'hdr' | 'bg'
+  scheme: 'vault' | 'hdr' | 'bg' | 'pinned-thumb'
 ): Promise<Response> {
   // CORS 预检（OPTIONS）直接放行：否则带自定义头的跨源请求会在预检阶段被挡
   if (request.method === 'OPTIONS') {
@@ -113,8 +133,10 @@ async function serveStatic(
 
     let root: string
     let rel: string
-    if (scheme === 'hdr' || scheme === 'bg') {
-      root = path.resolve(scheme === 'hdr' ? dirs.hdrDir : dirs.bgDir)
+    if (scheme === 'hdr' || scheme === 'bg' || scheme === 'pinned-thumb') {
+      root = path.resolve(
+        scheme === 'hdr' ? dirs.hdrDir : scheme === 'bg' ? dirs.bgDir : dirs.pinnedThumbsDir
+      )
       // `hdr://abc.hdr` / `bg://abc.png` → host = 'abc.<ext>'；也兼容文件名写在 pathname 的写法
       const fromHost = decodeURIComponent(url.host)
       const fromPath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
@@ -130,7 +152,7 @@ async function serveStatic(
 
     const abs = path.resolve(root, rel)
 
-    // 防目录穿越（四个目录一视同仁，bg:// 越界检查必须保留）
+    // 防目录穿越（五个目录一视同仁，pinned-thumb:// 越界检查必须保留）
     if (!isWithinRoot(root, abs, path.sep)) {
       return new Response('forbidden', { status: 403, headers: vaultResponseHeaders(403) })
     }

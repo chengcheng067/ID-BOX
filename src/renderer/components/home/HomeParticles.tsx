@@ -33,7 +33,7 @@ import { HEX_PATTERN } from '../../../shared/homeTide'
 import { clampWaveHeight, validHexOrNull } from '../../../shared/homeTide'
 import { DEFAULT_SETTINGS } from '../../../shared/types'
 import type { MotionQuality, Settings, ThemeWaveColors } from '../../../shared/types'
-import { createTideRenderer, type TideRenderer, type TideSettings } from './particleTide'
+import { createTideRenderer, clickRippleAllowed, type TideRenderer, type TideSettings } from './particleTide'
 
 /** 组件 props（由 `HomeCover` 传入；`quality` 契约不变，后两项为首页自定义新增）。 */
 export interface HomeParticlesProps {
@@ -567,10 +567,16 @@ export function HomeParticles({
     }
 
     const onPointerDown = (event: PointerEvent): void => {
+      // ⚠️ 涟漪跟总开关走（T-05 子项 4）：总开关（指针交互）关 → 这里本就不该被调到
+      // （attachPointer 的守卫），但仍要双保险 —— 竞态 / 重构窗口漏进来的 pointerdown
+      // 不许把指针涌浪或涟漪激出来；涟漪子开关关 → 只同步指针（涌浪归总开关管）、不激涟漪。
+      // 真值表唯一来源 = `clickRippleAllowed`（与引擎 ripple() 共用，见 particleTide.ts）。
+      if (!settings.interactive) return
       const point = toCanvasPoint(event)
       // 点击往往落在 pointermove 的节流窗口里，这里先同步一次再激涟漪
       pendingPointer = null
       renderer.setPointer(point.x, point.y)
+      if (!clickRippleAllowed(settings.interactive === true, settings.clickRipples === true)) return
       renderer.ripple(point.x, point.y)
     }
 
