@@ -1071,7 +1071,33 @@
  * 布局位置补回原样：**视觉与旧排逐字一致**，只有 hover 伸出的部分在盒子内。
  * 数值必须与 HomeCover.tsx 里 EDGE_BAND 的 topInset/bottomInset 同源：
  * 热区方向判定用同一对常量把纵向安全带收回来（不收就等于"搜索框旁边悬停也滚动"）。
+ *
+ * ── 横向补偿 padding（--hc-scroll-pad-left / -right，2026-11-26 新增）──────────
+ * 用户口径：「首页的这个文件夹页面，我觉得整体排列有一点紧。可以适当放宽左右的
+ * 边界」+「左侧的遮罩，我希望它是高斯模糊加上有一定的羽化范围，现在看着非常生硬。」
+ *
+ * 左右各 40px，用的是**同一套**「padding 撑开可视域 + 等量负 margin 把布局补回」：
+ *   · 上下：padding 让 hover 翻盖不被竖向裁掉；
+ *   · 左右：padding 让「滚到两端时」首/末卡不贴死裁切边，并且给羽化带（下面那节
+ *     `[data-overflow]` 的 mask）留出 40px 的落点 —— 静止态首卡正好落在羽化带已经
+ *     完全不透明的那一侧，卡片本体一个像素都不会被削。
+ *
+ * 为什么负 margin 不会让卡片错位（box 模型推一遍）：
+ *   `width:auto` 的块级元素满足 ml + pl + w + pr + mr = 包含块宽。
+ *   代入 ml = mr = −40、pl = pr = 40 → w = 包含块宽 **不变**。
+ *   即内容盒（= `.hc-folder-row` 的 100%）仍是 `.hc-folder-wrap` 的宽度，
+ *   只有边框盒向外多出 40px（那 40px 落在容器的 92px 内边距里，不产生横向滚动条）。
+ *   所以 `HomeCover` 的 `max-w-[1040px]`、`home-stats.css` 的数据卡对齐公式、
+ *   `scrollLeft` 全部零变化 —— 与上下那一对完全同一个原理。
+ *
+ * ★ 这两个变量定义在 **`.hc-folder-wrap`** 上而不是这里：边缘箭头 `.hc-folder-edge`
+ *   是 wrap 的子元素、scroller 的**兄弟**，自定义属性只能从 wrap 继承下来。
  * ─────────────────────────────────────────────────────────────────────────── */
+.hc-folder-wrap {
+  --hc-scroll-pad-left: 40px;
+  --hc-scroll-pad-right: 40px;
+}
+
 .hc-folder-scroll {
   --hc-scroll-pad-top: 110px;
   --hc-scroll-pad-bottom: 64px;
@@ -1079,8 +1105,12 @@
   overflow-y: hidden;
   padding-top: var(--hc-scroll-pad-top);
   padding-bottom: var(--hc-scroll-pad-bottom);
+  padding-left: var(--hc-scroll-pad-left);
+  padding-right: var(--hc-scroll-pad-right);
   margin-top: calc(var(--hc-scroll-pad-top) * -1);
   margin-bottom: calc(var(--hc-scroll-pad-bottom) * -1);
+  margin-left: calc(var(--hc-scroll-pad-left) * -1);
+  margin-right: calc(var(--hc-scroll-pad-right) * -1);
   /* 隐藏滚动条：滚轮 / 触控板 / 拖动条（F-2 的手动兜底）都还能滚 */
   scrollbar-width: none;
 }
@@ -1095,14 +1125,265 @@
    但 overflow 模式保持 auto/hidden 不变 —— 这点关键：改成 overflow:visible 会把
    scrollLeft 归零，让其余卡在退场起始帧右跳一个滚动量（窄窗口 / 钉选卡多时可见）。
    padding 与 margin 等量互补，内容布局位置与 scrollLeft 都原样不动，零跳变。
-   退场结束 HomeCover 整体卸载，容器不再存在。 */
+   退场结束 HomeCover 整体卸载，容器不再存在。
+
+   ★ 2026-11-26：左右那对补偿 padding（--hc-scroll-pad-left/-right）**同样要放大**
+   到 420px，羽化 mask 也在这里之外单独关断（见下一节末尾）。真实动因不是"飞出去
+   的卡"，而是**留在排里的卡**：退场时左右半排各向外 `translate ±40px`
+   （`home-outro.css` 的 `--ho-exit-x`），正好踩进本轮新增的 40px 补偿 padding 区 ——
+   不放大 padding，两端的卡会在退场帧撞上裁切边界；不关 mask，它们会被 48px 的
+   渐隐带提前淡掉，读起来像"边上的卡比中间的卡先消失"。
+   （飞向正中的那一张横向目标是视口中心、永远在带子内部，本来就不会被横切；
+   这条对它是**顺带的对称保险**，别据此把 420 改小 —— 纵向那 420 是它的刚需。） */
 .hc-root[data-leaving='true'] .hc-folder-scroll {
   --hc-scroll-pad-top: 420px;
   --hc-scroll-pad-bottom: 420px;
+  --hc-scroll-pad-left: 420px;
+  --hc-scroll-pad-right: 420px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ── 首页文件夹排：溢出时的左右高斯模糊 + 羽化（2026-11-26）────────────────────
+ *
+ * 用户口径（逐字）：
+ *   「如果超过 5 个文件夹的话，左右两侧肯定都是需要高斯模糊和羽化的。」
+ *   「左侧的遮罩，我希望它是高斯模糊加上有一定的羽化范围，现在看着非常生硬。」
+ *
+ * 两件事**同时**做，缺一件都会回到"生硬"：
+ *   ① **羽化**：scroller 自己加 `mask-image` 横向渐隐 —— 落点对齐左右 40px 补偿
+ *      padding（0 → 40px 之间过渡），静止态首/末卡落在 40px 处，完全不透明；
+ *      滚起来时卡片进入 padding 区（−40…0）就开始变淡，到裁切边正好是 0。
+ *   ② **高斯模糊**：`.hc-fog-left/right` 两条雾带叠在 scroller 之上，
+ *      `backdrop-filter: blur(12px)` 糊它背后的卡片，再叠 mask 让
+ *      "最糊（贴裁切边）→ 不糊（向中轴）"是连续过渡的，没有一条能看见的弧线。
+ *      宽度与羽化口径见下方「第四/五/六轮修正」——**当前是 2D 三角形过渡**，
+ *      不是一维线性。
+ *
+ * 只在**真的溢出**时才生效：`HomeCover` 用 ResizeObserver + MutationObserver 量
+ * `scrollWidth > clientWidth + 1`，把 `data-overflow` 写到 `.hc-folder-wrap` 上。
+ * 不溢出（≤5 张 / 6 槽位）时 mask 与两条雾带都不出现 —— 用户要的「5 张不滚、
+ * 也别糊」是靠这条属性成立的，**不要**改成"永远显示"。
+ *
+ * ⚠️ 为什么不把 mask 挂到 `.hc-folder-wrap`（更高一层）：wrap 是卡片的祖先，
+ *   `mask` 会让它成为 backdrop root，影响卡内 `.gf-front` 的 `backdrop-filter`
+ *   取样（文件头「玻璃的成因」那一节）。挂在 scroller 上只有"溢出时"才成立，
+ *   且实测结论是 `.gf-front` 背后压着的是卡片自己的不透明背板图（取样范围本来
+ *   就在卡内）→ 两者等价、零视觉差。
+ * ⚠️ `data-overflow` 挂在 wrap 上、选择器统一从 `.hc-folder-wrap[data-overflow…]`
+ *   往下选：一个属性同时驱动 mask（命中 scroller）与两条雾带（命中 .hc-fog）。
+ * ─────────────────────────────────────────────────────────────────────────── */
+.hc-folder-wrap[data-overflow='true'] .hc-folder-scroll {
+  /* 羽化距离 = 补偿 padding（40px）：与两条雾带的宽度、起点、终点完全对齐。
+     上一版是 48px、比 padding 多 8px —— 两条曲线错开，交界处能看出台阶（"边缘硬"）。
+     现在卡片从进入 padding 区开始变淡，到裁切边正好为 0，与雾带的模糊同步收尾。 */
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--hc-scroll-pad-left, 40px),
+    #000 calc(100% - var(--hc-scroll-pad-right, 40px)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--hc-scroll-pad-left, 40px),
+    #000 calc(100% - var(--hc-scroll-pad-right, 40px)),
+    transparent 100%
+  );
+}
+
+/* 两条雾带：常驻渲染（才吃得到 200ms 的 opacity 过渡），不溢出时 opacity:0。
+ *
+ * ★ 2026-11-26 第二轮修正（用户原话「两侧的模糊边缘有点硬，然后不需要有白色底色啊」）：
+ *   上一版宽度 72px，从裁切边起算 = 「40px padding + 卡片外侧 32px」。问题有两个：
+ *   ① **白底**：`backdrop-filter: blur()` 糊的是它背后的**卡片本体**（磨砂白背板）。
+ *      白色被糊平就成了一整块均匀的白色矩形 —— 用户看到的"白色底色"就是它，
+ *      不是背景色没设，是模糊把白卡糊成了一块白。
+ *   ② **边缘硬**：mask 是 `#000 0, #000 40%, transparent 100%` —— 前 40%（≈29px）
+ *      完全实心、之后才开始衰减，这个"实心→衰减"的台阶本身就是一条可见的硬边；
+ *      且它与 scroller 那条 40px 羽化是两条不同步的曲线，叠在一起更明显。
+ *
+ *   现在的口径：**雾带宽度 = padding 宽度（40px），即只覆盖"卡片被裁掉之前的那片空白"**。
+ *   · 静止态：雾带底下是壁纸而不是卡片 → **不可能出现白块**（这是"不要白底"的根本解法）；
+ *   · 滚动中：卡片滑进这 40px 时被渐糊、到裁切边正好消失 —— 模糊该起作用的地方一点没少；
+ *   · mask 改成 `#000 0 → transparent 100%` 纯线性，没有平台段 → 没有硬边；
+ *   · 再叠上 scroller 自己那条 40px 卡片羽化，两条曲线同向、不再互相打架。
+ *   实测过 `left: 0`（从卡片带起算）：静止态首卡左半糊到名字看不清，**不要改回去**。
+ *   · top/bottom 各外扩 10px：卡片 hover 会抬 4px，不外扩会在卡片上沿留一条
+ *     上糊下不糊的水平接缝。10px 远小于与搜索条的 mt-10（40px），不越界。
+ *
+ * ★ 2026-11-26 第三轮修正（用户原话「两侧边缘还是有点生硬」）：
+ *   前一轮把宽度收到 40px 之后，**白底确实没了**，但两侧仍有一条竖直硬边。根因是
+ *   mask 的方向：`#000 0 → transparent 100%` 让**最糊（alpha=1）贴着裁切边**、向内侧
+ *   才逐渐变清。而裁切边**外侧**什么都没有画（scroller 的 overflow 把那里裁掉了）——
+ *   于是「最糊的壁纸」与「清晰的壁纸」在 x=裁切边 处直接相接，亮度 2px 内跳 30/255，
+ *   放大图里就是一条能看见的竖线。**内侧的渐变是对的，缺的是外侧那一半。**
+ *
+ *   修正：把雾带**向容器外延伸 24px**，mask 峰值落在裁切边本身 ——
+ *     `transparent 0 → #000 24px → transparent 100%`（三角形，外侧 24px 渐入、
+ *      内侧 40px 渐出）。
+ *   · 外侧那 24px 底下是纯壁纸（且落在 wrap 外的页边距里，绝不压卡片），
+ *     所以「让它在外面糊」既不遮挡内容、也不会引出新的白块；
+ *   · 峰值正好在裁切边 ⇒ 两侧斜率同号、无驻点、无台阶，硬边消失；
+ *   · 24px 的取值不是审美：最小窗口 1080 下 wrap 左边界 = 页内边距 92px，
+ *     再往外扩仍在屏内；扩到 32px 以上在极窄档会顶出画面。
+ *
+ * ★ 2026-11-26 第四轮修正（横向修完，纵向还是硬切）：
+ *   上一条只解决了**横向**（一维 mask 只沿 x 渐变）。但雾带是个矩形元素 ——
+ *   它的 **上边和下边（top:-10px / bottom:-10px 那两条）从来没羽化过**，
+ *   于是排的上方、下方各留下一条**水平**硬边：糊与不糊在一行像素上直接切换。
+ *   纯色背景实测能清楚量到（雾带纵向范围 576..716，越过 716 后亮度阶跃）。
+ *
+ *   修正：把 mask 从一维换成**二维** —— 两个渐变相乘：
+ *     `mask-image: linear-gradient(横向三角), linear-gradient(纵向三角);
+ *      mask-composite: intersect`（两图取交集 = alpha 相乘）。
+ *   · 为什么用 mask-composite 而不是给元素加圆角：圆角是「形状裁切」，
+ *     边缘仍然是一次性切断；只有 alpha 连续过渡才读不出边界。
+ *   · ⚠️ `mask-composite` 必须写在**声明了 mask-image 的那条规则里**：
+ *     分开写在基类 `.hc-fog` 上会被子类的整条 mask-image 覆盖掉（实测 compute 出来
+ *     仍是 `add`，两条渐变直接相加 → 横向那条的硬边照旧）。现在两侧各自写全。
+ *
+ * ★ 2026-11-26 第五轮修正（纵向羽化必须整段落在卡片之外）：
+ *   第四轮加了 24px 纵向羽化，但元素只向外探 10px（`top/bottom: -10px`）——
+ *   **羽化段比延伸段长，渐变还没走完就撞上元素边界**，上下仍是硬切。
+ *   更糟的是卡片顶边（wrap 顶）正好落在渐变段中段 → 卡片上部被平白淡化。
+ *
+ *   现在：`top/bottom: calc(-1 * var(--hc-fog-top-ext))`，`--hc-fog-top-ext: 30px`。
+ *     · 元素范围 = 排的上下各外扩 30px，渐变段 24px **完整落在元素内**；
+ *     · 渐变段 556..580（顶）、712..736（底），卡片是 586..706 →
+ *       **卡片本体整段处在 alpha=1 的实心里**，纵向零淡化；
+ *     · 30px 里剩下 6px 是实心余量，正好覆盖卡片 hover 抬起的 4px；
+ *     · 30px 远小于搜索条与筛选气泡的间距（远离），不越界。
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** 雾带向容器外多探出去的距离（px）。见上文第三轮修正；两侧对称。 */
+:root {
+  --hc-fog-bleed: 24px;
+  /** 雾带上下各羽化的距离（px）。见上文第四轮修正。 */
+  --hc-fog-feather-y: 24px;
+  /**
+   * 雾带上下各向外延伸的距离（px）。**必须 ≥ --hc-fog-feather-y**，
+   * 否则渐变撞在元素边界上 = 硬边（第五轮修正的教训）。
+   */
+  --hc-fog-top-ext: 30px;
+}
+
+/* ── 当前口径一句话总结（改之前先读这段）───────────────────────────────────────
+ *   横向：三角（外侧 bleed 渐入 → 峰值在裁切边 → 内侧 padding 渐出）
+ *   纵向：三角（上下各 feather-y 渐入到实心，中部实心覆盖整张卡）
+ *   合成：mask-composite: intersect（两条渐变相乘）
+ *   元素框：左右 (padding + bleed)，上下 top-ext（≥ feather-y）
+ *   生效：仅 .hc-folder-wrap[data-overflow='true']
+ * 任何一个数字对不上，都会退回「一条能看见的边」——四个变量互相咬合，改一处要重算其余。
+ * ─────────────────────────────────────────────────────────────────────────── */
+.hc-fog {
+  position: absolute;
+  /* 上下各外扩 30px（≥ 羽化 24px）：让整段渐变落在元素内、且卡片本体落在实心区。
+     见上文第五轮修正 —— 这里改成 10px 会立刻退回"上下硬切"。 */
+  top: calc(-1 * var(--hc-fog-top-ext));
+  bottom: calc(-1 * var(--hc-fog-top-ext));
+  /* 宽度 = 补偿 padding（40px）+ 外侧溢出段（24px）：静止态只盖空白区，绝不压卡片本体 */
+  width: calc(var(--hc-scroll-pad-left, 40px) + var(--hc-fog-bleed));
+  z-index: 5;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 200ms ease;
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+/* 峰值（alpha=1）落在裁切边上：外侧 24px 渐入、内侧 40px 渐出 → 两端都不留台阶。
+   ⚠️ `#000 24px` 的 24 必须等于 --hc-fog-bleed；写成百分比会在窗口宽度变化时错位。
+   ⚠️ 不要再退回 `#000 0, transparent 100%`（那是第二轮，会把峰值顶到裁切边外沿）。
+   ⚠️ 这里是**二维 mask**：横向（第一条）+ 纵向（第二条）靠 intersect 相乘。
+      只写横向会退回「上下硬切」状态。
+   ⚠️ `mask-composite` **必须写在本规则里**（不能提回基类）：子类的 mask-image 是
+      整条覆盖，基类里那条 composite 会被一并盖掉，实测 compute 出来仍是 `add` ——
+      两条渐变直接相加，横向硬边照旧。 */
+.hc-fog-left {
+  left: calc(-1 * var(--hc-scroll-pad-left, 40px) - var(--hc-fog-bleed));
+  -webkit-mask-image:
+    linear-gradient(to right, transparent 0, #000 var(--hc-fog-bleed), transparent 100%),
+    linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 var(--hc-fog-feather-y),
+      #000 calc(100% - var(--hc-fog-feather-y)),
+      transparent 100%
+    );
+  mask-image:
+    linear-gradient(to right, transparent 0, #000 var(--hc-fog-bleed), transparent 100%),
+    linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 var(--hc-fog-feather-y),
+      #000 calc(100% - var(--hc-fog-feather-y)),
+      transparent 100%
+    );
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
+}
+.hc-fog-right {
+  right: calc(-1 * var(--hc-scroll-pad-right, 40px) - var(--hc-fog-bleed));
+  width: calc(var(--hc-scroll-pad-right, 40px) + var(--hc-fog-bleed));
+  -webkit-mask-image:
+    linear-gradient(to left, transparent 0, #000 var(--hc-fog-bleed), transparent 100%),
+    linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 var(--hc-fog-feather-y),
+      #000 calc(100% - var(--hc-fog-feather-y)),
+      transparent 100%
+    );
+  mask-image:
+    linear-gradient(to left, transparent 0, #000 var(--hc-fog-bleed), transparent 100%),
+    linear-gradient(
+      to bottom,
+      transparent 0,
+      #000 var(--hc-fog-feather-y),
+      #000 calc(100% - var(--hc-fog-feather-y)),
+      transparent 100%
+    );
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
+}
+.hc-folder-wrap[data-overflow='true'] .hc-fog {
+  opacity: 1;
+}
+/* 退场时雾带让位（整排本来就在淡出，留一条糊边会读成"卡住了"） */
+.hc-root[data-leaving='true'] .hc-fog {
+  opacity: 0;
+  transition: none;
+}
+
+/* 退场时整条羽化关断：左右半排退场时各向外 translate 40px，边上的卡会正好走进
+   左右 40px 的渐隐带 → 留着就会"边上的卡比中间的卡先淡掉"，一眼看出是遮罩。
+   ⚠️ 必须写在上面 `[data-overflow]` 那条**之后**：两选择器特异性相同（都是
+   2 class + 1 属性），靠源码顺序决胜负。 */
+.hc-root[data-leaving='true'] .hc-folder-scroll {
+  -webkit-mask-image: none;
+  mask-image: none;
 }
 
 /* 边缘热区提示（箭头微光）：只在可滚方向上淡入，零布局位移（absolute）。
-   motionQuality==='smooth' 档下父级不打 data-edge-scroll，提示整体不渲染。 */
+   ★ 2026-11-28：span 升级为 <button type="button">（可点击 = 平滑滚一个卡步进，
+   目标值收口在 homePinned.clickScrollTarget）。pointer-events 的口径：
+   · 默认（含 data-visible='false'，即不显现时）：`none` —— 隐形按钮绝不能
+     挡住雾带下方卡片的 hover / 右键（雾带本身也是 none，同一防线）；
+   · 只有 data-visible='true'（鼠标已在热区里、微光亮起）才放行 `auto`。
+   ★ 2026-11-28 位置重定（用户复验「箭头压在卡片上」）：箭头要落在**雾带条**
+   上而不是卡片带边缘。几何（wrap 坐标系）：
+   · 雾带 `.hc-fog-left` = wrap-x [-64, 0]（left: -(pad 40 + bleed 24)，宽 64），
+     中心 -32；
+   · 旧位置 `left: var(--hc-scroll-pad-left)` = wrap-x [40, 88] —— 而**卡片带
+     起点也在 wrap-x 40**（scroller 的补偿 padding 把内容内推 40px），行溢出时
+     （箭头显现的唯一时机）左右箭头必然叠在首/末可见卡上 —— 这就是压卡根因；
+   · 新位置：48px 按钮盒在雾带 [-64, 0] 内居中 → left = -(pad+16) = wrap-x
+     [-56, -8]，中心 -32 = 雾带中心，距内容带（wrap-x 0）余 8px（右侧对称）。
+     按钮盒一半在 wrap 外没问题（wrap `overflow: visible`，CDP 实测）。
+   退场态安全：`.hc-root[data-leaving='true'] .hc-folder-scroll` 把 pad 放大到
+   420px 时，雾带变量跟着走（fog 的 left/width 用同一组变量），箭头位置随
+   pad 同步外移且 opacity 由 fog/退场规则压掉，无布局跳变。
+   z-index 6：要压在两条雾带（z5）之上，否则箭头会被自己那侧的高斯模糊糊掉。 */
 .hc-folder-edge {
   position: absolute;
   top: 50%;
@@ -1112,19 +1393,34 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  /* button 默认样式归零：背景/边框/内边距不归零会盖住 48×48 热区原来的样子 */
+  appearance: none;
+  background: transparent;
+  border: none;
+  padding: 0;
   pointer-events: none;
+  cursor: pointer;
   opacity: 0;
   transition: opacity 200ms ease;
   color: var(--text-tertiary, #8a8f98);
-}
-.hc-folder-edge[data-side='left'] {
-  left: 0;
-}
-.hc-folder-edge[data-side='right'] {
-  right: 0;
+  z-index: 6;
 }
 .hc-folder-edge[data-visible='true'] {
   opacity: 1;
+  pointer-events: auto;
+}
+.hc-folder-edge[data-side='left'] {
+  /* 按钮盒（48px）在雾带 [-(pad+bleed), 0] 内居中：
+     left = -(pad + (bleed-0)/2 + 8) = -(pad+16) → 盒 [-(pad+16), -(pad-32)]，
+     bleed=24 时即 [-56, -8]，中心 -32 = 雾带中心，距 wrap-x 0（内容带）余 8px。 */
+  left: calc(-1 * var(--hc-scroll-pad-left, 40px) - 16px);
+}
+.hc-folder-edge[data-side='right'] {
+  right: calc(-1 * var(--hc-scroll-pad-right, 40px) - 16px);
+}
+/* hover 轻微提亮（只动颜色 token，一档灰阶，无位移无新增配色） */
+.hc-folder-edge[data-visible='true']:hover svg {
+  color: var(--text-secondary, #98989e);
 }
 /* 箭头图形：SVG 由组件内联，颜色跟文字 token 走（提示行同款灰阶） */
 .hc-folder-edge svg {

@@ -487,6 +487,25 @@ export const IPC = {
   fsRenameEntry: 'fs:renameEntry',
   /** invoke：把多个条目移入系统回收站（shell.trashItem）。部分失败不整批失败；单次上限 500。 */
   fsTrashEntries: 'fs:trashEntries',
+  /**
+   * invoke：列出**钉选根内部隐藏回收区**（`.idbox-trash`）的可恢复条目。
+   *
+   * 为什么需要：Windows 系统回收站对**网络映射盘**（DriveType 4）无效
+   * （`shell.trashItem` 报 `Failed to perform delete operation`）。这类条目改走同盘
+   * 原子 `rename` 进钉选根内的隐藏回收区，本通道即它的长期可访问入口。
+   * 入参 `FsListPinnedTrashInput`（只收 `pinId`，路径由主进程从 settings 解析）。
+   * 返回 `FsListPinnedTrashResult`（**永不 reject**）。
+   */
+  fsListPinnedTrash: 'fs:listPinnedTrash',
+  /**
+   * invoke：把隐藏回收区里的一个条目**真实还原**回原目录（同盘 `rename`）。
+   *
+   * 入参 `FsRestorePinnedTrashInput`（`pinId` + `token`；token 是 UUID，白名单
+   * `/^[0-9a-f-]{36}$/` 防穿越；绝不接收原始中文名当路径段）。原位置被占用时
+   * 自动追加 `-2/-3` 并返回 `renamed:true`。返回 `FsRestorePinnedTrashResult`
+   * （**永不 reject**）。
+   */
+  fsRestorePinnedTrash: 'fs:restorePinnedTrash',
   /** invoke：7z 解压压缩包到同目录同名文件夹（防穿越校验；7z 缺失报 `no-7z`）。 */
   fsExtractArchive: 'fs:extractArchive',
   /** invoke：7z 压缩为同目录 zip；7z 缺失降级 PowerShell Compress-Archive。 */
@@ -521,7 +540,40 @@ export const IPC = {
    * 文件 / 目录都走 `shell.showItemInFolder`（Windows 上目录会在父目录里选中它）。
    * 返回 `FsRevealEntryResult`（**永不 reject**，失败收口 `{ok:false, reason, error}`）。
    */
-  fsRevealEntry: 'fs:revealEntry'
+  fsRevealEntry: 'fs:revealEntry',
+  // ── 「关闭窗口」询问（2026-11 用户需求）──────────────────────────
+  //
+  // 三段式，结构照 `importConflictAsk` / `importConflictAnswer` / `importConflictExpired`
+  // （问 / 答 / 作废）：主进程问、渲染层答、主进程单方面结束时要显式作废。
+  //
+  // 触发链：`settings.closeBehavior === 'ask'`（默认档）时用户点主窗口 ✕
+  // → `main/index.ts` 的 `win.on('close')` 拦下并 `preventDefault` → 发本询问
+  // → `CloseAskDialog` 用户点「退至后台 / 彻底退出」→ 答复 → 主进程**执行完动作才收场**。
+  /**
+   * 主进程 → 渲染进程：用户点了窗口 ✕，请裁决「退至后台」还是「彻底退出」
+   * （Payload = `CloseAskPayload`）。
+   *
+   * 一次 ✕ 只发一次：主进程侧 `closeAskInFlight` 挡住"弹窗还开着又点 ✕"的重复询问。
+   */
+  closeAsk: 'app:closeAsk',
+  /**
+   * 渲染进程 → 主进程：裁决结果（Payload = `CloseAnswer`）。
+   *
+   * 主进程按 `requestId` 兑现挂起的 Promise；**未知 / 过期 requestId 必须静默丢弃**
+   * （超时 15s 之后迟到的答复不能反过来把已经 hide 的窗口再关一次）。
+   * 用 `invoke` 只是为了拿到兑现确认，主进程侧返回 void。
+   */
+  closeAnswer: 'app:closeAnswer',
+  /**
+   * 主进程 → 渲染进程：**这次询问已作废**（Payload = `CloseAskExpired`）。
+   *
+   * 只在**主进程单方面结束**时必须发：15s 超时（兜底动作 `'tray'`）。渲染层收到就关掉
+   * 弹窗 —— 否则它会挂在屏幕上，而用户之后的每次点击都会被当作「过期答复」静默丢弃
+   * （`requestId` 已从 `pendingCloseAsks` 移除），表现为"关不掉、点了没反应"（DEF-19-1）。
+   *
+   * 其它终止路径不需要发：用户自己答复时渲染层会主动清弹窗；渲染进程崩溃时已无接收方。
+   */
+  closeAskExpired: 'app:closeAskExpired'
 } as const
 
 /**
@@ -684,11 +736,64 @@ export interface FsTrashFailedItem {
 }
 
 /**
+ * `fs:trashEntries` 的一个**成功移出**条目。
+ *
+ * `token === null`：进了**系统回收站**（本地盘），系统级，本应用**不可撤销**；
+ * `token` 非 null：进了**钉选根内隐藏回收区**（网络盘兜底），可用
+ * `fs:restorePinnedTrash` 按 token 真实还原，也可在回收站入口里长期查看。
+ * 渲染层必须按此区分撤销条的可用性 —— 不要把系统回收站的条目做成可撤销按钮。
+ */
+export interface FsTrashedItem {
+  name: string
+  token: string | null
+}
+
+/**
  * `fs:trashEntries` 返回：`ok:true` 表示批次已执行完，**个别条目的失败在 `failed`
- * 里**（回收站化可能因占用 / 权限个别失败，其余条目照常成功）。
+ * 里**（回收站化可能因占用 / 权限个别失败，其余条目照常成功）；`trashed` 是
+ * 已成功移出的条目及其去向（见 {@link FsTrashedItem}）。
  */
 export type FsTrashEntriesResult =
-  | { ok: true; failed: FsTrashFailedItem[] }
+  | { ok: true; failed: FsTrashFailedItem[]; trashed: FsTrashedItem[] }
+  | FsWriteFailure
+
+/**
+ * 隐藏回收区（`<pinRoot>/.idbox-trash`）里的一个可恢复条目。
+ *
+ * `token` 是 UUID **目录名**（不是原始中文名，避免路径穿越与编码问题）；
+ * `relFolder` 是原所在目录相对 `pinRoot` 的 posix 路径，`''` = 钉选根本身。
+ */
+export interface PinnedTrashEntry {
+  token: string
+  name: string
+  relFolder: string
+  deletedAt: number
+  size: number
+  isDirectory: boolean
+}
+
+/** `fs:listPinnedTrash` 入参：只收 pinId，钉选根由主进程按 id 白名单解析 */
+export interface FsListPinnedTrashInput {
+  pinId: string
+}
+
+/** `fs:listPinnedTrash` 返回：**永不 reject** */
+export type FsListPinnedTrashResult =
+  | { ok: true; entries: PinnedTrashEntry[] }
+  | FsWriteFailure
+
+/** `fs:restorePinnedTrash` 入参：`token` 必须过 UUID 白名单 */
+export interface FsRestorePinnedTrashInput {
+  pinId: string
+  token: string
+}
+
+/**
+ * `fs:restorePinnedTrash` 返回：**永不 reject**。
+ * `renamed:true` 表示原位被占用、已追加 `-2/-3`，渲染层必须提示用户新名字。
+ */
+export type FsRestorePinnedTrashResult =
+  | { ok: true; name: string; relFolder: string; renamed: boolean }
   | FsWriteFailure
 
 /** `fs:extractArchive` 返回：`dirName` = 解压出的文件夹名（同目录下，渲染层刷新即见） */

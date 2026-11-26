@@ -12,6 +12,7 @@ import {
   LEGACY_DISPOSAL_ALIASES,
   clampHomeTideNumber,
   type ArchiveDisposal,
+  type CloseBehavior,
   type Settings,
   type ThemeMode,
   type TrashRetention
@@ -324,6 +325,26 @@ export const SettingsSchema = z.object({
   homeGuideLastVersion: z.string().nullable().optional().catch(null),
   /** 首页引导是否被永久关闭：脏值回落 `false`。 */
   homeGuideDisabled: z.boolean().optional().catch(false),
+  /**
+   * 关闭主窗口的行为三档（默认 `'ask'` = 点 ✕ 弹窗询问，用户选了才执行）。
+   *
+   * `.optional().catch('ask')` = **单项降级**：手改档写坏的值（`'minimize'`、`1`、`null`）
+   * 只让这一项回落「每次询问」，绝不拖垮整份 settings.json（zod 裸 enum 的默认行为是
+   * `safeParse` 整体失败 → `loadSettings` 丢掉 `libraryDir`，本仓库在 gridDensity /
+   * trashRetention / motionQuality 上都踩过这个坑，策略与它们保持一致）。
+   * 缺键时 `.optional()` 产出 `undefined`，再由 `normalizeSettings` / `migrateSettings`
+   * 用 `normalizeCloseBehavior` 收口成 `'ask'`。
+   */
+  closeBehavior: z.enum(['ask', 'quit', 'tray']).optional().catch('ask'),
+  /**
+   * 「关闭窗口时」一次性迁移标记（升级水位线，2026-11-27 装机反馈 v1.2.1）。
+   *
+   * 缺键 = 1.2.1 之前写出的档 → `loadSettings` 会强制落 `'ask'` 并写回标记。
+   * `.optional().catch(false)`：脏值只丢这一项（回落 false = 视为"未迁移"，
+   * 宁可多迁移一次也不漏掉残留档），绝不拖垮整份 settings.json —— 与 gridDensity /
+   * trashRetention / motionQuality 的单项降级策略一致。
+   */
+  closeBehaviorMigrated: z.boolean().optional().catch(false),
   /** @deprecated 旧档迁移用 */
   trashArchiveAfterImport: z.boolean().optional()
 })
@@ -665,7 +686,12 @@ export function migrateSettings(raw: RawSettings): Settings {
     homeGuideFirstRunShown: raw.homeGuideFirstRunShown === true,
     homeGuideLastVersion:
       typeof raw.homeGuideLastVersion === 'string' ? raw.homeGuideLastVersion : null,
-    homeGuideDisabled: raw.homeGuideDisabled === true
+    homeGuideDisabled: raw.homeGuideDisabled === true,
+    // 关闭窗口行为（默认 'ask' = 每次询问）：旧档缺键 / 脏值都在这里收口成「每次询问」，
+    // 保证返回的 Settings 是完整对象（`.optional()` 缺键产出 undefined 会覆盖默认值）
+    closeBehavior: normalizeCloseBehavior(raw.closeBehavior),
+    // 迁移标记只认严格 true：缺键 / 脏值 = 未迁移（宁多迁一次，不漏残留档）
+    closeBehaviorMigrated: raw.closeBehaviorMigrated === true
   }
   delete next.trashArchiveAfterImport
   return next
@@ -677,6 +703,21 @@ export function migrateSettings(raw: RawSettings): Settings {
  */
 export function normalizeTrashRetention(v: unknown): TrashRetention {
   return v === '5d' || v === '10d' || v === '30d' || v === 'recycle' ? v : '30d'
+}
+
+/**
+ * 关闭窗口行为三档的**唯一归一化入口**（读档 / 写档 / 测试共用）。
+ *
+ * 三个合法值（`'ask'` / `'quit'` / `'tray'`）原样保留；缺键、脏值（`'minimize'`、
+ * `1`、`null`、`true`）一律回落默认 `'ask'`（= 每次点 ✕ 都问一次），绝不抛错。
+ *
+ * ⚠️ 默认档从 `'quit'` 改成 `'ask'`（2026-11 用户需求）：老档缺键的升级用户因此落到
+ * 「每次询问」。这是**刻意**的 —— 静默退出会掐断正在跑的导入与分类，而多问一次
+ * 的成本只是点一下，且用户第一次点 ✕ 就看到了选择机会。
+ */
+export function normalizeCloseBehavior(v: unknown): CloseBehavior {
+  if (v === 'quit' || v === 'tray' || v === 'ask') return v
+  return 'ask'
 }
 
 /** 写档前归一化：补齐默认值、丢弃未知键、确保数值为正 */
@@ -790,6 +831,14 @@ export function normalizeSettings(s: Partial<Settings>): Settings {
   merged.homeGuideLastVersion =
     typeof merged.homeGuideLastVersion === 'string' ? merged.homeGuideLastVersion : null
   merged.homeGuideDisabled = merged.homeGuideDisabled === true
+  // 关闭窗口行为（设置·外观「窗口与后台」）：写档前再收口一次（与读档同一口径；
+  // 渲染层 patch 也可能带脏值进来）。只认三个合法档位，其余一律「每次询问」。
+  merged.closeBehavior = normalizeCloseBehavior(merged.closeBehavior)
+  // 迁移标记写档前再收口一次（与读档同一口径）：只认严格 true。
+  // ⚠️ 这里**不负责**翻牌 —— 迁移点在 `loadSettings`（读档侧，见
+  //    `planCloseBehaviorMigration`），写档侧只做透传收口，否则会把用户升级后
+  //    的显式选择也打回 'ask'。
+  merged.closeBehaviorMigrated = merged.closeBehaviorMigrated === true
   delete merged.trashArchiveAfterImport
   return merged
 }
@@ -835,23 +884,73 @@ async function readSettingsFile(file: string): Promise<Settings | null> {
   return null
 }
 
+/**
+ * 「关闭窗口时」一次性迁移的**纯决策函数**（2026-11-27 装机反馈，v1.2.1）。
+ *
+ * 背景（为什么必须有这条迁移）：v1.2.0 及更早**根本没有** closeBehavior 字段，
+ * 外部老用户升级上来走默认 `'ask'` 是对的；但 dev / 测试期间的机器 settings.json
+ * 里已经落了残留值（用户杨雯丞的档里是 `"closeBehavior": "tray"`），原样读入 →
+ * 第一次点 ✕ 不弹窗。产品口径：**升级到 1.2.1 后第一次必须落在「每次询问」**。
+ *
+ * 规则：
+ * - 标记不是严格 `true`（缺键 / 脏值 / `false`）→ 视为"1.2.1 之前写出的档"，
+ *   返回**新对象**：`closeBehavior` 强制 `'ask'` + 标记置 `true`；
+ * - 标记已是 `true` → 返回 `null`（什么都不动，用户的显式选择永远不被再碰）。
+ *
+ * ⚠️ 为什么迁移点在 **读档侧**（`loadSettings`）而不是写档侧
+ * （`normalizeSettings` / `migrateSettings`）：写档侧每次保存都会跑，会把用户
+ * 升级后的显式选择也打回 `'ask'`；读档侧一个进程只在启动时跑一次（标记落盘后
+ * `if (=== true) return null` 短路），语义正是"升级后的第一次"。
+ *
+ * 纯函数（不做 IO、不碰 electron）：可单测；写盘由 `loadSettings` 拿它的返回值
+ * 调 `saveSettings` 完成 —— 写盘失败不阻断启动（内存里标记已是 true，
+ * 后续任何一次 saveSettings 都会把它带上）。
+ */
+export function planCloseBehaviorMigration(s: Settings): Settings | null {
+  if (s.closeBehaviorMigrated === true) return null
+  return { ...s, closeBehavior: 'ask', closeBehaviorMigrated: true }
+}
+
 export async function loadSettings(): Promise<Settings> {
   // 品牌更名迁移（modvault → idbox）：先把旧 userData 目录的设置复制过来再读，
   // 否则老用户升级后读不到库路径，资产会全部从 UI 消失（2026-10 装机反馈 P0）。
   await migrateLegacySettingsFile(app.getPath('userData')).catch(() => {})
 
   const main = await readSettingsFile(settingsFilePath())
-  if (main) return main
+  if (main) return await applyCloseBehaviorMigration(main)
 
   // 主档缺失或损坏（典型：进程在 writeFile 中途被杀 → 截断 JSON）→ 先试一代备份。
   // ⚠️ 这一条是"库看起来空了"的最后防线：回落默认值会把 libraryDir 一起丢掉。
   const backup = await readSettingsFile(settingsBackupPath())
   if (backup) {
     console.error('[idbox] settings.json 不可用，已从 settings.json.bak 恢复')
-    return backup
+    return await applyCloseBehaviorMigration(backup)
   }
 
-  return { ...DEFAULT_SETTINGS, libraryDir: await resolveDefaultLibraryDir() }
+  // 全新安装（两键皆无）：走同一条迁移 —— 落 `'ask'` + 标记 `true` 并写盘。
+  // 新装档里没有残留值可迁移，但翻牌是为了让"标记已落盘"这条不变量对三种档形态
+  // （旧档 / 残留档 / 新装）都成立：否则新装用户第一次在弹窗勾「记住：彻底退出」
+  // 落盘的档里标记还是 false，下次启动又被强制回 'ask'（等于他选的档被吃掉）。
+  return applyCloseBehaviorMigration({
+    ...DEFAULT_SETTINGS,
+    libraryDir: await resolveDefaultLibraryDir()
+  })
+}
+
+/**
+ * 应用 {@link planCloseBehaviorMigration} 的决策：需要迁移就**立刻写回**（让标记
+ * 粘住），失败只告警不阻断启动。三条读档路径（主档 / 备份 / 全新默认）共用。
+ */
+async function applyCloseBehaviorMigration(s: Settings): Promise<Settings> {
+  const planned = planCloseBehaviorMigration(s)
+  if (!planned) return s
+  try {
+    await saveSettings(planned)
+  } catch (err) {
+    // 标记没粘住的下一次启动会再迁移一次（幂等、结果都是 'ask'），不是致命问题
+    console.warn('[idbox] closeBehavior 迁移标记写盘失败（下次保存会自动带上）', err)
+  }
+  return planned
 }
 
 /**

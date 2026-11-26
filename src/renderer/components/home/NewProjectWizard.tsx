@@ -82,7 +82,18 @@ function PreviewNode(props: {
  * 新建项目向导。由 `App.tsx` 挂载（入口：首页文件夹排「新建项目」虚卡 /
  * 文件夹排右键「新建项目…」，双入口同开这一个向导）。
  */
-export function NewProjectWizard({ onClose }: { onClose: () => void }): ReactElement {
+export function NewProjectWizard({
+  onClose,
+  onAddQuickAccess
+}: {
+  onClose: () => void
+  /**
+   * 「添加快速访问」次级入口（2026-11 用户点名的 1.2.1 插入项）：第 1 步模板卡下方
+   * 一行安静的次级按钮。点击交由宿主处理（App 先关向导再弹系统文件夹选择器，
+   * 避免模态和系统对话框叠着）；**不传 = 整行入口不渲染**，主流程零影响。
+   */
+  onAddQuickAccess?: () => void
+}): ReactElement {
   // 模板来自 settings（主进程归一化后的多模板表）；内置排首位（与设置页同一份排序纯函数）
   const rawTemplates = useVault((s) => s.settings?.projectTemplates ?? [])
   const templates = useMemo(() => sortTemplatesBuiltinFirst([...rawTemplates]), [rawTemplates])
@@ -234,6 +245,25 @@ export function NewProjectWizard({ onClose }: { onClose: () => void }): ReactEle
               </button>
             )
           })}
+          {/* 次级入口「添加快速访问」（可选 prop）：安静的小字按钮，不抢「下一步」的
+              视觉权重 —— 用户口径：右键添加快速访问太难发现，在新建项目这里给一条
+              可见的路。点击交宿主（App 先关向导再弹系统选择器）。 */}
+          {typeof onAddQuickAccess === 'function' ? (
+            <div className="mt-1 flex flex-col items-center gap-1 border-t border-line pt-3">
+              <span className="text-xs text-tertiary">不需要新建项目？</span>
+              <button
+                type="button"
+                className="flex items-center gap-1 rounded px-1 text-xs text-tertiary transition-colors hover:text-primary"
+                onClick={onAddQuickAccess}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                  <path d="M12 5.5v13" />
+                  <path d="M5.5 12h13" />
+                </svg>
+                添加快速访问到首页
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
 

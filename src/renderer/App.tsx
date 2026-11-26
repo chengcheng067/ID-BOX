@@ -22,6 +22,9 @@ import { SettingsDialog } from './components/SettingsDialog'
 import { NewProjectWizard } from './components/home/NewProjectWizard'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ImportConflictDialog } from './components/ImportConflictDialog'
+// 「关闭窗口」询问（2026-11 用户需求）：点主窗口 ✕ 时由主进程发来 `closeAsk`，
+// 用户必须明确选「退至后台 / 彻底退出」—— 右上角 ✕ 与 Esc 都无效（见组件头注）。
+import { CloseAskDialog } from './components/CloseAskDialog'
 // 一键打包（docs/58 T5）：导出选项 / 验包确认 / 逐项裁决 / 进度全在弹窗内部；
 // 它自己管 Esc 层与 z-index，全应用只挂这一个实例（与其它 Modal 同级）。
 import { PackageDialog } from './components/PackageDialog'
@@ -136,7 +139,7 @@ import { summarizeAsset } from './logic/fileView'
 import { isAllSelected } from './logic/selection'
 import { isDeletedAsset } from './logic/trashView'
 import { isCategoryIncomplete } from './logic/category'
-import type { AssetKind } from '../shared/types'
+import type { AssetKind, CloseAskPayload } from '../shared/types'
 import { DEFAULT_SETTINGS } from '../shared/types'
 import { clampWaveHeight } from '../shared/homeTide'
 import { hasAssetDragPayload } from './logic/dragAssign'
@@ -857,6 +860,36 @@ export default function App() {
    */
   const updateDialogOpen = useUpdateDialogOpen()
 
+  /**
+   * 「关闭窗口」询问的当前载荷（2026-11 用户需求）；`null` = 没有弹窗。
+   *
+   * 由主进程 `IPC.closeAsk` 推送（下面那个 effect 订阅），由 `CloseAskDialog` 只读渲染。
+   * 用户点了两个按钮之一 → 组件先同步通知这里清空（再去答复主进程），
+   * 主进程 15s 超时 → `closeAskExpired` 也清空。两条路径都以"清空 ⇒ 组件卸载"收场，
+   * 不存在僵尸弹窗。
+   */
+  const [closeAsk, setCloseAsk] = useState<CloseAskPayload | null>(null)
+
+  /**
+   * 订阅关窗询问（问 / 作废两条下行）。
+   *
+   * 退订写在 cleanup：`App` 在开发模式（StrictMode / HMR）会被挂载两次，
+   * 不退订会让同一次询问被处理两次（弹窗被重置、答复被发两次）。
+   */
+  useEffect(() => {
+    const offAsk = window.modvault.onCloseAsk((ask) => setCloseAsk(ask))
+    // 主进程 15s 超时是**单方面**结束（兜底动作「退至后台」）；这条事件是它唯一
+    // 会回推的通知，收到就必须关弹窗，否则它会挂在屏幕上"关不掉、点了没反应"。
+    // ⚠️ 只在 `requestId` 匹配时清：迟到的作废绝不能把**下一次**询问关掉。
+    const offExpired = window.modvault.onCloseAskExpired((ev) => {
+      setCloseAsk((current) => (current && current.requestId === ev.requestId ? null : current))
+    })
+    return () => {
+      offAsk()
+      offExpired()
+    }
+  }, [])
+
   // A 线 T-03：舞台单例（球从卡片飞进顶栏）。状态机在 logic/ballStage.ts，这里只做订阅。
   const stageState = useSyncExternalStore(
     stageController.subscribe,
@@ -1101,10 +1134,12 @@ export default function App() {
    *   · 现在库是 4 类有素材（模型 / CAD图纸 / 材质 / HDRI）→ 首页排 4 张卡；
    *     哪天出现「其他」或 `.d5a` 素材，`count > 0` 自动把第 5 张卡带回来，
    *     无需改代码（用户库里有 1 个 D5A 时就是这条规则在生效）。
-   *   · 卡片排布：`HomeCover` 的行宽上限是 820px（见该文件注释），
-   *     1440 下 4×151 = 604 → 3 个间隙各 ≈72px，是"紧凑但不散架"的读数；
-   *     第 5 张卡时 1440 下 5×151 = 755 ≤ 820 仍放得下，
-   *     间隙缩到 ≈16px（(820−755)/4）—— 密但不重叠，属可接受，故不必为"5 张"再设特例。
+   *   · 卡片排布：`HomeCover` 的行宽上限是 **1040px**（2026-11-26 由 820 放宽，
+   *     用户口径"整体排列有一点紧，可以适当放宽左右的边界；只有 5 张的话不要触发
+   *     滚动"，推导见该文件注释）。当前账：1440 下 5×151 = 753 → 4 个间隙各 ≈72px；
+   *     6 个槽位（5 张 + 「新建项目」虚卡）1440 下 904 → ≈27px、1520+ 下 966 → ≈15px，
+   *     都 ≤ 1040，**5~6 个槽位一律不出现横向滚动**；7 个以上（多张钉选卡）才滚，
+   *     此时左右两侧才上高斯模糊 + 羽化。故不必为"5 张"再设特例。
    *   · 副作用（有意为之）：搜索面板的「分类」组与看板的分类数据都吃这份结果，
    *     空分类自然不会出现在搜索结果里（点进去也只会是空网格，本就不该有入口）。
    *
@@ -1694,9 +1729,17 @@ export default function App() {
                   onNewProject={openNewProjectWizard}
                 />
               )}
-              {/* T-03 新建项目向导：两个入口（虚卡 / 排右键）都开这一个实例。 */}
+              {/* T-03 新建项目向导：两个入口（虚卡 / 排右键）都开这一个实例。
+                  次级入口「添加快速访问」：先关向导再弹系统选择器（模态和系统
+                  对话框不能叠着），钉选逻辑复用 addHomePinnedFromPicker。 */}
               {newProjectOpen ? (
-                <NewProjectWizard onClose={() => setNewProjectOpen(false)} />
+                <NewProjectWizard
+                  onClose={() => setNewProjectOpen(false)}
+                  onAddQuickAccess={() => {
+                    setNewProjectOpen(false)
+                    void addHomePinnedFromPicker()
+                  }}
+                />
               ) : null}
               {/* V1.0 分步引导：与 HomeCover 同级的一次性浮层。锚点在各组件根节点上，
                   引导不包任何 div、不改封面布局；关闭后首页交互原样保留。
@@ -2505,6 +2548,11 @@ export default function App() {
       {/* docs/27 T-07：导入重复处置（跳过 / 覆盖 / 保留两者）。
           `conflictAsk` 为 null 时组件自己返回 null，所以这里无条件挂载。 */}
       <ImportConflictDialog />
+      {/* 2026-11 用户需求：点主窗口 ✕ 时询问「退至后台 / 彻底退出」。
+          `closeAsk` 为 null 时组件返回 null，所以这里无条件挂载；
+          层级跟着 `Modal` 的 `zClassForDepth` 走（它天然是最后开的那一层 = 栈顶），
+          不手写更大的 z-index。 */}
+      <CloseAskDialog ask={closeAsk} onResolved={() => setCloseAsk(null)} />
       {/* docs/58 T5：一键打包（导出选项 / 验包 / 逐项裁决 / 进度）。
           `packageDialogOpen` 为 false 时组件自己返回 null，所以这里无条件挂载；
           内部自管 useEscLayer 与 zStack，与其它 Modal 同级。 */}

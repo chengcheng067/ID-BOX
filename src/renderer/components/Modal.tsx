@@ -34,6 +34,18 @@ interface ModalProps {
    * 全局快捷键去清选中 / 关掉下面那层视图），只是不触发 `onClose`。
    */
   dismissOnEsc?: boolean
+  /**
+   * 标题栏右上角那个 ✕ 关闭按钮是否渲染（默认 `true`，与旧行为逐字符一致，
+   * 其它调用点零改动）。
+   *
+   * 谁需要关掉它：**「关闭窗口」询问弹窗**（`CloseAskDialog`，2026-11 用户明确要求
+   * 「弹窗右上角 ✕ 和 Esc 都无效，必须明确点两个按钮之一」）。用户已经看过一次 ✕ 了
+   * —— 再给一个 ✕ 会让人以为"再点一次就等于取消 / 等于关掉窗口"，而这个询问
+   * **没有**"取消"这个选项（关窗这件事必须落到两个动作之一）。
+   *
+   * ⚠️ 只影响这个按钮的渲染，**不动** Esc 栈、`zClassForDepth` 层级、遮罩行为。
+   */
+  showCloseButton?: boolean
 }
 
 /**
@@ -53,7 +65,15 @@ interface ModalProps {
  * 旧的可调 `zClass` 已删除：谁都不该再手写一个更大的数字去插队（`ImportConflictDialog`
  * 曾经写死 `z-[60]`，与本层栈并存时谁在上只取决于 DOM 顺序）。
  */
-export function Modal({ title, onClose, children, width = 'max-w-lg', dismissOnScrim = true, dismissOnEsc = true }: ModalProps) {
+export function Modal({
+  title,
+  onClose,
+  children,
+  width = 'max-w-lg',
+  dismissOnScrim = true,
+  dismissOnEsc = true,
+  showCloseButton = true
+}: ModalProps) {
   // handler 存 ref：调用方普遍传内联箭头（`onClose={() => setX(null)}`），
   // 直接进依赖会让监听每次 render 都重挂，多弹窗在场时本层在栈里的位置会漂移。
   const handlerRef = useRef({ onClose, dismissOnEsc })
@@ -100,9 +120,13 @@ export function Modal({ title, onClose, children, width = 'max-w-lg', dismissOnS
       >
         <div className="sticky top-0 flex items-center justify-between border-b border-line bg-card px-5 py-3.5">
           <h2 className="text-base font-semibold">{title}</h2>
-          <button className="btn btn-ghost !p-1.5" onClick={onClose} title="关闭">
-            <IconClose />
-          </button>
+          {/* `showCloseButton={false}` 的调用点（关窗询问）不渲染它 —— 那里"关闭"
+              不是一个中性动作，必须由用户明确选两个按钮之一（见 ModalProps 注释） */}
+          {showCloseButton && (
+            <button className="btn btn-ghost !p-1.5" onClick={onClose} title="关闭">
+              <IconClose />
+            </button>
+          )}
         </div>
         <div className="px-5 py-4">{children}</div>
       </div>

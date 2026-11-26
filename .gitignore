@@ -52,3 +52,7 @@ qa-filter-tmp/
 # 2026-10-30 UI 修复真机像素验证（临时）
 qa-ui-tmp/
 _crop/
+
+# 2026-11-26 临时工作目录（不入库）
+design-tmp/
+qa-1126-tmp/

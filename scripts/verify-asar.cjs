@@ -112,7 +112,8 @@ check('renderer: 知末映射 木板（材质册无「板材」故 texture-only�
 // 判据仍是"压缩不会动的东西"：UI 文案、tab 中文标签、日志字面量、拒绝原因枚举值。
 // ① tab 重排证据：分类拆成独立 tab 后「数据与备份」这个 label 与页头副标题是新写的
 check('renderer: 设置 tab「数据与备份」', rendererAll, '数据与备份')
-check('renderer: 设置页头副标题（外观）', rendererAll, '主题、动效、侧栏显示')
+// 2026-11 外观 tab 新增「窗口与后台」卡，副标题随之从「主题、动效、侧栏显示」更新
+check('renderer: 设置页头副标题（外观）', rendererAll, '主题、动效、侧栏、窗口与后台')
 check('renderer: 设置卡「存量重排」', rendererAll, '存量重排')
 check('renderer: 长路径提示压一行', rendererAll, '超过 260 字符时提示；开启系统长路径支持可根治')
 check('renderer: 反馈卡 GitHub Issue 入口', rendererAll, '在 GitHub 提 Issue')

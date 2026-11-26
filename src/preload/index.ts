@@ -8,6 +8,8 @@ import {
   type FsExtractArchiveResult,
   type FsListDirInput,
   type FsListDirResult,
+  type FsListPinnedTrashInput,
+  type FsListPinnedTrashResult,
   type FsMkdirInput,
   type FsMkdirResult,
   type FsOpenEntryInput,
@@ -16,6 +18,8 @@ import {
   type FsOpenWithResult,
   type FsRenameEntryInput,
   type FsRenameEntryResult,
+  type FsRestorePinnedTrashInput,
+  type FsRestorePinnedTrashResult,
   type FsRevealEntryInput,
   type FsRevealEntryResult,
   type FsTrashEntriesInput,
@@ -42,6 +46,9 @@ import type {
   AssignCategoryPayload,
   AssignCategoryResult,
   Asset,
+  CloseAnswer,
+  CloseAskExpired,
+  CloseAskPayload,
   FetchZhimoCoverPayload,
   FetchZhimoCoverResult,
   FetchZhimoMetaPayload,
@@ -145,6 +152,38 @@ const api = {
       ipcRenderer.off(IPC.importConflictExpired, handler)
     }
   },
+  // ── 「关闭窗口」询问（2026-11 用户需求：点 ✕ 弹窗问「退至后台 / 彻底退出」）──
+  /**
+   * 订阅「用户点了窗口 ✕，请裁决」（主进程 `settings.closeBehavior === 'ask'` 时发）。
+   *
+   * 返回退订函数（与 `onImportConflictAsk` 同款）：`CloseAskDialog` 的宿主组件卸载
+   * 必须调用，否则重复注册会让同一次询问被处理多次。
+   */
+  onCloseAsk: (cb: (ask: CloseAskPayload) => void): (() => void) => {
+    const handler = (_: unknown, ask: CloseAskPayload) => cb(ask)
+    ipcRenderer.on(IPC.closeAsk, handler)
+    return () => {
+      ipcRenderer.off(IPC.closeAsk, handler)
+    }
+  },
+  /**
+   * 答复一次关窗询问。主进程按 `requestId` 兑现挂起的 Promise；
+   * **过期 requestId 会被静默丢弃**（15s 超时后迟到的答复不能把窗口再关一次）。
+   */
+  answerClose: (answer: CloseAnswer): Promise<void> =>
+    ipcRenderer.invoke(IPC.closeAnswer, answer),
+  /**
+   * 订阅「这次关窗询问已作废」（主进程 15s 超时后单方面结束）。
+   * 收到后必须立刻关掉弹窗 —— 否则它会挂在屏幕上，而用户之后的点击都会被当成过期答复丢弃。
+   * 返回退订函数（与其它 `on*` 同款）。
+   */
+  onCloseAskExpired: (cb: (ev: CloseAskExpired) => void): (() => void) => {
+    const handler = (_: unknown, ev: CloseAskExpired) => cb(ev)
+    ipcRenderer.on(IPC.closeAskExpired, handler)
+    return () => {
+      ipcRenderer.off(IPC.closeAskExpired, handler)
+    }
+  },
   onImportEvent: (cb: (ev: ImportEvent) => void): (() => void) => {
     const handler = (_: unknown, ev: ImportEvent) => cb(ev)
     ipcRenderer.on(IPC.importEvent, handler)
@@ -246,6 +285,19 @@ const api = {
    */
   trashPinnedEntries: (input: FsTrashEntriesInput): Promise<FsTrashEntriesResult> =>
     ipcRenderer.invoke(IPC.fsTrashEntries, input),
+  /**
+   * 列出钉选根**内部隐藏回收区** `.idbox-trash` 的可恢复条目（网络盘删除兜底）。
+   * 本地盘进的是系统回收站，不在这里；这里只列有 token、可真实还原的那些。
+   * **永不 reject**：失败是 `{ok:false, reason, error:中文单行}`。
+   */
+  listPinnedTrash: (input: FsListPinnedTrashInput): Promise<FsListPinnedTrashResult> =>
+    ipcRenderer.invoke(IPC.fsListPinnedTrash, input),
+  /**
+   * 按 token 把隐藏回收区里的条目**真实还原**回原目录（同盘 rename，O(1)）。
+   * 原位置被占用时自动追加 `-2/-3`，成功结果带 `renamed`。**永不 reject**。
+   */
+  restorePinnedTrash: (input: FsRestorePinnedTrashInput): Promise<FsRestorePinnedTrashResult> =>
+    ipcRenderer.invoke(IPC.fsRestorePinnedTrash, input),
   /**
    * 7z 解压压缩包到同目录「主名」文件夹（防穿越校验；7z 缺失 `reason:'no-7z'`）。
    * 顶部菜单的批量解压 = 渲染层对选中压缩包逐个调用本通道。

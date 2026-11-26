@@ -14,12 +14,14 @@
  * - **右键**：条目 / 空白处两套自绘菜单（`PinnedBrowserMenu`，escLayer 接管 Esc）；
  * - **写操作**：新建文件夹（行内输入态）、行内重命名（冲突红框不弹窗）、
  *   删除（确认层 → `trashPinnedEntries` → 屏幕中下方 5 秒撤销条）、压缩 / 解压、
- *   「打开方式」。写通道由主进程并行落地，未就绪时按钮置灰（`pinnedWriteApi` 探针）；
+ *   「打开方式」。本地盘文件进系统回收站（撤销只刷新），网络盘文件由主进程在同盘
+ *   隐藏回收区保留 token —— 撤销条可以真实还原到原位置。工具行「回收站」入口打开
+ *   回收区面板，逐个还原；全程不做永久删除。写通道未就绪时按钮置灰（`pinnedWriteApi`）；
  * - **边界**：>2000 条截断明示行（F8-1）、读取失败错误卡（F8-2）、空目录空态（F8-3）、
  *   站方推广文件（词表：微信扫码 / 知末）打开前确认层。
  *
  * 纪律：零系统默认控件；颜色全走 token；绝对路径不进渲染层状态（下钻只存相对段数组）；
- * Esc 层栈语义 = 关菜单 / 关确认层 → 清多选 → 关浏览器回首页。
+ * Esc 层栈语义 = 关菜单 / 关确认层 / 关回收站面板 → 清多选 → 关浏览器回首页。
  */
 import {
   useCallback,
@@ -36,7 +38,12 @@ import { zClassForDepth } from '../../logic/zStack'
 import { useVault } from '../../store'
 import { boxOf, type BoxRect } from '../../logic/fileView'
 import { selectRangeIds } from '../../logic/selection'
-import type { FsEntry, FsRevealEntryInput, FsRevealEntryResult } from '../../../shared/ipc'
+import type {
+  FsEntry,
+  FsRevealEntryInput,
+  FsRevealEntryResult,
+  FsTrashedItem
+} from '../../../shared/ipc'
 import {
   formatSize,
   formatTime,
@@ -60,9 +67,10 @@ import {
 } from '../../logic/pinnedBrowser'
 import { flushPinnedViewPrefs, patchPinnedViewPrefs } from '../../logic/pinnedViewPrefs'
 import { DEFAULT_PINNED_VIEW_PREFS } from '../../../shared/pinnedViewPrefs'
-import { IconFolder, IconList, IconGrid, IconRefresh, IconPlus } from '../../icons'
+import { IconFolder, IconList, IconGrid, IconRefresh, IconPlus, IconTrash } from '../../icons'
 import { PinnedBrowserMenu } from './PinnedBrowserMenu'
 import { PinnedQuickLook } from './PinnedQuickLook'
+import { PinnedTrashPanel } from './PinnedTrashPanel'
 import { PinnedThumbVisual } from './PinnedThumb'
 import './pinned-browser.css'
 import './pinned-enter.css'
@@ -209,11 +217,17 @@ export function PinnedFolderBrowser({
   const [creating, setCreating] = useState(false)
   const [createDraft, setCreateDraft] = useState('')
   const [createConflict, setCreateConflict] = useState<null | 'exists' | 'invalid'>(null)
-  const [undoBar, setUndoBar] = useState<{ count: number; first: string; startedAt: number } | null>(
-    null
-  )
+  /** 删除撤销条：`tokens` = 本批进软件内隐藏回收区、可真实还原的条目 token */
+  const [undoBar, setUndoBar] = useState<{
+    count: number
+    first: string
+    startedAt: number
+    tokens: string[]
+  } | null>(null)
   const [undoSecondsLeft, setUndoSecondsLeft] = useState(UNDO_BAR_SECONDS)
   const [scrollTarget, setScrollTarget] = useState<string | null>(null)
+  /** 工具行「回收站」入口：打开钉选目录回收区面板（面板自己占一层 Esc 栈） */
+  const [trashOpen, setTrashOpen] = useState(false)
 
   /* ── 空格 Quick Look：浮层目标 = 当前层文件名（null = 关闭）──────────── */
   const [quickLookName, setQuickLookName] = useState<string | null>(null)
@@ -474,13 +488,20 @@ export function PinnedFolderBrowser({
           refresh()
           if (result.ok) {
             if (result.failed.length === 0) {
-              // ⚠️ 撤销条本批**不做真实恢复**（主进程 trashItem 无法反悔）——
-              // 「撤销」只做视觉一致（对齐库内删除气泡），点击即刷新列表。
-              // 见 docs/61 批注附注与下方 UndoBar 注释。
+              // `trashed` 逐项标明去向：token = 进软件内隐藏回收区（可撤销还原），
+              // token:null = 进系统回收站（本版本只能刷新，不假装修复）。
+              // 可选读法兜住「旧包主进程未回传 trashed」的场景，避免 undefined.filter 崩溃。
+              const trashed: readonly FsTrashedItem[] =
+                (result as Extract<typeof result, { ok: true }> & { trashed?: readonly FsTrashedItem[] })
+                  .trashed ?? []
+              const tokens = trashed
+                .filter((item) => typeof item.token === 'string' && (item.token as string).length > 0)
+                .map((item) => item.token as string)
               setUndoBar({
                 count: names.length,
                 first: names[0] ?? '',
-                startedAt: Date.now()
+                startedAt: Date.now(),
+                tokens
               })
               clearSelection()
             } else {
@@ -502,6 +523,39 @@ export function PinnedFolderBrowser({
     },
     [pinId, relPath, refresh, setNotice, clearSelection]
   )
+
+  /** 撤销条「撤销」：有 token 则逐个真实还原；否则只刷新（系统回收站不可程序化反悔） */
+  const performUndo = useCallback((): void => {
+    const bar = undoBar
+    setUndoBar(null)
+    if (bar === null) return
+    if (bar.tokens.length === 0) {
+      refresh()
+      return
+    }
+    const api = pinnedWriteApi()
+    if (api === null) {
+      setNotice(WRITE_NOT_READY_NOTICE)
+      refresh()
+      return
+    }
+    // 逐个还原（不并行：主进程同名冲突处理有顺序语义），失败项汇总但不阻断其余
+    void (async (): Promise<void> => {
+      const failures: string[] = []
+      for (const token of bar.tokens) {
+        try {
+          const res = await api.restorePinnedTrash({ pinId, token })
+          if (!res.ok) failures.push(res.error)
+        } catch {
+          failures.push('还原请求失败')
+        }
+      }
+      refresh()
+      if (failures.length > 0) {
+        setNotice(`部分项目恢复失败：${failures.slice(0, 3).join('；')}`)
+      }
+    })()
+  }, [undoBar, pinId, refresh, setNotice])
 
   const compressTargets = useCallback(
     (targets: readonly FsEntry[]): void => {
@@ -701,7 +755,7 @@ export function PinnedFolderBrowser({
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  /* ── 撤销条倒计时（归零自动收尾；「撤销」只刷新 —— 本批不做真实恢复）─── */
+  /* ── 撤销条倒计时（归零自动收尾；有 token 的条目点击后真实还原到原位置）── */
   useEffect(() => {
     if (undoBar === null) return
     const tick = (): void => {
@@ -1098,6 +1152,20 @@ export function PinnedFolderBrowser({
           <IconSortArrows />
           {PINNED_SORT_KEY_LABEL[prefs.sortKey]}
           <span aria-hidden className="text-tertiary">{prefs.sortDir === 'asc' ? '↑' : '↓'}</span>
+        </button>
+        <button
+          type="button"
+          className={`btn btn-ghost !px-2 !py-1 ${writeApi === null ? 'cursor-not-allowed opacity-40' : ''}`}
+          onClick={() => {
+            if (writeApi === null) {
+              setNotice(WRITE_NOT_READY_NOTICE)
+              return
+            }
+            setTrashOpen(true)
+          }}
+          title={writeApi === null ? '功能就绪中' : '回收站'}
+        >
+          <IconTrash width={14} height={14} />
         </button>
         <button type="button" className="btn btn-ghost !px-2 !py-1" onClick={refresh} title="刷新">
           <IconRefresh width={14} height={14} />
@@ -1503,17 +1571,14 @@ export function PinnedFolderBrowser({
             </span>
             <span className="text-[13px] text-secondary">
               已把 {undoBar.count === 1 ? `「${undoBar.first}」` : `${undoBar.count} 项`}移入回收站
+              {undoBar.tokens.length > 0 ? '，可在原位置还原' : ''}
             </span>
-            {/* ⚠️ 本批限制：主进程 trashItem 无法反悔，「撤销」只刷新列表（视觉与库内一致）。
-                将来主进程提供恢复通道（undoTrash）后，这里改为调它。docs/61 批注附注。 */}
+            {/* 有 token（软件内隐藏回收区）→ 逐个真实还原；全为系统回收站项 → 只刷新列表。 */}
             <button
               type="button"
               className="shrink-0 rounded-md bg-accent px-2.5 py-1 text-[12px] font-semibold text-white transition active:scale-[.98]"
-              onClick={() => {
-                setUndoBar(null)
-                refresh()
-              }}
-              title="刷新列表（本版本暂不支持真实恢复）"
+              onClick={performUndo}
+              title={undoBar.tokens.length > 0 ? '还原到原位置' : '刷新列表'}
             >
               撤销 {undoSecondsLeft}s
             </button>
@@ -1523,6 +1588,11 @@ export function PinnedFolderBrowser({
 
       {/* ── 确认层：删除（F7-3）/ 站方推广文件（共用一个状态位，一次一层）─── */}
       {dialog !== null ? <ConfirmDialogLayer dialog={dialog} onClose={() => setDialog(null)} onDelete={commitDelete} onAdOpen={(entry) => openFileDirect(entry.name)} /> : null}
+
+      {/* ── 回收站面板：列出本钉选目录隐藏回收区条目，逐个还原（无永久删除）── */}
+      {trashOpen ? (
+        <PinnedTrashPanel pinId={pinId} onClose={() => setTrashOpen(false)} onRestored={refresh} />
+      ) : null}
 
       {/* ── 空格 Quick Look：大图快览浮层（Esc 关且保留选中；←/→ 序列内移动）── */}
       {quickLookName !== null ? (
@@ -1656,8 +1726,8 @@ function ConfirmDialogLayer({
             <h2 className="text-base font-semibold text-primary">移入回收站</h2>
             <p className="mt-1.5 text-[13px] leading-5 text-secondary">
               {targets.length === 1
-                ? `将把「${targets[0]?.name ?? ''}」移入系统回收站。`
-                : `将把以下 ${targets.length} 项移入系统回收站：`}
+                ? `将把「${targets[0]?.name ?? ''}」移入回收站。`
+                : `将把以下 ${targets.length} 项移入回收站：`}
             </p>
             {targets.length > 1 ? (
               <ul className="mt-2 max-h-40 overflow-auto rounded-md border border-line px-3 py-2 text-[12px] leading-5 text-muted">
@@ -1670,7 +1740,7 @@ function ConfirmDialogLayer({
               </ul>
             ) : null}
             <p className="mt-2 text-[12px] text-muted">
-              移入系统回收站的文件可随时还原，软件不做永久删除。
+              本地文件进系统回收站；网络位置的文件进软件内回收区，都可在撤销条或回收站中还原，软件不做永久删除。
             </p>
             <div className="mt-4 flex items-center justify-end gap-2">
               <button type="button" className="btn" onClick={onClose}>

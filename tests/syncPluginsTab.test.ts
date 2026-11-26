@@ -112,7 +112,8 @@ describe('tab 真源（S-8）', () => {
       expect(TABS_BLOCK, `label: ${label}`).toContain(`{ key: '${key}', label: '${label}' }`)
     }
     const subs: Array<[string, string]> = [
-      ['appearance', '主题、动效、侧栏显示'],
+      // appearance 副标题于 2026-11 追加「窗口与后台」卡后同步更新（原为「主题、动效、侧栏显示」）
+      ['appearance', '主题、动效、侧栏、窗口与后台'],
       ['import', '压缩包、解压、命名、来源与封面'],
       ['classify', '导入后怎么归类，以及存量怎么重排'],
       ['library', '库目录、索引维护、结构迁移'],

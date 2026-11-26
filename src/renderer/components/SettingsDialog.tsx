@@ -21,6 +21,7 @@ import {
 import type {
   AliasRecord,
   ArchiveDisposal,
+  CloseBehavior,
   HomeTideRange,
   MotionQuality,
   Settings,
@@ -145,7 +146,7 @@ const TAB_GROUPS: { label: string; keys: SettingsTab[] }[] = [
 
 /** 页头副标题（设计稿逐屏文案，12px / `--text-tertiary`） */
 const TAB_SUB: Record<SettingsTab, string> = {
-  appearance: '主题、动效、侧栏显示',
+  appearance: '主题、动效、侧栏、窗口与后台',
   import: '压缩包、解压、命名、来源与封面',
   classify: '导入后怎么归类，以及存量怎么重排',
   library: '库目录、索引维护、结构迁移',
@@ -279,6 +280,31 @@ const segItemClass = (active: boolean): string =>
 
 /** 三档处置的展示顺序：回收站（默认）→ 彻底删除 → 保留（§3.6 单选卡顺序） */
 const DISPOSAL_ORDER: ArchiveDisposal[] = ['recycle', 'delete', 'keep']
+
+/**
+ * 关闭窗口行为三档（设置·外观「窗口与后台」，默认档排在前）。
+ *
+ * 语义真源是 `Settings.closeBehavior`（归一化入口 `main/settings.ts#normalizeCloseBehavior`），
+ * 这里只决定**展示顺序与标签**：`ask` 是默认档（2026-11 用户需求：点 ✕ 先弹窗问一次），
+ * `quit` / `tray` 必须由用户在弹窗里勾「记住我的选择」或在这里主动选择才生效。
+ *
+ * ★ 2026-11-27 文案修正（用户原话：「'默认收起托盘'这个说法不太符合中文语境吧。
+ *   我认为应该是'退至后台'或者类似的意思」）：
+ *   原标签「收进托盘」是**开发视角的机制描述**（把我们用 Tray API 这件事说给用户听），
+ *   不是用户视角的结果描述。用户在意的不是"进了哪个托盘"，而是"软件没退、还在后台跑"。
+ *   所以标签统一改成 **「退至后台」**，desc / note 也只在**必须交代后果的地方**提托盘
+ *   （比如"图标在哪、从哪真退出"），不再把托盘当成动作本身。
+ *   ⚠️ 三个标签必须保持**同构**（一律 4 字），否则分段单选读起来一长一短。
+ */
+const CLOSE_BEHAVIOR_OPTIONS: ReadonlyArray<{
+  value: CloseBehavior
+  label: string
+  hint: string
+}> = [
+  { value: 'ask', label: '每次询问', hint: '点 ✕ 时弹窗问你一次，再决定怎么处理' },
+  { value: 'quit', label: '彻底退出', hint: '点 ✕ 直接退出 ID BOX（正在跑的导入与分类会中断）' },
+  { value: 'tray', label: '退至后台', hint: '点 ✕ 只收起窗口、软件继续在后台运行（导入与分类不中断）' }
+]
 
 /**
  * 动效性能三档的展示顺序：流畅 → 均衡 → 极致（代价从左到右递增）。
@@ -2571,6 +2597,46 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             {homeCustomHint}
           </div>
         ) : null}
+      </SettingsCard>
+
+      {/* 窗口与后台（2026-11 用户需求：「让用户选择彻底关闭还是常驻后台」）。
+          纯应用偏好，与「侧栏显示」同类，所以留在「外观」tab 而不是新开一屏；
+          `ask` 是默认档 —— 老用户升级后点 ✕ 会先被问一次（比静默退出安全，
+          静默退出会掐断正在跑的导入与分类）。 */}
+      <SettingsCard
+        title="窗口与后台"
+        note="默认「每次询问」：点 ✕ 会先弹窗问你一次，可以在弹窗里勾「记住我的选择」免打扰。选「退至后台」后，点 ✕ 不会中断正在跑的导入与分类；想真正关掉软件，用任务栏右下角托盘图标右键菜单里的「退出」。"
+      >
+        <SettingsRow
+          title="关闭窗口时"
+          desc="点 ✕ 时是直接关掉软件，还是先问你一次 / 继续在后台运行"
+          actions={
+            <div className={SEG_GROUP_CLASS} role="radiogroup" aria-label="关闭窗口时">
+              {CLOSE_BEHAVIOR_OPTIONS.map((opt) => {
+                const active = settings.closeBehavior === opt.value
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    title={opt.hint}
+                    className={segItemClass(active)}
+                    onClick={() => {
+                      void saveSettings({ closeBehavior: opt.value })
+                      flash()
+                    }}
+                  >
+                    <span>{opt.label}</span>
+                    {opt.value === 'ask' && (
+                      <span className="text-[10.5px] font-normal text-muted">默认</span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+          }
+        />
       </SettingsCard>
     </div>
   )

@@ -20,10 +20,14 @@ import type {
   FsExtractArchiveResult,
   FsMkdirInput,
   FsMkdirResult,
+  FsListPinnedTrashInput,
+  FsListPinnedTrashResult,
   FsOpenWithInput,
   FsOpenWithResult,
   FsRenameEntryInput,
   FsRenameEntryResult,
+  FsRestorePinnedTrashInput,
+  FsRestorePinnedTrashResult,
   FsTrashEntriesInput,
   FsTrashEntriesResult,
   FsWriteFailureReason
@@ -486,14 +490,18 @@ const MENU_ICON_SORT = ['M7.6 4.5v15M4.5 16.5l3.1 3 3.1-3', 'M16.4 19.5v-15M13.3
 
 /**
  * 写通道的**运行期探针**：主进程写通道（`fs:mkdir` / `fs:renameEntry` /
- * `fs:trashEntries` / `fs:extractArchive` / `fs:compressEntries` / `fs:openWith`，
- * 契约见 shared/ipc.ts「钉选目录浏览器 v2」段）未暴露前这里返回 `null` ——
+ * `fs:trashEntries` / `fs:extractArchive` / `fs:compressEntries` / `fs:openWith`
+ * / `fs:listPinnedTrash` / `fs:restorePinnedTrash`，契约见 shared/ipc.ts
+ * 「钉选目录浏览器 v2」段）未暴露前这里返回 `null` ——
  * 调用方据此把写操作按钮置灰 + toast「功能就绪中」。全部落地后无需改任何
  * 渲染层代码，探针自然返回真对象。
  *
  * ⚠️ 只在调用时碰 `window`（单测环境没有 window，但单测也不会调用它）。
  * 方法名与 preload 暴露一字不差（makePinnedDir / renamePinnedEntry /
- * trashPinnedEntries / extractPinnedArchive / compressPinnedEntries / openPinnedEntryWith）。
+ * trashPinnedEntries / extractPinnedArchive / compressPinnedEntries / openPinnedEntryWith /
+ * listPinnedTrash / restorePinnedTrash）。
+ * ⚠️ `WRITE_API_METHODS` 必须与下面接口**逐项对齐**：探针要求全部方法都存在才返回 API，
+ * 漏一个会让所有写按钮一起置灰（不是只灰漏掉的那一个）。
  */
 export interface PinnedWriteApi {
   makePinnedDir(input: FsMkdirInput): Promise<FsMkdirResult>
@@ -502,6 +510,8 @@ export interface PinnedWriteApi {
   extractPinnedArchive(input: FsExtractArchiveInput): Promise<FsExtractArchiveResult>
   compressPinnedEntries(input: FsCompressEntriesInput): Promise<FsCompressEntriesResult>
   openPinnedEntryWith(input: FsOpenWithInput): Promise<FsOpenWithResult>
+  listPinnedTrash(input: FsListPinnedTrashInput): Promise<FsListPinnedTrashResult>
+  restorePinnedTrash(input: FsRestorePinnedTrashInput): Promise<FsRestorePinnedTrashResult>
 }
 
 const WRITE_API_METHODS: readonly string[] = [
@@ -510,7 +520,9 @@ const WRITE_API_METHODS: readonly string[] = [
   'trashPinnedEntries',
   'extractPinnedArchive',
   'compressPinnedEntries',
-  'openPinnedEntryWith'
+  'openPinnedEntryWith',
+  'listPinnedTrash',
+  'restorePinnedTrash'
 ]
 
 /** 返回写通道 API；任一方法缺失返回 null（调用方置灰 + toast「功能就绪中」） */

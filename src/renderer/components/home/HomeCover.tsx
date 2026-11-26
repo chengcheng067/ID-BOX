@@ -30,6 +30,7 @@ import {
 // F-1/F-2/F-3 的纯逻辑（增删移 / 查重 / 边缘滚动 / 底纹 key）都在这里，组件只消费
 import {
   EDGE_HOT_ZONE_PX,
+  clickScrollTarget,
   edgeScrollDirection,
   edgeScrollStep,
   kindWallpaperKey,
@@ -648,7 +649,8 @@ export function HomeCover(props: {
   }, [])
 
   // ── F-2 悬停自动横向滚动（docs/60 §6.2）────────────────────────────────────
-  // 排超宽（素材卡 + 钉选卡 > 820px）时：鼠标悬停左右 48px 热区 → rAF 匀速 ~320px/s。
+  // 排超宽（素材卡 + 钉选卡 + 虚卡 > 行宽上限 1040px）时：鼠标悬停左右 48px 热区
+  // → rAF 匀速 ~320px/s。（行宽上限 2026-11-26 由 820 放宽到 1040，见下方 wrap 注释。）
   // 降级口径：`motionQuality === 'smooth'` 档**整体禁用**（rAF 不启动、箭头微光不显示，
   // 保留滚轮 / 触控板手动滚动 —— 项目唯一动效降级机制，`logic/motionProfile.ts` 同源）。
   // 方向判定 / 步长 / 滚到头停的收口全在 `logic/homePinned` 纯函数里（单测覆盖）。
@@ -747,6 +749,101 @@ export function HomeCover(props: {
     stopEdgeScroll()
   }, [stopEdgeScroll])
 
+  /**
+   * 边缘箭头**点击**：向对应方向平滑滚动一个「卡步进」（2026-11-28 新增）。
+   *
+   * 步进 = 一张文件夹卡宽 + 行 gap，不拍脑袋试算：直接量 row 上相邻两张卡的
+   * `getBoundingClientRect()` 左边缘距（拖动排序让位步长同一个口径，见
+   * `home-outro.css` 末尾注释「自动就是卡宽 + 48」），量不到时回落 209px
+   * （1520 档卡宽 161 + gap 48）。目标值经 `clickScrollTarget` 收口到 [0, max]，
+   * 滚到头就停在头。
+   *
+   * 先 `stopEdgeScroll()`：点击时鼠标就压在热区里，悬停 rAF 循环必然在跑，
+   * 不停的话 rAF 每帧写 `scrollLeft` 会和 `scrollBy({ behavior:'smooth' })`
+   * 的补间互相拉扯（肉眼抖动），必须先掐掉再起平滑滚动。
+   *
+   * smooth 档无需处理：该档 `edgeHint` 恒 null → 箭头 `data-visible=false`
+   * → CSS `pointer-events:none`，点击根本到不了按钮上（本回调也不会挂载后
+   * 被触发到可见箭头上）。
+   */
+  const handleEdgeClick = useCallback(
+    (dir: -1 | 1): void => {
+      stopEdgeScroll()
+      const el = scrollRef.current
+      const row = rowRef.current
+      if (el === null || row === null) return
+      // 内容没超宽 = 没有可滚的东西，点击静默（与热区判定同一守卫）
+      if (el.scrollWidth <= el.clientWidth + 1) return
+      // 卡步进 = 相邻两卡左边缘距；children 为空 / 只有 1 张时量不出，走回落值
+      let step = 209
+      const kids = row.children
+      if (kids.length >= 2) {
+        const a = kids[0]!.getBoundingClientRect()
+        const b = kids[1]!.getBoundingClientRect()
+        const gap = Math.abs(b.left - a.left)
+        if (Number.isFinite(gap) && gap > 0) step = gap
+      }
+      const max = el.scrollWidth - el.clientWidth
+      const target = clickScrollTarget(el.scrollLeft, dir, step, 0, max)
+      el.scrollBy({ left: target - el.scrollLeft, behavior: 'smooth' })
+    },
+    [stopEdgeScroll]
+  )
+
+  /**
+   * 排是否**真的**横向溢出（= 有东西可滚）。
+   *
+   * 用途只有一个：给 `.hc-folder-wrap` 打 `data-overflow`，CSS 侧据此决定要不要
+   * 上「左右高斯模糊 + 羽化」（见 `glass-folder.css` 同名那一节）。用户口径：
+   *   · 「只有 5 个文件夹封面的情况下，不要触发滚动。」→ 不溢出时**连羽化都不出现**；
+   *   · 「如果超过 5 个文件夹的话，左右两侧肯定都是需要高斯模糊和羽化的。」
+   *
+   * ⚠️ 必须是**响应式状态**而不是在 mousemove 里现算：溢出与否会随「窗口缩放」
+   *   与「卡片数量变化」翻转，而这两个事件都不经过鼠标。
+   * ⚠️ 阈值 `+1`：`.hc-folder-scroll` 有左右 40px 补偿 padding，滚动宽度的整数
+   *   舍入常常差不到 1px；不加这 1px 会在"刚好放得下"时误报溢出，一弹就是整条雾带。
+   * 三路触发（缺一路就会漏掉一类翻转）：
+   *   ① ResizeObserver 盯 scroller 自己的尺寸 → 窗口缩放 / 缩放级别 / max-w 生效；
+   *   ② MutationObserver 盯 row 的子节点增删 → 钉选卡增删、「新建项目」虚卡按档出现。
+   *      （①② 不重叠：卡片数量变化**不**改变 scroller 的内容盒尺寸，①收不到。）
+   *   ③ window resize → `--gf-scale` 是媒体查询阶梯（1440/1520 各跳一档），
+   *      卡片变宽**不**改变 scroller 的内容盒，①同样收不到；resize 一定先于它发生。
+   * 卸载时两观察器 + 监听器全部断开，一个不留。
+   */
+  const [rowOverflow, setRowOverflow] = useState(false)
+
+  const measureRowOverflow = useCallback((): void => {
+    const el = scrollRef.current
+    if (el === null) return
+    const next = el.scrollWidth > el.clientWidth + 1
+    // 只在翻转时 setState：这些回调会被 resize / 子节点变动成串调用
+    setRowOverflow((prev) => (prev === next ? prev : next))
+  }, [])
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el === null) return
+    measureRowOverflow()
+
+    const resizeObserver =
+      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => measureRowOverflow())
+    resizeObserver?.observe(el)
+
+    const row = rowRef.current
+    const mutationObserver =
+      typeof MutationObserver === 'undefined' || row === null
+        ? null
+        : new MutationObserver(() => measureRowOverflow())
+    mutationObserver?.observe(row as HTMLDivElement, { childList: true })
+
+    window.addEventListener('resize', measureRowOverflow)
+    return () => {
+      resizeObserver?.disconnect()
+      mutationObserver?.disconnect()
+      window.removeEventListener('resize', measureRowOverflow)
+    }
+  }, [measureRowOverflow])
+
   // ── 拖动排序：指针手势（阈值 / 让位 / 取消 / 吞 click）──────────────────────
   /** rAF 里唯一的写入口：被拖卡跟手抬升，其余卡按目标位置让位一格 */
   const applyDragFrame = useCallback((): void => {
@@ -799,8 +896,10 @@ export function HomeCover(props: {
         if (rect.width <= 0) return
         centers.push(rect.left + rect.width / 2)
       }
-      // 槽位等宽等距（同一套 --gf-scale + justify-between），相邻中心距即让位步长；
+      // 槽位等宽等距（同一套 --gf-scale + CSS 固定 48px 间隙），相邻中心距即让位步长；
       // 只有一张卡时退化成"卡宽 + 常见间隙"，拖动本身仍然可用（不会出现 0 步长）。
+      // ⚠️ 这里的 `centers` 是**实测**的 `getBoundingClientRect()`，不假设间隙算法 ——
+      //    2026-11-27 把 `justify-between` 换成固定 `column-gap` 后，本段零改动即自洽。
       const firstRect = sourceEl.getBoundingClientRect()
       const step =
         centers.length > 1 ? centers[1] - centers[0] : firstRect.width + 16
@@ -1171,24 +1270,52 @@ export function HomeCover(props: {
             1080 ≈ 104px、1440 ≈ 151px、1520+ 上限 161px），父级**不要**再写死宽高。
             ⚠️ 父级**不能**加 `overflow-hidden` —— 卡片的翻盖/阴影会伸出根部盒子。
 
-            ── 行宽上限 960 → 820（用户 2026-11-09：「变成下方 4 个文件夹」）──────────
-            960 是给「5 张卡」定的：缩到 2/3 以后 5×151=753 摊在 ~1256 里太散架
-            （4 个间隙各 ~126px），所以收窄到 960 并居中。
-            而 5 张变成 4 张后，960 反而太松：4×151 = 604，3 个间隙各 (960−604)/3 ≈ 118px，
-            又是"散架"的读数。按 4 张卡反算：
-              · 1440 窗口：可用宽 = 100vw − 184 = 1256 > 820 → 行宽取 820，
-                4×151 = 604，(820 − 604) / 3 ≈ **72px** 间隙 —— 紧凑但不挤。
-              · 1080 窗口（窗口最小宽）：可用宽 = 896 > 820 → 行宽仍是 820，
-                4×104 = 416，(820 − 416) / 3 ≈ **135px** 间隙。
-                1080 下确实偏松 —— 但这是卡片等比缩放的必然结果（卡变小、带子不变），
-                且 1080 是极限窄窗口，**不要**为它加断点特例：宁可偏松也不要让
-                常驻窗口（1280~1600）变紧。
-              · 1520+：卡封顶 161 → 4×161 = 644，(820 − 644) / 3 ≈ 59px。
-            ⚠️ 改了这里的 820，必须同步改 `home-stats.css` 里 `.hs-card` 的 `right`
-            （数据卡右边缘要与第 4 张卡的右边缘逐像素对齐，公式里含行宽）。
+            ── 行宽上限 960 → 820 → **1040**（2026-11-26 用户第四轮口径）──────────────
+            历史：960 是给「5 张卡」定的（缩到 2/3 后 5×151=753 摊在 ~1256 里太散架）；
+            5 张变 4 张后收窄到 820，让 4×151=604 摊成 3 个 ~72px 间隙。
 
-            `justify-between` 让卡片在这条 820 的带子里均分空白；若将来「其他」分类
-            有了素材、第 5 张卡回来，5×151=755 ≤ 820 依然放得下，间隙缩到 ~16px，可接受。
+            ★ 本轮为什么放宽到 1040（用户原话，逐字）：
+              「首页的这个文件夹页面，我觉得整体排列有一点紧。可以适当放宽左右的边界；
+                并且如果只有 5 张的话，不会往右边移触发滚动。」
+              「只有 5 个文件夹封面的情况下，不要触发滚动。」
+              「如果超过 5 个文件夹的话，左右两侧肯定都是需要高斯模糊和羽化的。」
+
+            820 下的实测（用户看到问题的那个窗口）：5 张卡总宽 1520+ 是 805.8，
+            只剩 **3.6px** 余量，卡片几乎贴在一起 —— 这就是"紧"的来源；而 6 个槽位
+            （5 张 + 「新建项目」虚卡，或 5 张 + 1 张钉选卡）在 1440/1520 必然溢出。
+
+            改到 1040 之后的账（行宽 = min(1040, 100vw − 184)，居中）：
+              · 5 张：1080 → 522 摊在 896 里（间隙 ~93）；1280 → 594 摊在 1040（~111）；
+                1440 → 753（~72）；1520+ → 806（~59）—— 全程宽松、零滚动。
+              · 6 槽位（5 张 + 虚卡）：1080 → 626 摊在 896（~54）；
+                1280 → 712 摊在 1040（~66）；1440 → 904（~27）；1520+ → 966（~15）。
+                **全部 ≤ 1040 → 不触发滚动**（1520+ 的 15px 是极限窗口下的"刚好不挤"）。
+              · 7 个及以上槽位（多张钉选卡）才开始出现横向滚动（1440+ 起 7 槽位就溢出；
+                1080~1366 下 7 槽位还放得下，8 槽位才滚）→ 只有这时才上左右高斯模糊 +
+                羽化（CSS 在 `glass-folder.css` 的 `[data-overflow='true']` 那一节）。
+            ⚠️ 上面三行「间隙 ~93 / ~59 / ~15」是 **`justify-between` 时代的旧账**，
+            2026-11-27 起已作废（间隙不再是行宽余数，见本节下半段"间隙固定 48px"）。
+            那几行保留只为说明"为什么 1040"；**排布结论一律以下半段为准**。
+            ⚠️ 改了这里的 1040，必须同步改 `home-stats.css` 里 `.hs-card` 的 `right`
+            （数据卡右边缘要与末卡的右边缘逐像素对齐，公式里含行宽），
+            以及下面类别筛选气泡那一层的 `max-w-[…]`（同一条带子）。
+
+            ── 间隙固定 48px（2026-11-27 用户报障后改）──────────────────────────
+            用户原话：「底部状态不对吧，文件夹的间隙是固定的」，并配了 6 张（几乎贴住，
+            间隙 ~14px）/ 4 张（拉散到上百像素）/ 3 张（紧凑居中 72px）三张截图。
+
+            根因：旧法用 `justify-between` 让卡片在 1040 带子里**均分空余** ——
+            间隙 = 行宽余数，张数一变间隙就变。所以这里**不再**用 `justify-between`，
+            间隙改由 CSS 一条规则统一定死：`home-outro.css` 末尾 `.hc-folder-row`
+            { justify-content: safe center; column-gap: 48px }（所有张数共用）。
+              · 48px 的由来：5 张 @1520+ = 5×161.2 = 806，行宽 1040 → 4 个间隙预算
+                234，即 gap ≤ 58.5；取 48 → 998 ≤ 1040（余 42px 给 open 态外溢）。
+                旧特例的 72 会得到 1094，溢出 54px，直接破坏「5 张不滚」。
+              · 6 个槽位 @1520+ = 967 + 5×48 = 1207 > 1040 → 滚动 + 左右羽化，
+                这是有意接受的（要让 6 张也塞下，gap 得压到 14.6px = 用户截图里
+                那个"贴在一起"的值）。各窗口实测账见 `home-outro.css` 那一节。
+            ⚠️ 别再往这一行加 `justify-*` 工具类：它会覆盖掉 CSS 里的
+            `safe center` 语义（溢出时无法退化为 start，滚动会裁掉左端半张卡）。
             `[&>*]:shrink-0`：组件根节点已经写了 `flex: none`，这里再兜一道，
             防止将来有人给 `.gf-root` 换 class 名时被 flex 压扁 ——
             内部是按设计稿 340×272 等比缩放的一组卡片，一压就会互相穿模。
@@ -1213,10 +1340,20 @@ export function HomeCover(props: {
             · `.hc-folder-scroll` 的补偿 padding 与本文件 SCROLL_PAD_* 是一对
               （卡片 hover 翻盖伸出盒子的部分不再被竖向裁掉，布局位置不变）；
             · 右键：卡片 → 钉选/底纹菜单，空白处 → 添加快速访问（卡片内
-              `stopPropagation` 抢在 wrap 之前）。 */}
+              `stopPropagation` 抢在 wrap 之前）。
+
+            ── `data-overflow`（2026-11-26）────────────────────────────────────────
+            由 `measureRowOverflow`（见上方 effect）在「scroller 尺寸变化 / row 子节点
+            增删 / 窗口 resize」三种时机量 `scrollWidth > clientWidth + 1` 后写到这一层。
+            CSS 侧一个属性同时驱动两件事：
+              · `.hc-folder-wrap[data-overflow='true'] .hc-folder-scroll` → 左右羽化 mask；
+              · `.hc-folder-wrap[data-overflow='true'] .hc-fog` → 两条高斯模糊窄带淡入。
+            不溢出时两者都不出现 —— 「5 张不滚也不糊」靠的就是这条属性，
+            别把它简化成"永远是 true"。 */}
         <div
-          className="hc-folder-wrap relative mx-auto mt-10 w-full max-w-[820px]"
+          className="hc-folder-wrap relative mx-auto mt-10 w-full max-w-[1040px]"
           data-guide="folders"
+          data-overflow={rowOverflow ? 'true' : 'false'}
           data-reveal={filterTouchedRef.current ? revealVariant : 'none'}
           data-reveal-motion={quality !== 'smooth' && !reduced ? 'true' : 'false'}
           onMouseMove={handleRowMouseMove}
@@ -1230,7 +1367,7 @@ export function HomeCover(props: {
           <div ref={scrollRef} className="hc-folder-scroll">
             <div
               ref={rowRef}
-              className="hc-folder-row flex w-full items-start justify-between [&>*]:shrink-0"
+              className="hc-folder-row flex w-full items-start [&>*]:shrink-0"
               data-count={visibleFolders.length + visiblePinned.length + (showNewProject ? 1 : 0)}
               /* 拖动排序（2026-11-25）：事件委托在这一层 —— 卡片不需要认识指针，
                  只有 `data-slot-key` 与 CSS `order` 是它参与排序的全部接口。
@@ -1336,34 +1473,60 @@ export function HomeCover(props: {
             </div>
           </div>
 
-          {/* 边缘热区提示（F-2）：箭头微光淡入淡出，零布局位移（absolute + pointer-events:none）。
-              smooth 档下 edgeHint 恒为 null（rAF 循环不启动），提示永不出现 —— 降级口径。 */}
-          <span
+          {/* 溢出时的左右雾带（2026-11-26）：用户原话「左侧的遮罩，我希望它是高斯模糊
+              加上有一定的羽化范围，现在看着非常生硬。」
+              · 两条都是**常驻渲染**的空 div（不条件渲染）：只有常驻才吃得到 CSS 里那条
+                200ms 的 opacity 过渡，溢出/恢复时才是"淡入淡出"而不是"啪一下出现"；
+              · 不溢出时 CSS 里 `opacity: 0`，一个像素都不画（`.hc-fog` 的默认态）；
+              · `pointer-events: none` 写在 CSS 里 —— 绝对不能吃卡片的 hover / 右键；
+              · z-index 5：压在 scroller 之上、边缘箭头（z6）之下；
+              · 位置/宽度/模糊半径全在 CSS（`.hc-fog` / `.hc-fog-left` / `-right`），
+                这里只管出现。 */}
+          <div className="hc-fog hc-fog-left" aria-hidden="true" />
+          <div className="hc-fog hc-fog-right" aria-hidden="true" />
+
+          {/* 边缘热区提示（F-2）：箭头微光淡入淡出，零布局位移（absolute）。
+              2026-11-28：span 升级为 <button type="button"> —— 微光显现时可以点击，
+              点一下向对应方向平滑滚一个「卡步进」（`handleEdgeClick`）。
+              ⚠️ 可见性同时是**可点性**：data-visible=false 时 CSS 把 pointer-events
+              关掉（箭头不显现就不能吃雾带区域的点击 / hover）；
+              smooth 档 edgeHint 恒 null（rAF 循环不启动）→ 箭头永不显现 →
+              永不可点、永不出现，降级口径零额外代码。
+              ⚠️ 必须排在雾带**之后**（配 CSS 的 z-index:6）：否则箭头会被自己那侧的
+              高斯模糊糊成一片灰。 */}
+          <button
+            type="button"
             className="hc-folder-edge"
             data-side="left"
             data-visible={edgeHint === 'left' ? 'true' : 'false'}
-            aria-hidden="true"
+            aria-label="向左滚动"
+            onClick={() => handleEdgeClick(-1)}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M14.5 5.5L8 12l6.5 6.5" />
             </svg>
-          </span>
-          <span
+          </button>
+          <button
+            type="button"
             className="hc-folder-edge"
             data-side="right"
             data-visible={edgeHint === 'right' ? 'true' : 'false'}
-            aria-hidden="true"
+            aria-label="向右滚动"
+            onClick={() => handleEdgeClick(1)}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M9.5 5.5L16 12l-6.5 6.5" />
             </svg>
-          </span>
+          </button>
         </div>
 
         {/* 类别筛选气泡（gallery10 Browse by type）：主页内筛选，不离开主页。
             用户 2026-11-26 拍板放在**文件夹排下方**（原在上方，现下移）：
-            视觉顺序 = 搜索 → 文件夹排 → 气泡 → 提示字。mt-7 与提示行的 mt-54 分摊。 */}
-        <div className="hc-exit hc-exit--down mx-auto mt-7 w-full max-w-[820px] shrink-0">
+            视觉顺序 = 搜索 → 文件夹排 → 气泡 → 提示字。mt-7 与提示行的 mt-54 分摊。
+            ⚠️ `max-w-[1040px]` 必须与上面 `.hc-folder-wrap` 的行宽上限一致 ——
+            气泡是"文件夹排的从属控件"，宽度不一致会读成两套栅格
+            （上一版这里与 wrap 同为 820，本轮随行宽一起放宽）。 */}
+        <div className="hc-exit hc-exit--down mx-auto mt-7 w-full max-w-[1040px] shrink-0">
           <HomeFolderFilter
             value={folderFilter}
             onChange={handleFilterChange}

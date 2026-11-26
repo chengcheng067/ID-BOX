@@ -107,6 +107,26 @@ export type ThemeMode = 'light' | 'dark' | 'system'
  */
 export type MotionQuality = 'smooth' | 'balanced' | 'ultra'
 
+/**
+ * 关闭主窗口时干什么（设置·外观「窗口与后台」）。
+ *
+ * - `'ask'`（**默认**）= 点 ✕ 弹窗问一次「退至后台 / 彻底退出」，用户选了才执行。
+ *   弹窗带「记住我的选择，以后不再询问」复选框（**默认不勾**）：
+ *   不勾 → 以后每次都问；勾了 → 把本次动作写进本字段，以后不再问；
+ * - `'quit'` = 点 ✕ 彻底退出进程（与新增本设置之前的行为逐字一致）；
+ * - `'tray'` = 退至后台继续运行（窗口 hide 不销毁），托盘图标单击可唤回。
+ *
+ * ⚠️ **默认档从 `'quit'` 改成 `'ask'` 是刻意的**（2026-11 用户需求）：
+ * 老档缺键的升级用户会落到「每次询问」而不是静默退出 —— 静默退出会让正在跑的
+ * 导入 / 分类被无声掐断，而多问一次的成本只是点一下；且用户第一次点 ✕ 就会
+ * 看到这个选择机会，比"升级后发现软件直接没了"安全得多。
+ *
+ * ⚠️ 归一化唯一入口：`main/settings.ts#normalizeCloseBehavior`（缺键 / 脏值一律 `'ask'`）。
+ * 主进程的窗口 `close` 拦截读的就是这个值（`main/index.ts` 的 `createWindow()`）；
+ * 托盘里的「退出」菜单项会先置 `appQuitting` 再 `app.quit()`，绕过该拦截。
+ */
+export type CloseBehavior = 'ask' | 'quit' | 'tray'
+
 /** 缩略图状态：`none`=未生成 / `ready`=已生成 / `failed`=生成失败 */
 export type ThumbStatus = 'ready' | 'failed' | 'none'
 
@@ -621,6 +641,51 @@ export interface ImportConflictExpired {
   requestId: string
 }
 
+// ── 「关闭窗口」询问（2026-11 用户需求：点 ✕ 弹窗问「退至后台 / 彻底退出」） ──
+
+/**
+ * 一次「关闭窗口」询问（主进程 → 渲染进程）。
+ *
+ * 只在 `settings.closeBehavior === 'ask'` 时发出：用户点了主窗口 ✕，主进程拦下 close
+ * 事件、把裁决权交给渲染层的 `CloseAskDialog`。
+ */
+export interface CloseAskPayload {
+  requestId: string
+  /**
+   * 上一次被记住的选择（仅用于文案 / 按钮排序参考，可空）。
+   *
+   * `null` = 用户从来没记住过（默认档，或刚在设置页切回「每次询问」）——
+   * 弹窗此时不需要突出任何一侧；非 null 时可以在下次询问里把这一侧排在前面。
+   */
+  remembered: Exclude<CloseBehavior, 'ask'> | null
+}
+
+/**
+ * 用户对「关闭窗口」询问的答复。
+ *
+ * 两种情况都合法：
+ * - `remember: false` → 只执行本次动作，`closeBehavior` **不改**（下次 ✕ 继续问）；
+ * - `remember: true`  → 把 `action` 写进 `closeBehavior`，以后不再问。
+ */
+export interface CloseAnswer {
+  requestId: string
+  /** 本次要执行的动作 */
+  action: 'quit' | 'tray'
+  /** 是否把本次选择写进设置（true → 落 closeBehavior = action，以后不再问） */
+  remember: boolean
+}
+
+/**
+ * 主进程 → 渲染进程：**这次询问已作废**（只有 `requestId`）。
+ *
+ * 只在主进程**单方面**结束时发（超时 15s，兜底动作 `'tray'`）。渲染层收到必须自己
+ * 关掉弹窗 —— 否则它会挂在屏幕上，而用户之后点按钮只会命中主进程的 stale 分支
+ * （幂等丢弃），表现为「点了没反应、弹窗不关」（DEF-19-1 同类问题）。
+ */
+export interface CloseAskExpired {
+  requestId: string
+}
+
 /**
  * 用户自定义分类词表（2026-10 用户需求：「无论模型还是材质还是 HDR，
  * 文件的一级分类和二级分类都允许用户增加自定义」）。
@@ -1033,6 +1098,29 @@ export interface Settings {
   homeGuideLastVersion: string | null
   /** 用户是否永久关闭了首页引导（默认 false）。 */
   homeGuideDisabled: boolean
+  /**
+   * 关闭主窗口的行为（默认 `'ask'` = 点 ✕ 先弹窗问一次，2026-11 用户需求）。
+   *
+   * `'tray'` / `'quit'` 只在用户**显式选择**后生效：弹窗里勾「记住我的选择」，
+   * 或设置页「窗口与后台」手动切档。归一化入口 `normalizeCloseBehavior`：
+   * 缺键 / 脏值一律回落 `'ask'`，单项降级不拖垮整份 settings.json。
+   */
+  closeBehavior: CloseBehavior
+  /**
+   * 「关闭窗口时」**一次性迁移标记**（2026-11-27 装机反馈，v1.2.1）。
+   *
+   * 背景：v1.2.0 及更早**没有** closeBehavior 字段，外部老用户升级上来走默认 `'ask'`
+   * 是对的；但 dev / 测试期间的机器 settings.json 里已经落了残留值（用户杨雯丞的档里
+   * 是 `"closeBehavior": "tray"`），原样读入 → 第一次点 ✕ 不弹窗。
+   *
+   * 规则：档里没有这个标记（= 1.2.1 之前写出的档）→ 读档时强制落 `'ask'` +
+   * 置 `true` + 立刻写回（见 `main/settings.ts#planCloseBehaviorMigration`）。
+   * 之后用户的显式选择**永远**不被再动 —— 迁移点在 `loadSettings`（读档侧），
+   * 标记落盘后短路返回，一个进程只跑一次。
+   *
+   * ⚠️ 不是"档位字段"而是"升级水位线"：渲染层 / 设置页**不要**展示或修改它。
+   */
+  closeBehaviorMigrated: boolean
   /** @deprecated 仅用于读取旧 settings.json，读到后映射为 archiveDisposal */
   trashArchiveAfterImport?: boolean
 }
@@ -1116,7 +1204,14 @@ export const DEFAULT_SETTINGS: Settings = {
   homeFolderOrder: [],
   homeGuideFirstRunShown: false,
   homeGuideLastVersion: null,
-  homeGuideDisabled: false
+  homeGuideDisabled: false,
+  // 关闭窗口默认「每次询问」：点 ✕ 弹窗问「退至后台 / 彻底退出」，用户选了才执行
+  // （静默退出会掐断正在跑的导入与分类，多问一次的成本只是点一下，见 `CloseBehavior` 注释）
+  closeBehavior: 'ask',
+  // 迁移标记默认 false：默认值本身没被迁移过 —— 全新档 / 旧档都会在 `loadSettings`
+  // 里经 `planCloseBehaviorMigration` 翻成 true 并写盘（新装档里没有残留值可迁移，
+  // 但翻牌是为了让"标记粘住"这条不变量对三种档形态都成立）
+  closeBehaviorMigrated: false
 }
 
 // ── T06 分类体系 IPC 载荷（shared 定义，main 与 preload 共用，避免 preload 反向 import main） ──

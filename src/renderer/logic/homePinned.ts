@@ -162,6 +162,29 @@ export function edgeScrollStep(
 }
 
 /**
+ * 边缘箭头**点击**滚动的目标值（2026-11-28 新增）：从当前 scrollLeft 出发沿 dir
+ * 走一个「卡步进」（一张卡宽 + 行 gap），再收口到 [min, max] —— 滚到头就停在头。
+ *
+ * 与 `nextScrollLeft`（rAF 逐帧小步）的区别：
+ *   · dir 只允许 ±1：点击没有中性方向，点的是哪边箭头就往哪边滚；
+ *   · step 非有限 / ≤0 视为无效，原地收口不动（调用方已用真实 DOM 几何兜底，
+ *     这里是纯函数层面的双保险，绝不产出 NaN 目标值）。
+ */
+export function clickScrollTarget(
+  current: number,
+  dir: -1 | 1,
+  step: number,
+  min: number,
+  max: number
+): number {
+  if (!Number.isFinite(step) || step <= 0) {
+    return Math.min(max, Math.max(min, current))
+  }
+  const next = current + dir * step
+  return Math.min(max, Math.max(min, next))
+}
+
+/**
  * 把方向与当前 scrollLeft 收口成下一帧的 scrollLeft：
  * 滚到头自动停（docs/60 §6.2「边界：滚到头自动停」）。
  */

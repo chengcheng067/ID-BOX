@@ -1,5 +1,16 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, nativeImage, type NativeImage } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  shell,
+  nativeImage,
+  Menu,
+  Tray,
+  type NativeImage
+} from 'electron'
 import fs from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
@@ -13,6 +24,8 @@ import {
   type FsExtractArchiveResult,
   type FsListDirInput,
   type FsListDirResult,
+  type FsListPinnedTrashInput,
+  type FsListPinnedTrashResult,
   type FsMkdirInput,
   type FsMkdirResult,
   type FsOpenEntryInput,
@@ -21,11 +34,14 @@ import {
   type FsOpenWithResult,
   type FsRenameEntryInput,
   type FsRenameEntryResult,
+  type FsRestorePinnedTrashInput,
+  type FsRestorePinnedTrashResult,
   type FsRevealEntryInput,
   type FsRevealEntryResult,
   type FsTrashEntriesInput,
   type FsTrashEntriesResult,
   type FsTrashFailedItem,
+  type FsTrashedItem,
   type HomeBackgroundSaveInput,
   type PackageExportInput,
   type PackageExportProgressEvent,
@@ -47,6 +63,9 @@ import {
   type AssignCategoryPayload,
   type AssignCategoryResult,
   type Asset,
+  type CloseAnswer,
+  type CloseAskPayload,
+  type CloseBehavior,
   type FetchZhimoCoverPayload,
   type FetchZhimoCoverResult,
   type FetchZhimoMetaPayload,
@@ -88,7 +107,7 @@ import { applyLibraryChoice, broadcastSettingsToWindows } from './settingsBroadc
 import { findSevenZip, thumbsDir } from './paths'
 import { guardDragIconPath } from './dragIconGuard'
 import { guardOpenPaths, guardTrashPaths } from './ipcGuard'
-import { fetchLatestRelease } from './updateCheck'
+import { fetchMergedRelease } from './updateCheck'
 import { freeBytesOf } from './disk'
 import { deleteThumb, deleteOneThumb, ensureThumb, ensurePreview, clearThumbs, listThumbFiles, pruneThumbs, thumbStats } from './thumb'
 import { MAX_COVER_IMAGE_BYTES, writeCoverImageInto } from './coverImage'
@@ -107,6 +126,11 @@ import { applyLayoutMigration, moveAssetCategory, planLayoutMigration } from './
 import { buildProjectPlan, createProjectDirs } from './projectCreate'
 import { scanTemplateFromDir } from './templateScan'
 import { readDirEntries, resolveWithinPinRoot } from './pinnedDirGuard'
+import {
+  listPinnedTrash,
+  moveToPinnedTrash,
+  restorePinnedTrash
+} from './pinnedTrash'
 import { revealEntryInExplorer } from './pinnedReveal'
 import { pinnedThumbsDir, resolveThumbForEntry } from './pinnedThumb'
 import {
@@ -222,6 +246,25 @@ import {
 } from './crashGuard'
 
 let win: BrowserWindow | null = null
+/**
+ * 托盘图标句柄（`settings.closeBehavior === 'tray'` 时用户从托盘唤回窗口 / 退出）。
+ *
+ * ⚠️ **必须持有模块级引用**：`Tray` 实例一旦被 GC 回收，Windows 托盘上的图标会直接消失，
+ * 而应用看起来"正常在后台跑却唤不回来"。所以这里绝不写成 `new Tray(...)` 用完就丢。
+ */
+let tray: Tray | null = null
+/**
+ * 「用户刚明确选了『退至后台』」的临时标记（2026-11 关窗询问）。
+ *
+ * 只可能为 true 的情况：`closeBehavior === 'ask'` + 用户在弹窗里点了「退至后台」+
+ * **没有**勾「记住我的选择」。此时 `closeBehavior` 仍是 `'ask'`，但窗口是隐藏的、
+ * 托盘图标是我们按需建的 —— 这是一个自洽的状态，{@link syncTrayWithSettings} 必须
+ * 尊重它（否则用户改个主题就会把窗口弹出来 + 销毁托盘）。
+ *
+ * 生命周期：由 {@link hideToBackground} 置真；由 {@link showMainWindow} 置假
+ * （窗口重新可见 = 这段临时态结束）。进程内单例，不落盘。
+ */
+let backgroundHold = false
 let settings: Settings = { ...DEFAULT_SETTINGS }
 const watcher = new ArchiveWatcher()
 
@@ -330,6 +373,8 @@ function showCrashGiveUpDialog(context: {
       appQuitting = true
       clearCrashTimers()
       clearPendingAsks('app-relaunch')
+      // 挂着的关窗询问一并兑现（不兑现 → close 拦截的 await 永久停住，relaunch 卡死）
+      clearPendingCloseAsks('app-relaunch')
       flushLogsSync()
       app.relaunch()
       app.exit(0)
@@ -558,6 +603,118 @@ function clearPendingAsks(reason: string): void {
   for (const resolve of pendingAsks.values()) resolve(null)
   pendingAsks.clear()
   logWarn('import:conflict:cancelled', { pending: count, reason })
+}
+
+// ── 「关闭窗口」询问（2026-11 用户需求）────────────────────────────────
+//
+// 结构**照抄**上面的 `pendingAsks` / `sendConflictAsk` / `clearPendingAsks` 三段式：
+// 主进程问、渲染层答、主进程单方面结束时（超时）显式作废。
+//
+// 单独一张表（而不是复用 `pendingAsks`）的理由：两者的超时与兜底动作完全不同
+// —— 重复询问超时 = 「全部跳过」（数据侧），关窗询问超时 = 「退至后台」（进程侧）。
+// 混在一张表里就得在兑现函数里分辨"这条是哪一种询问"，那是两套语义共用一份状态，
+// 迟早出错。
+
+/**
+ * 关窗询问的超时。
+ *
+ * 取值 15s：比重复询问的 120s 短得多 —— 这里只有一句文案 + 两个按钮，用户看一眼就能选；
+ * 卡住时进程侧每多等一秒，"窗口没反应"的观感就多留一秒，而兜底动作（退至后台）本身
+ * 是无损的，早兜底比晚兜底好。
+ */
+const CLOSE_ASK_TIMEOUT_MS = 15_000
+
+/** `requestId → 兑现函数`（渲染进程答复 / 超时 / 关窗 / 渲染崩溃都从这里收口） */
+const pendingCloseAsks = new Map<string, (answer: CloseAnswer | null) => void>()
+
+/**
+ * 「弹窗已经开着」闩锁：用户连点 ✕ 时不叠加第二个询问。
+ *
+ * 关窗拦截是 `preventDefault` + 异步询问，`close` 可能被连点触发多次；没有这个闩锁
+ * 会同时挂起多个 Promise、多个 requestId，渲染层弹窗被反复重置。
+ */
+let closeAskInFlight = false
+
+/**
+ * 发一次「关闭窗口」询问给渲染层，等用户裁决（照抄 {@link sendConflictAsk} 的结构）。
+ *
+ * - **窗口不可用 → 立刻返回 null**（= 按兜底动作 `'tray'` 处理），绝不等 15s；
+ * - 15s 无人应答 → 兑现 null 并推 `closeAskExpired`（D08 同纪律：绝不永久悬挂）；
+ * - 答复经 `IPC.closeAnswer` handler 兑现；过期 requestId 的答复被丢弃（幂等）。
+ */
+function sendCloseAsk(): Promise<CloseAnswer | null> {
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) {
+    // 窗口都快没了：没有接收方，直接按兜底动作收场（调用方按 'tray' → hide，安全）
+    logWarn('close:ask', { phase: 'no-window' })
+    return Promise.resolve(null)
+  }
+  const target = win
+  const requestId = randomUUID()
+  // 上一次被记住的选择：只作为文案 / 排序参考传给渲染层（'ask' 档下必然没有，
+  // 因为用户一记住就切走了；但设置页手动切回「每次询问」时可能残留旧值 → 一律给 null）
+  const payload: CloseAskPayload = { requestId, remembered: null }
+  return new Promise<CloseAnswer | null>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingCloseAsks.delete(requestId)
+      // ── 作废事件（同 importConflictExpired 的理由）─────────────────
+      // 超时是主进程**单方面**结束：不通知的话渲染层的 closeAsk 仍非 null → 弹窗一直
+      // 挂在屏幕上；用户之后点按钮只会命中答复 handler 的 stale 分支（幂等丢弃），
+      // 表现却是「点了没反应、弹窗不关」。
+      // ⚠️ 只在这里发（超时路径）。`clearPendingCloseAsks()` 走的是渲染进程已崩 /
+      //    窗口正在销毁 / 退出中，那三条路要么没有接收方、要么窗口正在销毁 ——
+      //    发过去只会在日志里造噪音。
+      let notified = false
+      if (!target.isDestroyed() && !target.webContents.isDestroyed()) {
+        try {
+          target.webContents.send(IPC.closeAskExpired, { requestId })
+          notified = true
+        } catch (err) {
+          logWarn('close:ask', {
+            requestId,
+            phase: 'expire-send-failed',
+            error: err instanceof Error ? err.message : String(err)
+          })
+        }
+      }
+      // 超时兜底 = 'tray'（安全侧：不退出、只 hide，用户的数据与正在跑的导入都不受影响）
+      logWarn('close:ask:timeout', { requestId, notified })
+      resolve(null)
+    }, CLOSE_ASK_TIMEOUT_MS)
+
+    pendingCloseAsks.set(requestId, (answer) => {
+      clearTimeout(timer)
+      resolve(answer)
+    })
+    logInfo('close:ask', { requestId, phase: 'ask' })
+    try {
+      target.webContents.send(IPC.closeAsk, payload)
+    } catch (err) {
+      // 发送瞬间窗口没了：按超时兜底（绝不把异常漏给 close 流程）
+      pendingCloseAsks.delete(requestId)
+      clearTimeout(timer)
+      logWarn('close:ask', {
+        requestId,
+        phase: 'send-failed',
+        error: err instanceof Error ? err.message : String(err)
+      })
+      resolve(null)
+    }
+  })
+}
+
+/**
+ * 清场：兑现所有挂起的关窗询问为 `null`（= 按兜底动作 `'tray'` 处理）并清空表。
+ *
+ * ⚠️ 必须与 {@link clearPendingAsks} **同点调用**：挂着的 Promise 不兑现，`close`
+ * 拦截里的 `await sendCloseAsk()` 会永久停住 —— 窗口关不掉、退出流程也卡死。
+ * 三个调用点：`win.on('closed')` / `render-process-gone` / `before-quit`。
+ */
+function clearPendingCloseAsks(reason: string): void {
+  if (pendingCloseAsks.size === 0) return
+  const count = pendingCloseAsks.size
+  for (const resolve of pendingCloseAsks.values()) resolve(null)
+  pendingCloseAsks.clear()
+  logWarn('close:ask:cancelled', { pending: count, reason })
 }
 
 /**
@@ -877,6 +1034,9 @@ function installCrashHandlers(): void {
     // 退出前必须把挂起的重复询问兑现掉，否则正在等答复的批次会卡在 await 上，
     // `cleanupStaging` 会把它的 staging 删掉而 Promise 永远不返回（docs/27 §4.3）
     clearPendingAsks('before-quit')
+    // 退出流程里挂着的关窗询问同样必须兑现：不兑现 → `close` handler 的 await 停住，
+    // 窗口既不销毁也不 hide，`window-all-closed` 永远不来，进程退不掉。
+    clearPendingCloseAsks('before-quit')
     void cleanupStaging(settings.libraryDir)
   }
   app.on('before-quit', cleanup)
@@ -920,6 +1080,8 @@ function installCrashHandlers(): void {
     // 渲染进程没了 = 没人能回答重复询问：**立刻**全按「跳过」收尾，绝不干等 120s
     // （docs/27 §4.3 / 端到端验收 6：kill 渲染进程后主进程要立即收尾）
     clearPendingAsks('render-gone')
+    // 渲染进程没了 = 没人能答关窗询问：同样立刻按兜底动作收场，绝不干等 15s
+    clearPendingCloseAsks('render-gone')
     // 新一轮崩溃开始：旧"稳定观察"定时器必须停掉，否则它会在本轮崩溃后把历史清零，
     // 把退避上限绕过去（= 循环崩溃）
     if (stableTimer !== null) {
@@ -998,6 +1160,151 @@ function installCrashHandlers(): void {
   })
 }
 
+/**
+ * 把主窗口唤回前台（托盘单击 / 托盘菜单「显示主窗口」/ 第二个实例启动都走这里）。
+ *
+ * `win` 已销毁（用户选了「彻底退出」后关窗，但进程还没退完）时直接返回 —— 绝不 `new` 一个
+ * 新窗口，否则托盘单击会凭空造出第二份界面。
+ */
+function showMainWindow(): void {
+  if (!win || win.isDestroyed()) return
+  // 窗口被重新显示 = 「退至后台」这段临时状态结束：清掉标记，
+  // 之后 `syncTrayWithSettings` 恢复按 `closeBehavior` 正常收口（'ask' 档会按需销毁托盘）。
+  backgroundHold = false
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/**
+ * 创建系统托盘图标（「关闭窗口时退至后台」的常驻入口）。
+ *
+ * 四个决定，改动前必读：
+ * 1. **只在 `settings.closeBehavior === 'tray'` 时创建**（由 {@link syncTrayWithSettings}
+ *    统一判定）：选了「彻底退出」的用户不该在任务栏托盘区多出一个 ID BOX 图标 ——
+ *    那会让人以为"软件没关掉"。切换是即时生效的：`settings:set` 里先同步托盘再广播，
+ *    所以用户在设置页点「退至后台」的那一刻图标就出现了，不会出现"窗口已 hide、图标还没建"
+ *    的空档。**第一次点 ✕ 之前图标一定已经存在**，这是这条链路的安全前提。
+ * 2. **图标从 `resources/tray.png` 读**（`build/icon.png` 不在打包 files 白名单里、
+ *    `renderer/assets` 的资源构建后被 hash 改名，两者路径都不稳定）。`resources`
+ *    整个目录都在 `package.json` 的 files 里，dev（`app.getAppPath()` = 项目根）与打包后
+ *    （asar 根）同一条相对路径都成立 —— 与 `drag-icon.png` 同一先例。
+ * 3. **读不到图就不建托盘**：`new Tray(空 nativeImage)` 会抛异常，宁可没有托盘图标
+ *    （此时 `closeBehavior='tray'` 只表现为关窗后进程还在：再启动一次走 `second-instance`
+ *    会把藏起来的窗口 `show()` 回来，任务管理器也能结束），也绝不让启动流程崩掉。
+ * 4. **幂等**：已有 `tray` 直接返回，`syncTrayWithSettings` 可以放心地被反复调用。
+ */
+function createTray(): void {
+  if (tray) return
+  const iconPath = path.join(app.getAppPath(), 'resources', 'tray.png')
+  let img = nativeImage.createFromPath(iconPath)
+  if (img.isEmpty()) {
+    logWarn('tray:icon:missing', { iconPath })
+    return
+  }
+  // 托盘图标按 16/24/32 物理像素显示（100% / 150% / 200% 缩放）；先按 32 收一遍，
+  // 让 Electron 拿一张尺寸稳定的图去缩放，避免直接缩 256 时的模糊与内存浪费。
+  img = img.resize({ width: 32, height: 32 })
+  tray = new Tray(img)
+  tray.setToolTip('ID BOX')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示主窗口', click: () => showMainWindow() },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          // 置真之后 `close` 拦截不再 preventDefault，窗口真的销毁 → `window-all-closed`
+          // → 进程退出（`before-quit` 里还会再置一次，这里先置是为了让 close 事件本身放行）
+          appQuitting = true
+          app.quit()
+        }
+      }
+    ])
+  )
+  // 单击唤回（Windows 惯例；双击与单击等价，不用另挂）
+  tray.on('click', () => showMainWindow())
+  logInfo('tray:created', { iconPath })
+}
+
+/**
+ * 销毁托盘图标（只是移除常驻入口，**不影响窗口与进程**）。
+ *
+ * 三处调用：切回 `'quit'` 时（{@link syncTrayWithSettings}）、退出流程（`will-quit`）、
+ * 未来的热重载场景。幂等：没有 `tray` 时什么都不做。
+ */
+function destroyTray(): void {
+  if (!tray) return
+  tray.destroy()
+  tray = null
+  logInfo('tray:destroyed')
+}
+
+/**
+ * 让托盘图标的存在与 `settings.closeBehavior` 保持一致（设置页切换后即时生效）。
+ *
+ * `'tray'`  → 建图标（幂等）；
+ * `'quit'` / `'ask'` → 销毁图标，**并且如果窗口此刻正隐藏在后台，必须先把它显示出来**：
+ *             否则用户刚把开关切回「彻底退出」/「每次询问」，图标已消失、窗口又不可见 ——
+ *             两份入口同时没了，用户只能去任务管理器结束进程。
+ *             `closeBehavior` 的语义只是"点 ✕ 时怎么处理"，不是"把窗口藏起来"，
+ *             所以这里 `show()` 是唯一正确的收尾（窗口本来就可见时 `wasHidden=false`，不做多余动作）。
+ *
+ * ⚠️ 唯一的例外是 `'ask'` 档下"用户刚在弹窗里选了「退至后台」、但没勾记住"——
+ * 那种情况下 `closeBehavior` 仍是 `'ask'`，而窗口**必须**保持隐藏、托盘图标**必须**留着
+ * （用户明确表达了"退至后台"）。这条由 {@link backgroundHold} 标记，本函数看到它就直接
+ * 放行，什么都不销毁、什么都不唤回。标记在下一次「窗口被重新显示」时自动清除。
+ *
+ * 调用点：启动（`whenReady`）、每次 `settings:set`（在广播之前 —— 渲染层收到广播时
+ * 主进程侧副作用必须已经就位）、关窗弹窗记住选择之后。
+ */
+function syncTrayWithSettings(): void {
+  if (settings.closeBehavior === 'tray') {
+    createTray()
+    return
+  }
+  // 'ask' 档 + 用户明确选了「退至后台」：托盘与隐藏都是用户要的状态，不许推翻
+  if (backgroundHold) return
+  // 先记下可见性再销毁：销毁与"窗口还藏着"是两件独立的事，顺序不能反
+  const wasHidden = win !== null && !win.isDestroyed() && !win.isVisible()
+  destroyTray()
+  if (wasHidden) showMainWindow()
+}
+
+/**
+ * 把窗口收进后台（= 用户理解的「退至后台」）：**先保证有托盘图标，再 hide**。
+ *
+ * ⚠️ 顺序与 `createTray()` 头注第 1 条的安全前提直接相关：`closeBehavior === 'tray'`
+ * 时图标在启动 / 切档时就建好了，hide 之前一定存在；但 **`'ask'` 档下托盘图标根本不会
+ * 被创建**（{@link syncTrayWithSettings} 只认 `'tray'`）—— 用户在弹窗里选「退至后台」、
+ * 又没勾「记住我的选择」时，`closeBehavior` 仍是 `'ask'`，若这里直接 `hide()`，
+ * 窗口不可见 + 托盘无图标 = **两份入口同时消失**，用户只能去任务管理器结束进程
+ * （正是 `syncTrayWithSettings` 里那段注释要防的事故）。
+ *
+ * 所以「收进后台」这个动作自己负责补齐入口：`createTray()` 幂等，已有图标时什么都不做。
+ * 图标读不到时它自己放弃（`tray:icon:missing`），此时 `second-instance`（再启动一次）
+ * 仍能把窗口唤回 —— 与既有的兜底入口一致。
+ *
+ * 同时置 {@link backgroundHold}：让这条**临时**的后台态在后续 `settings:set` 触发的
+ * `syncTrayWithSettings()` 里不被推翻（否则用户改个主题就会把窗口从后台弹出来、
+ * 托盘图标也被销毁 —— 而他刚刚才明确选了"退至后台"）。
+ *
+ * 两个"什么都不做"的前置条件：
+ * - **退出中**（`appQuitting`）：`before-quit` 会把挂起的询问兑现成 null → 走到这里。
+ *   退出链路上不该凭空造一个托盘图标（`will-quit` 紧接着又会销毁它，只剩日志噪音）；
+ * - **窗口已销毁**（`window-closed` / `render-gone` 把询问兑现成 null 之后的续跑）：
+ *   没有可唤回的窗口，hide 与托盘都没有意义，直接返回（close 事件本身已经收场）。
+ */
+function hideToBackground(): void {
+  if (appQuitting) return
+  if (!win || win.isDestroyed()) return
+  createTray()
+  // 只在 `'ask'`（或 `'quit'`）档下标记：`'tray'` 档下 `syncTrayWithSettings` 本来
+  // 就会保留托盘，不需要这个标记，留个 true 只会让人以为"这里有额外语义"。
+  if (settings.closeBehavior !== 'tray') backgroundHold = true
+  win.hide()
+}
+
 function createWindow(): void {
   win = new BrowserWindow({
     width: 1440,
@@ -1016,6 +1323,76 @@ function createWindow(): void {
     }
   })
 
+  // ── 关闭窗口行为（设置·外观「窗口与后台」）────────────────────────────
+  //
+  // 三档（`settings.closeBehavior`）：
+  // - `'ask'`（**默认**）→ 拦下 close、弹窗问用户「退至后台 / 彻底退出」，选了才执行；
+  // - `'quit'`          → 放行，窗口真的销毁（= 新增本设置之前的行为）；
+  // - `'tray'`          → 拦截 close、**只 hide 不 destroy**。
+  //
+  // ⚠️ 为什么 tray 档必须是 hide 而不是 `win.destroy()`：下面的 `closed` 处理器会把
+  // `appQuitting` 永久置真（那是「窗口真的没了 ⇒ 别再自动恢复崩溃」的判据），一旦
+  // destroy，崩溃自动恢复（DEF-19-5）与 `before-quit` 的清理判断都会永久失效。
+  // hide 不触发 `closed`，窗口对象与 webContents 都活着 —— 从托盘唤回是"同一份界面"，
+  // 渲染层状态（滚动位置 / 选中项 / 未保存草稿）全部保留，也不需要重新 load。
+  //
+  // `appQuitting` 是唯一放行条件：托盘菜单「退出」、`before-quit`、崩溃重启等所有
+  // **真实退出路径**都会先置真，因此"常驻后台的用户点托盘『退出』"仍然能正常退出，
+  // 不会被这些拦截挡回去。
+  win.on('close', (e) => {
+    if (appQuitting) return
+    const behavior = settings.closeBehavior
+    if (behavior !== 'ask') {
+      if (behavior !== 'tray') return // 'quit' → 放行
+      e.preventDefault()
+      win?.hide()
+      return
+    }
+    // 'ask' 档：一律先拦下（异步询问期间窗口不能真的关掉）
+    e.preventDefault()
+    // 弹窗已经开着：再点 ✕ 什么都不做（不叠加第二个询问、不重置已开的那一个）
+    if (closeAskInFlight) return
+    closeAskInFlight = true
+    void (async () => {
+      try {
+        const answer = await sendCloseAsk()
+        // 超时 / 无窗口 / 渲染层没答 → 安全侧「退至后台」：不退出，用户的数据与
+        // 正在跑的导入 / 分类都不受影响，随时可以从托盘或再启动一次唤回
+        const action: Exclude<CloseBehavior, 'ask'> =
+          answer?.action === 'quit' ? 'quit' : 'tray'
+        if (answer?.remember) {
+          // 「以后不再询问」：把本次动作落进设置，并让主进程侧副作用（托盘图标）
+          // 与渲染层广播就位 —— 与 `settings:set` handler 同一条链路，顺序也一样：
+          // 先写盘、再同步托盘、最后广播（广播之后渲染层读到的必须是最终状态）。
+          settings = normalizeSettings({ ...settings, closeBehavior: action })
+          await saveSettings(settings)
+          syncTrayWithSettings()
+          broadcastSettingsChanged(settings)
+          logInfo('close:ask:remember', { action })
+        }
+        if (action === 'quit') {
+          // 先置真让**这一次** close 放行（`app.quit()` 会再触发一次 close 事件，
+          // 不置真会被本拦截重新问一遍 —— 那就成了"选彻底退出又弹窗"的死循环）
+          appQuitting = true
+          app.quit()
+        } else {
+          // ⚠️ 不能裸 `win?.hide()`：'ask' 档下托盘图标还没建，
+          // 裸 hide 会让"窗口没了、托盘也没有"，用户找不回来（见 hideToBackground 注释）
+          hideToBackground()
+        }
+      } catch (err) {
+        // 询问 / 写盘链路上的任何异常都不许把窗口卡在"关不掉也退不掉"的状态：
+        // 兜底走「退至后台」（安全侧，进程与数据都还在，且同样补齐托盘入口）
+        logWarn('close:ask:failed', {
+          error: err instanceof Error ? err.message : String(err)
+        })
+        hideToBackground()
+      } finally {
+        closeAskInFlight = false
+      }
+    })()
+  })
+
   // 最大化状态广播：WindowControls 切 □ / ❐ 图标（§3.1 加分项）
   const sendMaximized = (): void => {
     win?.webContents.send(IPC.winMaximizedEvent, win?.isMaximized() ?? false)
@@ -1030,6 +1407,7 @@ function createWindow(): void {
     appQuitting = true
     clearCrashTimers()
     clearPendingAsks('window-closed')
+    clearPendingCloseAsks('window-closed')
   })
 
   // 每次页面加载完成都重新起"稳定观察"：只有 reload 之后才需要观察，
@@ -1106,10 +1484,18 @@ function bootstrap(): void {
 
   // 第二个实例启动时：把已有窗口唤到前台，然后自己退出（由 Electron 自动触发 quit）
   app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore()
-      win.focus()
-    }
+    // `isDestroyed()` 必须挡在最前面：对已销毁的 BrowserWindow 调 `isVisible()` /
+    // `restore()` 会抛 "Object has been destroyed"（第一个实例正在退出时用户又双击了图标）
+    if (!win || win.isDestroyed()) return
+    // ⚠️ 走 `showMainWindow()` 而**不是**裸 `restore/show/focus`：那个函数还会清掉
+    // `backgroundHold`（"退至后台"的临时态）—— 窗口重新可见 = 这段临时态结束。
+    // 不清的话，之后任何一次 `settings:set` 都会被 `syncTrayWithSettings` 的 early-return
+    // 挡住，托盘图标在本该收掉时反而留着。
+    // `showMainWindow` 的内部实现与此处原先的三行逐一等价（restore 最小化 + show + focus），
+    // 且同样以 `isDestroyed()` 收口 —— 行为只多不少。
+    // 这一步也是**托盘图标缺失时的兜底入口**（`resources/tray.png` 读不到 → 没有托盘，
+    // 用户只能靠再启动一次把藏起来的窗口唤回）
+    showMainWindow()
   })
 
   registerVaultScheme()
@@ -1146,6 +1532,9 @@ function bootstrap(): void {
     const trashSweepTimer = setInterval(() => void runTrashSweep(), TRASH_SWEEP_INTERVAL_MS)
     trashSweepTimer.unref?.()
     createWindow()
+    // 托盘按设置决定有无：`closeBehavior === 'tray'` 才建图标（默认 'quit' 的用户
+    // 不该在任务栏托盘区看到 ID BOX）；切换由 `settings:set` 里的同一次同步兜住
+    syncTrayWithSettings()
     restartWatcher()
     // SketchUp 插件收件箱（docs/48 §7 / 勘察方案 A）：监听 + 启动存量扫描。
     // 放在 createWindow() 之后：`startInboxWatcher` 的派发是 at-least-once（每 3s 重发
@@ -1218,6 +1607,9 @@ app.on('will-quit', () => {
   stopInboxWatcher()
   // 使用记录 watcher 一并停（独立实例；`stopInboxWatcher` 不会碰它）
   void stopInboxUsageWatcher()
+  // 托盘图标随进程退出一起消失，但显式销毁更稳妥：Windows 上残留的托盘图标
+  // 会让用户以为进程还在（"幽灵图标"），置空也顺手断掉我们对它的引用。
+  destroyTray()
 })
 
 // ── IPC ──────────────────────────────────────────────────────────
@@ -1267,6 +1659,31 @@ ipcMain.handle(IPC.importConflictAnswer, (_e, answer: ImportConflictAnswer | und
   resolve(answer ?? null)
 })
 
+/**
+ * 「关闭窗口」询问的答复（2026-11 用户需求）。
+ *
+ * 按 `requestId` 兑现挂起的 Promise；**过期 requestId 幂等丢弃**（15s 超时之后才到的
+ * 答复不能反过来把已经 hide 的窗口再关一次）。渲染层被注入也不会造成越权：
+ * 这里只认主进程自己发出去的 id。
+ */
+ipcMain.handle(IPC.closeAnswer, (_e, answer: CloseAnswer | undefined) => {
+  const requestId = typeof answer?.requestId === 'string' ? answer.requestId : ''
+  if (!requestId) return
+  const resolve = pendingCloseAsks.get(requestId)
+  if (!resolve) {
+    logWarn('close:ask:answer', { requestId, phase: 'stale' })
+    return
+  }
+  pendingCloseAsks.delete(requestId)
+  logInfo('close:ask', {
+    requestId,
+    action: answer?.action ?? null,
+    remember: answer?.remember === true,
+    phase: 'answer'
+  })
+  resolve(answer ?? null)
+})
+
 ipcMain.handle(IPC.getSettings, () => settings)
 
 ipcMain.handle(IPC.setSettings, async (_e, patch: Partial<Settings>) => {
@@ -1283,6 +1700,10 @@ ipcMain.handle(IPC.setSettings, async (_e, patch: Partial<Settings>) => {
     verboseLogging: settings.verboseLogging
   })
   restartWatcher()
+  // 「关闭窗口时」两档即时生效：切到 tray 建图标、切回 quit 销毁图标（并把可能藏在
+  // 托盘里的窗口显式唤回，见 `syncTrayWithSettings` 头注）。必须在**广播之前**做 ——
+  // 渲染层收到 `settings:changed` 时主进程侧副作用必须已经就位（与 restartWatcher 同一纪律）。
+  syncTrayWithSettings()
   // ── 广播回路（DEF-22-1）──────────────────────────────────────────────
   // 必须在 `saveSettings` **之后**：写盘失败会抛到这里之前，渲染层保持旧值
   // （否则界面说改了、重启又变回去）。放在 `restartWatcher` 之后是刻意的：
@@ -1670,12 +2091,15 @@ ipcMain.handle(IPC.fsRenameEntry, (_e, input: FsRenameEntryInput): FsRenameEntry
 
 /**
  * `fs:trashEntries`（浏览器 v2，docs/61 A9 批注：删除 = 回收站化）：
- * 把 `dirRel` 下的多条目逐个 `shell.trashItem` 移入**系统回收站** ——
- * 绝不做永久删除，用户可从回收站找回。
+ * 把 `dirRel` 下的多条目移走 —— **绝不做永久删除**，用户总能找回。
  *
+ * - 本地盘：`trashOne`（`shell.trashItem` + trash 包兜底）进**系统回收站**，
+ *   返回 `token:null`（系统级，本应用不可撤销）；
+ * - 网络映射盘：系统回收站无效，改由 `pinnedTrash.moveToPinnedTrash` 在钉选根内
+ *   建 `.idbox-trash/<uuid>/`，同盘原子 rename，返回 token（可用 `fs:restorePinnedTrash` 撤销）；
  * - 单次上限 `FS_BATCH_MAX_ENTRIES`（500）；
  * - **部分失败不整批失败**：每个条目独立执行，失败项（非法名 / 不存在 / 被占用）进
- *   `failed` 数组（name + 中文单行 message），其余照常成功；
+ *   `failed` 数组（name + 中文单行 message，**绝不泄露系统英文错误串**），其余照常成功；
  * - `dirRel` 越界 / pinId 未登记 → 整批拒绝（reason:'guard'，记 ipc:guard）。
  */
 ipcMain.handle(
@@ -1703,6 +2127,7 @@ ipcMain.handle(
         return { ok: false, reason: 'guard', error: dir.error }
       }
       const failed: FsTrashFailedItem[] = []
+      const trashed: FsTrashedItem[] = []
       for (const raw of names) {
         const name = typeof raw === 'string' ? raw : ''
         const bad = validateEntryName(name)
@@ -1715,24 +2140,103 @@ ipcMain.handle(
           failed.push({ name, message: '文件不存在或已被移动' })
           continue
         }
+        // ① 本地盘首选：复用全局回收站策略（shell.trashItem + trash 包兜底）。
+        let systemError = ''
         try {
-          await shell.trashItem(abs)
+          await trashOne(abs, trashStrategy)
+          trashed.push({ name, token: null }) // 系统回收站：不可在本应用内撤销
+          continue
         } catch (err) {
-          const message = (err instanceof Error ? err.message : String(err))
+          systemError = (err instanceof Error ? err.message : String(err))
             .replace(/\s*[\r\n]+\s*/g, ' ')
             .trim()
-          failed.push({ name, message: message.length > 0 ? message : '移入回收站失败' })
+        }
+        // ② 网络盘兜底：系统回收站对网络映射盘无效（SHFileOperation 直接失败），
+        //    改在同盘钉选根内部建隐藏回收区，一次原子 rename 完成，可真实撤销。
+        try {
+          const entry = await moveToPinnedTrash(root.absPath, dirRel, name)
+          trashed.push({ name, token: entry.token })
+        } catch (err) {
+          // 两条路都失败：英文原文只落日志，用户看到的是单行中文（不泄露系统错误串）
+          logWarn('fs:trashEntries-item-failed', {
+            name,
+            message: systemError || '移入系统回收站失败',
+            pinnedTrashError: (err instanceof Error ? err.message : String(err))
+              .replace(/\s*[\r\n]+\s*/g, ' ')
+              .trim()
+          })
+          failed.push({ name, message: '文件被占用或没有删除权限，请关闭相关程序后重试' })
         }
       }
       if (failed.length > 0) {
-        logWarn('fs:trashEntries-partial', { failed: failed.length, total: names.length })
+        logWarn('fs:trashEntries-partial', {
+          failed: failed.length,
+          trashed: trashed.length,
+          total: names.length
+        })
       } else {
-        logInfo('fs:trashEntries', { total: names.length })
+        logInfo('fs:trashEntries', { trashed: trashed.length, total: names.length })
       }
-      return { ok: true, failed }
+      return { ok: true, failed, trashed }
     } catch (err) {
       logError('fs:trashEntries-failed', { err: err instanceof Error ? err.message : String(err) })
       return { ok: false, reason: 'io', error: '删除失败，请重试' }
+    }
+  }
+)
+
+/**
+ * `fs:listPinnedTrash`：列出钉选根内部隐藏回收区 `.idbox-trash` 的可恢复条目。
+ *
+ * 这是网络盘删除的**长期可访问入口**：系统回收站对网络盘无效，那些条目只能在这里
+ * 看到并还原。只收 `pinId`（主进程从自己的 settings 解析钉选根，不信渲染层路径），
+ * 与 `fs:trashEntries` 完全同源守卫。**永不 reject**，失败收口中文单行。
+ */
+ipcMain.handle(
+  IPC.fsListPinnedTrash,
+  async (_e, input: FsListPinnedTrashInput): Promise<FsListPinnedTrashResult> => {
+    try {
+      const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+      const root = resolvePinnedRootById(pinId)
+      if (!root.ok) return { ok: false, reason: 'guard', error: root.error }
+      return { ok: true, entries: await listPinnedTrash(root.absPath) }
+    } catch (err) {
+      logError('fs:listPinnedTrash-failed', {
+        err: err instanceof Error ? err.message : String(err)
+      })
+      return { ok: false, reason: 'io', error: '读取回收记录失败，请重试' }
+    }
+  }
+)
+
+/**
+ * `fs:restorePinnedTrash`：按 token 把隐藏回收区条目**真实还原**回原目录。
+ *
+ * token 在 `pinnedTrash.restorePinnedTrash` 内过 UUID 白名单，原始 relFolder 也
+ * 再过一次 `resolveWithinPinRoot` 同款根校验（`isWithinRoot`），绝不接收渲染层路径。
+ * 原位置被占用时自动追加 `-2/-3`，`renamed:true` 必须提示用户。**永不 reject**。
+ */
+ipcMain.handle(
+  IPC.fsRestorePinnedTrash,
+  async (_e, input: FsRestorePinnedTrashInput): Promise<FsRestorePinnedTrashResult> => {
+    try {
+      const pinId = typeof input?.pinId === 'string' ? input.pinId : ''
+      const token = typeof input?.token === 'string' ? input.token : ''
+      const root = resolvePinnedRootById(pinId)
+      if (!root.ok) return { ok: false, reason: 'guard', error: root.error }
+      const restored = await restorePinnedTrash(root.absPath, token)
+      logInfo('fs:restorePinnedTrash', { renamed: restored.renamed })
+      return {
+        ok: true,
+        name: restored.name,
+        relFolder: restored.relFolder,
+        renamed: restored.renamed
+      }
+    } catch (err) {
+      logError('fs:restorePinnedTrash-failed', {
+        err: err instanceof Error ? err.message : String(err)
+      })
+      return { ok: false, reason: 'io', error: '还原失败，请稍后重试' }
     }
   }
 )
@@ -3345,7 +3849,8 @@ function checkUpdateWithCache(force: boolean): Promise<UpdateInfo> {
   }
   if (updateInFlight) return updateInFlight
   const current = app.getVersion()
-  updateInFlight = fetchLatestRelease({ current })
+  // 2026-11 起改用「跨版本合并」：用户跳过中间版本时，说明里会包含这些版本的更新内容。
+  updateInFlight = fetchMergedRelease({ current })
     .then((info) => {
       // 只缓存成功结论；失败留空 → 下次调用真的重试
       updateCache = info.error === null ? info : null
@@ -3358,7 +3863,7 @@ function checkUpdateWithCache(force: boolean): Promise<UpdateInfo> {
       return info
     })
     .catch((err: unknown) => {
-      // fetchLatestRelease 契约上**从不抛错**；这里是最后一道保险：
+      // fetchMergedRelease 契约上**从不抛错**；这里是最后一道保险：
       // 无论如何都要给渲染层一个结构完整的 UpdateInfo，绝不把异常穿过 IPC。
       logWarn('update:check 意外异常', err)
       updateCache = null

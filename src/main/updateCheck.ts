@@ -340,3 +340,357 @@ export async function fetchLatestRelease(
   info.hasUpdate = compareVersions(latest, current) > 0
   return info
 }
+
+// ── 跨版本更新说明合并（2026-11，用户需求：「跳过两个版本时不能只显示最新那一条」） ──
+//
+// 用户原话：从很老的版本（例如第一个能收到推送的版本）直接跳到最新版时，弹窗里的更新
+// 说明应当**包含中间跳过的每个版本的具体内容**，而不是只有最新一条。
+//
+// 实现路线（最小侵入）：
+// 1. 改用**列表端点** `GET /releases?per_page=100`（`/releases/latest` 只能拿到一条）；
+// 2. 版本区间 = `current < v <= latest`，按版本降序；
+// 3. 逐版清洗 body 后拼成一份 Markdown，写回既有的 `UpdateInfo.notes` ——
+//    **不改 `UpdateInfo` 形状**（`tests/updateCheck.test.ts` 用 `toEqual` 钉死了全字段），
+//    渲染层 `logic/releaseNotes.ts` 一行都不用改。
+// 4. 总预算仍是 `MAX_NOTES_CHARS`（这段字符串要过 IPC + 常驻渲染进程）。
+
+/**
+ * 公开仓库的**发布列表**端点（按 `created_at` 倒序，最多 100 条）。
+ *
+ * 为什么不用 `/releases/latest`：那个端点只返回一条，拿不到"中间跳过的版本"。
+ * `per_page=100` 是本仓库的量级（单条 Release 说明通常几百字）够用的上限，
+ * 也是 GitHub 允许的最大值；超出的部分对"跳版本提示"没有意义。
+ */
+export const GITHUB_RELEASES_LIST_URL =
+  'https://api.github.com/repos/chengcheng067/ID-BOX/releases?per_page=100'
+
+/** 合并时最多拼进多少个版本（用户从 1.0.0 跳到 1.5.0 时不能把全部中间版都塞进来） */
+const MAX_MERGED_VERSIONS = 10
+
+/** 单版 body 的字符上限（合并后还要再过 `MAX_NOTES_CHARS` 总预算） */
+const MAX_SINGLE_NOTES_CHARS = 6_000
+
+/** 单版截断后缀（长度算进 6000 上限） */
+const SINGLE_NOTES_SUFFIX = '\n\n（本版本说明过长，已截断）'
+
+/** 合并后总预算被裁掉旧版本时的说明 */
+const OLDER_OMITTED_HINT = '\n\n（更早的更新说明已省略，完整内容见 Release 页面）'
+
+/** 版本条数超过 `MAX_MERGED_VERSIONS` 时的说明 */
+const MORE_VERSIONS_HINT = '\n\n还有更早的更新未展示'
+
+/** 某一版本来没有写说明时的占位（空块看起来像 bug，必须给一句人话） */
+const EMPTY_BODY_PLACEHOLDER = '（这个版本没有写更新说明）'
+
+/**
+ * 行内图片语法 `![alt](url)` —— 解析器不支持图片，必须换成纯文本。
+ *
+ * 刻意分成**两个**正则：`.test()` 用非全局的（全局正则的 `lastIndex` 会被 `.test()`
+ * 推进，下次调用从上次停的位置开始找，是一个典型的偶发漏判 bug）；
+ * 替换用全局的（`String.replace` 配 `/g` 每次都会自己归零）。
+ */
+const IMAGE_INLINE_RE = /!\[[^\]]*\]\([^)]*\)/
+const IMAGE_INLINE_ALL_RE = /!\[[^\]]*\]\([^)]*\)/g
+
+/** 整行就是一个图片 */
+const IMAGE_LINE_RE = /^!\[[^\]]*\]\([^)]*\)$/
+
+/** 整行以 HTML 标签开头（`<img ...>` / `<br>` / `</div>`）—— 解析器会把它们当文本显示 */
+const HTML_LINE_RE = /^<\/?[A-Za-z][^>]*>/
+
+/** 标题行（1~6 个 `#` + 空白） */
+const HEADING_LINE_RE = /^(#{1,6})\s/
+
+/** 合并后仍可能超预算：先按「丢最旧版本」裁，极端情况才硬截断 */
+function cutText(value: string, limit: number, suffix: string): string {
+  if (value.length <= limit) return value
+  const room = Math.max(0, limit - suffix.length)
+  let cut = value.slice(0, room)
+  // 不把代理对（emoji 等）切一半：孤立代理在渲染层会显示成 ▯
+  const tail = cut.charCodeAt(cut.length - 1)
+  if (tail >= 0xd800 && tail <= 0xdbff) cut = cut.slice(0, -1)
+  return `${cut}${suffix}`
+}
+
+/** 把连续空行压成一个（清洗掉表格行/引用行后常会留下空档） */
+function collapseBlankLines(lines: string[]): string {
+  const out: string[] = []
+  for (const line of lines) {
+    if (!line.trim()) {
+      if (out.length > 0 && out[out.length - 1] === '') continue
+      out.push('')
+      continue
+    }
+    out.push(line)
+  }
+  return out.join('\n').trim()
+}
+
+/**
+ * 单个版本的 `body` → 能被 `logic/releaseNotes.ts` 完整吃下的受限 Markdown。
+ *
+ * 清洗顺序（**不可调换**）：
+ * 1. `normalizeReleaseNotes` —— 复用既有的类型收敛 + `\r` 归一化 + 20000 上限保护；
+ * 2. 引用块行（`>` 开头）整行丢弃 —— 解析器不支持引用，留着会显示成字面 `>`；
+ * 3. 表格行（`|` 开头，含 `|---|` 分隔行）整行丢弃 —— 解析器不支持表格；
+ * 4. 纯图片行 → `[图片已省略]`；行内图片 → 同样替换（解析器没有 image token，
+ *    `![x](url)` 会渲染成 "!" + 链接文字，很难看）；
+ * 5. HTML 标签行整行丢弃 —— 解析器会把 `<img onerror=...>` 当字面文本显示（安全，
+ *    但用户看到的是源码）；
+ * 6. **正文小标题降一级**（`#` → `##`、`##` → `###`）—— 否则正文的 `## 新增`
+ *    会和版头 `## v1.2.0` 同级，读起来分不清"这是哪个版本的"；
+ * 7. 单版封顶 6000 字符（见 `MAX_SINGLE_NOTES_CHARS`）。
+ *
+ * 围栏代码块不做状态机：解析器本来就不支持 ``` ，块内内容原样当段落是既有行为。
+ *
+ * @returns 清洗后的 Markdown；`null` = 这一版没有可展示的内容
+ */
+function sanitizeReleaseBody(value: unknown): string | null {
+  const normalized = normalizeReleaseNotes(value)
+  if (!normalized) return null
+
+  const lines: string[] = []
+  for (const rawLine of normalized.split('\n')) {
+    let line = rawLine.trim()
+    if (!line) {
+      lines.push('')
+      continue
+    }
+    // ② 引用块
+    if (line.startsWith('>')) continue
+    // ③ 表格（含 `|---|` 分隔行）
+    if (line.startsWith('|')) continue
+    // ⑤ HTML 整行
+    if (HTML_LINE_RE.test(line)) continue
+    // ④ 图片
+    if (IMAGE_LINE_RE.test(line)) {
+      lines.push('[图片已省略]')
+      continue
+    }
+    if (IMAGE_INLINE_RE.test(line)) {
+      line = line.replace(IMAGE_INLINE_ALL_RE, '[图片已省略]')
+    }
+    // ⑥ 小标题降一级（已经是 6 级就不再加，否则 7 个 `#` 会被解析器当成段落）
+    const heading = HEADING_LINE_RE.exec(line)
+    if (heading && heading[1].length < 6) line = `#${line}`
+    lines.push(line)
+  }
+
+  const cleaned = collapseBlankLines(lines)
+  if (!cleaned) return null
+  return cutText(cleaned, MAX_SINGLE_NOTES_CHARS, SINGLE_NOTES_SUFFIX)
+}
+
+/** `published_at`（ISO 8601）→ `YYYY-MM-DD`；格式不符返回 null（版头就不写日期） */
+function releaseDate(publishedAt: string | null): string | null {
+  if (!publishedAt) return null
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(publishedAt)
+  return match ? match[1] : null
+}
+
+/** 单个版本的列表项（已过滤 draft / prerelease / 非版本号 tag） */
+interface ReleaseEntry {
+  /** 去掉 `v` 前缀的版本号 */
+  version: string
+  /** 原始 `body`（未清洗，可能在拼接阶段因总预算被丢弃） */
+  body: unknown
+  htmlUrl: string | null
+  assetUrl: string | null
+  publishedAt: string | null
+}
+
+/**
+ * 列表端点返回的 JSON → 可比较的条目数组。
+ *
+ * @returns `null` = 结构不符（不是数组，→ `error:'parse'`）；`[]` = 没有可用的正式版
+ */
+function parseReleaseList(value: unknown): ReleaseEntry[] | null {
+  if (!Array.isArray(value)) return null
+  const entries: ReleaseEntry[] = []
+  const seen = new Set<string>()
+  for (const item of value) {
+    if (item === null || typeof item !== 'object') continue
+    const release = item as Record<string, unknown>
+    // draft / prerelease 一律不参与（绝不给用户推测试版）
+    if (release.draft === true || release.prerelease === true) continue
+    const rawTag = typeof release.tag_name === 'string' ? release.tag_name : ''
+    const parsed = parseVersion(rawTag)
+    // 不是版本号（'nightly' / 'latest'）→ 丢弃
+    if (!parsed) continue
+    // 带预发布后缀的 tag（`v1.3.0-beta.1`）即使没打 prerelease 标记也不参与，
+    // 否则它会被当成"最新版"把正式版挡在外面
+    if (parsed.prerelease) continue
+    const version = normalizeVersion(rawTag)
+    if (!version || seen.has(version)) continue
+    seen.add(version)
+    entries.push({
+      version,
+      body: release.body,
+      htmlUrl: optionalString(release.html_url),
+      assetUrl: pickAssetUrl(release.assets),
+      publishedAt: optionalString(release.published_at)
+    })
+  }
+  return entries
+}
+
+/** 一个版本的 Markdown 块（版头 + 清洗后的正文） */
+function buildReleaseBlock(entry: ReleaseEntry): string {
+  const date = releaseDate(entry.publishedAt)
+  const header = date ? `## v${entry.version} · ${date}` : `## v${entry.version}`
+  const body = sanitizeReleaseBody(entry.body) ?? EMPTY_BODY_PLACEHOLDER
+  return `${header}\n\n${body}`
+}
+
+/**
+ * 多个块拼成一份 Markdown，并守住总字符预算。
+ *
+ * 超预算时**从最旧的版本开始丢**（而不是从末尾砍字符串）：用户最关心的是最新那几版，
+ * 而把一个版本拦腰截断会留下半句话。全部丢完仍超（不可能，单版已封 6000，10 × 6000
+ * 也只在极端情况下超 20000）才硬截断。
+ *
+ * @param limit 本次允许的总字符数（调用方会在需要时预留末尾提示的位置）
+ */
+function joinBlocks(blocks: string[], limit: number): string {
+  const text = blocks.join('\n\n---\n\n')
+  if (text.length <= limit) return text
+  let kept = blocks.slice()
+  while (kept.length > 1) {
+    kept = kept.slice(0, -1)
+    const candidate = `${kept.join('\n\n---\n\n')}${OLDER_OMITTED_HINT}`
+    if (candidate.length <= limit) return candidate
+  }
+  // 只剩一块仍超：单块已被 `MAX_SINGLE_NOTES_CHARS` 封顶，这里只会发生在 limit 被
+  // 预留压低到 6000 以下的情况 —— 直接硬截断，保证"总量恒定守住预算"这个不变量
+  return cutText(`${blocks.join('\n\n---\n\n')}${OLDER_OMITTED_HINT}`, limit, '')
+}
+
+/** `fetchMergedRelease` 的可选入参（全部可注入，便于单测） */
+export interface FetchMergedReleaseOptions {
+  /** 当前版本（无 v 前缀）。生产传 `app.getVersion()`；缺省按 `0.0.0` 处理 */
+  current?: string
+  /**
+   * 测试注入的 fetcher。生产不传 → 用 `globalThis.fetch`；
+   * 传 `null` 表示「刻意没有网络能力」，直接返回 network 错误。
+   */
+  fetcher?: UpdateFetcher | null
+  /** 超时毫秒（缺省 8s） */
+  timeoutMs?: number
+  /** 结果里的 `checkedAt`（缺省 Date.now()；测试注入固定值） */
+  now?: number
+}
+
+/**
+ * 拉取**发布列表**，把 `current` 之后、直到最新版的每个版本的说明合并成一份 Markdown。
+ *
+ * 与 `fetchLatestRelease` 的关系：**并列的另一条路径**，不改动也不调用它
+ * （它的 URL 被 `tests/updateCheck.test.ts` 用源码断言钉死了）。
+ *
+ * 返回的 `url` / `assetUrl` / `publishedAt` **一律取最新那一条** ——
+ * 下载按钮永远指向最新安装包，合并进来的老版本只提供"更新内容"。
+ *
+ * **永不抛错**（同 `fetchLatestRelease` 的契约）：
+ * - 无 fetch 能力 / 网络异常 / 超时 → `error:'network'`；
+ * - 非 2xx → `error:'http'`；
+ * - JSON 不是数组 / 解析失败 → `error:'parse'`；
+ * - 列表里一个可用正式版都没有（仓库还没发过 Release）→ 当作"无更新"，`error:null`。
+ */
+export async function fetchMergedRelease(
+  opts: FetchMergedReleaseOptions = {}
+): Promise<UpdateInfo> {
+  const current = normalizeVersion(opts.current ?? '0.0.0') || '0.0.0'
+  const checkedAt = typeof opts.now === 'number' && Number.isFinite(opts.now) ? opts.now : Date.now()
+  const timeoutMs =
+    typeof opts.timeoutMs === 'number' && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+      ? opts.timeoutMs
+      : UPDATE_CHECK_TIMEOUT_MS
+
+  const fetcher: UpdateFetcher | null =
+    opts.fetcher === null
+      ? null
+      : (opts.fetcher ??
+        (typeof globalThis.fetch === 'function'
+          ? (globalThis.fetch as unknown as UpdateFetcher)
+          : null))
+
+  if (!fetcher) return emptyInfo(current, checkedAt, 'network')
+
+  const signal =
+    typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined
+
+  let res: UpdateFetchResponse
+  try {
+    res = await fetcher(GITHUB_RELEASES_LIST_URL, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `IDBOX/${current}`
+      },
+      signal
+    })
+  } catch {
+    return emptyInfo(current, checkedAt, 'network')
+  }
+
+  if (!res || typeof res.ok !== 'boolean') return emptyInfo(current, checkedAt, 'network')
+  if (!res.ok) return emptyInfo(current, checkedAt, 'http')
+
+  let body: unknown
+  try {
+    body = await res.json()
+  } catch {
+    return emptyInfo(current, checkedAt, 'parse')
+  }
+
+  const entries = parseReleaseList(body)
+  if (entries === null) return emptyInfo(current, checkedAt, 'parse')
+  // 列表为空 = 仓库还没有已发布的正式版 → 不是错误，就是"没有更新"
+  if (entries.length === 0) return emptyInfo(current, checkedAt, null)
+
+  // 定 latest：按 compareVersions 取最大，**不信数组顺序**（API 是 created_at 倒序，
+  // 补发的老版本 Release 可能排在前面）
+  let newest = entries[0]
+  for (const entry of entries) {
+    if (compareVersions(entry.version, newest.version) > 0) newest = entry
+  }
+
+  const base: UpdateInfo = {
+    current,
+    latest: newest.version,
+    hasUpdate: false,
+    url: newest.htmlUrl,
+    assetUrl: newest.assetUrl,
+    publishedAt: newest.publishedAt,
+    notes: null,
+    checkedAt,
+    error: null
+  }
+
+  // 已是最新（或本地版本更新）：没有可合并的区间
+  if (compareVersions(newest.version, current) <= 0) return base
+
+  const inRange = entries
+    .filter(
+      (entry) =>
+        compareVersions(entry.version, current) > 0 &&
+        compareVersions(entry.version, newest.version) <= 0
+    )
+    .sort((a, b) => compareVersions(b.version, a.version))
+
+  // 理论上 inRange 至少含 newest 自身；空数组只可能出现在版本号畸形时
+  if (inRange.length === 0) return base
+
+  const capped = inRange.length > MAX_MERGED_VERSIONS
+  const chosen = capped ? inRange.slice(0, MAX_MERGED_VERSIONS) : inRange
+  // 条数提示也算进总预算：否则「10 条刚好 19990 字 + 提示」会越过 MAX_NOTES_CHARS，
+  // 而这段字符串的契约是「绝不超 20000」（要过 IPC + 常驻渲染进程）
+  const budget = capped ? MAX_NOTES_CHARS - MORE_VERSIONS_HINT.length : MAX_NOTES_CHARS
+  const merged = joinBlocks(chosen.map(buildReleaseBlock), budget)
+
+  return {
+    ...base,
+    hasUpdate: true,
+    notes: capped ? `${merged}${MORE_VERSIONS_HINT}` : merged
+  }
+}

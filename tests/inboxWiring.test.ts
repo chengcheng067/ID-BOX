@@ -83,7 +83,9 @@ describe('主进程接线（src/main/index.ts）', () => {
 
   it('启动时起收件箱监听（bootstrap 的 whenReady 里）', () => {
     expect(src).toContain('function startInbox(): void')
-    expect(src).toMatch(/createWindow\(\)\n\s*restartWatcher\(\)/)
+    // 2026-11 起 createWindow() 与 restartWatcher() 之间多了一步「按设置同步托盘」
+    // （closeBehavior === 'tray' 才建图标），启动链顺序仍须是 建窗 → 同步托盘 → 重启 watcher。
+    expect(src).toMatch(/createWindow\(\)\n\s*syncTrayWithSettings\(\)\n\s*restartWatcher\(\)/)
     expect(src).toMatch(/restartWatcher\(\)[\s\S]{0,400}startInbox\(\)/)
     expect(src).toMatch(/startInboxWatcher\(\(job\)/)
   })
